@@ -1,0 +1,63 @@
+import argparse
+import asyncio
+import yaml
+
+from vectorforge.sources.huggingface import HuggingFaceSource
+from vectorforge.embedders.openai import OpenAIEmbedder
+from vectorforge.embedders.baseten import BasetenEmbedder
+from vectorforge.embedders.cohere import CohereEmbedder
+from vectorforge.pipeline.runner import run
+
+
+SOURCE_REGISTRY = {
+    "huggingface": HuggingFaceSource,
+}
+
+EMBEDDER_REGISTRY = {
+    "openai": OpenAIEmbedder,
+    "baseten": BasetenEmbedder,
+    "cohere": CohereEmbedder,
+}
+
+
+def build_source(cfg: dict):
+    source_type = cfg.pop("type")
+    cls = SOURCE_REGISTRY[source_type]
+    return cls(**cfg)
+
+
+def build_embedder(cfg: dict):
+    embedder_type = cfg.pop("type")
+    cls = EMBEDDER_REGISTRY[embedder_type]
+    return cls(**cfg)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run a vectorforge embedding pipeline")
+    parser.add_argument("config", help="Path to YAML config file")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+
+    source = build_source(dict(config["source"]))
+    embedder = build_embedder(dict(config["embedder"]))
+
+    pipeline_cfg = config.get("pipeline", {})
+    storage_cfg = config.get("storage", {})
+
+    asyncio.run(
+        run(
+            source=source,
+            embedder=embedder,
+            s3_bucket=storage_cfg["s3_bucket"],
+            s3_prefix=storage_cfg["s3_prefix"],
+            chunk_size=pipeline_cfg.get("chunk_size", 10_000),
+            num_workers=pipeline_cfg.get("num_workers", 8),
+            output_dir=storage_cfg.get("output_dir", "/tmp/vectorforge"),
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

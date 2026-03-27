@@ -1,0 +1,23 @@
+source:
+  type: huggingface
+  dataset_name: wikimedia/wikipedia
+  config: 20231101.en
+  split: train
+  text_field: text
+  payload_fields:
+    - title
+    - url
+
+embedder:
+  type: openai
+  model: text-embedding-3-small
+  dimensions: 1536
+
+pipeline:
+  chunk_size: 10000
+  num_workers: 8
+
+storage:
+  s3_bucket: my-vectorforge-bucket
+  s3_prefix: wikipedia/openai-3-small
+  output_dir: /tmp/vectorforge

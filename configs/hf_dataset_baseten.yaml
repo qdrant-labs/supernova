@@ -1,0 +1,20 @@
+source:
+  type: huggingface
+  dataset_name: sentence-transformers/all-nli
+  split: train
+  text_field: text
+
+embedder:
+  type: baseten
+  deployment_id: YOUR_DEPLOYMENT_ID
+  api_key: YOUR_API_KEY
+  model_id: bge-base-en-v1.5
+
+pipeline:
+  chunk_size: 5000
+  num_workers: 4
+
+storage:
+  s3_bucket: my-vectorforge-bucket
+  s3_prefix: all-nli/bge-base
+  output_dir: /tmp/vectorforge
