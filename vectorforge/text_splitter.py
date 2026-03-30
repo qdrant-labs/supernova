@@ -7,7 +7,7 @@ def split_text(text: str, max_tokens: int = 8192, model: str = "text-embedding-3
     Returns a list of text pieces. If the text fits, returns [text].
     """
     encoder = tiktoken.encoding_for_model(model)
-    tokens = encoder.encode(text)
+    tokens = encoder.encode(text, allowed_special="all")
 
     if len(tokens) <= max_tokens:
         return [text]
