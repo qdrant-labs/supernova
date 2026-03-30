@@ -57,6 +57,11 @@ class DatasetSource(ABC):
 
         for raw_row in self.stream():
             base_record = self.format_record(raw_row, row_id, chunk_id)
+
+            if not base_record.text or not base_record.text.strip():
+                source_row_id += 1
+                continue
+
             text_pieces = split_text(base_record.text, max_tokens=max_tokens)
 
             for chunk_index, piece in enumerate(text_pieces):

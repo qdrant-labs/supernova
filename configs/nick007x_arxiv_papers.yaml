@@ -1,0 +1,19 @@
+source:
+  type: huggingface
+  dataset_name: nick007x/arxiv-papers
+  split: train
+  text_field: abstract
+
+embedder:
+  type: openai
+  model: text-embedding-3-small
+  dimensions: 1536
+
+pipeline:
+  chunk_size: 10000
+  num_workers: 2
+
+storage:
+  s3_bucket: qdrant--vectorforge
+  s3_prefix: openassistant--oasst1/openai-3-small
+  output_dir: /tmp/vectorforge
