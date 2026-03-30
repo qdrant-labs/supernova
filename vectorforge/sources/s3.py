@@ -28,7 +28,9 @@ class S3Source(DatasetSource):
         payload = {k: row[k] for k in self.payload_fields if k in row}
         return Record(
             row_id=row_id,
+            source_row_id=0,
             chunk_id=chunk_id,
+            chunk_index=0,
             text=row[self.text_field],
             source=self.source_name,
             payload=payload,

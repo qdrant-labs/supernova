@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import yaml
 
 from vectorforge.sources.huggingface import HuggingFaceSource
@@ -33,6 +34,13 @@ def build_embedder(cfg: dict):
 
 
 def main():
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("vectorforge").setLevel(logging.INFO)
+
     parser = argparse.ArgumentParser(description="Run a vectorforge embedding pipeline")
     parser.add_argument("config", help="Path to YAML config file")
     args = parser.parse_args()
@@ -53,7 +61,9 @@ def main():
             s3_bucket=storage_cfg["s3_bucket"],
             s3_prefix=storage_cfg["s3_prefix"],
             chunk_size=pipeline_cfg.get("chunk_size", 10_000),
+            max_tokens=pipeline_cfg.get("max_tokens", 8192),
             num_workers=pipeline_cfg.get("num_workers", 8),
+            flush_threshold=pipeline_cfg.get("flush_threshold", 100_000),
             output_dir=storage_cfg.get("output_dir", "/tmp/vectorforge"),
         )
     )

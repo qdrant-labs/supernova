@@ -1,12 +1,8 @@
 source:
   type: huggingface
-  dataset_name: wikimedia/wikipedia
-  config: 20231101.en
+  dataset_name: mteb/tweet_sentiment_extraction
   split: train
   text_field: text
-  payload_fields:
-    - title
-    - url
 
 embedder:
   type: openai
@@ -15,10 +11,9 @@ embedder:
 
 pipeline:
   chunk_size: 10000
-  num_workers: 8
-  flush_threshold: 100000
+  num_workers: 4
 
 storage:
   s3_bucket: qdrant--vectorforge
-  s3_prefix: wikipedia/openai-3-small
+  s3_prefix: mteb--tweet-sentiment/openai-3-small
   output_dir: /tmp/vectorforge

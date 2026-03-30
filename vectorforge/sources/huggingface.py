@@ -3,6 +3,7 @@ from datasets import load_dataset
 from vectorforge.sources.base import DatasetSource
 from vectorforge.models import Record
 
+_payload_extract_all = lambda row, fields: {k: row[k] for k in fields if k in row}
 
 class HuggingFaceSource(DatasetSource):
     def __init__(
@@ -30,10 +31,14 @@ class HuggingFaceSource(DatasetSource):
         yield from self._dataset
 
     def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
-        payload = {k: row[k] for k in self.payload_fields if k in row}
+        payload = self.extract_payload(row)
+        if payload is None:
+            payload = _payload_extract_all(row, self.payload_fields) if self.payload_fields else {}
         return Record(
             row_id=row_id,
+            source_row_id=0,  # set by get_chunks
             chunk_id=chunk_id,
+            chunk_index=0,    # set by get_chunks
             text=row[self.text_field],
             source=self.source_name,
             payload=payload,

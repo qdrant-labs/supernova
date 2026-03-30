@@ -19,7 +19,9 @@ class FakeSource(DatasetSource):
     def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
         return Record(
             row_id=row_id,
+            source_row_id=0,
             chunk_id=chunk_id,
+            chunk_index=0,
             text=row[self._text_field],
             source=self.source_name,
         )
@@ -35,6 +37,8 @@ def test_get_chunks_single_chunk():
     assert len(records) == 5
     assert records[0].text == "row 0"
     assert records[4].row_id == 4
+    assert records[0].source_row_id == 0
+    assert records[4].source_row_id == 4
 
 
 def test_get_chunks_multiple_chunks():
@@ -57,3 +61,13 @@ def test_get_chunks_exact_boundary():
     assert len(chunks) == 2
     assert len(chunks[0][1]) == 10
     assert len(chunks[1][1]) == 10
+
+
+def test_chunk_index_for_short_texts():
+    """Short texts should all have chunk_index=0."""
+    rows = [{"text": "short"} for _ in range(3)]
+    source = FakeSource(rows)
+    chunks = list(source.get_chunks(chunk_size=10))
+    for _, records in chunks:
+        for r in records:
+            assert r.chunk_index == 0

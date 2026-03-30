@@ -1,12 +1,20 @@
 import asyncio
+import json
+import logging
 import os
+import time
+from datetime import datetime, timezone
+
+from tqdm import tqdm
 
 from vectorforge.sources.base import DatasetSource
 from vectorforge.embedders.base import Embedder
 from vectorforge.pipeline.buffer import ResultBuffer
 from vectorforge.pipeline.worker import worker
-from vectorforge.storage.writer import write_chunk
-from vectorforge.storage.s3 import upload_to_s3
+from vectorforge.storage.writer import write_batch
+from vectorforge.storage.s3 import upload_to_s3, upload_bytes_to_s3
+
+logger = logging.getLogger(__name__)
 
 
 async def run(
@@ -15,45 +23,93 @@ async def run(
     s3_bucket: str,
     s3_prefix: str,
     chunk_size: int = 10_000,
+    max_tokens: int = 8192,
     num_workers: int = 8,
+    flush_threshold: int = 100_000,
     output_dir: str = "/tmp/vectorforge",
 ):
+    logger.info(
+        "Starting pipeline: source=%s embedder=%s chunk_size=%d num_workers=%d flush_threshold=%d",
+        source.source_name, embedder.model_name, chunk_size, num_workers, flush_threshold,
+    )
+    start_time = time.time()
+    total_records = 0
+
     work_queue: asyncio.Queue = asyncio.Queue(maxsize=num_workers * 2)
     result_queue: asyncio.Queue = asyncio.Queue()
 
-    async def flush(chunk_result):
-        local_path = write_chunk(chunk_result, output_dir)
+    batch_counter = 0
+
+    async def flush(records):
+        nonlocal batch_counter, total_records
+        local_path = write_batch(records, output_dir, batch_counter)
+        logger.info("Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path)
+        batch_counter += 1
+        total_records += len(records)
         await upload_to_s3(local_path, s3_bucket, s3_prefix)
-        # below is technically blocking, but upload_to_s3 is the real
-        # bottleneck so it shouldn't add much overhead... ideally.
         os.remove(local_path)
 
-    buffer = ResultBuffer(flush_fn=flush)
+    buffer = ResultBuffer(flush_fn=flush, flush_threshold=flush_threshold)
 
-    # start workers
+    # chunker: feeds work queue, then sends sentinels to shut down workers
+    async def run_chunker():
+        for chunk_id, records in source.get_chunks(chunk_size, max_tokens=max_tokens):
+            await work_queue.put((chunk_id, records))
+        logger.info("Chunker finished, sending stop signals to %d workers", num_workers)
+        for _ in range(num_workers):
+            await work_queue.put(None)
+
+    # drain: pulls from result queue into buffer until all workers are done
+    progress = tqdm(unit=" chunks", desc="Embedding")
+
+    async def drain_results():
+        finished_workers = 0
+        while finished_workers < num_workers:
+            result = await result_queue.get()
+            if result is None:  # worker finished sentinel
+                finished_workers += 1
+                continue
+            await buffer.push(result)
+            progress.update(1)
+        await buffer.drain()
+        progress.close()
+
     worker_tasks = [
         asyncio.create_task(worker(i, work_queue, result_queue, embedder))
         for i in range(num_workers)
     ]
 
-    # drain result queue into buffer concurrently
-    async def drain_results(total_chunks):
-        for _ in range(total_chunks):
-            result = await result_queue.get()
-            await buffer.push(result)
-        await buffer.drain()
+    await asyncio.gather(
+        run_chunker(),
+        *worker_tasks,
+        drain_results(),
+    )
 
-    # run chunker (fills work queue), track how many chunks we send
-    chunk_count = 0
+    elapsed = time.time() - start_time
+    logger.info(
+        "Pipeline complete: %d records in %d batches, %.1fs elapsed (%.0f records/s)",
+        total_records, batch_counter, elapsed, total_records / elapsed if elapsed > 0 else 0,
+    )
 
-    async def run_chunker():
-        nonlocal chunk_count
-        for chunk_id, records in source.get_chunks(chunk_size):
-            await work_queue.put((chunk_id, records))
-            chunk_count += 1
-        for _ in range(num_workers):
-            await work_queue.put(None)  # Sentinels
-
-    await run_chunker()
-    await asyncio.gather(*worker_tasks)
-    await drain_results(chunk_count)
+    manifest = {
+        "source": source.source_name,
+        "embedder": embedder.model_name,
+        "dimensions": embedder.dimensions,
+        "chunk_size": chunk_size,
+        "max_tokens": max_tokens,
+        "num_workers": num_workers,
+        "flush_threshold": flush_threshold,
+        "total_records": total_records,
+        "total_batches": batch_counter,
+        "elapsed_seconds": round(elapsed, 2),
+        "records_per_second": round(total_records / elapsed, 1) if elapsed > 0 else 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "s3_bucket": s3_bucket,
+        "s3_prefix": s3_prefix,
+    }
+    await upload_bytes_to_s3(
+        json.dumps(manifest, indent=2).encode(),
+        s3_bucket,
+        f"{s3_prefix}/_manifest.json",
+    )
+    logger.info("Uploaded manifest to s3://%s/%s/_manifest.json", s3_bucket, s3_prefix)

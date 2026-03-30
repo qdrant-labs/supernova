@@ -5,7 +5,7 @@ from vectorforge.models import ChunkResult, EmbeddedRecord
 
 
 async def worker(
-    worker_id: int,
+    _worker_id: int,
     work_queue: asyncio.Queue,
     result_queue: asyncio.Queue,
     embedder: Embedder,
@@ -14,6 +14,7 @@ async def worker(
         item = await work_queue.get()
         if item is None:  # sentinel
             work_queue.task_done()
+            await result_queue.put(None)  # signal drain that this worker is done
             break
 
         chunk_id, records = item
@@ -24,7 +25,9 @@ async def worker(
         embedded = [
             EmbeddedRecord(
                 row_id=r.row_id,
+                source_row_id=r.source_row_id,
                 chunk_id=r.chunk_id,
+                chunk_index=r.chunk_index,
                 text=r.text,
                 source=r.source,
                 embedding=emb,

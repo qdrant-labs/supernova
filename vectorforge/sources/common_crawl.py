@@ -19,7 +19,9 @@ class CommonCrawlSource(DatasetSource):
     def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
         return Record(
             row_id=row_id,
+            source_row_id=0,
             chunk_id=chunk_id,
+            chunk_index=0,
             text=row[self.text_field],
             source=self.source_name,
             payload={k: v for k, v in row.items() if k != self.text_field},

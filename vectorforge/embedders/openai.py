@@ -1,13 +1,26 @@
+import asyncio
+import logging
+
 from vectorforge.embedders.base import Embedder
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAIEmbedder(Embedder):
-    def __init__(self, model: str = "text-embedding-3-small", dimensions: int | None = None):
+    def __init__(
+        self,
+        model: str = "text-embedding-3-small",
+        dimensions: int | None = None,
+        batch_size: int = 128,
+        max_retries: int = 5,
+    ):
         from openai import AsyncOpenAI
-        
+
         self.client = AsyncOpenAI()
         self._model = model
         self._dimensions = dimensions
+        self._batch_size = batch_size
+        self._max_retries = max_retries
 
     @property
     def model_name(self) -> str:
@@ -18,8 +31,31 @@ class OpenAIEmbedder(Embedder):
         return self._dimensions
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        kwargs = {"model": self._model, "input": texts}
+        from openai import RateLimitError
+
+        kwargs_base = {"model": self._model}
         if self._dimensions:
-            kwargs["dimensions"] = self._dimensions
-        response = await self.client.embeddings.create(**kwargs)
-        return [item.embedding for item in response.data]
+            kwargs_base["dimensions"] = self._dimensions
+
+        batches = [
+            texts[i : i + self._batch_size]
+            for i in range(0, len(texts), self._batch_size)
+        ]
+
+        async def _embed_batch(batch: list[str]) -> list[list[float]]:
+            for attempt in range(self._max_retries):
+                try:
+                    response = await self.client.embeddings.create(input=batch, **kwargs_base)
+                    return [item.embedding for item in response.data]
+                except RateLimitError as e:
+                    if attempt == self._max_retries - 1:
+                        raise
+                    wait = 2 ** attempt
+                    retry_after = getattr(e.response, "headers", {}).get("retry-after")
+                    if retry_after:
+                        wait = float(retry_after)
+                    logger.warning("Rate limited, retrying in %.1fs (attempt %d/%d)", wait, attempt + 1, self._max_retries)
+                    await asyncio.sleep(wait)
+
+        results = await asyncio.gather(*[_embed_batch(b) for b in batches])
+        return [emb for batch_result in results for emb in batch_result]
