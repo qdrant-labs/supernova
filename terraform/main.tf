@@ -122,6 +122,7 @@ resource "aws_batch_job_definition" "vectorforge" {
 
     environment = [
       { name = "OPENAI_API_KEY", value = var.openai_api_key },
+      { name = "HF_TOKEN", value = var.hf_token },
     ]
 
     logConfiguration = {
@@ -135,6 +136,122 @@ resource "aws_batch_job_definition" "vectorforge" {
 
     networkConfiguration = {
       assignPublicIp = "ENABLED"
+    }
+  })
+}
+
+# --- GPU compute environment (EC2-backed, optional) ---
+
+data "aws_iam_policy_document" "batch_service_assume" {
+  count = var.enable_gpu ? 1 : 0
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["batch.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "batch_service" {
+  count              = var.enable_gpu ? 1 : 0
+  name               = "${var.project_name}-batch-service"
+  assume_role_policy = data.aws_iam_policy_document.batch_service_assume[0].json
+}
+
+resource "aws_iam_role_policy_attachment" "batch_service" {
+  count      = var.enable_gpu ? 1 : 0
+  role       = aws_iam_role.batch_service[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole"
+}
+
+# EC2 instance profile for GPU instances
+resource "aws_iam_role" "ecs_instance" {
+  count              = var.enable_gpu ? 1 : 0
+  name               = "${var.project_name}-ecs-instance"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_instance" {
+  count      = var.enable_gpu ? 1 : 0
+  role       = aws_iam_role.ecs_instance[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}
+
+resource "aws_iam_instance_profile" "ecs_instance" {
+  count = var.enable_gpu ? 1 : 0
+  name  = "${var.project_name}-ecs-instance"
+  role  = aws_iam_role.ecs_instance[0].name
+}
+
+resource "aws_batch_compute_environment" "gpu" {
+  count = var.enable_gpu ? 1 : 0
+  name  = "${var.project_name}-gpu"
+  type  = "MANAGED"
+  state = "ENABLED"
+
+  compute_resources {
+    type                = "EC2"
+    max_vcpus           = var.gpu_max_vcpus
+    min_vcpus           = 0
+    desired_vcpus       = 0
+    instance_type       = var.gpu_instance_types
+    instance_role       = aws_iam_instance_profile.ecs_instance[0].arn
+    subnets             = data.aws_subnets.default.ids
+    security_group_ids  = [data.aws_security_group.default.id]
+  }
+}
+
+resource "aws_batch_job_queue" "gpu" {
+  count    = var.enable_gpu ? 1 : 0
+  name     = "${var.project_name}-gpu"
+  state    = "ENABLED"
+  priority = 1
+
+  compute_environment_order {
+    order               = 1
+    compute_environment = aws_batch_compute_environment.gpu[0].arn
+  }
+}
+
+resource "aws_batch_job_definition" "gpu" {
+  count = var.enable_gpu ? 1 : 0
+  name  = "${var.project_name}-gpu"
+  type  = "container"
+
+  platform_capabilities = ["EC2"]
+
+  container_properties = jsonencode({
+    image = "${aws_ecr_repository.vectorforge.repository_url}:latest-gpu"
+
+    resourceRequirements = [
+      { type = "VCPU", value = "4" },
+      { type = "MEMORY", value = "15000" },
+      { type = "GPU", value = "1" },
+    ]
+
+    jobRoleArn       = aws_iam_role.batch_job.arn
+    executionRoleArn = aws_iam_role.batch_job.arn
+
+    environment = [
+      { name = "OPENAI_API_KEY", value = var.openai_api_key },
+      { name = "HF_TOKEN", value = var.hf_token },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.vectorforge.name
+        "awslogs-region"        = var.region
+        "awslogs-stream-prefix" = "batch-gpu"
+      }
     }
   })
 }
@@ -162,6 +279,7 @@ resource "aws_batch_job_definition" "per_config" {
 
     environment = [
       { name = "OPENAI_API_KEY", value = var.openai_api_key },
+      { name = "HF_TOKEN", value = var.hf_token },
     ]
 
     logConfiguration = {

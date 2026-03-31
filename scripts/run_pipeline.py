@@ -9,10 +9,10 @@ import yaml
 
 from vectorforge.sources.huggingface import HuggingFaceSource
 from vectorforge.embedders.openai import OpenAIEmbedder
-from vectorforge.embedders.baseten import BasetenEmbedder
-from vectorforge.embedders.cohere import CohereEmbedder
+from vectorforge.embedders.sentence_transformer import SentenceTransformerEmbedder
 from vectorforge.storage.s3 import S3Backend
 from vectorforge.storage.huggingface import HuggingFaceBackend
+from vectorforge.storage.local import LocalBackend
 from vectorforge.pipeline.runner import run
 
 
@@ -22,8 +22,7 @@ SOURCE_REGISTRY = {
 
 EMBEDDER_REGISTRY = {
     "openai": OpenAIEmbedder,
-    "baseten": BasetenEmbedder,
-    "cohere": CohereEmbedder,
+    "sentence_transformer": SentenceTransformerEmbedder,
 }
 
 
@@ -51,6 +50,10 @@ def build_storage(cfg: dict):
             repo_id=cfg["repo_id"],
             token=cfg.get("token"),
             private=cfg.get("private", True),
+        )
+    elif storage_type == "local":
+        return LocalBackend(
+            output_dir=cfg.get("output_dir", "/tmp/vectorforge"),
         )
     else:
         raise ValueError(f"Unknown storage type: {storage_type}")

@@ -16,6 +16,8 @@ dependencies = [
     "tqdm",
     "huggingface_hub",
     "duckdb>=1.5.1",
+    "sentence-transformers",
+    "torch",
 ]
 
 [tool.setuptools.packages.find]
