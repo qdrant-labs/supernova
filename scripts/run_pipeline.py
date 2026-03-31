@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import logging
+import os
 import yaml
 
 from vectorforge.sources.huggingface import HuggingFaceSource
@@ -64,10 +65,14 @@ def main():
     logging.getLogger("vectorforge").setLevel(logging.INFO)
 
     parser = argparse.ArgumentParser(description="Run a vectorforge embedding pipeline")
-    parser.add_argument("config", help="Path to YAML config file")
+    parser.add_argument("config", nargs="?", help="Path to YAML config file")
     args = parser.parse_args()
 
-    with open(args.config) as f:
+    config_path = args.config or os.environ.get("CONFIG_PATH")
+    if not config_path:
+        parser.error("Provide a config path as argument or set CONFIG_PATH env var")
+
+    with open(config_path) as f:
         config = yaml.safe_load(f)
 
     source = build_source(dict(config["source"]))
