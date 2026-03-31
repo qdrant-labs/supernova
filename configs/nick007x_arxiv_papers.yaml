@@ -14,6 +14,7 @@ pipeline:
   num_workers: 2
 
 storage:
+  type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: openassistant--oasst1/openai-3-small
+  s3_prefix: arxiv-papers/openai-3-small
   output_dir: /tmp/vectorforge

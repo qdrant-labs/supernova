@@ -14,6 +14,7 @@ pipeline:
   num_workers: 4
 
 storage:
+  type: s3
   s3_bucket: qdrant--vectorforge
   s3_prefix: mteb--tweet-sentiment/openai-3-small
   output_dir: /tmp/vectorforge

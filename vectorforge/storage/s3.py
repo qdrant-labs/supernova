@@ -3,34 +3,51 @@ import logging
 import aiobotocore.session
 from botocore.exceptions import ClientError
 
+from vectorforge.storage.base import StorageBackend
+
 logger = logging.getLogger(__name__)
 
 
-async def ensure_bucket_exists(client, bucket: str):
-    try:
-        await client.head_bucket(Bucket=bucket)
-    except ClientError:
-        logger.info("Bucket %s does not exist, creating it", bucket)
-        await client.create_bucket(Bucket=bucket)
+class S3Backend(StorageBackend):
+    def __init__(self, bucket: str, prefix: str):
+        self.bucket = bucket
+        self.prefix = prefix
+        self._ready = False
 
+    @property
+    def destination(self) -> str:
+        return f"s3://{self.bucket}/{self.prefix}"
 
-async def upload_to_s3(local_path: str, bucket: str, prefix: str):
-    filename = local_path.split("/")[-1]
-    key = f"{prefix}/{filename}"
+    async def ensure_ready(self) -> None:
+        if self._ready:
+            return
+        session = aiobotocore.session.get_session()
+        async with session.create_client("s3") as client:
+            try:
+                await client.head_bucket(Bucket=self.bucket)
+            except ClientError:
+                logger.info("Bucket %s does not exist, creating it", self.bucket)
+                await client.create_bucket(Bucket=self.bucket)
+        self._ready = True
 
-    session = aiobotocore.session.get_session()
-    async with session.create_client("s3") as client:
-        await ensure_bucket_exists(client, bucket)
-        with open(local_path, "rb") as f:
-            await client.put_object(Bucket=bucket, Key=key, Body=f)
+    async def upload_file(self, local_path: str) -> None:
+        filename = local_path.split("/")[-1]
+        key = f"{self.prefix}/{filename}"
 
-    logger.info("Uploaded s3://%s/%s", bucket, key)
+        session = aiobotocore.session.get_session()
+        async with session.create_client("s3") as client:
+            await self.ensure_ready()
+            with open(local_path, "rb") as f:
+                await client.put_object(Bucket=self.bucket, Key=key, Body=f)
 
+        logger.info("Uploaded s3://%s/%s", self.bucket, key)
 
-async def upload_bytes_to_s3(data: bytes, bucket: str, key: str):
-    session = aiobotocore.session.get_session()
-    async with session.create_client("s3") as client:
-        await ensure_bucket_exists(client, bucket)
-        await client.put_object(Bucket=bucket, Key=key, Body=data)
+    async def upload_bytes(self, data: bytes, filename: str) -> None:
+        key = f"{self.prefix}/{filename}"
 
-    logger.info("Uploaded s3://%s/%s", bucket, key)
+        session = aiobotocore.session.get_session()
+        async with session.create_client("s3") as client:
+            await self.ensure_ready()
+            await client.put_object(Bucket=self.bucket, Key=key, Body=data)
+
+        logger.info("Uploaded s3://%s/%s", self.bucket, key)

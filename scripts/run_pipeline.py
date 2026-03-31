@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+"""CLI entrypoint for vectorforge pipelines."""
+
 import argparse
 import asyncio
 import logging
@@ -7,6 +10,8 @@ from vectorforge.sources.huggingface import HuggingFaceSource
 from vectorforge.embedders.openai import OpenAIEmbedder
 from vectorforge.embedders.baseten import BasetenEmbedder
 from vectorforge.embedders.cohere import CohereEmbedder
+from vectorforge.storage.s3 import S3Backend
+from vectorforge.storage.huggingface import HuggingFaceBackend
 from vectorforge.pipeline.runner import run
 
 
@@ -33,6 +38,23 @@ def build_embedder(cfg: dict):
     return cls(**cfg)
 
 
+def build_storage(cfg: dict):
+    storage_type = cfg.pop("type", "s3")
+    if storage_type == "s3":
+        return S3Backend(
+            bucket=cfg["s3_bucket"],
+            prefix=cfg["s3_prefix"],
+        )
+    elif storage_type == "hf":
+        return HuggingFaceBackend(
+            repo_id=cfg["repo_id"],
+            token=cfg.get("token"),
+            private=cfg.get("private", True),
+        )
+    else:
+        raise ValueError(f"Unknown storage type: {storage_type}")
+
+
 def main():
     logging.basicConfig(
         level=logging.WARNING,
@@ -50,6 +72,7 @@ def main():
 
     source = build_source(dict(config["source"]))
     embedder = build_embedder(dict(config["embedder"]))
+    storage = build_storage(dict(config["storage"]))
 
     pipeline_cfg = config.get("pipeline", {})
     storage_cfg = config.get("storage", {})
@@ -58,8 +81,7 @@ def main():
         run(
             source=source,
             embedder=embedder,
-            s3_bucket=storage_cfg["s3_bucket"],
-            s3_prefix=storage_cfg["s3_prefix"],
+            storage=storage,
             chunk_size=pipeline_cfg.get("chunk_size", 10_000),
             max_tokens=pipeline_cfg.get("max_tokens", 8192),
             num_workers=pipeline_cfg.get("num_workers", 8),

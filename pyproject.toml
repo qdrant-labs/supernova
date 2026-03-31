@@ -14,6 +14,7 @@ dependencies = [
     "pyyaml",
     "tiktoken>=0.12.0",
     "tqdm",
+    "huggingface_hub",
     "duckdb>=1.5.1",
 ]
 

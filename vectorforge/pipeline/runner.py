@@ -11,8 +11,8 @@ from vectorforge.sources.base import DatasetSource
 from vectorforge.embedders.base import Embedder
 from vectorforge.pipeline.buffer import ResultBuffer
 from vectorforge.pipeline.worker import worker
+from vectorforge.storage.base import StorageBackend
 from vectorforge.storage.writer import write_batch
-from vectorforge.storage.s3 import upload_to_s3, upload_bytes_to_s3
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,7 @@ logger = logging.getLogger(__name__)
 async def run(
     source: DatasetSource,
     embedder: Embedder,
-    s3_bucket: str,
-    s3_prefix: str,
+    storage: StorageBackend,
     chunk_size: int = 10_000,
     max_tokens: int = 8192,
     num_workers: int = 8,
@@ -29,11 +28,13 @@ async def run(
     output_dir: str = "/tmp/vectorforge",
 ):
     logger.info(
-        "Starting pipeline: source=%s embedder=%s chunk_size=%d num_workers=%d flush_threshold=%d",
-        source.source_name, embedder.model_name, chunk_size, num_workers, flush_threshold,
+        "Starting pipeline: source=%s embedder=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
+        source.source_name, embedder.model_name, storage.destination, chunk_size, num_workers, flush_threshold,
     )
     start_time = time.time()
     total_records = 0
+
+    await storage.ensure_ready()
 
     work_queue: asyncio.Queue = asyncio.Queue(maxsize=num_workers * 2)
     result_queue: asyncio.Queue = asyncio.Queue()
@@ -46,7 +47,7 @@ async def run(
         logger.info("Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path)
         batch_counter += 1
         total_records += len(records)
-        await upload_to_s3(local_path, s3_bucket, s3_prefix)
+        await storage.upload_file(local_path)
         os.remove(local_path)
 
     buffer = ResultBuffer(flush_fn=flush, flush_threshold=flush_threshold)
@@ -104,12 +105,10 @@ async def run(
         "elapsed_seconds": round(elapsed, 2),
         "records_per_second": round(total_records / elapsed, 1) if elapsed > 0 else 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "s3_bucket": s3_bucket,
-        "s3_prefix": s3_prefix,
+        "destination": storage.destination,
     }
-    await upload_bytes_to_s3(
+    await storage.upload_bytes(
         json.dumps(manifest, indent=2).encode(),
-        s3_bucket,
-        f"{s3_prefix}/_manifest.json",
+        "_manifest.json",
     )
-    logger.info("Uploaded manifest to s3://%s/%s/_manifest.json", s3_bucket, s3_prefix)
+    logger.info("Uploaded manifest to %s", storage.destination)

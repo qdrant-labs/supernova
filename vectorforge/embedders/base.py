@@ -11,7 +11,7 @@ class Embedder(ABC):
     @abstractmethod
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """
-        Takes a batch of strings.
+        Takes a batch of strings. Needs to be async to allow for parallelism across batches.
         Returns a list of embedding vectors in the same order.
         """
         pass

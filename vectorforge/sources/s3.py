@@ -3,7 +3,9 @@ from vectorforge.models import Record
 
 
 class S3Source(DatasetSource):
-    """Stub — reads parquet/jsonl files already stored in S3."""
+    """
+    Stub — reads parquet/jsonl files already stored in S3.
+    """
 
     def __init__(
         self,
