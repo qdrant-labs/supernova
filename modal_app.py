@@ -51,8 +51,11 @@ for src, dst in LOCAL_DIRS:
 
 
 def _run_pipeline(config_path: str):
-    """Shared pipeline execution logic."""
+    """
+    Shared pipeline execution logic.
+    """
     import sys
+
     sys.path.insert(0, "/app")
     import asyncio
     import yaml
