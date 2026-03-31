@@ -1,9 +1,0 @@
-.git
-.venv
-__pycache__
-*.egg-info
-dashboard
-terraform
-tests
-.env
-.pytest_cache
