@@ -22,7 +22,6 @@ async def run(
     embedder: Embedder,
     storage: StorageBackend,
     chunk_size: int = 10_000,
-    max_tokens: int = 8192,
     num_workers: int = 8,
     flush_threshold: int = 100_000,
     output_dir: str = "/tmp/vectorforge",
@@ -54,7 +53,7 @@ async def run(
 
     # chunker: feeds work queue, then sends sentinels to shut down workers
     async def run_chunker():
-        for chunk_id, records in source.get_chunks(chunk_size, max_tokens=max_tokens):
+        for chunk_id, records in source.get_chunks(embedder, chunk_size):
             await work_queue.put((chunk_id, records))
         logger.info("Chunker finished, sending stop signals to %d workers", num_workers)
         for _ in range(num_workers):
@@ -62,8 +61,10 @@ async def run(
 
     # drain: pulls from result queue into buffer until all workers are done
     progress = tqdm(unit=" chunks", desc="Embedding")
+    embedded_records = 0
 
     async def drain_results():
+        nonlocal embedded_records
         finished_workers = 0
         while finished_workers < num_workers:
             result = await result_queue.get()
@@ -71,7 +72,9 @@ async def run(
                 finished_workers += 1
                 continue
             await buffer.push(result)
+            embedded_records += len(result.records)
             progress.update(1)
+            progress.set_postfix(records=f"{embedded_records:,}")
         await buffer.drain()
         progress.close()
 
@@ -97,7 +100,7 @@ async def run(
         "embedder": embedder.model_name,
         "dimensions": embedder.dimensions,
         "chunk_size": chunk_size,
-        "max_tokens": max_tokens,
+        "max_tokens": embedder.max_tokens,
         "num_workers": num_workers,
         "flush_threshold": flush_threshold,
         "total_records": total_records,

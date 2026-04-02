@@ -14,6 +14,13 @@ class FakeEmbedder(Embedder):
     def dimensions(self) -> int:
         return 3
 
+    @property
+    def max_tokens(self) -> int:
+        return 100
+
+    def split_text(self, text: str) -> list[str]:
+        return [text]
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return [[float(len(t)), 0.0, 1.0] for t in texts]
 
@@ -33,8 +40,8 @@ def test_embedder_properties():
     assert embedder.dimensions == 3
 
 
-def test_base_embedder_dimensions_default():
-    """Base class returns None for dimensions by default."""
+def test_base_embedder_requires_max_tokens():
+    """Base class raises NotImplementedError for max_tokens."""
 
     class MinimalEmbedder(Embedder):
         @property
@@ -46,3 +53,7 @@ def test_base_embedder_dimensions_default():
 
     e = MinimalEmbedder()
     assert e.dimensions is None
+    with pytest.raises(NotImplementedError):
+        e.max_tokens
+    with pytest.raises(NotImplementedError):
+        e.split_text("hello")

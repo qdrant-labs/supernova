@@ -18,6 +18,7 @@ dependencies = [
     "duckdb>=1.5.1",
     "sentence-transformers",
     "torch",
+    "transformers<5"
 ]
 
 [tool.setuptools.packages.find]

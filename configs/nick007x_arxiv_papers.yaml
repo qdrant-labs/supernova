@@ -5,9 +5,10 @@ source:
   text_field: abstract
 
 embedder:
-  type: openai
-  model: text-embedding-3-small
-  dimensions: 1536
+  type: sentence_transformer
+  model: Alibaba-NLP/gte-multilingual-base
+  trust_remote_code: true
+  batch_size: 32
 
 pipeline:
   chunk_size: 10000
@@ -16,5 +17,5 @@ pipeline:
 storage:
   type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: arxiv-papers/openai-3-small
+  s3_prefix: arxiv-papers/gte-multilingual-base
   output_dir: /tmp/vectorforge

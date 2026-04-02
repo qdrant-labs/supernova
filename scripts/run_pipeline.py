@@ -32,7 +32,7 @@ def build_source(cfg: dict):
     return cls(**cfg)
 
 
-def build_embedder(cfg: dict):
+def build_embedder(cfg: dict) -> OpenAIEmbedder | SentenceTransformerEmbedder:
     embedder_type = cfg.pop("type")
     cls = EMBEDDER_REGISTRY[embedder_type]
     return cls(**cfg)
@@ -91,7 +91,6 @@ def main():
             embedder=embedder,
             storage=storage,
             chunk_size=pipeline_cfg.get("chunk_size", 10_000),
-            max_tokens=pipeline_cfg.get("max_tokens", 8192),
             num_workers=pipeline_cfg.get("num_workers", 8),
             flush_threshold=pipeline_cfg.get("flush_threshold", 100_000),
             output_dir=storage_cfg.get("output_dir", "/tmp/vectorforge"),

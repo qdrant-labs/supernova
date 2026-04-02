@@ -19,9 +19,7 @@ class Embedder(ABC):
     @property
     @abstractmethod
     def model_name(self) -> str:
-        """
-        Human-readable model identifier, written into parquet.
-        """
+        """Human-readable model identifier, written into parquet."""
         pass
 
     @property
@@ -31,3 +29,15 @@ class Embedder(ABC):
         If None, dimensions are inferred from the first batch result.
         """
         return None
+
+    @property
+    def max_tokens(self) -> int:
+        """Max token length this embedder supports. Must be overridden."""
+        raise NotImplementedError("Embedder subclass must define max_tokens")
+
+    def split_text(self, text: str) -> list[str]:
+        """
+        Split text into pieces that fit within this embedder's token limit.
+        Must be overridden — each embedder should use its own tokenizer.
+        """
+        raise NotImplementedError("Embedder subclass must implement split_text")

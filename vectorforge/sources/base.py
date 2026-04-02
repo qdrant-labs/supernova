@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
-from typing import Any, Iterator
+from typing import Any, Iterator, TYPE_CHECKING
 
 from vectorforge.models import Record
-from vectorforge.text_splitter import split_text
+
+if TYPE_CHECKING:
+    from vectorforge.embedders.base import Embedder
 
 
 class DatasetSource(ABC):
@@ -14,9 +16,7 @@ class DatasetSource(ABC):
 
     @abstractmethod
     def stream(self) -> Iterator[dict]:
-        """
-        Yield raw rows one at a time from the underlying source.
-        """
+        """Yield raw rows one at a time from the underlying source."""
         pass
 
     @abstractmethod
@@ -43,12 +43,12 @@ class DatasetSource(ABC):
 
     def get_chunks(
         self,
+        embedder: "Embedder",
         chunk_size: int = 10_000,
-        max_tokens: int = 8192,
     ) -> Iterator[tuple[int, list[Record]]]:
         """
         Default chunking logic. Yields (chunk_id, records[]).
-        Long texts are split into multiple records that share a source_row_id.
+        Long texts are split using the embedder's tokenizer.
         """
         chunk: list[Record] = []
         chunk_id = 0
@@ -62,7 +62,7 @@ class DatasetSource(ABC):
                 source_row_id += 1
                 continue
 
-            text_pieces = split_text(base_record.text, max_tokens=max_tokens)
+            text_pieces = embedder.split_text(base_record.text)
 
             for chunk_index, piece in enumerate(text_pieces):
                 record = Record(

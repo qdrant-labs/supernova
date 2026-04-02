@@ -1,5 +1,25 @@
 from vectorforge.sources.base import DatasetSource
+from vectorforge.embedders.base import Embedder
 from vectorforge.models import Record
+
+
+class FakeEmbedder(Embedder):
+    """Embedder stub for testing source chunking."""
+
+    @property
+    def model_name(self) -> str:
+        return "fake"
+
+    @property
+    def max_tokens(self) -> int:
+        return 1000
+
+    def split_text(self, text: str) -> list[str]:
+        # No splitting for tests — just return as-is
+        return [text]
+
+    async def embed(self, texts):
+        return [[0.0]] * len(texts)
 
 
 class FakeSource(DatasetSource):
@@ -27,10 +47,13 @@ class FakeSource(DatasetSource):
         )
 
 
+embedder = FakeEmbedder()
+
+
 def test_get_chunks_single_chunk():
     rows = [{"text": f"row {i}"} for i in range(5)]
     source = FakeSource(rows)
-    chunks = list(source.get_chunks(chunk_size=10))
+    chunks = list(source.get_chunks(embedder, chunk_size=10))
     assert len(chunks) == 1
     chunk_id, records = chunks[0]
     assert chunk_id == 0
@@ -44,7 +67,7 @@ def test_get_chunks_single_chunk():
 def test_get_chunks_multiple_chunks():
     rows = [{"text": f"row {i}"} for i in range(25)]
     source = FakeSource(rows)
-    chunks = list(source.get_chunks(chunk_size=10))
+    chunks = list(source.get_chunks(embedder, chunk_size=10))
     assert len(chunks) == 3
     assert chunks[0][0] == 0
     assert len(chunks[0][1]) == 10
@@ -57,7 +80,7 @@ def test_get_chunks_multiple_chunks():
 def test_get_chunks_exact_boundary():
     rows = [{"text": f"row {i}"} for i in range(20)]
     source = FakeSource(rows)
-    chunks = list(source.get_chunks(chunk_size=10))
+    chunks = list(source.get_chunks(embedder, chunk_size=10))
     assert len(chunks) == 2
     assert len(chunks[0][1]) == 10
     assert len(chunks[1][1]) == 10
@@ -67,7 +90,7 @@ def test_chunk_index_for_short_texts():
     """Short texts should all have chunk_index=0."""
     rows = [{"text": "short"} for _ in range(3)]
     source = FakeSource(rows)
-    chunks = list(source.get_chunks(chunk_size=10))
+    chunks = list(source.get_chunks(embedder, chunk_size=10))
     for _, records in chunks:
         for r in records:
             assert r.chunk_index == 0

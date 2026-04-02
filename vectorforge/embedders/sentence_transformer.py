@@ -21,15 +21,21 @@ class SentenceTransformerEmbedder(Embedder):
     def __init__(
         self,
         model: str = "Alibaba-NLP/gte-multilingual-base",
-        batch_size: int = 256,
+        batch_size: int = 32,
         device: str | None = None,
+        trust_remote_code: bool = False,
     ):
         self._device = device or _detect_device()
         logger.info("Loading %s on %s", model, self._device)
-        self._model = SentenceTransformer(model, device=self._device)
+        self._model = SentenceTransformer(model, device=self._device, trust_remote_code=trust_remote_code)
         self._model_name = model
         self._batch_size = batch_size
         self._dimensions_val = self._model.get_sentence_embedding_dimension()
+        self._max_tokens = self._model.max_seq_length
+        # Separate tokenizer copy for split_text to avoid "Already borrowed"
+        # race with the model's internal tokenizer used during encode()
+        from transformers import AutoTokenizer
+        self._splitter_tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
 
     @property
     def model_name(self) -> str:
@@ -38,6 +44,25 @@ class SentenceTransformerEmbedder(Embedder):
     @property
     def dimensions(self) -> int | None:
         return self._dimensions_val
+
+    @property
+    def max_tokens(self) -> int:
+        return self._max_tokens
+
+    def split_text(self, text: str) -> list[str]:
+        """
+        Split text using the model's own tokenizer.
+        """
+        tokens = self._splitter_tokenizer.encode(text, add_special_tokens=False)
+
+        if len(tokens) <= self._max_tokens:
+            return [text]
+
+        chunks = []
+        for i in range(0, len(tokens), self._max_tokens):
+            chunk_tokens = tokens[i : i + self._max_tokens]
+            chunks.append(self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True))
+        return chunks
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
         embeddings = self._model.encode(
