@@ -18,16 +18,29 @@ def _detect_device() -> str:
 
 
 class SentenceTransformerEmbedder(Embedder):
+    DTYPE_MAP = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+
     def __init__(
         self,
         model: str = "Alibaba-NLP/gte-multilingual-base",
         batch_size: int = 32,
         device: str | None = None,
+        dtype: str = "float32",
         trust_remote_code: bool = False,
     ):
         self._device = device or _detect_device()
-        logger.info("Loading %s on %s", model, self._device)
-        self._model = SentenceTransformer(model, device=self._device, trust_remote_code=trust_remote_code)
+        torch_dtype = self.DTYPE_MAP.get(dtype, torch.float32)
+        logger.info("Loading %s on %s (dtype=%s)", model, self._device, dtype)
+        self._model = SentenceTransformer(
+            model,
+            device=self._device,
+            trust_remote_code=trust_remote_code,
+            model_kwargs={"torch_dtype": torch_dtype},
+        )
         self._model_name = model
         self._batch_size = batch_size
         self._dimensions_val = self._model.get_sentence_embedding_dimension()

@@ -1,22 +1,21 @@
 source:
   type: huggingface
-  dataset_name: nick007x/arxiv-papers
+  dataset_name: mteb/tweet_sentiment_extraction
   split: train
-  text_field: abstract
+  text_field: text
 
 embedder:
   type: sentence_transformer
   model: Alibaba-NLP/gte-multilingual-base
   trust_remote_code: true
-  batch_size: 64
-  dtype: bfloat16
+  batch_size: 32
 
 pipeline:
-  chunk_size: 100000
-  num_workers: 2
+  chunk_size: 10000
+  num_workers: 4
 
 storage:
   type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: arxiv-papers/gte-multilingual-base
+  s3_prefix: mteb--tweet-sentiment/gte-multilingual-base
   output_dir: /tmp/vectorforge

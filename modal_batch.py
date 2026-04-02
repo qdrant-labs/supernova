@@ -209,7 +209,6 @@ def embed_slice_gpu(slice_args: dict) -> dict:
 def main(
     config: str,
     gpu: bool = False,
-    chunk_size: int = 100_000,
     dry_run: bool = False,
 ):
     import json
@@ -227,6 +226,10 @@ def main(
     source_cfg = cfg["source"]
     embedder_cfg = cfg["embedder"]
     storage_cfg = cfg["storage"]
+    pipeline_cfg = cfg.get("pipeline", {})
+
+    # config overrides default
+    chunk_size = pipeline_cfg.get("chunk_size", 100_000)
 
     dataset_name = source_cfg["dataset_name"]
     hf_config = source_cfg.get("config")
