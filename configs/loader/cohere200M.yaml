@@ -1,0 +1,17 @@
+datasource:
+  type: s3
+  s3_bucket: qdrant--vectorforge
+  s3_prefix: cohere--wikipedia/embed-multilingual-v3
+  payload_fields:
+    text: text
+    source: source
+
+vectorstore:
+  type: qdrant
+  collection_name: cohere-wikipedia
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+
+loader:
+  batch_size: 1000
+  concurrency: 8

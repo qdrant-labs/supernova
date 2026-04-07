@@ -1,0 +1,24 @@
+datasource:
+  type: s3
+  s3_bucket: qdrant--vectorforge
+  s3_prefix: arxiv-papers/gte-multilingual-base
+  payload_fields:
+    text: text             # parquet "text" col -> payload key "text"
+    source: source         # parquet "source" col -> payload key "source"
+    model: model           # parquet "model" col -> payload key "model"
+
+vectorstore:
+  type: qdrant
+  collection_name: arxiv-papers
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  params:
+    hnsw:
+      m: 16
+      ef: 128
+    payload:
+      on_disk: true
+
+loader:
+  batch_size: 1000
+  concurrency: 8

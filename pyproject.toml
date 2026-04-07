@@ -18,7 +18,8 @@ dependencies = [
     "duckdb>=1.5.1",
     "sentence-transformers",
     "torch",
-    "transformers<5"
+    "transformers<5",
+    "qdrant-client>=1.9.0"
 ]
 
 [tool.setuptools.packages.find]
@@ -26,6 +27,7 @@ include = ["vectorforge*"]
 
 [project.scripts]
 vectorforge = "scripts.run_pipeline:main"
+vectorforge-load = "scripts.run_loader:main"
 
 [dependency-groups]
 dev = [
