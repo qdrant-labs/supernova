@@ -39,6 +39,7 @@ class SentenceTransformerEmbedder(Embedder):
             model,
             device=self._device,
             trust_remote_code=trust_remote_code,
+            # TODO torch_dtype is deprecated, use dtpye instead
             model_kwargs={"torch_dtype": torch_dtype},
         )
         self._model_name = model

@@ -6,10 +6,10 @@ set -e
 PROFILE="${AWS_PROFILE:-qdrant-sandbox}"
 
 # Ensure SSO session is active
-aws sso login --profile "$PROFILE"
+/usr/local/bin/aws sso login --profile "$PROFILE"
 
 # Export temporary credentials
-eval "$(aws configure export-credentials --profile "$PROFILE" --format env)"
+eval "$(/usr/local/bin/aws configure export-credentials --profile "$PROFILE" --format env)"
 
 # Update Modal secret with fresh creds
 modal secret create vectorforge-secrets \

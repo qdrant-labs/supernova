@@ -3,6 +3,8 @@ source:
   dataset_name: nick007x/arxiv-papers
   split: train
   text_field: abstract
+  exclude_columns:
+    - authors
 
 embedder:
   type: sentence_transformer
