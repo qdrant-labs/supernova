@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import Iterator, TYPE_CHECKING
 
 from vectorforge.models import Record
 
@@ -23,8 +23,7 @@ class DatasetSource(ABC):
     def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
         """
         Convert a raw row into a Record.
-        The implementor decides which field(s) become `text`
-        and what goes into `payload`.
+        The implementor decides which field(s) become `text`.
         """
         pass
 
@@ -32,14 +31,6 @@ class DatasetSource(ABC):
     @abstractmethod
     def source_name(self) -> str:
         pass
-
-    def extract_payload(self, row: dict) -> dict[str, Any] | None:
-        """
-        Override to define custom payload extraction from a raw row.
-        Return a dict to use as the record payload, or None to fall back
-        to the default behavior (e.g. payload_fields).
-        """
-        return None
 
     def get_chunks(
         self,
@@ -72,7 +63,6 @@ class DatasetSource(ABC):
                     chunk_index=chunk_index,
                     text=piece,
                     source=base_record.source,
-                    payload=base_record.payload,
                 )
                 chunk.append(record)
                 row_id += 1

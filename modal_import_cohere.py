@@ -66,7 +66,6 @@ def import_config(config: str) -> dict:
         pa.field("source", pa.string()),
         pa.field("embedding", pa.list_(pa.float32())),
         pa.field("model", pa.string()),
-        pa.field("payload", pa.string()),
     ])
 
     storage = S3Backend(BUCKET, f"{PREFIX}/{config}")
@@ -103,13 +102,7 @@ def import_config(config: str) -> dict:
                     text,
                     '{DATASET}'                                     AS source,
                     emb                                             AS embedding,
-                    '{MODEL_NAME}'                                  AS model,
-                    json_object(
-                        '_id', _id,
-                        'url', url,
-                        'title', title,
-                        'lang', '{config}'
-                    )                                               AS payload
+                    '{MODEL_NAME}'                                  AS model
                 FROM '{hf_path}'
                 LIMIT {limit} OFFSET {offset}
             ) TO '{local_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)

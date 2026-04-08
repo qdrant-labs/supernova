@@ -1,5 +1,4 @@
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 
 @dataclass
@@ -14,7 +13,6 @@ class Record:
     chunk_index: int                     # Position within a split (0 if not split)
     text: str
     source: str
-    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -30,7 +28,6 @@ class EmbeddedRecord:
     source: str
     embedding: list[float]
     model: str
-    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

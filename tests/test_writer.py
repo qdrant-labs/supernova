@@ -18,7 +18,6 @@ def test_write_batch_creates_parquet():
             source="test",
             embedding=[0.1, 0.2, 0.3],
             model="test-model",
-            payload={"key": "value"},
         ),
         EmbeddedRecord(
             row_id=1,

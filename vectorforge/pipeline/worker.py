@@ -32,7 +32,6 @@ async def worker(
                 source=r.source,
                 embedding=emb,
                 model=embedder.model_name,
-                payload=r.payload,
             )
             for r, emb in zip(records, embeddings)
         ]

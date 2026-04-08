@@ -12,12 +12,10 @@ class S3Source(DatasetSource):
         bucket: str,
         prefix: str,
         text_field: str = "text",
-        payload_fields: list[str] | None = None,
     ):
         self.bucket = bucket
         self.prefix = prefix
         self.text_field = text_field
-        self.payload_fields = payload_fields or []
 
     @property
     def source_name(self) -> str:
@@ -27,7 +25,6 @@ class S3Source(DatasetSource):
         raise NotImplementedError("S3Source.stream() not yet implemented")
 
     def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
-        payload = {k: row[k] for k in self.payload_fields if k in row}
         return Record(
             row_id=row_id,
             source_row_id=0,
@@ -35,5 +32,4 @@ class S3Source(DatasetSource):
             chunk_index=0,
             text=row[self.text_field],
             source=self.source_name,
-            payload=payload,
         )

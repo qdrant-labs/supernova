@@ -1,4 +1,3 @@
-import json
 import os
 
 import pyarrow as pa
@@ -15,7 +14,6 @@ SCHEMA = pa.schema([
     pa.field("source", pa.string()),
     pa.field("embedding", pa.list_(pa.float32())),
     pa.field("model", pa.string()),
-    pa.field("payload", pa.string()),
 ])
 
 
@@ -33,7 +31,6 @@ def write_batch(records: list[EmbeddedRecord], output_dir: str, batch_id: int) -
         "source":        [r.source for r in records],
         "embedding":     [r.embedding for r in records],
         "model":         [r.model for r in records],
-        "payload":       [json.dumps(r.payload) for r in records],
     }, schema=SCHEMA)
 
     pq.write_table(table, path, compression="snappy")

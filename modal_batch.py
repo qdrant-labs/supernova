@@ -103,8 +103,6 @@ def _process_slice(slice_args: dict) -> dict:
         source_cfg.get("text_field"),
         source_cfg.get("text_template"),
     )
-    payload_fields = source_cfg.get("payload_fields", [])
-
     # Collect records, splitting text as needed
     from tqdm import tqdm
 
@@ -122,7 +120,6 @@ def _process_slice(slice_args: dict) -> dict:
         if not text or not text.strip():
             continue
 
-        payload = {k: row[k] for k in payload_fields if k in row} if payload_fields else {}
         chunks = embedder.split_text(text)
 
         for chunk_index, chunk_text in enumerate(chunks):
@@ -133,7 +130,6 @@ def _process_slice(slice_args: dict) -> dict:
                 chunk_index=chunk_index,
                 text=chunk_text,
                 source=source_cfg["dataset_name"],
-                payload=payload,
             ))
             row_counter += 1
 
@@ -169,7 +165,6 @@ def _process_slice(slice_args: dict) -> dict:
             source=rec.source,
             embedding=emb,
             model=embedder.model_name,
-            payload=rec.payload,
         ))
 
     # Write parquet
