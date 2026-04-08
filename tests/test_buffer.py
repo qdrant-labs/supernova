@@ -14,9 +14,7 @@ def _make_chunk(chunk_id: int, num_records: int = 3) -> ChunkResult:
                 chunk_id=chunk_id,
                 chunk_index=0,
                 text=f"text {i}",
-                source="test",
                 embedding=[0.0],
-                model="test-model",
             )
             for i in range(num_records)
         ],

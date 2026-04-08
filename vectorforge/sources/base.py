@@ -62,7 +62,7 @@ class DatasetSource(ABC):
                     chunk_id=chunk_id,
                     chunk_index=chunk_index,
                     text=piece,
-                    source=base_record.source,
+                    columns=base_record.columns,
                 )
                 chunk.append(record)
                 row_id += 1

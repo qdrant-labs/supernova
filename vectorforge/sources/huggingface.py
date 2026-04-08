@@ -3,6 +3,7 @@ from datasets import load_dataset
 from vectorforge.sources.base import DatasetSource
 from vectorforge.models import Record
 
+
 def _build_text_extractor(text_field: str | None, text_template: str | None):
     """
     Returns a function that extracts text from a row.
@@ -33,12 +34,14 @@ class HuggingFaceSource(DatasetSource):
         split: str = "train",
         text_field: str | None = "text",
         text_template: str | None = None,
+        exclude_columns: list[str] | None = None,
     ):
         self.dataset_name = dataset_name
         self.config = config
         self.split = split
         self.text_field = text_field
         self.text_template = text_template
+        self.exclude_columns = set(exclude_columns or [])
         self._extract_text = _build_text_extractor(text_field, text_template)
         self._dataset = load_dataset(
             dataset_name, config, streaming=True, split=split
@@ -56,11 +59,12 @@ class HuggingFaceSource(DatasetSource):
         return self._extract_text(row)
 
     def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
+        columns = {k: v for k, v in row.items() if k not in self.exclude_columns}
         return Record(
             row_id=row_id,
-            source_row_id=0,  # set by get_chunks
+            source_row_id=0,
             chunk_id=chunk_id,
-            chunk_index=0,    # set by get_chunks
+            chunk_index=0,
             text=self.extract_text(row),
-            source=self.source_name,
+            columns=columns,
         )

@@ -43,7 +43,7 @@ class FakeSource(DatasetSource):
             chunk_id=chunk_id,
             chunk_index=0,
             text=row[self._text_field],
-            source=self.source_name,
+            columns=dict(row),
         )
 
 

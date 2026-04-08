@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -6,13 +6,15 @@ class Record:
     """
     A single record from a dataset source, before embedding.
     One source row may produce multiple Records if the text is split.
+
+    `columns` carries all original source columns (after exclude_columns filtering).
     """
-    row_id: int                          # Auto-incrementing ID for this record
-    source_row_id: int                   # Original row position in the dataset
-    chunk_id: int                        # Pipeline batch this record belongs to
-    chunk_index: int                     # Position within a split (0 if not split)
+    row_id: int
+    source_row_id: int
+    chunk_id: int
+    chunk_index: int
     text: str
-    source: str
+    columns: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -25,9 +27,8 @@ class EmbeddedRecord:
     chunk_id: int
     chunk_index: int
     text: str
-    source: str
     embedding: list[float]
-    model: str
+    columns: dict = field(default_factory=dict)
 
 
 @dataclass

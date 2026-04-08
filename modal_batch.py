@@ -6,19 +6,19 @@ Modal jobs, each processing a slice of the dataset.
 
 Usage:
   # Dry run (print plan only)
-  modal run modal_batch.py --config configs/arxiv.yaml --dry-run
+  modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --dry-run
 
   # CPU (API-based embedders like OpenAI)
-  modal run modal_batch.py --config configs/arxiv_openai.yaml
+  modal run modal_batch.py --config configs/embedder/mteb_tweets_openai.yaml
 
   # GPU (sentence-transformers)
-  modal run modal_batch.py --config configs/arxiv_gte.yaml --gpu
+  modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu
 
   # Custom chunk size
-  modal run modal_batch.py --config configs/arxiv.yaml --gpu --chunk-size 50000
+  modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu --chunk-size 50000
 
   # Fire-and-forget
-  modal run --detach modal_batch.py --config configs/arxiv.yaml --gpu
+  modal run --detach modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu
 """
 
 import modal
@@ -100,6 +100,8 @@ def _process_slice(slice_args: dict) -> dict:
         source_cfg.get("text_field"),
         source_cfg.get("text_template"),
     )
+    exclude_columns = set(source_cfg.get("exclude_columns", []))
+
     # Collect records, splitting text as needed
     from tqdm import tqdm
 
@@ -112,6 +114,7 @@ def _process_slice(slice_args: dict) -> dict:
         if not text or not text.strip():
             continue
 
+        columns = {k: v for k, v in row.items() if k not in exclude_columns}
         chunks = embedder.split_text(text)
 
         for chunk_index, chunk_text in enumerate(chunks):
@@ -121,7 +124,7 @@ def _process_slice(slice_args: dict) -> dict:
                 chunk_id=slice_id,
                 chunk_index=chunk_index,
                 text=chunk_text,
-                source=source_cfg["dataset_name"],
+                columns=columns,
             ))
             row_counter += 1
 
@@ -153,9 +156,8 @@ def _process_slice(slice_args: dict) -> dict:
             chunk_id=rec.chunk_id,
             chunk_index=rec.chunk_index,
             text=rec.text,
-            source=rec.source,
             embedding=emb,
-            model=embedder.model_name,
+            columns=rec.columns,
         ))
 
     # Write parquet

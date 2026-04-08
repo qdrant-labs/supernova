@@ -15,9 +15,8 @@ def test_write_batch_creates_parquet():
             chunk_id=0,
             chunk_index=0,
             text="hello world",
-            source="test",
             embedding=[0.1, 0.2, 0.3],
-            model="test-model",
+            columns={"title": "greeting", "url": "http://example.com"},
         ),
         EmbeddedRecord(
             row_id=1,
@@ -25,9 +24,8 @@ def test_write_batch_creates_parquet():
             chunk_id=0,
             chunk_index=1,
             text="another record",
-            source="test",
             embedding=[0.4, 0.5, 0.6],
-            model="test-model",
+            columns={"title": "second", "url": "http://example.com/2"},
         ),
     ]
 
@@ -42,8 +40,11 @@ def test_write_batch_creates_parquet():
         assert table.column("text").to_pylist() == ["hello world", "another record"]
         assert table.column("source_row_id").to_pylist() == [0, 0]
         assert table.column("chunk_index").to_pylist() == [0, 1]
-        assert table.column("model").to_pylist() == ["test-model", "test-model"]
         assert table.column("row_id").to_pylist() == [0, 1]
+
+        # Dynamic columns from source data
+        assert table.column("title").to_pylist() == ["greeting", "second"]
+        assert table.column("url").to_pylist() == ["http://example.com", "http://example.com/2"]
 
         embeddings = table.column("embedding").to_pylist()
         assert len(embeddings[0]) == 3

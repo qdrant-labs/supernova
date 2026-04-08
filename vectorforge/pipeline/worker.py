@@ -29,9 +29,8 @@ async def worker(
                 chunk_id=r.chunk_id,
                 chunk_index=r.chunk_index,
                 text=r.text,
-                source=r.source,
                 embedding=emb,
-                model=embedder.model_name,
+                columns=r.columns,
             )
             for r, emb in zip(records, embeddings)
         ]
