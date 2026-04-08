@@ -278,8 +278,13 @@ Requires [SkyPilot](https://skypilot.readthedocs.io/) configured with AWS creden
 uv run pytest tests/ -v
 ```
 
-## Additional docs
+## Documentation
 
-- [Loader architecture](docs/loader.md) -- detailed design docs for the loading pipeline
-- [AWS SSO setup](docs/aws-sso-setup.md) -- configuring AWS SSO for local and Modal usage
-- [SkyPilot migration](docs/skypilot-migration.md) -- plan for moving sustained workloads from Modal to SkyPilot
+- [Introduction](docs/introduction.md) -- concepts, mental model, architecture diagrams
+- [Installation](docs/installation.md) -- setup, environment variables, Modal and SkyPilot configuration
+- [Quickstart](docs/quickstart.md) -- embed a dataset and load it into Qdrant end-to-end
+- [Embedding Generation](docs/embedding-generation.md) -- embedder options, Modal at scale, output format
+- [Data Loading](docs/data-loading.md) -- column mapping, payload composition, distributed loading
+- [Loader Architecture](docs/loader.md) -- internal design docs
+- [AWS SSO Setup](docs/aws-sso-setup.md) -- configuring AWS SSO for local and Modal usage
+- [SkyPilot Migration](docs/skypilot-migration.md) -- plan for moving sustained workloads to SkyPilot
