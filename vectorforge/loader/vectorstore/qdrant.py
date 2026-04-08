@@ -23,7 +23,7 @@ class QdrantVectorStore(VectorStore):
         self.api_key = api_key
         self.collection_name = collection_name
         self.params = params or {}
-        self._client = AsyncQdrantClient(url=url, api_key=api_key)
+        self._client = AsyncQdrantClient(url=url, api_key=api_key, timeout=60)
 
     async def ensure_collection(self, dimension: int) -> None:
         collections = await self._client.get_collections()
@@ -95,7 +95,7 @@ class QdrantVectorStore(VectorStore):
             )
         return None
 
-    async def upsert_batch(self, points: list[dict]) -> None:
+    async def upsert_batch(self, points: list[dict], max_retries: int = 3) -> None:
         qdrant_points = [
             models.PointStruct(
                 id=p["id"],
@@ -104,10 +104,19 @@ class QdrantVectorStore(VectorStore):
             )
             for p in points
         ]
-        await self._client.upsert(
-            collection_name=self.collection_name,
-            points=qdrant_points,
-        )
+        for attempt in range(max_retries):
+            try:
+                await self._client.upsert(
+                    collection_name=self.collection_name,
+                    points=qdrant_points,
+                )
+                return
+            except Exception:
+                if attempt == max_retries - 1:
+                    raise
+                wait = 2 ** attempt
+                logger.warning(f"Upsert failed (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                await asyncio.sleep(wait)
 
     async def close(self) -> None:
         await self._client.close()

@@ -7,9 +7,9 @@ loader + SkyPilot configs, manages the Qdrant indexing lifecycle, and fans
 out SkyPilot spot instance jobs.
 
 Usage:
-  vectorforge-dispatch configs/dispatch/cohere200M.yaml
-  vectorforge-dispatch configs/dispatch/cohere200M.yaml --dry-run
-  vectorforge-dispatch configs/dispatch/cohere200M.yaml --num-shards 20
+  vectorforge-load-distributed configs/dispatch/cohere200M.yaml
+  vectorforge-load-distributed configs/dispatch/cohere200M.yaml --dry-run
+  vectorforge-load-distributed configs/dispatch/cohere200M.yaml --num-shards 20
 """
 
 import argparse
@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import time
+
 from datetime import datetime
 from pathlib import Path
 
@@ -123,7 +124,7 @@ def generate_sky_yaml(
         "file_mounts": {
             "/app": ".",
         },
-        "setup": "cd /app && pip install -e .",
+        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync",
         "run": f"cd /app && vectorforge-load {loader_config_path} --no-manage-indexing",
     }
 

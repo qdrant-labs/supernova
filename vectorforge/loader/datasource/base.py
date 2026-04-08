@@ -102,6 +102,7 @@ class DataReader(ABC):
             f"SELECT {select_sql} FROM {self.source_sql}"
         )
 
+        logger.info(f"Starting fetchmany with batch size {batch_size}")
         while True:
             batch = result.fetchmany(batch_size)
             if not batch:

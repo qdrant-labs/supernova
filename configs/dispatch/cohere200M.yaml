@@ -3,8 +3,8 @@ dispatch:
   run_name: cohere200M
 
 resources:
-  cpus: 8
-  memory: 32
+  cpus: 2
+  memory: 8
   cloud: aws
   use_spot: true
 
@@ -12,13 +12,12 @@ datasource:
   type: s3
   s3_bucket: qdrant---vectorforge
   s3_prefix: cohere--wikipedia/embed-multilingual-v3
-  columns:
-    id: _id
-    embedding: emb
   payload_fields:
     text: text
-    url: url
-    title: title
+    source: source
+    row_id: row_id
+    chunk_id: chunk_id
+    chunk_index: chunk_index
 
 vectorstore:
   type: qdrant
