@@ -1,38 +1,63 @@
 # vectorforge
 
-Stream massive datasets, embed at scale, load into vector databases.
+Generate massive pre-embedded datasets, then load them into vector databases.
 
 ## Overview
 
-vectorforge is a pipeline for generating and loading pre-embedded vector datasets. It streams data from sources (HuggingFace datasets, S3, etc.), embeds text using configurable backends (OpenAI, sentence-transformers), writes the results as parquet files to S3 or HuggingFace Hub, and loads them into vector stores (Qdrant, etc.) for benchmarking.
+vectorforge has two pipelines:
 
-Key properties:
-- **Streaming** -- never loads the full dataset into memory
-- **Massively parallel** -- splits datasets into slices and processes them across hundreds of GPUs via Modal
-- **Text splitting** -- long texts are automatically split using each embedder's native tokenizer
-- **Pluggable** -- add new sources, embedders, storage backends, or vector stores by subclassing
-- **Database loading** -- stream pre-embedded parquet data into vector stores with deferred indexing for bulk performance
-- **Distributed loading** -- fan out loading jobs across SkyPilot spot instances for terabyte-scale datasets
+1. **Embedding** -- stream data from HuggingFace, embed with OpenAI or sentence-transformers, write parquet to S3
+2. **Loading** -- stream pre-embedded parquet from S3/HuggingFace into vector stores (Qdrant)
+
+Both pipelines are streaming (never loads the full dataset into memory), pluggable (add new sources/embedders/stores by subclassing), and parallelizable (Modal for embedding, SkyPilot for loading).
 
 ## Quickstart
 
 ```bash
-# Install
 uv sync
 
-# Embed a dataset locally
+# 1. Embed a dataset
 vectorforge configs/embedder/mteb_tweets_openai.yaml
 
-# Load pre-embedded data into Qdrant
-vectorforge-load configs/loader/arxiv_papers_qdrant.yaml
+# 2. Load into Qdrant
+vectorforge-load configs/loader/cohere200M.yaml
 
-# Distributed loading across SkyPilot spot instances
+# 3. Distributed loading (SkyPilot)
 vectorforge-load-distributed configs/dispatch/cohere200M.yaml --dry-run
 ```
 
-## Embedding configuration
+## Project structure
 
-Embedding pipelines are defined as YAML configs:
+```
+vectorforge/
+  sources/            # Data sources (HuggingFace, S3)
+  embedders/          # Embedding backends (OpenAI, sentence-transformers)
+  storage/            # Output backends (S3, HuggingFace Hub, local)
+  pipeline/           # Embedding orchestration (runner, worker, buffer)
+  loader/
+    datasource/       # Parquet readers (S3, HuggingFace)
+    vectorstore/      # Vector store backends (Qdrant)
+    runner.py         # Loading orchestration
+
+configs/
+  embedder/           # Embedding pipeline configs
+  loader/             # Loading pipeline configs
+  dispatch/           # Distributed loading configs
+
+scripts/
+  run_embedder.py     # vectorforge CLI entrypoint
+  run_loader.py       # vectorforge-load CLI entrypoint
+  run_dispatch.py     # vectorforge-load-distributed CLI entrypoint
+
+modal_batch.py        # Modal distributed embedding
+modal_import_cohere.py # Modal Cohere dataset import
+```
+
+---
+
+## Pipeline 1: Embedding
+
+### Configuration
 
 ```yaml
 source:
@@ -42,7 +67,7 @@ source:
   text_field: text
 
 embedder:
-  type: openai
+  type: openai                    # or sentence_transformer
   model: text-embedding-3-small
   dimensions: 1536
 
@@ -52,34 +77,9 @@ pipeline:
   flush_threshold: 100000
 
 storage:
-  type: s3
-  s3_bucket: qdrant---vectorforge
-  s3_prefix: mteb--tweet-sentiment/openai-3-small
-  output_dir: /tmp/vectorforge
-```
-
-### Storage backends
-
-**S3:**
-```yaml
-storage:
-  type: s3
+  type: s3                        # or hf, local
   s3_bucket: qdrant---vectorforge
   s3_prefix: dataset-name/model-name
-```
-
-**HuggingFace Hub:**
-```yaml
-storage:
-  type: hf
-  repo_id: Qdrant/dataset-name--model-name
-  private: true
-```
-
-**Local (no upload):**
-```yaml
-storage:
-  type: local
   output_dir: /tmp/vectorforge
 ```
 
@@ -87,22 +87,46 @@ storage:
 
 | Type | Config key | Notes |
 |------|-----------|-------|
-| OpenAI | `openai` | Supports `model`, `dimensions`, `batch_size`, `max_concurrent` |
-| Sentence Transformers | `sentence_transformer` | Supports `model`, `batch_size`, `device`. Auto-detects CUDA/MPS/CPU |
+| OpenAI | `openai` | `model`, `dimensions`, `batch_size`, `max_concurrent` |
+| Sentence Transformers | `sentence_transformer` | `model`, `batch_size`, `dtype`. Auto-detects CUDA/MPS/CPU |
 
-### Sentence Transformers example
+### Storage backends
 
-```yaml
-embedder:
-  type: sentence_transformer
-  model: Alibaba-NLP/gte-multilingual-base
-  trust_remote_code: true
-  batch_size: 32
+| Type | Config key | Notes |
+|------|-----------|-------|
+| S3 | `s3` | `s3_bucket`, `s3_prefix` |
+| HuggingFace Hub | `hf` | `repo_id`, `private` |
+| Local | `local` | `output_dir` |
+
+### Running locally
+
+```bash
+vectorforge configs/embedder/mteb_tweets_openai.yaml
 ```
 
-## Output format
+### Running at scale with Modal
 
-Output is parquet with this schema:
+Modal splits the dataset into slices and processes each on its own GPU/CPU:
+
+```bash
+# Setup
+pip install modal && modal setup
+modal secret create vectorforge-secrets \
+  OPENAI_API_KEY=$OPENAI_API_KEY \
+  AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+  AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+  AWS_DEFAULT_REGION=us-east-1 \
+  HF_TOKEN=$HF_TOKEN
+
+# Run
+modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu
+modal run modal_batch.py --config configs/embedder/mteb_tweets_openai.yaml          # CPU for API embedders
+modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu --dry-run  # preview only
+```
+
+### Output format
+
+Parquet files with this schema:
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -114,96 +138,30 @@ Output is parquet with this schema:
 | `source` | string | Dataset identifier |
 | `embedding` | list\<float32\> | The embedding vector |
 | `model` | string | Model used for embedding |
-| `payload` | string | JSON metadata from the source |
 
 Query with DuckDB:
 
 ```sql
-SELECT * FROM 's3://qdrant---vectorforge/dataset/model/*.parquet' LIMIT 10;
+SELECT * FROM 's3://qdrant---vectorforge/dataset/model/**/*.parquet' LIMIT 10;
 ```
 
-## Running at scale with Modal
+---
 
-vectorforge uses [Modal](https://modal.com) for massively parallel embedding. The dataset is split into slices, and each slice runs as an independent job on its own GPU/CPU. For a 10M row dataset with `chunk_size=100_000`, that's 100 jobs running concurrently.
+## Pipeline 2: Loading
 
-### Setup
-
-1. Install Modal and authenticate:
-
-```bash
-pip install modal
-modal setup
-```
-
-2. Create a secret group with your credentials:
-
-```bash
-modal secret create vectorforge-secrets \
-  OPENAI_API_KEY=$OPENAI_API_KEY \
-  AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
-  AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-  AWS_DEFAULT_REGION=us-east-1 \
-  HF_TOKEN=$HF_TOKEN
-```
-
-### Running jobs
-
-```bash
-# Preview the plan (no jobs submitted)
-modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu --dry-run
-
-# Run with GPU (sentence-transformers)
-modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu
-
-# Run with CPU (API-based embedders like OpenAI)
-modal run modal_batch.py --config configs/embedder/mteb_tweets_openai.yaml
-
-# Custom chunk size (smaller = more parallelism)
-modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu --chunk-size 50000
-
-# Fire and forget
-modal run --detach modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu
-```
-
-### How it works
-
-1. **Planner** (runs locally): reads config, queries dataset size, divides into slices
-2. **`spawn_map`**: kicks off N independent jobs on Modal
-3. **Each job**: streams its slice from HuggingFace, embeds, writes one parquet, uploads to storage
-4. **Manifest**: after all jobs complete, a `_manifest.json` is uploaded with run metadata
-
-### Local runner
-
-For development and small datasets, run locally without Modal:
-
-```bash
-uv run python scripts/run_pipeline.py configs/embedder/mteb_tweets_openai.yaml
-```
-
-The local runner uses async workers with a priority queue buffer for ordered output.
-
-## Loading into vector stores
-
-Once you have pre-embedded parquet data on S3 or HuggingFace, load it into a vector store:
-
-```bash
-vectorforge-load configs/loader/cohere200M.yaml
-```
-
-### Loader configuration
+### Configuration
 
 ```yaml
 datasource:
   type: s3                          # s3 or huggingface
   s3_bucket: qdrant---vectorforge
   s3_prefix: cohere--wikipedia/embed-multilingual-v3
-  columns:                          # override parquet column names
+  columns:                          # optional: override parquet column names
     id: _id                         # default: row_id
     embedding: emb                  # default: embedding
-  payload_fields:                   # parquet columns to include as payload
-    text: text                      # payload key: parquet column
-    url: url
-    title: title
+  payload_fields:                   # what goes into the vector store payload
+    text: text                      # payload key: parquet column name
+    source: source
 
 vectorstore:
   type: qdrant
@@ -217,144 +175,90 @@ loader:
   concurrency: 8                    # parallel upsert tasks
 ```
 
+### Running
+
+```bash
+vectorforge-load configs/loader/cohere200M.yaml
+```
+
 ### Datasources
 
 | Type | Config key | Notes |
 |------|-----------|-------|
-| S3 | `s3` | Requires `s3_bucket`, `s3_prefix`. Streams via DuckDB httpfs |
-| HuggingFace | `huggingface` | Requires `repo_id`. Streams via DuckDB `hf://` protocol |
-
-**HuggingFace example:**
-```yaml
-datasource:
-  type: huggingface
-  repo_id: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
-  subdir: en                        # optional, scope to a subfolder
-```
+| S3 | `s3` | `s3_bucket`, `s3_prefix`. Streams via DuckDB httpfs |
+| HuggingFace | `huggingface` | `repo_id`, optional `subdir`. Streams via DuckDB `hf://` protocol |
 
 ### Vector stores
 
 | Type | Config key | Notes |
 |------|-----------|-------|
-| Qdrant | `qdrant` | Requires `url`, `api_key`, `collection_name` |
-
-### How it works
-
-1. DuckDB streams parquet data in large prefetch chunks (minimizes remote I/O)
-2. Chunks are sliced into upsert-sized batches and written concurrently
-3. **Deferred indexing** -- HNSW indexing is disabled during load, then enabled for a single efficient batch build
-4. Progress bar tracks points loaded, with throughput logging
+| Qdrant | `qdrant` | `url`, `api_key`, `collection_name`. Retry with backoff on timeouts |
 
 ### Column mapping
 
-The `columns` field maps logical names to actual parquet column names. Defaults:
+The `columns` field maps logical names to actual parquet column names:
 
-| Logical name | Default parquet column |
-|-------------|----------------------|
-| `id` | `row_id` |
-| `embedding` | `embedding` |
+| Logical name | Default | Description |
+|-------------|---------|-------------|
+| `id` | `row_id` | Point ID in the vector store |
+| `embedding` | `embedding` | Vector column |
 
 ### Payload composition
 
-The `payload_fields` field controls what goes into the vector store payload. Each entry maps a payload key (what gets stored) to a parquet column name (where the data comes from):
+`payload_fields` maps payload keys to parquet columns. Only the fields you list end up in the vector store payload:
 
 ```yaml
 payload_fields:
-  abstract: text        # store parquet "text" column as "abstract"
+  abstract: text        # parquet "text" column stored as "abstract" in payload
   source: source
-  metadata: payload     # JSON columns are auto-unpacked
 ```
 
-If omitted, defaults to `{text: text}`.
-
-## Distributed loading with SkyPilot
-
-For terabyte-scale datasets, distribute loading across SkyPilot spot instances:
-
-```bash
-vectorforge-load-distributed configs/dispatch/cohere200M.yaml
-```
-
-### Dispatch configuration
-
-Extends the loader config with `dispatch` and `resources` sections:
-
-```yaml
-dispatch:
-  num_shards: 10                    # number of parallel workers
-  run_name: cohere200M              # optional, used in run directory name
-
-resources:                          # SkyPilot VM spec
-  cpus: 8
-  memory: 32
-  cloud: aws
-  use_spot: true                    # 60-90% cheaper than on-demand
-
-# Standard loader config (passed through to workers)
-datasource:
-  type: s3
-  s3_bucket: qdrant---vectorforge
-  s3_prefix: cohere--wikipedia/embed-multilingual-v3
-  columns:
-    id: _id
-    embedding: emb
-  payload_fields:
-    text: text
-    url: url
-    title: title
-
-vectorstore:
-  type: qdrant
-  collection_name: cohere-wikipedia
-  url: ${QDRANT_URL}
-  api_key: ${QDRANT_API_KEY}
-
-loader:
-  batch_size: 1000
-  prefetch_size: 100000
-  concurrency: 8
-```
+Default when omitted: `{text: text}`.
 
 ### How it works
 
-1. **Discover** -- lists all parquet files at the S3 prefix via boto3
-2. **Shard** -- divides files round-robin across N workers
-3. **Generate** -- writes per-shard loader + SkyPilot YAML configs to `runs/<run_id>/`
-4. **Setup** -- creates Qdrant collection and defers indexing
-5. **Launch** -- fans out N SkyPilot spot instance jobs (env vars injected at runtime, never written to disk)
-6. **Wait** -- polls `sky jobs queue` until all complete
-7. **Index** -- enables indexing and waits for HNSW build
-8. **Report** -- writes `report.json` with timing and success/failure counts
+1. DuckDB streams parquet data in large prefetch chunks (minimizes S3 round trips)
+2. Chunks are sliced into upsert-sized batches and written concurrently via asyncio
+3. **Deferred indexing** -- HNSW construction is disabled during load, then enabled for one efficient batch build
+4. Failed upserts are retried with exponential backoff
 
-### Dry run
+### Distributed loading with SkyPilot
 
-Preview the plan without launching:
+For terabyte-scale datasets, fan out across SkyPilot spot instances:
 
 ```bash
-vectorforge-load-distributed configs/dispatch/cohere200M.yaml --dry-run
+vectorforge-load-distributed configs/dispatch/cohere200M.yaml
+vectorforge-load-distributed configs/dispatch/cohere200M.yaml --dry-run      # preview only
+vectorforge-load-distributed configs/dispatch/cohere200M.yaml --num-shards 20  # override shard count
 ```
 
-### Generated artifacts
+Dispatch config adds `dispatch` and `resources` sections to the standard loader config:
 
-Each run produces a directory with a full paper trail:
+```yaml
+dispatch:
+  num_shards: 10
+  run_name: cohere200M
 
+resources:
+  cpus: 2
+  memory: 8
+  cloud: aws
+  use_spot: true
 ```
-runs/2026-04-07T14-30_cohere200M/
-  manifest.json              # file list + shard assignments
-  shard_000_loader.yaml      # per-shard loader config (with file_list)
-  shard_000_sky.yaml         # per-shard SkyPilot job config
-  shard_001_loader.yaml
-  shard_001_sky.yaml
-  ...
-  report.json                # timing, success/failure counts
-```
 
-### Prerequisites
+The dispatch flow:
+1. Lists all parquet files at the S3 prefix
+2. Divides files round-robin across N shards
+3. Generates per-shard loader + SkyPilot YAML configs in `runs/<timestamp>_<name>/`
+4. Creates Qdrant collection and defers indexing
+5. Launches N SkyPilot spot instance jobs (credentials injected at runtime, never written to disk)
+6. Waits for all jobs to complete
+7. Enables indexing and measures HNSW build time
+8. Writes `report.json`
 
-1. [SkyPilot](https://skypilot.readthedocs.io/) installed and configured with AWS credentials
-2. Required env vars set: `QDRANT_URL`, `QDRANT_API_KEY`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+Requires [SkyPilot](https://skypilot.readthedocs.io/) configured with AWS credentials. See [docs/aws-sso-setup.md](docs/aws-sso-setup.md).
 
-See [docs/aws-sso-setup.md](docs/aws-sso-setup.md) for AWS SSO credential setup.
+---
 
 ## Environment variables
 
@@ -368,19 +272,14 @@ See [docs/aws-sso-setup.md](docs/aws-sso-setup.md) for AWS SSO credential setup.
 | `QDRANT_URL` | Qdrant vector store |
 | `QDRANT_API_KEY` | Qdrant vector store |
 
-## Dashboard
-
-A static Next.js site that displays all completed embedding runs by reading `_manifest.json` files from S3.
-
-```bash
-cd dashboard
-npm install
-npm run fetch-manifests  # pull manifests from S3
-npm run build            # static export to out/
-```
-
 ## Tests
 
 ```bash
 uv run pytest tests/ -v
 ```
+
+## Additional docs
+
+- [Loader architecture](docs/loader.md) -- detailed design docs for the loading pipeline
+- [AWS SSO setup](docs/aws-sso-setup.md) -- configuring AWS SSO for local and Modal usage
+- [SkyPilot migration](docs/skypilot-migration.md) -- plan for moving sustained workloads from Modal to SkyPilot

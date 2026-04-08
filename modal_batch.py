@@ -71,7 +71,7 @@ def _process_slice(slice_args: dict) -> dict:
     import time
 
     from datasets import load_dataset
-    from scripts.run_pipeline import build_embedder, build_storage
+    from scripts.run_embedder import build_embedder, build_storage
     from vectorforge.models import Record, EmbeddedRecord
     from vectorforge.storage.writer import write_batch
     from vectorforge.sources.huggingface import _build_text_extractor
@@ -82,8 +82,6 @@ def _process_slice(slice_args: dict) -> dict:
     offset = slice_args["offset"]
     limit = slice_args["limit"]
     slice_id = slice_args["slice_id"]
-    held_out_indices = set(slice_args.get("held_out_indices", []))
-
     t0 = time.time()
 
     # Build embedder and storage
@@ -97,7 +95,6 @@ def _process_slice(slice_args: dict) -> dict:
         source_cfg.get("config"),
         split=f"{base_split}[{offset}:{offset + limit}]",
     )
-    stream = ds
 
     extract_text = _build_text_extractor(
         source_cfg.get("text_field"),
@@ -108,13 +105,8 @@ def _process_slice(slice_args: dict) -> dict:
 
     records: list[Record] = []
     row_counter = 0
-    skipped = 0
     for local_index, row in enumerate(tqdm(ds, total=limit, desc=f"[slice {slice_id}] Streaming")):
         source_row_id = offset + local_index
-
-        if source_row_id in held_out_indices:
-            skipped += 1
-            continue
 
         text = extract_text(row)
         if not text or not text.strip():
@@ -137,7 +129,6 @@ def _process_slice(slice_args: dict) -> dict:
         return {
             "slice_id": slice_id,
             "num_records": 0,
-            "held_out": skipped,
             "elapsed": round(time.time() - t0, 1),
         }
 
@@ -175,12 +166,11 @@ def _process_slice(slice_args: dict) -> dict:
     asyncio.run(storage.upload_file(parquet_path))
 
     elapsed = round(time.time() - t0, 1)
-    print(f"[slice {slice_id:08d}] {len(embedded)} records, {skipped} held out, {elapsed}s")
+    print(f"[slice {slice_id:08d}] {len(embedded)} records, {elapsed}s")
 
     return {
         "slice_id": slice_id,
         "num_records": len(embedded),
-        "held_out": skipped,
         "elapsed": elapsed,
     }
 
@@ -215,11 +205,9 @@ def main(
     config: str,
     gpu: bool = False,
     dry_run: bool = False,
-    num_queries: int = 10_000,
 ):
     import json
     import math
-    import random
     import time
 
     import yaml
@@ -246,11 +234,6 @@ def main(
     builder = load_dataset_builder(dataset_name, hf_config)
     total_rows = builder.info.splits[split].num_examples
 
-    # Generate deterministic held-out indices
-    num_queries = min(num_queries, total_rows // 10)  # cap at 10% of dataset
-    random.seed(42)
-    held_out_indices = sorted(random.sample(range(total_rows), num_queries))
-
     num_jobs = math.ceil(total_rows / chunk_size)
 
     print("=" * 60)
@@ -259,8 +242,6 @@ def main(
     print(f"  Dataset:      {dataset_name}")
     print(f"  Split:        {split}")
     print(f"  Total rows:   {total_rows:,}")
-    print(f"  Held out:     {num_queries:,} queries")
-    print(f"  Corpus rows:  ~{total_rows - num_queries:,}")
     print(f"  Chunk size:   {chunk_size:,}")
     print(f"  Num jobs:     {num_jobs}")
     print(f"  GPU:          {gpu}")
@@ -272,12 +253,10 @@ def main(
         print("\n[dry run] No jobs submitted.")
         return
 
-    # Build slice arguments, distributing held-out indices to their respective slices
     slices = []
     for i in range(num_jobs):
         offset = i * chunk_size
         limit = min(chunk_size, total_rows - offset)
-        slice_held_out = [idx for idx in held_out_indices if offset <= idx < offset + limit]
         slices.append({
             "source_cfg": dict(source_cfg),
             "embedder_cfg": dict(embedder_cfg),
@@ -285,7 +264,6 @@ def main(
             "offset": offset,
             "limit": limit,
             "slice_id": i,
-            "held_out_indices": slice_held_out,
         })
 
     # Dispatch
@@ -297,22 +275,19 @@ def main(
     for result in fn.map(slices):
         results.append(result)
         print(f"  Completed slice {result['slice_id']:08d}: "
-              f"{result['num_records']:,} records, {result.get('held_out', 0)} held out, {result['elapsed']}s")
+              f"{result['num_records']:,} records, {result['elapsed']}s")
 
     total_time = round(time.time() - t0, 1)
     total_records = sum(r["num_records"] for r in results)
 
     # Upload manifest
-    from scripts.run_pipeline import build_storage
+    from scripts.run_embedder import build_storage
 
     manifest = {
         "dataset": dataset_name,
         "split": split,
         "total_rows": total_rows,
         "total_records": total_records,
-        "held_out_indices": held_out_indices,
-        "num_queries": num_queries,
-        "queries_hydrated": False,
         "chunk_size": chunk_size,
         "num_slices": num_jobs,
         "gpu": gpu,
@@ -333,9 +308,7 @@ def main(
     print("\n" + "=" * 60)
     print("batch complete")
     print("=" * 60)
-    print(f"  Corpus records:  {total_records:,}")
-    print(f"  Held out:        {num_queries:,} (stored in manifest)")
+    print(f"  Total records:   {total_records:,}")
     print(f"  Total time:      {total_time}s")
-    print(f"  Queries hydrated: False")
     print(f"  Manifest:        _manifest.json uploaded")
     print("=" * 60)

@@ -8,9 +8,7 @@ dependencies = [
     "datasets",
     "pyarrow",
     "aiobotocore",
-    "httpx",
     "openai",
-    "cohere",
     "pyyaml",
     "tiktoken>=0.12.0",
     "tqdm",
@@ -28,7 +26,7 @@ dependencies = [
 include = ["vectorforge*", "scripts*"]
 
 [project.scripts]
-vectorforge = "scripts.run_pipeline:main"
+vectorforge = "scripts.run_embedder:main"
 vectorforge-load = "scripts.run_loader:main"
 vectorforge-load-distributed = "scripts.run_dispatch:main"
 
