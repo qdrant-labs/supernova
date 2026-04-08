@@ -105,7 +105,7 @@ storage:
   s3_prefix: dataset-name/model-name
 ```
 
-Uploads parquet files to `s3://bucket/prefix/batch_00000000.parquet`. Auto-creates the bucket if it doesn't exist.
+Each chunk/slice produces one parquet file, uploaded as `s3://bucket/prefix/batch_00000000.parquet`, `batch_00000001.parquet`, etc. A large dataset might produce hundreds of parquet files under the same prefix. Auto-creates the bucket if it doesn't exist.
 
 ### HuggingFace Hub
 

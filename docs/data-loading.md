@@ -1,6 +1,6 @@
 # Data Loading
 
-vectorforge's loading pipeline streams pre-embedded parquet data from S3 or HuggingFace into vector stores like Qdrant. It uses DuckDB for efficient remote parquet reads and async concurrency for parallel upserts.
+vectorforge's loading pipeline streams pre-embedded parquet files from S3 or HuggingFace into vector stores like Qdrant. An embedding run typically produces many parquet files (one per chunk/slice) under a shared S3 prefix -- the loader reads all of them. It uses DuckDB for efficient remote parquet reads and async concurrency for parallel upserts.
 
 ![Loading Pipeline](fig/ingestion_pipelione.svg)
 

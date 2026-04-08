@@ -9,23 +9,23 @@ Both tasks are designed for massive parallelization. Embedding generation fans o
 
 ## Mental model
 
-The two pipelines are independent. You can run them separately, on different machines, at different times. The parquet files on S3 are the bridge between them.
+The two pipelines are independent. You can run them separately, on different machines, at different times. The parquet files on S3 are the bridge between them -- each embedding run produces many parquet files (one per chunk/slice), stored under a common S3 prefix.
 
 ```
-Source (HuggingFace) ──> [Embedding Pipeline] ──> S3 (parquet) ──> [Loading Pipeline] ──> Qdrant
+Source (HuggingFace) ──> [Embedding Pipeline] ──> S3 (many parquets) ──> [Loading Pipeline] ──> Qdrant
 ```
 
 ### Embedding pipeline
 
 ![Embedding Pipeline](fig/embedding_pipeline.svg)
 
-A HuggingFace dataset is split into N chunks. Each chunk is assigned to a Modal compute node (CPU for API-based embedders like OpenAI, GPU for local models like sentence-transformers). Each node embeds its chunk and uploads the result as a parquet file to S3. The output parquet contains the original data plus an embedding column.
+A HuggingFace dataset is split into N chunks. Each chunk is assigned to a Modal compute node (CPU for API-based embedders like OpenAI, GPU for local models like sentence-transformers). Each node embeds its chunk and uploads the result as a parquet file to S3. The result is many parquet files under a shared S3 prefix -- each containing a batch of rows with the original text plus an embedding column.
 
 ### Loading pipeline
 
 ![Loading Pipeline](fig/ingestion_pipelione.svg)
 
-Pre-embedded parquet files on S3 are split into N groups. Each group is assigned to an EC2 spot instance (provisioned by SkyPilot). Each instance streams its parquet files via DuckDB and upserts the vectors into a shared Qdrant cluster. HNSW indexing is deferred until all data is loaded, then built in one efficient pass.
+The many parquet files on S3 are divided into N groups. Each group is assigned to an EC2 spot instance (provisioned by SkyPilot). Each instance streams its assigned parquet files via DuckDB and upserts the vectors into a shared Qdrant cluster. HNSW indexing is deferred until all data is loaded, then built in one efficient pass.
 
 ## Key design principles
 
