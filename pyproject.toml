@@ -19,7 +19,8 @@ dependencies = [
     "sentence-transformers",
     "torch",
     "transformers<5",
-    "qdrant-client>=1.9.0"
+    "qdrant-client>=1.9.0",
+    "boto3"
 ]
 
 [tool.setuptools.packages.find]
@@ -28,6 +29,7 @@ include = ["vectorforge*"]
 [project.scripts]
 vectorforge = "scripts.run_pipeline:main"
 vectorforge-load = "scripts.run_loader:main"
+vectorforge-load-distributed = "scripts.run_dispatch:main"
 
 [dependency-groups]
 dev = [

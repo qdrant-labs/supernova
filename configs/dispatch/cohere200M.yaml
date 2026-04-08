@@ -1,0 +1,32 @@
+dispatch:
+  num_shards: 10
+  run_name: cohere200M
+
+resources:
+  cpus: 8
+  memory: 32
+  cloud: aws
+  use_spot: true
+
+datasource:
+  type: s3
+  s3_bucket: qdrant---vectorforge
+  s3_prefix: cohere--wikipedia/embed-multilingual-v3
+  columns:
+    id: _id
+    embedding: emb
+  payload_fields:
+    text: text
+    url: url
+    title: title
+
+vectorstore:
+  type: qdrant
+  collection_name: cohere-wikipedia
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+
+loader:
+  batch_size: 1000
+  prefetch_size: 100000
+  concurrency: 8

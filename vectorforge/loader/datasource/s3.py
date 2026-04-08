@@ -8,14 +8,29 @@ from .base import DataReader
 class S3DataReader(DataReader):
     """Reads pre-embedded parquet files from S3."""
 
-    def __init__(self, s3_bucket: str, s3_prefix: str, columns: dict[str, str] | None = None, payload_fields: dict[str, str] | None = None):
+    def __init__(
+        self,
+        s3_bucket: str,
+        s3_prefix: str,
+        columns: dict[str, str] | None = None,
+        payload_fields: dict[str, str] | None = None,
+        file_list: list[str] | None = None,
+    ):
         super().__init__(columns=columns, payload_fields=payload_fields)
         self.s3_bucket = s3_bucket
         self.s3_prefix = s3_prefix.rstrip("/")
+        self.file_list = file_list
 
     @property
     def glob_path(self) -> str:
         return f"s3://{self.s3_bucket}/{self.s3_prefix}/**/*.parquet"
+
+    @property
+    def source_sql(self) -> str:
+        if self.file_list:
+            files_literal = ", ".join(f"'{f}'" for f in self.file_list)
+            return f"read_parquet([{files_literal}])"
+        return f"'{self.glob_path}'"
 
     def _configure_connection(self) -> None:
         conn = self._conn

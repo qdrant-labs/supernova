@@ -93,6 +93,8 @@ def main():
     parser = argparse.ArgumentParser(description="Load pre-embedded data into a vector store")
     parser.add_argument("config", nargs="?", help="Path to YAML config file")
     parser.add_argument("--dry-run", "-d", action="store_true", help="Parse config and print info without loading")
+    parser.add_argument("--no-manage-indexing", action="store_true", default=False,
+                        help="Skip collection creation and indexing lifecycle (for distributed workers)")
     args = parser.parse_args()
 
     config_path = args.config or os.environ.get("LOADER_CONFIG_PATH")
@@ -123,6 +125,7 @@ def main():
             batch_size=loader_cfg.get("batch_size", 1000),
             prefetch_size=loader_cfg.get("prefetch_size"),
             concurrency=loader_cfg.get("concurrency", 8),
+            manage_indexing=not args.no_manage_indexing,
         )
     )
 

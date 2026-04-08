@@ -23,11 +23,15 @@ async def run_loader(
     batch_size: int = 1000,
     prefetch_size: int | None = None,
     concurrency: int = 8,
+    manage_indexing: bool = True,
 ) -> None:
     """Stream pre-embedded parquet data into a vector store.
 
     Reads large chunks (prefetch_size) from DuckDB to minimize remote I/O,
     then slices into upsert-sized batches and writes them concurrently.
+
+    When manage_indexing=False, skips collection creation and indexing lifecycle
+    (for distributed workers where the master handles this).
     """
     if prefetch_size is None:
         prefetch_size = batch_size * 10
@@ -39,12 +43,10 @@ async def run_loader(
     total = reader.get_total_count()
     logger.info(f"Found {total:,} vectors (dim={dimension})")
 
-    # Ensure collection/index exists
-    await store.ensure_collection(dimension)
-
-    # Defer indexing for fast bulk load
-    logger.info("Deferring indexing for bulk load...")
-    await store.defer_indexing()
+    if manage_indexing:
+        await store.ensure_collection(dimension)
+        logger.info("Deferring indexing for bulk load...")
+        await store.defer_indexing()
 
     sem = asyncio.Semaphore(concurrency)
     loaded = 0
@@ -92,11 +94,11 @@ async def run_loader(
         f"in {elapsed:.1f}s ({rate:,.0f} pts/s)"
     )
 
-    # Re-enable indexing and wait for HNSW build
-    await store.enable_indexing()
-    t1 = time.perf_counter()
-    await store.wait_for_indexing()
-    index_elapsed = time.perf_counter() - t1
-    logger.info(f"Indexing completed in {index_elapsed:.1f}s")
+    if manage_indexing:
+        await store.enable_indexing()
+        t1 = time.perf_counter()
+        await store.wait_for_indexing()
+        index_elapsed = time.perf_counter() - t1
+        logger.info(f"Indexing completed in {index_elapsed:.1f}s")
 
     await store.close()

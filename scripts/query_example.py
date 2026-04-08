@@ -38,5 +38,6 @@ f"""
     SELECT row_id, source_row_id, chunk_index, source, text[:80] AS text_preview, model, embedding
     FROM '{PATH}'
     LIMIT 10
+    OFFSET 500000
 """)
 

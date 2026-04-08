@@ -45,6 +45,11 @@ class DataReader(ABC):
     def glob_path(self) -> str:
         """DuckDB-readable glob path to the parquet files."""
 
+    @property
+    def source_sql(self) -> str:
+        """DuckDB FROM-clause expression. Override for non-glob sources."""
+        return f"'{self.glob_path}'"
+
     def _get_connection(self) -> duckdb.DuckDBPyConnection:
         if self._conn is None:
             self._conn = duckdb.connect()
@@ -59,7 +64,7 @@ class DataReader(ABC):
         conn = self._get_connection()
         embedding_col = self.columns["embedding"]
         result = conn.execute(
-            f"SELECT length({embedding_col}) as dim FROM '{self.glob_path}' LIMIT 1"
+            f"SELECT length({embedding_col}) as dim FROM {self.source_sql} LIMIT 1"
         ).fetchone()
         if result is None:
             raise RuntimeError(f"No data found at {self.glob_path}")
@@ -69,7 +74,7 @@ class DataReader(ABC):
         """Get the total number of records."""
         conn = self._get_connection()
         result = conn.execute(
-            f"SELECT count(*) FROM '{self.glob_path}'"
+            f"SELECT count(*) FROM {self.source_sql}"
         ).fetchone()
         return result[0]
 
@@ -92,9 +97,9 @@ class DataReader(ABC):
         conn = self._get_connection()
         select_sql, payload_keys = self._build_select()
 
-        logger.info(f"Reading batches from {self.glob_path}")
+        logger.info(f"Reading batches from {self.source_sql}")
         result = conn.execute(
-            f"SELECT {select_sql} FROM '{self.glob_path}'"
+            f"SELECT {select_sql} FROM {self.source_sql}"
         )
 
         while True:
