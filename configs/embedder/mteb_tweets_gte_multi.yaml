@@ -16,6 +16,6 @@ pipeline:
 
 storage:
   type: s3
-  s3_bucket: qdrant--vectorforge
+  s3_bucket: qdrant---vectorforge
   s3_prefix: mteb--tweet-sentiment/gte-multilingual-base
   output_dir: /tmp/vectorforge

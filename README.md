@@ -45,7 +45,7 @@ pipeline:
 
 storage:
   type: s3
-  s3_bucket: qdrant--vectorforge
+  s3_bucket: qdrant---vectorforge
   s3_prefix: mteb--tweet-sentiment/openai-3-small
   output_dir: /tmp/vectorforge
 ```
@@ -56,7 +56,7 @@ storage:
 ```yaml
 storage:
   type: s3
-  s3_bucket: qdrant--vectorforge
+  s3_bucket: qdrant---vectorforge
   s3_prefix: dataset-name/model-name
 ```
 
@@ -120,7 +120,7 @@ Output is parquet with this schema:
 Query with DuckDB:
 
 ```sql
-SELECT * FROM 's3://qdrant--vectorforge/dataset/model/*.parquet' LIMIT 10;
+SELECT * FROM 's3://qdrant---vectorforge/dataset/model/*.parquet' LIMIT 10;
 ```
 
 ## Running at scale with Modal

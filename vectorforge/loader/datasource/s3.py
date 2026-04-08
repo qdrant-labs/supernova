@@ -29,3 +29,7 @@ class S3DataReader(DataReader):
         if key and secret:
             conn.execute(f"SET s3_access_key_id = '{key}';")
             conn.execute(f"SET s3_secret_access_key = '{secret}';")
+
+        session_token = os.environ.get("AWS_SESSION_TOKEN", "")
+        if session_token:
+            conn.execute(f"SET s3_session_token = '{session_token}';")

@@ -111,7 +111,7 @@ for lang in en de fr es; do
   cat > /tmp/load_${lang}.yaml <<EOF
 datasource:
   type: s3
-  s3_bucket: qdrant--vectorforge
+  s3_bucket: qdrant---vectorforge
   s3_prefix: cohere--wikipedia/embed-multilingual-v3/${lang}
   columns:
     id: row_id

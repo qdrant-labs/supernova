@@ -29,7 +29,7 @@ image = (
 )
 
 DATASET = "CohereLabs/wikipedia-2023-11-embed-multilingual-v3"
-BUCKET = "qdrant--vectorforge"
+BUCKET = "qdrant---vectorforge"
 PREFIX = "cohere--wikipedia/embed-multilingual-v3"
 MODEL_NAME = "embed-multilingual-v3.0"
 BATCH_SIZE = 100_000

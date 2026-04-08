@@ -3,7 +3,7 @@ import os
 import duckdb
 
 # Point this at your S3 path or local output dir
-S3_PATH = "s3://qdrant--vectorforge/cohere--wikipedia/embed-multilingual-v3/**/*.parquet"
+S3_PATH = "s3://qdrant---vectorforge/cohere--wikipedia/embed-multilingual-v3/**/*.parquet"
 LOCAL_PATH = "/tmp/vectorforge/*.parquet"
 
 # Use local path by default — swap to S3_PATH if querying from S3
@@ -21,6 +21,10 @@ secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 if key and secret:
     con.execute(f"SET s3_access_key_id = '{key}';")
     con.execute(f"SET s3_secret_access_key = '{secret}';")
+
+session_token = os.environ.get("AWS_SESSION_TOKEN", "")
+if session_token:
+    con.execute(f"SET s3_session_token = '{session_token}';")
 
 con.sql(
 f"""

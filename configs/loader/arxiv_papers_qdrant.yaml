@@ -1,6 +1,6 @@
 datasource:
   type: s3
-  s3_bucket: qdrant--vectorforge
+  s3_bucket: qdrant---vectorforge
   s3_prefix: arxiv-papers/gte-multilingual-base
   payload_fields:
     text: text             # parquet "text" col -> payload key "text"

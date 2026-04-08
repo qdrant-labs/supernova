@@ -129,7 +129,7 @@ def process_config(
 def main():
     parser = argparse.ArgumentParser(description="Import pre-embedded HF dataset to S3")
     parser.add_argument("--dataset", required=True, help="HuggingFace dataset name")
-    parser.add_argument("--bucket", default="qdrant--vectorforge")
+    parser.add_argument("--bucket", default="qdrant---vectorforge")
     parser.add_argument("--prefix", required=True, help="S3 prefix")
     parser.add_argument("--batch-size", type=int, default=100_000)
     parser.add_argument("--model-name", default="embed-multilingual-v3.0",
