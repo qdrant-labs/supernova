@@ -82,19 +82,22 @@ def _process_slice(slice_args: dict) -> dict:
     offset = slice_args["offset"]
     limit = slice_args["limit"]
     slice_id = slice_args["slice_id"]
+    max_text_length = slice_args.get("max_text_length")
     t0 = time.time()
 
     # Build embedder and storage
     embedder = build_embedder(dict(embedder_cfg))
     storage = build_storage(dict(storage_cfg))
 
-    # Load only our slice using HF split range syntax
+    # Stream only our slice — avoids downloading the full dataset per container
     base_split = source_cfg.get("split", "train")
     ds = load_dataset(
         source_cfg["dataset_name"],
         source_cfg.get("config"),
-        split=f"{base_split}[{offset}:{offset + limit}]",
+        split=base_split,
+        streaming=True,
     )
+    ds = ds.skip(offset).take(limit)
 
     extract_text = _build_text_extractor(
         source_cfg.get("text_field"),
@@ -113,6 +116,9 @@ def _process_slice(slice_args: dict) -> dict:
         text = extract_text(row)
         if not text or not text.strip():
             continue
+
+        if max_text_length and len(text) > max_text_length:
+            text = text[:max_text_length]
 
         columns = {k: v for k, v in row.items() if k not in exclude_columns}
         chunks = embedder.split_text(text)
@@ -227,6 +233,7 @@ def main(
 
     # config overrides default
     chunk_size = pipeline_cfg.get("chunk_size", 100_000)
+    max_text_length = pipeline_cfg.get("max_text_length")
 
     dataset_name = source_cfg["dataset_name"]
     hf_config = source_cfg.get("config")
@@ -266,6 +273,7 @@ def main(
             "offset": offset,
             "limit": limit,
             "slice_id": i,
+            "max_text_length": max_text_length,
         })
 
     # Dispatch

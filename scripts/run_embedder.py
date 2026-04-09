@@ -94,6 +94,7 @@ def main():
             num_workers=pipeline_cfg.get("num_workers", 8),
             flush_threshold=pipeline_cfg.get("flush_threshold", 100_000),
             output_dir=storage_cfg.get("output_dir", "/tmp/vectorforge"),
+            max_text_length=pipeline_cfg.get("max_text_length"),
         )
     )
 

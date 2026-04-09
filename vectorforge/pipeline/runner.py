@@ -25,6 +25,7 @@ async def run(
     num_workers: int = 8,
     flush_threshold: int = 100_000,
     output_dir: str = "/tmp/vectorforge",
+    max_text_length: int | None = None,
 ):
     logger.info(
         "Starting pipeline: source=%s embedder=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
@@ -53,7 +54,7 @@ async def run(
 
     # chunker: feeds work queue, then sends sentinels to shut down workers
     async def run_chunker():
-        for chunk_id, records in source.get_chunks(embedder, chunk_size):
+        for chunk_id, records in source.get_chunks(embedder, chunk_size, max_text_length):
             await work_queue.put((chunk_id, records))
         logger.info("Chunker finished, sending stop signals to %d workers", num_workers)
         for _ in range(num_workers):

@@ -36,10 +36,12 @@ class DatasetSource(ABC):
         self,
         embedder: "Embedder",
         chunk_size: int = 10_000,
+        max_text_length: int | None = None,
     ) -> Iterator[tuple[int, list[Record]]]:
         """
         Default chunking logic. Yields (chunk_id, records[]).
         Long texts are split using the embedder's tokenizer.
+        If max_text_length is set, texts are truncated before splitting.
         """
         chunk: list[Record] = []
         chunk_id = 0
@@ -53,7 +55,11 @@ class DatasetSource(ABC):
                 source_row_id += 1
                 continue
 
-            text_pieces = embedder.split_text(base_record.text)
+            text = base_record.text
+            if max_text_length and len(text) > max_text_length:
+                text = text[:max_text_length]
+
+            text_pieces = embedder.split_text(text)
 
             for chunk_index, piece in enumerate(text_pieces):
                 record = Record(
