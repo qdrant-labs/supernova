@@ -7,22 +7,24 @@ and dtypes to measure tokens/sec on the current GPU.
 
 Usage:
   # Default: gte-multilingual-base on finewiki english
-  python3.11 bench.py
+  python3.11 throughput_bench.py
 
   # Custom dataset
-  python3.11 bench.py --dataset nick007x/arxiv-papers --column abstract --hf-config None
+  python3.11 throughput_bench.py --dataset nick007x/arxiv-papers --column abstract --hf-config None
 
   # Sweep specific batch sizes
-  python3.11 bench.py --batch-sizes 64,128,256,512
+  python3.11 throughput_bench.py --batch-sizes 64,128,256,512
 
   # Test flash attention
-  python3.11 bench.py --flash-attn
+  python3.11 throughput_bench.py --flash-attn
 
   # Multiple dtypes
-  python3.11 bench.py --dtypes float16,bfloat16
+  python3.11 throughput_bench.py --dtypes float16,bfloat16
 
   # Cap text length before splitting
-  python3.11 bench.py --max-text-length 50000
+  python3.11 throughput_bench.py --max-text-length 50000
+
+  python throughput_bench.py --dataset HuggingFaceTB/dclm-edu --cutoffs 256,512,1024,2048,4096,8192 --batch-sizes 64 --sample 10000 --output dclm_cutoff_results.json --hf-config None
 """
 
 import argparse
@@ -112,12 +114,14 @@ def main():
     parser.add_argument("--dtypes", default="bfloat16", help="Comma-separated dtypes to test (float32,float16,bfloat16)")
     parser.add_argument("--flash-attn", action="store_true", help="Enable flash attention 2")
     parser.add_argument("--max-text-length", type=int, default=None, help="Truncate texts to this many chars before embedding")
+    parser.add_argument("--cutoffs", default=None, help="Comma-separated token cutoffs to sweep (e.g. 256,512,1024,2048,4096)")
     parser.add_argument("--output", default="results.json")
     args = parser.parse_args()
 
     hf_config = None if args.hf_config == "None" else args.hf_config
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     dtypes_to_test = args.dtypes.split(",")
+    cutoffs_to_test = [int(x) for x in args.cutoffs.split(",")] if args.cutoffs else [None]
     dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
     # sample dataset
@@ -154,48 +158,77 @@ def main():
             model_kwargs=model_kwargs,
         )
 
-        # count tokens for tok/s calculation (model truncates internally during encode)
         tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
         max_tokens = model.max_seq_length
 
+        # tokenize all texts once upfront
+        print("Tokenizing all texts...")
         t_tok = time.perf_counter()
-        token_counts = [min(len(tokenizer.encode(t, add_special_tokens=False)), max_tokens) for t in tqdm(texts, desc="Counting tokens")]
+        all_token_ids = [tokenizer.encode(t, add_special_tokens=False) for t in tqdm(texts, desc="Tokenizing")]
         tokenize_time = time.perf_counter() - t_tok
-        total_tokens = sum(token_counts)
-        print(f"  {len(texts):,} texts, {total_tokens:,} tokens (capped at max_seq_length={max_tokens})")
-        print(f"  Tokenization: {tokenize_time:.1f}s ({total_tokens/tokenize_time:,.0f} tok/s)")
 
-        for bs in batch_sizes:
-            print(f"\n--- batch_size={bs}, dtype={dtype_name} ---")
-            result = run_trial(model, texts, token_counts, batch_size=bs)
-            result.update({
-                "model": args.model,
-                "dtype": dtype_name,
-                "batch_size": bs,
-                "flash_attn": args.flash_attn,
-                "gpu": gpu_name,
-                "dataset": args.dataset,
-                "source_texts": len(texts),
-                "max_text_length": args.max_text_length,
-                "tokenize_s": round(tokenize_time, 2),
-                "tokenize_tok_per_s": round(total_tokens / tokenize_time, 0),
-            })
-            all_results.append(result)
+        for cutoff in cutoffs_to_test:
+            effective_cutoff = cutoff or max_tokens
+            cutoff_label = f"cutoff={cutoff}" if cutoff else "no cutoff"
 
-            print(f"  {result['tokens_per_s']:,.0f} tok/s | {result['texts_per_s']:,.0f} texts/s | "
-                  f"{result['gpu_mem_peak_gb']:.1f} GB peak | {result['elapsed_s']:.1f}s")
+            # truncate tokens and decode back to text
+            if cutoff:
+                trial_texts = [
+                    tokenizer.decode(toks[:cutoff], skip_special_tokens=True) if len(toks) > cutoff else texts[i]
+                    for i, toks in enumerate(all_token_ids)
+                ]
+                token_counts = [min(len(toks), cutoff) for toks in all_token_ids]
+            else:
+                trial_texts = texts
+                token_counts = [min(len(toks), max_tokens) for toks in all_token_ids]
+
+            total_tokens = sum(token_counts)
+            mean_tokens = total_tokens / len(token_counts)
+            print(f"\n  [{cutoff_label}] {len(trial_texts):,} texts, {total_tokens:,} tokens (mean {mean_tokens:.0f})")
+
+            for bs in batch_sizes:
+                print(f"\n--- batch_size={bs}, dtype={dtype_name}, {cutoff_label} ---")
+                result = run_trial(model, trial_texts, token_counts, batch_size=bs)
+                result.update({
+                    "model": args.model,
+                    "dtype": dtype_name,
+                    "batch_size": bs,
+                    "cutoff": cutoff,
+                    "flash_attn": args.flash_attn,
+                    "gpu": gpu_name,
+                    "dataset": args.dataset,
+                    "source_texts": len(trial_texts),
+                    "mean_tokens": round(mean_tokens, 1),
+                    "max_text_length": args.max_text_length,
+                    "tokenize_s": round(tokenize_time, 2),
+                    "tokenize_tok_per_s": round(sum(len(t) for t in all_token_ids) / tokenize_time, 0),
+                })
+                all_results.append(result)
+
+                print(f"  {result['tokens_per_s']:,.0f} tok/s | {result['texts_per_s']:,.0f} texts/s | "
+                      f"{result['gpu_mem_peak_gb']:.1f} GB peak | {result['elapsed_s']:.1f}s")
 
         # free GPU memory before next dtype
         del model
         torch.cuda.empty_cache()
 
     # summary table
-    print(f"\n\n{'='*80}")
-    print(f"{'Model':<40} {'dtype':<10} {'batch':>6} {'tok/s':>10} {'texts/s':>10} {'VRAM GB':>8}")
-    print(f"{'='*80}")
-    for r in all_results:
-        print(f"{r['model']:<40} {r['dtype']:<10} {r['batch_size']:>6} "
-              f"{r['tokens_per_s']:>10,.0f} {r['texts_per_s']:>10,.0f} {r['gpu_mem_peak_gb']:>8.1f}")
+    has_cutoffs = any(r["cutoff"] is not None for r in all_results)
+    if has_cutoffs:
+        print(f"\n\n{'='*90}")
+        print(f"{'Model':<40} {'dtype':<10} {'cutoff':>7} {'batch':>6} {'tok/s':>10} {'texts/s':>10} {'VRAM GB':>8}")
+        print(f"{'='*90}")
+        for r in all_results:
+            co = f"{r['cutoff']:,}" if r['cutoff'] else "none"
+            print(f"{r['model']:<40} {r['dtype']:<10} {co:>7} {r['batch_size']:>6} "
+                  f"{r['tokens_per_s']:>10,.0f} {r['texts_per_s']:>10,.0f} {r['gpu_mem_peak_gb']:>8.1f}")
+    else:
+        print(f"\n\n{'='*80}")
+        print(f"{'Model':<40} {'dtype':<10} {'batch':>6} {'tok/s':>10} {'texts/s':>10} {'VRAM GB':>8}")
+        print(f"{'='*80}")
+        for r in all_results:
+            print(f"{r['model']:<40} {r['dtype']:<10} {r['batch_size']:>6} "
+                  f"{r['tokens_per_s']:>10,.0f} {r['texts_per_s']:>10,.0f} {r['gpu_mem_peak_gb']:>8.1f}")
 
     # save
     with open(args.output, "w") as f:

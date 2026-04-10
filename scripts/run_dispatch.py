@@ -135,7 +135,9 @@ def generate_sky_yaml(
 
 
 def launch_jobs(sky_configs: list[Path], run_name: str) -> list[str]:
-    """Launch SkyPilot jobs with env vars forwarded from the current shell."""
+    """
+    Launch SkyPilot jobs with env vars forwarded from the current shell.
+    """
     job_names = []
     env_flags = []
     for var in ENV_VARS_TO_FORWARD:

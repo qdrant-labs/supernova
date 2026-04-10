@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 
 
 def _slice_batch(records: list[dict], batch_size: int) -> list[list[dict]]:
-    """Slice a large prefetched chunk into upsert-sized batches."""
+    """
+    Slice a large prefetched chunk into upsert-sized batches.
+    """
     return [records[i:i + batch_size] for i in range(0, len(records), batch_size)]
 
 
@@ -25,7 +27,8 @@ async def run_loader(
     concurrency: int = 8,
     manage_indexing: bool = True,
 ) -> None:
-    """Stream pre-embedded parquet data into a vector store.
+    """
+    Stream pre-embedded parquet data into a vector store.
 
     Reads large chunks (prefetch_size) from DuckDB to minimize remote I/O,
     then slices into upsert-sized batches and writes them concurrently.
@@ -67,7 +70,7 @@ async def run_loader(
     pbar = tqdm(total=total, desc="Loading", unit=" pts")
 
     try:
-        # Read large chunks from DuckDB, slice into upsert batches
+        # read large chunks from duckdb, slice into upsert batches
         for chunk in reader.read_batches(prefetch_size):
             for batch in _slice_batch(chunk, batch_size):
                 task = asyncio.create_task(_upsert(batch))

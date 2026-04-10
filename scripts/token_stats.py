@@ -19,8 +19,7 @@ def main():
     parser.add_argument("--config", default=None, help="Dataset config (e.g. 'en', '20231101.en')")
     parser.add_argument("--split", default="train", help="Dataset split (default: train)")
     parser.add_argument("--column", default="text", help="Text column to measure (default: text)")
-    parser.add_argument("--tokenizer", default="Alibaba-NLP/gte-multilingual-base",
-                        help="HF tokenizer or tiktoken encoding name (default: gte-multilingual-base)")
+    parser.add_argument("--tokenizer", default="Alibaba-NLP/gte-multilingual-base", help="HF tokenizer or tiktoken encoding name (default: gte-multilingual-base)")
     parser.add_argument("--sample", type=int, default=10_000, help="Number of rows to sample (default: 10000)")
     args = parser.parse_args()
 

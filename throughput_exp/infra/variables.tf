@@ -10,6 +10,7 @@ variable "instance_type" {
   default     = "g5.xlarge" # A10G — also try g4dn.xlarge (T4), g6.xlarge (L4)
 }
 
+# use like: terraform apply -var="key_pair_name=my-key"
 variable "key_pair_name" {
   description = "EC2 key pair name for SSH access"
   type        = string

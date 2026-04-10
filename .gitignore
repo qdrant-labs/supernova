@@ -132,6 +132,9 @@ runs/
 *.swo
 *~
 
+# throughput experiment results
+padding_sim_results/
+
 # terraform
 .terraform/
 .terraform.lock.hcl
