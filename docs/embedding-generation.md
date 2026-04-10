@@ -189,6 +189,84 @@ modal run --detach modal_batch.py --config configs/embedder/arxiv_papers.yaml --
 
 For a 10M row dataset with `chunk_size=100,000`, that's 100 jobs running concurrently -- each on its own GPU.
 
+## Cost and time estimation
+
+Before embedding a dataset, estimate how long it will take and what it will cost.
+
+### Step 1: Profile the dataset
+
+Use `token_stats.py` to sample token lengths:
+
+```bash
+python scripts/token_stats.py HuggingFaceFW/finewiki --config en --sample 100000
+```
+
+This gives you the **mean tokens per row** from a random sample. That's the key input.
+
+### Step 2: Estimate total tokens
+
+```
+total_tokens = rows × mean_tokens_per_row
+```
+
+The mean already accounts for skewed distributions (most datasets have a long tail of very long texts). For a confidence interval on the estimate:
+
+```
+standard_error = stdev / sqrt(sample_size)
+total_tokens = rows × mean ± rows × 1.96 × standard_error  (95% CI)
+```
+
+With a 100K sample, the standard error is typically small enough to ignore.
+
+### Step 3: Estimate time and cost
+
+```
+gpu_hours = total_tokens / throughput_tok_s / 3600
+cost      = gpu_hours × price_per_gpu_hour
+wall_time = gpu_hours / num_gpus
+```
+
+### Assumptions and reference values
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Throughput (gte-multilingual-base, A10G, bfloat16) | 50,000 tok/s | Budget estimate; raw benchmarks show 45K-87K depending on text length |
+| Throughput (snowflake-arctic-embed-l-v2.0, A10G, bfloat16) | ~35,000 tok/s | Single GPU, benchmarked on real data |
+| A10G price (Modal) | $0.60/hr | On-demand |
+| A10G price (AWS) | ~$0.38/hr | Spot, g5.xlarge |
+| T4 price (GCP) | ~$0.18/hr | Spot |
+| OpenAI text-embedding-3-small | $0.02/1M tokens | API pricing, no GPU needed |
+
+Throughput varies with text length: short texts (~20 tok avg) achieve ~58K tok/s due to padding waste, while medium-to-long texts (~700+ tok avg) hit ~80-87K tok/s. Always use bfloat16 — it's ~2x faster than float32 with no quality loss.
+
+### Example
+
+finewiki (English): 1.82M rows, mean 676 tok/row:
+
+```
+total_tokens = 1,820,000 × 676 = 1.23B tokens
+gpu_hours    = 1,230,000,000 / 50,000 / 3600 = 6.8 GPU-hours
+cost (Modal) = 6.8 × $0.60 = $4.10
+cost (AWS)   = 6.8 × $0.38 = $2.60  (spot g5.xlarge)
+wall_time    = 6.8 / 10 GPUs = 41 min
+```
+
+Compare with OpenAI API:
+
+```
+cost (OpenAI) = 1,230,000,000 / 1,000,000 × $0.02 = $24.60
+```
+
+Self-hosted GPU embedding is ~10x cheaper than OpenAI at this scale. The cost gap widens with larger datasets.
+
+### Caveats
+
+- **Throughput varies by model and GPU.** The 10K tok/s figure is for gte-multilingual-base on A10G with bfloat16. Larger models or float32 will be slower. Measure your own throughput from a test run.
+- **Long texts create multiple chunks.** A 50K-token text becomes ~6 chunks at 8192 max_seq_length. The total tokens already accounts for this since we measure at the source row level.
+- **Use `max_text_length` to cap outliers.** Setting `pipeline.max_text_length` in your config prevents the long tail from dominating compute. A value of ~80K characters caps texts to ~10 chunks.
+- **GPU utilization matters.** The formula assumes 100% utilization. Real runs have overhead from data loading, uploads, and container startup. Add ~20% buffer.
+- **Cost scales linearly, wall time doesn't.** Adding more GPUs reduces wall time but total cost stays the same (minus fixed overhead).
+
 ## Importing pre-embedded datasets
 
 Some datasets on HuggingFace are already embedded (e.g. Cohere Wikipedia). Use `modal_import_cohere.py` to import them to S3 in vectorforge's parquet format:
