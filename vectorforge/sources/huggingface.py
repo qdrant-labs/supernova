@@ -35,6 +35,8 @@ class HuggingFaceSource(DatasetSource):
         text_field: str | None = "text",
         text_template: str | None = None,
         exclude_columns: list[str] | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
     ):
         self.dataset_name = dataset_name
         self.config = config
@@ -42,6 +44,8 @@ class HuggingFaceSource(DatasetSource):
         self.text_field = text_field
         self.text_template = text_template
         self.exclude_columns = set(exclude_columns or [])
+        self._offset = offset
+        self._limit = limit
         self._extract_text = _build_text_extractor(text_field, text_template)
         self._dataset = load_dataset(
             dataset_name, config, streaming=True, split=split
@@ -52,7 +56,12 @@ class HuggingFaceSource(DatasetSource):
         return self.dataset_name
 
     def stream(self):
-        yield from self._dataset
+        ds = self._dataset
+        if self._offset:
+            ds = ds.skip(self._offset)
+        if self._limit:
+            ds = ds.take(self._limit)
+        yield from ds
 
     def extract_text(self, row: dict) -> str:
         """Extract text from a row using text_template or text_field."""

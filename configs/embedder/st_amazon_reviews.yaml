@@ -4,7 +4,7 @@ source:
   split: train
   text_template: "Title: {title}\nReview: {review}"
 
-embedder:
+dense_embedder:
   type: sentence_transformer
   model: Alibaba-NLP/gte-multilingual-base
   trust_remote_code: true

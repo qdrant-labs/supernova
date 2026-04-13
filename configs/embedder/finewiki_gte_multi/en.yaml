@@ -5,10 +5,16 @@ source:
   config: "en"
   text_template: "Title: {title}\nText: {text}"
 
-embedder:
+dense_embedder:
   type: sentence_transformer
   model: Alibaba-NLP/gte-multilingual-base
   trust_remote_code: true
+  batch_size: 64
+  dtype: bfloat16
+
+sparse_embedder:
+  type: sentence_transformer
+  model: Alibaba-NLP/gte-multilingual-base
   batch_size: 64
   dtype: bfloat16
 
@@ -21,4 +27,4 @@ storage:
 pipeline:
   chunk_size: 100000
   num_workers: 2
-  max_text_length: 81,920 # 10X the default max length of 8,192 for gte-multilingual-base
+  max_text_length: 81920

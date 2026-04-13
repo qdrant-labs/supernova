@@ -39,43 +39,9 @@ Set the variables relevant to your workflow:
 | `QDRANT_URL` | Qdrant cluster URL |
 | `QDRANT_API_KEY` | Qdrant API key |
 
-## Modal setup (for distributed embedding)
+## SkyPilot setup (for distributed embedding and loading)
 
-Modal is used to parallelize embedding generation across GPUs/CPUs in the cloud.
-
-```bash
-pip install modal
-modal setup
-```
-
-Create a secret group with your credentials:
-
-```bash
-modal secret create vectorforge-secrets \
-  OPENAI_API_KEY=$OPENAI_API_KEY \
-  AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
-  AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-  AWS_DEFAULT_REGION=us-east-1 \
-  HF_TOKEN=$HF_TOKEN
-```
-
-If using AWS SSO, refresh secrets before each run with:
-
-```bash
-eval "$(aws configure export-credentials --profile your-profile --format env)"
-modal secret create vectorforge-secrets \
-  AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
-  AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-  AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN \
-  AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1} \
-  OPENAI_API_KEY=${OPENAI_API_KEY:-} \
-  HF_TOKEN=${HF_TOKEN:-} \
-  --force
-```
-
-## SkyPilot setup (for distributed loading)
-
-SkyPilot is used to parallelize vector store loading across EC2 spot instances.
+SkyPilot is used to parallelize both embedding generation (GPU instances) and vector store loading (CPU spot instances).
 
 ```bash
 # SkyPilot is included in vectorforge dependencies
@@ -89,6 +55,7 @@ SkyPilot requires IAM permissions to launch EC2 instances. See the [SkyPilot AWS
 ```bash
 # Check CLI tools are available
 vectorforge --help
+vectorforge-embed-distributed --help
 vectorforge-load --help
 vectorforge-load-distributed --help
 

@@ -8,7 +8,7 @@ source:
     - title
     - url
 
-embedder:
+dense_embedder:
   type: openai
   model: text-embedding-3-small
   dimensions: 1536

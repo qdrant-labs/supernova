@@ -1,18 +1,18 @@
 from abc import ABC, abstractmethod
 
 
-class Embedder(ABC):
+class DenseEmbedder(ABC):
     """
-    Abstract base for all embedding backends.
-    All implementations must be async — parallelism comes from
+    Abstract base for dense embedding backends.
+    All implementations must be async -- parallelism comes from
     running many embed() calls concurrently via asyncio.gather.
     """
 
     @abstractmethod
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """
-        Takes a batch of strings. Needs to be async to allow for parallelism across batches.
-        Returns a list of embedding vectors in the same order.
+        Takes a batch of strings. Returns a list of dense embedding vectors
+        in the same order.
         """
         pass
 
@@ -33,11 +33,11 @@ class Embedder(ABC):
     @property
     def max_tokens(self) -> int:
         """Max token length this embedder supports. Must be overridden."""
-        raise NotImplementedError("Embedder subclass must define max_tokens")
+        raise NotImplementedError("DenseEmbedder subclass must define max_tokens")
 
     def split_text(self, text: str) -> list[str]:
         """
         Split text into pieces that fit within this embedder's token limit.
-        Must be overridden — each embedder should use its own tokenizer.
+        Must be overridden -- each embedder should use its own tokenizer.
         """
-        raise NotImplementedError("Embedder subclass must implement split_text")
+        raise NotImplementedError("DenseEmbedder subclass must implement split_text")

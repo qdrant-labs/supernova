@@ -13,7 +13,7 @@ source:
   split: train
   text_field: text
 
-embedder:
+dense_embedder:
   type: openai
   model: text-embedding-3-small
   dimensions: 1536
@@ -40,10 +40,10 @@ vectorforge configs/embedder/my_dataset.yaml
 
 This streams the dataset from HuggingFace, embeds each text with OpenAI, and uploads parquet files to S3.
 
-For larger datasets, use Modal to parallelize:
+For larger datasets, use SkyPilot to parallelize across GPU instances:
 
 ```bash
-modal run modal_batch.py --config configs/embedder/my_dataset.yaml
+vectorforge-embed-distributed configs/embedder/my_dataset.yaml
 ```
 
 ## 2. Verify the output
@@ -120,5 +120,5 @@ results = client.query_points(
 
 ## Next steps
 
-- [Embedding Generation](embedding-generation.md) -- configuration reference, Modal at scale, embedder options
+- [Embedding Generation](embedding-generation.md) -- configuration reference, SkyPilot at scale, dense/sparse embedder options
 - [Data Loading](data-loading.md) -- column mapping, payload composition, distributed loading with SkyPilot

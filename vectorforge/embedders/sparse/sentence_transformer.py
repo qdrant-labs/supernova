@@ -2,9 +2,10 @@ import asyncio
 import logging
 
 import torch
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SparseEncoder
 
-from vectorforge.embedders.base import Embedder
+from vectorforge.embedders.sparse.base import SparseEmbedder
+from vectorforge.models import SparseEmbedding
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,12 @@ def _detect_device() -> str:
     return "cpu"
 
 
-class SentenceTransformerEmbedder(Embedder):
+class SentenceTransformerSparseEmbedder(SparseEmbedder):
+    """
+    Sparse embedder using sentence-transformers SparseEncoder.
+    Works with models like SPLADE, gte-multilingual-base (sparse mode), etc.
+    """
+
     DTYPE_MAP = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -34,20 +40,15 @@ class SentenceTransformerEmbedder(Embedder):
     ):
         self._device = device or _detect_device()
         torch_dtype = self.DTYPE_MAP.get(dtype, torch.float32)
-        logger.info("Loading %s on %s (dtype=%s)", model, self._device, dtype)
-        self._model = SentenceTransformer(
+        logger.info("Loading sparse encoder %s on %s (dtype=%s)", model, self._device, dtype)
+        self._model = SparseEncoder(
             model,
             device=self._device,
             trust_remote_code=trust_remote_code,
-            # TODO torch_dtype is deprecated, use dtpye instead
-            model_kwargs={"dtype": torch_dtype},
         )
         self._model_name = model
         self._batch_size = batch_size
-        self._dimensions_val = self._model.get_sentence_embedding_dimension()
         self._max_tokens = self._model.max_seq_length
-        # Separate tokenizer copy for split_text to avoid "Already borrowed"
-        # race with the model's internal tokenizer used during encode()
         from transformers import AutoTokenizer
         self._splitter_tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
 
@@ -56,17 +57,10 @@ class SentenceTransformerEmbedder(Embedder):
         return self._model_name
 
     @property
-    def dimensions(self) -> int | None:
-        return self._dimensions_val
-
-    @property
     def max_tokens(self) -> int:
         return self._max_tokens
 
     def split_text(self, text: str) -> list[str]:
-        """
-        Split text using the model's own tokenizer.
-        """
         tokens = self._splitter_tokenizer.encode(text, add_special_tokens=False)
 
         if len(tokens) <= self._max_tokens:
@@ -78,17 +72,33 @@ class SentenceTransformerEmbedder(Embedder):
             chunks.append(self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True))
         return chunks
 
-    def _encode(self, texts: list[str]) -> list[list[float]]:
-        embeddings = self._model.encode(
+    def _encode(self, texts: list[str]) -> list[SparseEmbedding]:
+        results = self._model.encode(
             texts,
             batch_size=self._batch_size,
             show_progress_bar=False,
-            convert_to_numpy=True,
         )
-        return embeddings.tolist()
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        """
-        Small wrapper to make sure that the blocking _encode method runs in a thread, allowing for concurrency across batches.
-        """
+        embeddings = []
+        for row in results:
+            # SparseEncoder returns scipy sparse matrices or dicts depending on version
+            if hasattr(row, "toarray"):
+                # scipy sparse matrix — convert to indices/values
+                dense = row.toarray().squeeze()
+                nonzero = dense.nonzero()[0]
+                embeddings.append(SparseEmbedding(
+                    indices=nonzero.tolist(),
+                    values=dense[nonzero].tolist(),
+                ))
+            elif isinstance(row, dict):
+                embeddings.append(SparseEmbedding(
+                    indices=list(row.keys()),
+                    values=list(row.values()),
+                ))
+            else:
+                raise TypeError(f"Unexpected sparse output type: {type(row)}")
+
+        return embeddings
+
+    async def embed(self, texts: list[str]) -> list[SparseEmbedding]:
         return await asyncio.to_thread(self._encode, texts)

@@ -2,6 +2,16 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class SparseEmbedding:
+    """
+    Sparse vector representation: parallel lists of token indices and weights.
+    Used by BM25, SPLADE, and other sparse retrieval models.
+    """
+    indices: list[int]
+    values: list[float]
+
+
+@dataclass
 class Record:
     """
     A single record from a dataset source, before embedding.
@@ -20,14 +30,16 @@ class Record:
 @dataclass
 class EmbeddedRecord:
     """
-    A Record after embedding.
+    A Record after embedding. One or both of dense/sparse will be set
+    depending on which embedders are configured.
     """
     row_id: int
     source_row_id: int
     chunk_id: int
     chunk_index: int
     text: str
-    embedding: list[float]
+    dense_embedding: list[float] | None = None
+    sparse_embedding: SparseEmbedding | None = None
     columns: dict = field(default_factory=dict)
 
 

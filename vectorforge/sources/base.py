@@ -4,7 +4,7 @@ from typing import Iterator, TYPE_CHECKING
 from vectorforge.models import Record
 
 if TYPE_CHECKING:
-    from vectorforge.embedders.base import Embedder
+    from vectorforge.embedders.engine import EmbeddingEngine
 
 
 class DatasetSource(ABC):
@@ -34,13 +34,13 @@ class DatasetSource(ABC):
 
     def get_chunks(
         self,
-        embedder: "Embedder",
+        engine: "EmbeddingEngine",
         chunk_size: int = 10_000,
         max_text_length: int | None = None,
     ) -> Iterator[tuple[int, list[Record]]]:
         """
         Default chunking logic. Yields (chunk_id, records[]).
-        Long texts are split using the embedder's tokenizer.
+        Long texts are split using the engine's tokenizer.
         If max_text_length is set, texts are truncated before splitting.
         """
         chunk: list[Record] = []
@@ -59,7 +59,7 @@ class DatasetSource(ABC):
             if max_text_length and len(text) > max_text_length:
                 text = text[:max_text_length]
 
-            text_pieces = embedder.split_text(text)
+            text_pieces = engine.split_text(text)
 
             for chunk_index, piece in enumerate(text_pieces):
                 record = Record(

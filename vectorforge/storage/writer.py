@@ -5,39 +5,65 @@ import pyarrow.parquet as pq
 
 from vectorforge.models import EmbeddedRecord
 
-# Fixed columns that vectorforge always adds, with explicit types
-FIXED_SCHEMA = [
+# Fixed columns that vectorforge always writes
+BASE_SCHEMA = [
     pa.field("row_id", pa.int64()),
     pa.field("source_row_id", pa.int64()),
     pa.field("chunk_id", pa.int32()),
     pa.field("chunk_index", pa.int32()),
     pa.field("text", pa.string()),
-    pa.field("embedding", pa.list_(pa.float32())),
 ]
 
-FIXED_COLUMN_NAMES = {f.name for f in FIXED_SCHEMA}
+SPARSE_EMBEDDING_TYPE = pa.struct([
+    pa.field("indices", pa.list_(pa.uint32())),
+    pa.field("values", pa.list_(pa.float32())),
+])
+
+BASE_COLUMN_NAMES = {f.name for f in BASE_SCHEMA}
 
 
-def write_batch(records: list[EmbeddedRecord], output_dir: str, batch_id: int) -> str:
+def write_batch(
+    records: list[EmbeddedRecord],
+    output_dir: str,
+    batch_id: int,
+    dense_column: str | None = "dense_embedding",
+    sparse_column: str | None = None,
+) -> str:
     os.makedirs(output_dir, exist_ok=True)
     filename = f"batch_{batch_id:08d}.parquet"
     path = os.path.join(output_dir, filename)
 
-    # Fixed columns with explicit types
+    # Fixed columns
     data = {
         "row_id":        [r.row_id for r in records],
         "source_row_id": [r.source_row_id for r in records],
         "chunk_id":      [r.chunk_id for r in records],
         "chunk_index":   [r.chunk_index for r in records],
         "text":          [r.text for r in records],
-        "embedding":     [r.embedding for r in records],
     }
-    table = pa.table(data, schema=pa.schema(FIXED_SCHEMA))
 
-    # Dynamic columns — let PyArrow infer types from the data
+    schema_fields = list(BASE_SCHEMA)
+
+    # Dense embedding column
+    if dense_column and records and records[0].dense_embedding is not None:
+        data[dense_column] = [r.dense_embedding for r in records]
+        schema_fields.append(pa.field(dense_column, pa.list_(pa.float32())))
+
+    # Sparse embedding column
+    if sparse_column and records and records[0].sparse_embedding is not None:
+        data[sparse_column] = [
+            {"indices": r.sparse_embedding.indices, "values": r.sparse_embedding.values}
+            for r in records
+        ]
+        schema_fields.append(pa.field(sparse_column, SPARSE_EMBEDDING_TYPE))
+
+    table = pa.table(data, schema=pa.schema(schema_fields))
+
+    # Dynamic columns -- let PyArrow infer types from the data
+    embedding_columns = {dense_column, sparse_column} | BASE_COLUMN_NAMES
     if records and records[0].columns:
         for col_name in records[0].columns:
-            if col_name not in FIXED_COLUMN_NAMES:
+            if col_name not in embedding_columns:
                 values = [r.columns.get(col_name) for r in records]
                 table = table.append_column(col_name, pa.array(values))
 

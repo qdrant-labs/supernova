@@ -6,7 +6,7 @@ source:
   exclude_columns:
     - authors
 
-embedder:
+dense_embedder:
   type: sentence_transformer
   model: Alibaba-NLP/gte-multilingual-base
   trust_remote_code: true

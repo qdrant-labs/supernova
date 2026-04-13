@@ -1,12 +1,12 @@
 import asyncio
 import logging
 
-from vectorforge.embedders.base import Embedder
+from vectorforge.embedders.dense.base import DenseEmbedder
 
 logger = logging.getLogger(__name__)
 
 
-class OpenAIEmbedder(Embedder):
+class OpenAIEmbedder(DenseEmbedder):
     def __init__(
         self,
         model: str = "text-embedding-3-small",

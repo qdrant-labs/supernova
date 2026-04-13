@@ -1,6 +1,6 @@
 import asyncio
 
-from vectorforge.embedders.base import Embedder
+from vectorforge.embedders.engine import EmbeddingEngine
 from vectorforge.models import ChunkResult, EmbeddedRecord
 
 
@@ -8,7 +8,7 @@ async def worker(
     _worker_id: int,
     work_queue: asyncio.Queue,
     result_queue: asyncio.Queue,
-    embedder: Embedder,
+    engine: EmbeddingEngine,
 ):
     while True:
         item = await work_queue.get()
@@ -20,7 +20,7 @@ async def worker(
         chunk_id, records = item
         texts = [r.text for r in records]
 
-        embeddings = await embedder.embed(texts)
+        result = await engine.embed(texts)
 
         embedded = [
             EmbeddedRecord(
@@ -29,10 +29,11 @@ async def worker(
                 chunk_id=r.chunk_id,
                 chunk_index=r.chunk_index,
                 text=r.text,
-                embedding=emb,
+                dense_embedding=result.dense[i] if result.dense else None,
+                sparse_embedding=result.sparse[i] if result.sparse else None,
                 columns=r.columns,
             )
-            for r, emb in zip(records, embeddings)
+            for i, r in enumerate(records)
         ]
 
         await result_queue.put(ChunkResult(chunk_id=chunk_id, records=embedded))
