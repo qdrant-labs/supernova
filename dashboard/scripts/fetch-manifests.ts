@@ -2,7 +2,7 @@ import { S3Client, ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/clien
 import { writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 
-const BUCKET = "qdrant---vectorforge";
+const BUCKET = "qdrant--vectorforge";
 const OUTPUT_DIR = join(__dirname, "..", "data");
 const OUTPUT_FILE = join(OUTPUT_DIR, "manifests.json");
 

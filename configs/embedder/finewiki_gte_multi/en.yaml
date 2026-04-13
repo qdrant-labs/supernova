@@ -20,7 +20,7 @@ sparse_embedder:
 
 storage:
   type: s3
-  s3_bucket: qdrant---vectorforge
+  s3_bucket: qdrant--vectorforge
   s3_prefix: finewiki/gte-multilingual-base
   output_dir: /tmp/vectorforge
 

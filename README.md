@@ -78,7 +78,7 @@ pipeline:
 
 storage:
   type: s3                        # or hf, local
-  s3_bucket: qdrant---vectorforge
+  s3_bucket: qdrant--vectorforge
   s3_prefix: dataset-name/model-name
   output_dir: /tmp/vectorforge
 ```
@@ -142,7 +142,7 @@ Parquet files with this schema:
 Query with DuckDB:
 
 ```sql
-SELECT * FROM 's3://qdrant---vectorforge/dataset/model/**/*.parquet' LIMIT 10;
+SELECT * FROM 's3://qdrant--vectorforge/dataset/model/**/*.parquet' LIMIT 10;
 ```
 
 ---
@@ -154,7 +154,7 @@ SELECT * FROM 's3://qdrant---vectorforge/dataset/model/**/*.parquet' LIMIT 10;
 ```yaml
 datasource:
   type: s3                          # s3 or huggingface
-  s3_bucket: qdrant---vectorforge
+  s3_bucket: qdrant--vectorforge
   s3_prefix: cohere--wikipedia/embed-multilingual-v3
   columns:                          # optional: override parquet column names
     id: _id                         # default: row_id

@@ -15,6 +15,6 @@ pipeline:
 
 storage:
   type: s3
-  s3_bucket: qdrant---vectorforge
+  s3_bucket: qdrant--vectorforge
   s3_prefix: openassistant--oasst1/openai-3-small
   output_dir: /tmp/vectorforge
