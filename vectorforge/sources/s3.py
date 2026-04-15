@@ -21,6 +21,9 @@ class S3Source(DatasetSource):
     def source_name(self) -> str:
         return f"s3://{self.bucket}/{self.prefix}"
 
+    def get_total_rows(self) -> int:
+        raise NotImplementedError("S3Source.get_total_rows() not yet implemented")
+
     def stream(self):
         raise NotImplementedError("S3Source.stream() not yet implemented")
 

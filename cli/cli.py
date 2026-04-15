@@ -25,16 +25,16 @@ def main():
     argv = sys.argv[2:]
 
     if command == "embed":
-        from scripts.run_embedder import main as embed_main
+        from cli.run_embedder import main as embed_main
         embed_main(argv)
     elif command == "embed-dist":
-        from scripts.run_embed_distributed import main as embed_dist_main
+        from cli.run_embed_distributed import main as embed_dist_main
         embed_dist_main(argv)
     elif command == "load":
-        from scripts.run_loader import main as load_main
+        from cli.run_loader import main as load_main
         load_main(argv)
     elif command == "load-dist":
-        from scripts.run_dispatch import main as load_dist_main
+        from cli.run_dispatch import main as load_dist_main
         load_dist_main(argv)
     else:
         print(f"unknown command: {command}")

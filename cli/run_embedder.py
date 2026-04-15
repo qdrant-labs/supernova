@@ -130,27 +130,26 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--job-rank", type=int, default=None, help="This job's rank (0-indexed, used with --num-jobs)")
     args = parser.parse_args(argv)
 
-    config_path = args.config or os.environ.get("CONFIG_PATH")
+    config_path = args.config or os.environ.get("VF_CONFIG_PATH")
     if not config_path:
-        parser.error("Provide a config path as argument or set CONFIG_PATH env var")
+        parser.error("Provide a config path as argument or set VF_CONFIG_PATH env var")
 
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    # Support both explicit offset/limit and rank-based slicing
+    # support both explicit offset/limit and rank-based slicing
     if args.num_jobs is not None:
         job_rank = args.job_rank
         if job_rank is None:
             # SkyPilot pools set these env vars automatically
             job_rank = int(os.environ.get("SKYPILOT_JOB_RANK", 0))
-            logger = logging.getLogger("vectorforge")
-            logger.info(f"Auto-detected job rank {job_rank} from SKYPILOT_JOB_RANK env var")
+            logging.getLogger("vectorforge").info(
+                f"Auto-detected job rank {job_rank} from SKYPILOT_JOB_RANK env var"
+            )
 
-        from datasets import load_dataset_builder
-
-        source_cfg = config["source"]
-        builder = load_dataset_builder(source_cfg["dataset_name"], source_cfg.get("config"))
-        total_rows = builder.info.splits[source_cfg.get("split", "train")].num_examples
+        # Build source to query total rows (source-agnostic)
+        source_for_count = build_source(dict(config["source"]))
+        total_rows = source_for_count.get_total_rows()
 
         rows_per_job = math.ceil(total_rows / args.num_jobs)
         offset = job_rank * rows_per_job
@@ -165,8 +164,10 @@ def main(argv: list[str] | None = None):
 
     elif args.offset is not None or args.limit is not None:
         if args.offset is not None:
+            # just use what was provided, no auto-computation
             config["source"]["offset"] = args.offset
         if args.limit is not None:
+            # just use what was provided, no auto-computation
             config["source"]["limit"] = args.limit
 
     source = build_source(dict(config["source"]))

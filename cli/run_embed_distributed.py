@@ -69,14 +69,10 @@ def main(argv: list[str] | None = None):
     pipeline_cfg = config.get("pipeline", {})
     resources = config.get("resources", DEFAULT_RESOURCES)
 
-    dataset_name = source_cfg["dataset_name"]
-    hf_config = source_cfg.get("config")
-    split = source_cfg.get("split", "train")
-
-    # Get dataset size
-    from datasets import load_dataset_builder
-    builder = load_dataset_builder(dataset_name, hf_config)
-    total_rows = builder.info.splits[split].num_examples
+    # Get dataset size (source-agnostic)
+    from cli.run_embedder import build_source
+    source = build_source(dict(source_cfg))
+    total_rows = source.get_total_rows()
 
     chunk_size = args.chunk_size or pipeline_cfg.get("chunk_size", 100_000)
     num_jobs = args.num_jobs or math.ceil(total_rows / chunk_size)

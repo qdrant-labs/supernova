@@ -55,6 +55,11 @@ class HuggingFaceSource(DatasetSource):
     def source_name(self) -> str:
         return self.dataset_name
 
+    def get_total_rows(self) -> int:
+        from datasets import load_dataset_builder
+        builder = load_dataset_builder(self.dataset_name, self.config)
+        return builder.info.splits[self.split].num_examples
+
     def stream(self):
         ds = self._dataset
         if self._offset:

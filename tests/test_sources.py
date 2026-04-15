@@ -33,6 +33,9 @@ class FakeSource(DatasetSource):
     def source_name(self) -> str:
         return "fake"
 
+    def get_total_rows(self) -> int:
+        return len(self._rows)
+
     def stream(self):
         yield from self._rows
 

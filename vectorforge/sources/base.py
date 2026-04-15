@@ -32,6 +32,11 @@ class DatasetSource(ABC):
     def source_name(self) -> str:
         pass
 
+    @abstractmethod
+    def get_total_rows(self) -> int:
+        """Return the total number of rows in the source (before any offset/limit)."""
+        pass
+
     def get_chunks(
         self,
         engine: "EmbeddingEngine",

@@ -23,10 +23,10 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["vectorforge*", "scripts*"]
+include = ["vectorforge*", "cli*"]
 
 [project.scripts]
-vf = "scripts.cli:main"
+vf = "cli.cli:main"
 
 [dependency-groups]
 dev = [
