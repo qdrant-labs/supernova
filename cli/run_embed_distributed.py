@@ -6,6 +6,9 @@ Creates a pool of GPU workers and submits parallel embedding jobs. Each job
 processes a slice of the dataset using --num-jobs/--job-rank for automatic
 partitioning.
 
+Then wrapper that joins sky pilot pool management with the existing embedding pipeline. The embedding
+pipeline is designed to be run in parallel across multiple workers.
+
 Usage:
   vectorforge-embed-distributed configs/embedder/finewiki_gte_multi/en.yaml
   vectorforge-embed-distributed configs/embedder/finewiki_gte_multi/en.yaml --dry-run
@@ -69,7 +72,7 @@ def main(argv: list[str] | None = None):
     pipeline_cfg = config.get("pipeline", {})
     resources = config.get("resources", DEFAULT_RESOURCES)
 
-    # Get dataset size (source-agnostic)
+    # get dataset size (source-agnostic)
     from cli.run_embedder import build_source
     source = build_source(dict(source_cfg))
     total_rows = source.get_total_rows()
@@ -81,7 +84,7 @@ def main(argv: list[str] | None = None):
     config_name = Path(args.config).stem
     pool_name = args.pool_name or f"vf-embed-{config_name}"
 
-    # Create run directory
+    # create run directory
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M")
     run_id = f"{timestamp}_{pool_name}"
     run_dir = Path("runs") / run_id
@@ -90,8 +93,7 @@ def main(argv: list[str] | None = None):
     print("=" * 60)
     print("vectorforge distributed embedding plan")
     print("=" * 60)
-    print(f"  Dataset:      {dataset_name}")
-    print(f"  Split:        {split}")
+    print(f"  Source:       {source.source_name}")
     print(f"  Total rows:   {total_rows:,}")
     print(f"  Num jobs:     {num_jobs}")
     print(f"  Rows/job:     ~{math.ceil(total_rows / num_jobs):,}")
@@ -101,7 +103,7 @@ def main(argv: list[str] | None = None):
     print(f"  Run dir:      {run_dir}")
     print("=" * 60)
 
-    # Generate pool YAML
+    # generate pool YAML
     pool_yaml = {
         "pool": {
             "min_workers": 0,
@@ -117,7 +119,7 @@ def main(argv: list[str] | None = None):
     with open(pool_path, "w") as f:
         yaml.dump(pool_yaml, f, default_flow_style=False, sort_keys=False)
 
-    # Generate job YAML
+    # generate job YAML
     job_yaml = {
         "name": f"embed-{config_name}",
         "resources": resources,
@@ -127,12 +129,11 @@ def main(argv: list[str] | None = None):
     with open(job_path, "w") as f:
         yaml.dump(job_yaml, f, default_flow_style=False, sort_keys=False)
 
-    # Write manifest
+    # write manifest
     manifest = {
         "run_id": run_id,
         "config": args.config,
-        "dataset": dataset_name,
-        "split": split,
+        "source": source.source_name,
         "total_rows": total_rows,
         "num_jobs": num_jobs,
         "max_workers": max_workers,
@@ -147,26 +148,26 @@ def main(argv: list[str] | None = None):
         print(f"\n[dry run] Would create pool '{pool_name}' and submit {num_jobs} jobs")
         print(f"  Pool config: {pool_path}")
         print(f"  Job config:  {job_path}")
-        print(f"\nTo run manually:")
+        print("\nTo run manually:")
         print(f"  sky jobs pool apply -p {pool_name} {pool_path}")
         print(f"  sky jobs launch -p {pool_name} --num-jobs {num_jobs} {job_path}")
         return
 
-    # Build env flags
+    # build env flags
     env_flags = []
     for var in ENV_VARS_TO_FORWARD:
         val = os.environ.get(var)
         if val:
             env_flags.extend(["--env", f"{var}={val}"])
 
-    # Create pool
+    # create pool
     logger.info(f"Creating pool '{pool_name}'...")
     subprocess.run(
         ["sky", "jobs", "pool", "apply", "-p", pool_name, str(pool_path), *env_flags],
         check=True,
     )
 
-    # Submit jobs
+    # submit jobs
     logger.info(f"Submitting {num_jobs} jobs to pool '{pool_name}'...")
     subprocess.run(
         ["sky", "jobs", "launch", "-p", pool_name, "--num-jobs", str(num_jobs), "-y", str(job_path), *env_flags],

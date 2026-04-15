@@ -1,6 +1,8 @@
 """
 EmbeddingEngine -- orchestrates dense and/or sparse embedding generation.
 
+Thin wrapper around one or two embedders, with some logic to optimize the hybrid case (same underlying model for both dense and sparse, e.g. gte-multilingual-base).
+
 Sits between the pipeline worker and the embedder(s). The worker calls
 engine.embed(texts) and gets back an EmbedResult with optional dense
 and sparse embeddings. Handles the hybrid optimization internally.

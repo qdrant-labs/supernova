@@ -80,14 +80,14 @@ def build_engine(config: dict) -> EmbeddingEngine:
     if not dense_cfg and not sparse_cfg:
         raise ValueError("Config must specify at least one of: dense_embedder, sparse_embedder")
 
-    # Detect hybrid case: same model for both → single forward pass
+    # detect hybrid case: same model for both --> optimize for a single forfward pass
     if dense_cfg and sparse_cfg and _can_hybrid(dense_cfg, sparse_cfg):
         hybrid_cfg = dict(dense_cfg)
-        hybrid_cfg.pop("type")
+        hybrid_cfg.pop("type") # remove the type
         hybrid = SentenceTransformerHybridEmbedder(**hybrid_cfg)
         return EmbeddingEngine(hybrid=hybrid)
 
-    # Build separately
+    # build separately (two distinct models, no optimization is possible)
     dense = build_dense_embedder(dense_cfg) if dense_cfg else None
     sparse = build_sparse_embedder(sparse_cfg) if sparse_cfg else None
     return EmbeddingEngine(dense=dense, sparse=sparse)
@@ -147,10 +147,11 @@ def main(argv: list[str] | None = None):
                 f"Auto-detected job rank {job_rank} from SKYPILOT_JOB_RANK env var"
             )
 
-        # Build source to query total rows (source-agnostic)
+        # build source to query total rows (source-agnostic)
         source_for_count = build_source(dict(config["source"]))
         total_rows = source_for_count.get_total_rows()
 
+        # using the dataset size and num_jobs, compute offset and limit for this job
         rows_per_job = math.ceil(total_rows / args.num_jobs)
         offset = job_rank * rows_per_job
         limit = min(rows_per_job, total_rows - offset)
@@ -163,11 +164,11 @@ def main(argv: list[str] | None = None):
         config["source"]["limit"] = limit
 
     elif args.offset is not None or args.limit is not None:
+        # just use what was provided, no auto-computation
+        # in theory lets us do manual slicing
         if args.offset is not None:
-            # just use what was provided, no auto-computation
             config["source"]["offset"] = args.offset
         if args.limit is not None:
-            # just use what was provided, no auto-computation
             config["source"]["limit"] = args.limit
 
     source = build_source(dict(config["source"]))
