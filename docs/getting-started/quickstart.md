@@ -1,10 +1,10 @@
 # Quickstart
 
-This guide walks through embedding a small dataset and loading it into Qdrant.
+Embed a small dataset and load it into Qdrant.
 
 ## 1. Embed a dataset
 
-Create a config file `configs/embedder/my_dataset.yaml`:
+Create `configs/embedder/my_dataset.yaml`:
 
 ```yaml
 source:
@@ -38,9 +38,7 @@ export OPENAI_API_KEY=sk-...
 vf embed configs/embedder/my_dataset.yaml
 ```
 
-This streams the dataset from HuggingFace, embeds each text with OpenAI, and uploads parquet files to S3.
-
-For larger datasets, use SkyPilot to parallelize across GPU instances:
+For larger datasets, use SkyPilot to parallelize:
 
 ```bash
 vf embed-dist configs/embedder/my_dataset.yaml
@@ -48,21 +46,20 @@ vf embed-dist configs/embedder/my_dataset.yaml
 
 ## 2. Verify the output
 
-Query the parquet files directly with DuckDB:
+Query the parquet files with DuckDB:
 
 ```bash
 uv run python -c "
 import duckdb
 con = duckdb.connect()
 con.execute('INSTALL httpfs; LOAD httpfs;')
-# configure S3 creds if needed
 print(con.sql(\"SELECT count(*) FROM 's3://my-bucket/tweet-sentiment/openai-3-small/**/*.parquet'\"))
 "
 ```
 
 ## 3. Load into Qdrant
 
-Create a loader config `configs/loader/my_dataset.yaml`:
+Create `configs/loader/my_dataset.yaml`:
 
 ```yaml
 datasource:
@@ -71,7 +68,6 @@ datasource:
   s3_prefix: tweet-sentiment/openai-3-small
   payload_fields:
     text: text
-    source: source
 
 vectorstore:
   type: qdrant
@@ -93,18 +89,9 @@ export QDRANT_API_KEY=your-key
 vf load configs/loader/my_dataset.yaml
 ```
 
-You'll see a progress bar as points are upserted:
+The loader automatically creates the Qdrant collection, defers HNSW indexing during load, and builds the index after all data is loaded.
 
-```
-Loading:  45%|██████████████████▎                      | 4,500/10,000 [00:12<00:15, 360 pts/s]
-```
-
-The loader automatically:
-- Creates the Qdrant collection if it doesn't exist
-- Defers HNSW indexing during the load for speed
-- Enables indexing and waits for the HNSW graph to build after all data is loaded
-
-## 4. Query Qdrant
+## 4. Query
 
 ```python
 from qdrant_client import QdrantClient
@@ -117,8 +104,3 @@ results = client.query_points(
     limit=10,
 )
 ```
-
-## Next steps
-
-- [Embedding Generation](embedding-generation.md) -- configuration reference, SkyPilot at scale, dense/sparse embedder options
-- [Data Loading](data-loading.md) -- column mapping, payload composition, distributed loading with SkyPilot

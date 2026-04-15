@@ -48,8 +48,10 @@ ENV_VARS_TO_FORWARD = [
 ]
 
 
-def resolve_env_vars(value):
-    """Replace ${VAR_NAME} references with environment variable values."""
+def resolve_env_vars(value: str) -> str:
+    """
+    Replace ${VAR_NAME} references with environment variable values.
+    """
     def _replace(match):
         var_name = match.group(1)
         val = os.environ.get(var_name)
@@ -62,8 +64,10 @@ def resolve_env_vars(value):
     return value
 
 
-def resolve_config(obj):
-    """Recursively resolve env vars in config values."""
+def resolve_config(obj: str | dict | list):
+    """
+    Recursively resolve env vars in config values.
+    """
     if isinstance(obj, str):
         return resolve_env_vars(obj)
     elif isinstance(obj, dict):
@@ -121,7 +125,7 @@ def main(argv: list[str] | None = None):
 
     resolved_config = resolve_config(config)
 
-    # --finalize: just enable indexing and exit
+    # just enable indexing and exit
     if args.finalize:
         logger.info("Enabling Qdrant indexing...")
         vs_cfg = dict(resolved_config["vectorstore"])
@@ -142,13 +146,13 @@ def main(argv: list[str] | None = None):
     run_name = dispatch_cfg.get("run_name", config_name)
     pool_name = args.pool_name or f"vf-load-{run_name}"
 
-    # Create run directory
+    # create run directory
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M")
     run_id = f"{timestamp}_{run_name}"
     run_dir = Path("runs") / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Discover parquet files
+    # discover parquet files
     ds_cfg = config["datasource"]
     bucket = ds_cfg["s3_bucket"]
     prefix = ds_cfg["s3_prefix"]
@@ -172,7 +176,7 @@ def main(argv: list[str] | None = None):
     print(f"  Run dir:      {run_dir}")
     print("=" * 60)
 
-    # Generate pool YAML
+    # generate pool YAML
     pool_yaml = {
         "pool": {
             "min_workers": 0,
@@ -188,7 +192,7 @@ def main(argv: list[str] | None = None):
     with open(pool_path, "w") as f:
         yaml.dump(pool_yaml, f, default_flow_style=False, sort_keys=False)
 
-    # Generate job YAML
+    # generate job YAML
     job_yaml = {
         "name": f"load-{run_name}",
         "resources": resources,
@@ -198,7 +202,7 @@ def main(argv: list[str] | None = None):
     with open(job_path, "w") as f:
         yaml.dump(job_yaml, f, default_flow_style=False, sort_keys=False)
 
-    # Write manifest
+    # write manifest
     manifest = {
         "run_id": run_id,
         "config": args.config,
@@ -215,7 +219,7 @@ def main(argv: list[str] | None = None):
         print(f"\n[dry run] Would create pool '{pool_name}' and submit {num_shards} jobs")
         print(f"  Pool config: {pool_path}")
         print(f"  Job config:  {job_path}")
-        print(f"\nTo run manually:")
+        print("\nTo run manually:")
         print(f"  sky jobs pool apply -p {pool_name} {pool_path}")
         print(f"  sky jobs launch -p {pool_name} --num-jobs {num_shards} {job_path}")
         return
@@ -234,21 +238,21 @@ def main(argv: list[str] | None = None):
     asyncio.run(_setup_collection(store, dimension))
     logger.info("Qdrant collection ready (indexing deferred)")
 
-    # Build env flags
+    # build env flagsf
     env_flags = []
     for var in ENV_VARS_TO_FORWARD:
         val = os.environ.get(var)
         if val:
             env_flags.extend(["--env", f"{var}={val}"])
 
-    # Create pool
+    # create pool
     logger.info(f"Creating pool '{pool_name}'...")
     subprocess.run(
         ["sky", "jobs", "pool", "apply", "-p", pool_name, str(pool_path), *env_flags],
         check=True,
     )
 
-    # Submit jobs
+    # submit jobs
     logger.info(f"Submitting {num_shards} jobs to pool '{pool_name}'...")
     subprocess.run(
         ["sky", "jobs", "launch", "-p", pool_name, "--num-jobs", str(num_shards), "-y", str(job_path), *env_flags],
@@ -259,7 +263,7 @@ def main(argv: list[str] | None = None):
     print(f"\nMonitor:    sky jobs pool status {pool_name}")
     print(f"View logs:  sky jobs pool logs {pool_name}")
     print(f"Tear down:  sky jobs pool down {pool_name}")
-    print(f"\nAfter all jobs complete, enable Qdrant indexing:")
+    print("\nAfter all jobs complete, enable Qdrant indexing:")
     print(f"  vf load-dist {args.config} --finalize")
 
 

@@ -5,7 +5,7 @@
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
-## Basic setup
+## Setup
 
 ```bash
 git clone <repo-url>
@@ -34,12 +34,12 @@ Set the variables relevant to your workflow:
 |----------|-------------|
 | `AWS_ACCESS_KEY_ID` | Reading from S3 |
 | `AWS_SECRET_ACCESS_KEY` | Reading from S3 |
-| `AWS_SESSION_TOKEN` | S3 with AWS SSO (see [AWS SSO setup](aws-sso-setup.md)) |
+| `AWS_SESSION_TOKEN` | S3 with AWS SSO (see [AWS SSO setup](../reference/aws-sso.md)) |
 | `AWS_REGION` | S3 region (defaults to `us-east-1`) |
 | `QDRANT_URL` | Qdrant cluster URL |
 | `QDRANT_API_KEY` | Qdrant API key |
 
-## SkyPilot setup (for distributed embedding and loading)
+## SkyPilot setup
 
 SkyPilot is used to parallelize both embedding generation (GPU instances) and vector store loading (CPU spot instances).
 
@@ -48,17 +48,15 @@ SkyPilot is used to parallelize both embedding generation (GPU instances) and ve
 sky check aws
 ```
 
-SkyPilot requires IAM permissions to launch EC2 instances. See the [SkyPilot AWS permissions docs](https://docs.skypilot.co/en/stable/cloud-setup/cloud-permissions/aws.html#minimal-permissions) or ask your AWS admin to set up the `skypilot-v1` instance profile.
+SkyPilot requires IAM permissions to launch EC2 instances. See the [SkyPilot AWS permissions docs](https://docs.skypilot.co/en/stable/cloud-setup/cloud-permissions/aws.html#minimal-permissions).
 
 ## Verify installation
 
 ```bash
-# Check CLI tools are available
 vf embed --help
 vf embed-dist --help
 vf load --help
 vf load-dist --help
 
-# Run tests
 uv run pytest tests/ -v
 ```

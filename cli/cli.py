@@ -34,7 +34,7 @@ def main():
         from cli.run_loader import main as load_main
         load_main(argv)
     elif command == "load-dist":
-        from cli.run_dispatch import main as load_dist_main
+        from cli.run_load_distributed import main as load_dist_main
         load_dist_main(argv)
     else:
         print(f"unknown command: {command}")

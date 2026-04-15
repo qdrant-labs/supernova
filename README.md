@@ -55,7 +55,7 @@ scripts/
   run_embedder.py           # vectorforge CLI
   run_embed_distributed.py  # vf embed-dist CLI
   run_loader.py             # vf load CLI
-  run_dispatch.py           # vf load-dist CLI
+  run_load_distributed.py   # vf load-dist CLI
 ```
 
 ---

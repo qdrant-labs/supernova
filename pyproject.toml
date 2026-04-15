@@ -32,4 +32,5 @@ vf = "cli.cli:main"
 dev = [
     "pytest",
     "pytest-asyncio",
+    "zensical",
 ]

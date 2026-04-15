@@ -1,4 +1,4 @@
-# Introduction
+# vectorforge
 
 vectorforge is a toolkit for building large-scale vector search benchmarks. It handles two tasks:
 
@@ -30,22 +30,15 @@ The many parquet files on S3 are divided into N groups. Each group is assigned t
 ## Key design principles
 
 - **Streaming** -- neither pipeline loads the full dataset into memory. Data is processed in chunks/batches throughout.
-- **Core library + thin orchestrators** -- all business logic lives in `vectorforge/`. Scripts like `run_embed_distributed.py` and `run_dispatch.py` are thin wrappers that import and use the library. This means you can use the same code locally, on SkyPilot, or anywhere else.
+- **Core library + thin orchestrators** -- all business logic lives in `vectorforge/`. CLI scripts are thin wrappers that import and use the library.
 - **YAML-driven** -- every pipeline run is defined by a YAML config. No hardcoded datasets, models, or destinations.
 - **Flat parquet output** -- embedding output is flat columnar data (no nested JSON). Payload composition happens at load time, not at embed time.
 
-## What's in the box
+## CLI
 
-| Component | Purpose |
-|-----------|---------|
-| `vf embed` CLI | Run embedding pipelines locally |
-| `vf embed-dist` CLI | Distribute embedding across SkyPilot GPU instances |
-| `vf load` CLI | Load pre-embedded data into vector stores |
-| `vf load-dist` CLI | Distribute loading across SkyPilot spot instances |
-
-## Next steps
-
-- [Installation](installation.md) -- get vectorforge running
-- [Quickstart](quickstart.md) -- embed a dataset and load it into Qdrant in 5 minutes
-- [Embedding Generation](embedding-generation.md) -- deep dive into the embedding pipeline
-- [Data Loading](data-loading.md) -- deep dive into the loading pipeline
+| Command | Purpose |
+|---------|---------|
+| `vf embed` | Embed a dataset locally |
+| `vf embed-dist` | Distribute embedding across SkyPilot GPU pool |
+| `vf load` | Load pre-embedded data into a vector store |
+| `vf load-dist` | Distribute loading across SkyPilot spot instances |
