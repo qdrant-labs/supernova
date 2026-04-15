@@ -11,7 +11,7 @@ Pre-embedded parquet files on S3 are split into N groups. Each group is assigned
 For small-to-medium datasets, or when running on a single VM:
 
 ```bash
-vectorforge-load configs/loader/my_dataset.yaml
+vf load configs/loader/my_dataset.yaml
 ```
 
 ### Configuration
@@ -122,7 +122,7 @@ Default when omitted: `{text: text}`.
 For terabyte-scale datasets, distribute across SkyPilot spot instances:
 
 ```bash
-vectorforge-load-distributed configs/dispatch/my_dataset.yaml
+vf load-dist configs/dispatch/my_dataset.yaml
 ```
 
 ### Configuration
@@ -179,7 +179,7 @@ The dispatch command runs on your local machine as a master orchestrator:
 Preview the plan without launching anything:
 
 ```bash
-vectorforge-load-distributed configs/dispatch/cohere200M.yaml --dry-run
+vf load-dist configs/dispatch/cohere200M.yaml --dry-run
 ```
 
 This discovers files, generates all configs, and prints the shard plan -- but doesn't create any Qdrant collections or SkyPilot jobs.
@@ -187,7 +187,7 @@ This discovers files, generates all configs, and prints the shard plan -- but do
 ### Override shard count
 
 ```bash
-vectorforge-load-distributed configs/dispatch/cohere200M.yaml --num-shards 50
+vf load-dist configs/dispatch/cohere200M.yaml --num-shards 50
 ```
 
 ### Generated artifacts
@@ -209,15 +209,15 @@ You can inspect any shard config, re-run a failed shard manually, or debug issue
 
 ### Running shards manually
 
-Each generated loader config is a valid `vectorforge-load` config. You can run shards locally without SkyPilot:
+Each generated loader config is a valid `vf load` config. You can run shards locally without SkyPilot:
 
 ```bash
 # Run a single shard
-vectorforge-load runs/2026-04-08T14-30_cohere200M/shard_000_loader.yaml --no-manage-indexing
+vf load runs/2026-04-08T14-30_cohere200M/shard_000_loader.yaml --no-manage-indexing
 
 # Run all shards sequentially
 for f in runs/2026-04-08T14-30_cohere200M/shard_*_loader.yaml; do
-  vectorforge-load "$f" --no-manage-indexing
+  vf load "$f" --no-manage-indexing
 done
 ```
 

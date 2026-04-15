@@ -44,7 +44,7 @@ DEFAULT_RESOURCES = {
 }
 
 
-def main():
+def main(argv: list[str] | None = None):
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--chunk-size", type=int, help="Rows per job (used to auto-compute num-jobs)")
     parser.add_argument("--pool-name", type=str, help="SkyPilot pool name (default: auto-generated)")
     parser.add_argument("--max-workers", type=int, help="Max pool workers for autoscaling (default: num-jobs)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -125,7 +125,7 @@ def main():
     job_yaml = {
         "name": f"embed-{config_name}",
         "resources": resources,
-        "run": f"cd /app && vectorforge {args.config} --num-jobs {num_jobs}",
+        "run": f"cd /app && vf embed {args.config} --num-jobs {num_jobs}",
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:

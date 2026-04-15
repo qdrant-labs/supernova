@@ -6,32 +6,39 @@ Generate massive pre-embedded datasets, then load them into vector databases.
 
 vectorforge has two pipelines:
 
-1. **Embedding** -- stream data from HuggingFace, embed with OpenAI or sentence-transformers, write parquet to S3
+1. **Embedding** -- stream data from HuggingFace, embed with dense and/or sparse models, write parquet to S3
 2. **Loading** -- stream pre-embedded parquet from S3/HuggingFace into vector stores (Qdrant)
 
-Both pipelines are streaming (never loads the full dataset into memory), pluggable (add new sources/embedders/stores by subclassing), and parallelizable (Modal for embedding, SkyPilot for loading).
+Both pipelines are streaming (never loads the full dataset into memory), pluggable (add new sources/embedders/stores by subclassing), and parallelizable (SkyPilot for distributed embedding and loading).
 
 ## Quickstart
 
 ```bash
 uv sync
 
-# 1. Embed a dataset
-vectorforge configs/embedder/mteb_tweets_openai.yaml
+# 1. Embed a dataset locally
+vf embed configs/embedder/nick007x_arxiv_papers.yaml
 
-# 2. Load into Qdrant
-vectorforge-load configs/loader/cohere200M.yaml
+# 2. Embed distributed across SkyPilot GPU pool
+vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml
 
-# 3. Distributed loading (SkyPilot)
-vectorforge-load-distributed configs/dispatch/cohere200M.yaml --dry-run
+# 3. Load into Qdrant
+vf load configs/loader/cohere200M.yaml
+
+# 4. Distributed loading (SkyPilot)
+vf load-dist configs/dispatch/cohere200M.yaml
 ```
 
 ## Project structure
 
 ```
 vectorforge/
-  sources/            # Data sources (HuggingFace, S3)
-  embedders/          # Embedding backends (OpenAI, sentence-transformers)
+  sources/            # Data sources (HuggingFace)
+  embedders/
+    dense/            # Dense embedding backends (OpenAI, sentence-transformers)
+    sparse/           # Sparse embedding backends (sentence-transformers SparseEncoder)
+    engine.py         # EmbeddingEngine -- orchestrates dense/sparse/hybrid
+    hybrid.py         # HybridEmbedder -- single forward pass for both
   storage/            # Output backends (S3, HuggingFace Hub, local)
   pipeline/           # Embedding orchestration (runner, worker, buffer)
   loader/
@@ -45,12 +52,10 @@ configs/
   dispatch/           # Distributed loading configs
 
 scripts/
-  run_embedder.py     # vectorforge CLI entrypoint
-  run_loader.py       # vectorforge-load CLI entrypoint
-  run_dispatch.py     # vectorforge-load-distributed CLI entrypoint
-
-modal_batch.py        # Modal distributed embedding
-modal_import_cohere.py # Modal Cohere dataset import
+  run_embedder.py           # vectorforge CLI
+  run_embed_distributed.py  # vf embed-dist CLI
+  run_loader.py             # vf load CLI
+  run_dispatch.py           # vf load-dist CLI
 ```
 
 ---
@@ -62,33 +67,57 @@ modal_import_cohere.py # Modal Cohere dataset import
 ```yaml
 source:
   type: huggingface
-  dataset_name: mteb/tweet_sentiment_extraction
+  dataset_name: nick007x/arxiv-papers
   split: train
-  text_field: text
+  text_field: abstract
 
-embedder:
-  type: openai                    # or sentence_transformer
-  model: text-embedding-3-small
-  dimensions: 1536
+dense_embedder:
+  type: sentence_transformer    # or openai
+  model: Alibaba-NLP/gte-multilingual-base
+  trust_remote_code: true
+  batch_size: 64
+  dtype: bfloat16
 
 pipeline:
-  chunk_size: 10000
-  num_workers: 4
-  flush_threshold: 100000
+  chunk_size: 100000
+  num_workers: 2
 
 storage:
-  type: s3                        # or hf, local
+  type: s3                      # or hf, local
   s3_bucket: qdrant--vectorforge
-  s3_prefix: dataset-name/model-name
+  s3_prefix: arxiv-papers/gte-multilingual-base
   output_dir: /tmp/vectorforge
 ```
 
-### Embedders
+### Sparse embeddings
+
+Add a `sparse_embedder` section to produce sparse vectors alongside dense:
+
+```yaml
+dense_embedder:
+  type: sentence_transformer
+  model: Alibaba-NLP/gte-multilingual-base
+  trust_remote_code: true
+  batch_size: 64
+  dtype: bfloat16
+
+sparse_embedder:
+  type: sentence_transformer
+  model: Alibaba-NLP/gte-multilingual-base
+  batch_size: 64
+  dtype: bfloat16
+```
+
+When both point to the same model, vectorforge automatically uses a hybrid encoder to minimize forward passes. You must specify at least one of `dense_embedder` or `sparse_embedder`.
+
+### Dense embedders
 
 | Type | Config key | Notes |
 |------|-----------|-------|
-| OpenAI | `openai` | `model`, `dimensions`, `batch_size`, `max_concurrent` |
+| OpenAI | `openai` | `model`, `dimensions`, `batch_size`, `max_concurrent`, `base_url`, `api_key` |
 | Sentence Transformers | `sentence_transformer` | `model`, `batch_size`, `dtype`. Auto-detects CUDA/MPS/CPU |
+
+The OpenAI embedder supports any OpenAI-compatible API via `base_url` (llama.cpp, vLLM, Ollama, etc). Set `api_key: none` for local servers that don't require auth.
 
 ### Storage backends
 
@@ -101,27 +130,31 @@ storage:
 ### Running locally
 
 ```bash
-vectorforge configs/embedder/mteb_tweets_openai.yaml
+vf embed configs/embedder/nick007x_arxiv_papers.yaml
 ```
 
-### Running at scale with Modal
+### Running at scale with SkyPilot
 
-Modal splits the dataset into slices and processes each on its own GPU/CPU:
+SkyPilot pools create GPU workers and distribute embedding jobs across them. Workers are reused -- setup happens once, not per-slice.
 
 ```bash
-# Setup
-pip install modal && modal setup
-modal secret create vectorforge-secrets \
-  OPENAI_API_KEY=$OPENAI_API_KEY \
-  AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
-  AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-  AWS_DEFAULT_REGION=us-east-1 \
-  HF_TOKEN=$HF_TOKEN
+# Preview the plan
+vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml --dry-run
 
-# Run
-modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu
-modal run modal_batch.py --config configs/embedder/mteb_tweets_openai.yaml          # CPU for API embedders
-modal run modal_batch.py --config configs/embedder/nick007x_arxiv_papers.yaml --gpu --dry-run  # preview only
+# Run (default: A10G spot, autoscaling)
+vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml
+
+# Custom parallelism
+vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml --num-jobs 20
+```
+
+Override resources in your config:
+
+```yaml
+resources:
+  accelerators: A10G:1
+  cloud: aws
+  use_spot: true
 ```
 
 ### Output format
@@ -135,14 +168,15 @@ Parquet files with this schema:
 | `chunk_id` | int32 | Pipeline batch / slice ID |
 | `chunk_index` | int32 | Position within a text split (0 if not split) |
 | `text` | string | The embedded text |
-| `source` | string | Dataset identifier |
-| `embedding` | list\<float32\> | The embedding vector |
-| `model` | string | Model used for embedding |
+| `dense_embedding` | list\<float32\> | Dense embedding vector (when configured) |
+| `sparse_embedding` | struct{indices, values} | Sparse embedding (when configured) |
 
 Query with DuckDB:
 
 ```sql
-SELECT * FROM 's3://qdrant--vectorforge/dataset/model/**/*.parquet' LIMIT 10;
+SELECT row_id, text[:80] AS preview, length(dense_embedding) AS dim
+FROM 's3://qdrant--vectorforge/dataset/model/**/*.parquet'
+LIMIT 10;
 ```
 
 ---
@@ -158,7 +192,7 @@ datasource:
   s3_prefix: cohere--wikipedia/embed-multilingual-v3
   columns:                          # optional: override parquet column names
     id: _id                         # default: row_id
-    embedding: emb                  # default: embedding
+    embedding: dense_embedding      # default: dense_embedding
   payload_fields:                   # what goes into the vector store payload
     text: text                      # payload key: parquet column name
     source: source
@@ -178,7 +212,7 @@ loader:
 ### Running
 
 ```bash
-vectorforge-load configs/loader/cohere200M.yaml
+vf load configs/loader/cohere200M.yaml
 ```
 
 ### Datasources
@@ -194,27 +228,6 @@ vectorforge-load configs/loader/cohere200M.yaml
 |------|-----------|-------|
 | Qdrant | `qdrant` | `url`, `api_key`, `collection_name`. Retry with backoff on timeouts |
 
-### Column mapping
-
-The `columns` field maps logical names to actual parquet column names:
-
-| Logical name | Default | Description |
-|-------------|---------|-------------|
-| `id` | `row_id` | Point ID in the vector store |
-| `embedding` | `embedding` | Vector column |
-
-### Payload composition
-
-`payload_fields` maps payload keys to parquet columns. Only the fields you list end up in the vector store payload:
-
-```yaml
-payload_fields:
-  abstract: text        # parquet "text" column stored as "abstract" in payload
-  source: source
-```
-
-Default when omitted: `{text: text}`.
-
 ### How it works
 
 1. DuckDB streams parquet data in large prefetch chunks (minimizes S3 round trips)
@@ -227,36 +240,10 @@ Default when omitted: `{text: text}`.
 For terabyte-scale datasets, fan out across SkyPilot spot instances:
 
 ```bash
-vectorforge-load-distributed configs/dispatch/cohere200M.yaml
-vectorforge-load-distributed configs/dispatch/cohere200M.yaml --dry-run      # preview only
-vectorforge-load-distributed configs/dispatch/cohere200M.yaml --num-shards 20  # override shard count
+vf load-dist configs/dispatch/cohere200M.yaml
+vf load-dist configs/dispatch/cohere200M.yaml --dry-run
+vf load-dist configs/dispatch/cohere200M.yaml --num-shards 20
 ```
-
-Dispatch config adds `dispatch` and `resources` sections to the standard loader config:
-
-```yaml
-dispatch:
-  num_shards: 10
-  run_name: cohere200M
-
-resources:
-  cpus: 2
-  memory: 8
-  cloud: aws
-  use_spot: true
-```
-
-The dispatch flow:
-1. Lists all parquet files at the S3 prefix
-2. Divides files round-robin across N shards
-3. Generates per-shard loader + SkyPilot YAML configs in `runs/<timestamp>_<name>/`
-4. Creates Qdrant collection and defers indexing
-5. Launches N SkyPilot spot instance jobs (credentials injected at runtime, never written to disk)
-6. Waits for all jobs to complete
-7. Enables indexing and measures HNSW build time
-8. Writes `report.json`
-
-Requires [SkyPilot](https://skypilot.readthedocs.io/) configured with AWS credentials. See [docs/aws-sso-setup.md](docs/aws-sso-setup.md).
 
 ---
 
@@ -281,10 +268,10 @@ uv run pytest tests/ -v
 ## Documentation
 
 - [Introduction](docs/introduction.md) -- concepts, mental model, architecture diagrams
-- [Installation](docs/installation.md) -- setup, environment variables, Modal and SkyPilot configuration
+- [Installation](docs/installation.md) -- setup, environment variables, SkyPilot configuration
 - [Quickstart](docs/quickstart.md) -- embed a dataset and load it into Qdrant end-to-end
-- [Embedding Generation](docs/embedding-generation.md) -- embedder options, Modal at scale, output format
+- [Embedding Generation](docs/embedding-generation.md) -- dense/sparse embedders, SkyPilot at scale, output format
 - [Data Loading](docs/data-loading.md) -- column mapping, payload composition, distributed loading
 - [Loader Architecture](docs/loader.md) -- internal design docs
-- [AWS SSO Setup](docs/aws-sso-setup.md) -- configuring AWS SSO for local and Modal usage
-- [SkyPilot Migration](docs/skypilot-migration.md) -- plan for moving sustained workloads to SkyPilot
+- [AWS SSO Setup](docs/aws-sso-setup.md) -- configuring AWS SSO credentials
+- [SkyPilot](docs/skypilot-migration.md) -- distributed compute setup and cost estimates

@@ -64,7 +64,7 @@ The embedding columns default to `dense_embedding` and `sparse_embedding`. Overr
 
 ```yaml
 pipeline:
-  dense_embedding_column: my_dense   # default: embedding (dense-only) or dense_embedding (both)
+  dense_embedding_column: my_dense   # default: dense_embedding
   sparse_embedding_column: my_sparse # default: sparse_embedding
 ```
 
@@ -200,7 +200,7 @@ LIMIT 10;
 ## Running locally
 
 ```bash
-vectorforge configs/embedder/my_dataset.yaml
+vf embed configs/embedder/my_dataset.yaml
 ```
 
 The local runner uses async workers with a priority queue buffer to ensure ordered output. Good for development and small datasets.
@@ -211,19 +211,19 @@ SkyPilot pools create a set of GPU workers and distribute embedding jobs across 
 
 ```bash
 # Preview the plan
-vectorforge-embed-distributed configs/embedder/arxiv_papers.yaml --dry-run
+vf embed-dist configs/embedder/arxiv_papers.yaml --dry-run
 
 # Run with default resources (A10G spot)
-vectorforge-embed-distributed configs/embedder/arxiv_papers.yaml
+vf embed-dist configs/embedder/arxiv_papers.yaml
 
 # Custom number of jobs
-vectorforge-embed-distributed configs/embedder/arxiv_papers.yaml --num-jobs 20
+vf embed-dist configs/embedder/arxiv_papers.yaml --num-jobs 20
 
 # Custom chunk size (smaller = more parallelism)
-vectorforge-embed-distributed configs/embedder/arxiv_papers.yaml --chunk-size 50000
+vf embed-dist configs/embedder/arxiv_papers.yaml --chunk-size 50000
 
 # Named pool (for reuse across runs)
-vectorforge-embed-distributed configs/embedder/arxiv_papers.yaml --pool-name my-gpu-pool
+vf embed-dist configs/embedder/arxiv_papers.yaml --pool-name my-gpu-pool
 ```
 
 ### How it works
@@ -231,7 +231,7 @@ vectorforge-embed-distributed configs/embedder/arxiv_papers.yaml --pool-name my-
 1. **Plan** (runs locally): reads config, queries HuggingFace for dataset size
 2. **Pool**: creates a SkyPilot pool with autoscaling GPU workers (`min_workers: 0`, `max_workers: N`)
 3. **Submit**: submits N jobs to the pool via `sky jobs launch --num-jobs N`
-4. **Each job**: SkyPilot sets `$SKYPILOT_JOB_RANK` and `$SKYPILOT_NUM_JOBS`. The `vectorforge` CLI uses these to auto-compute offset/limit and process its slice
+4. **Each job**: SkyPilot sets `$SKYPILOT_JOB_RANK` and `$SKYPILOT_NUM_JOBS`. The `vf` CLI uses these to auto-compute offset/limit and process its slice
 5. **Autoscale**: workers scale up to handle the queue, scale back to zero when done
 
 ### Custom resources

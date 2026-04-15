@@ -82,7 +82,32 @@ def build_vectorstore(cfg: dict):
     return cls(**kwargs)
 
 
-def main():
+def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]:
+    """Discover parquet files on S3 and return this job's shard."""
+    import boto3
+
+    bucket = ds_cfg["s3_bucket"]
+    prefix = ds_cfg["s3_prefix"].rstrip("/")
+
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    files = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".parquet"):
+                files.append(f"s3://{bucket}/{key}")
+    files.sort()
+
+    # Round-robin assignment
+    shard = [f for i, f in enumerate(files) if i % num_jobs == job_rank]
+    logging.getLogger("vectorforge").info(
+        "Job %d/%d: %d files (of %d total)", job_rank, num_jobs, len(shard), len(files),
+    )
+    return shard
+
+
+def main(argv: list[str] | None = None):
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -95,7 +120,11 @@ def main():
     parser.add_argument("--dry-run", "-d", action="store_true", help="Parse config and print info without loading")
     parser.add_argument("--no-manage-indexing", action="store_true", default=False,
                         help="Skip collection creation and indexing lifecycle (for distributed workers)")
-    args = parser.parse_args()
+    parser.add_argument("--num-jobs", type=int, default=None,
+                        help="Total number of parallel jobs (auto-shards files by rank)")
+    parser.add_argument("--job-rank", type=int, default=None,
+                        help="This job's rank (0-indexed, used with --num-jobs)")
+    args = parser.parse_args(argv)
 
     config_path = args.config or os.environ.get("LOADER_CONFIG_PATH")
     if not config_path:
@@ -106,6 +135,18 @@ def main():
 
     # Resolve environment variables throughout the config
     config = resolve_config(config)
+
+    # Rank-based file sharding for distributed loading
+    if args.num_jobs is not None:
+        job_rank = args.job_rank
+        if job_rank is None:
+            job_rank = int(os.environ.get("SKYPILOT_JOB_RANK", 0))
+
+        shard_files = _discover_and_shard(config["datasource"], args.num_jobs, job_rank)
+        if not shard_files:
+            logging.getLogger("vectorforge").info("No files assigned to this shard, exiting.")
+            return
+        config["datasource"]["file_list"] = shard_files
 
     reader = build_reader(config["datasource"])
     store = build_vectorstore(dict(config["vectorstore"]))

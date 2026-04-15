@@ -54,10 +54,10 @@ SkyPilot requires IAM permissions to launch EC2 instances. See the [SkyPilot AWS
 
 ```bash
 # Check CLI tools are available
-vectorforge --help
-vectorforge-embed-distributed --help
-vectorforge-load --help
-vectorforge-load-distributed --help
+vf embed --help
+vf embed-dist --help
+vf load --help
+vf load-dist --help
 
 # Run tests
 uv run pytest tests/ -v

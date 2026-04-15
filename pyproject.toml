@@ -26,10 +26,7 @@ dependencies = [
 include = ["vectorforge*", "scripts*"]
 
 [project.scripts]
-vectorforge = "scripts.run_embedder:main"
-vectorforge-embed-distributed = "scripts.run_embed_distributed:main"
-vectorforge-load = "scripts.run_loader:main"
-vectorforge-load-distributed = "scripts.run_dispatch:main"
+vf = "scripts.cli:main"
 
 [dependency-groups]
 dev = [

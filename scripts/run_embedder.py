@@ -114,7 +114,7 @@ def build_storage(cfg: dict):
         raise ValueError(f"Unknown storage type: {storage_type}")
 
 
-def main():
+def main(argv: list[str] | None = None):
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -128,7 +128,7 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Process at most this many rows (for distributed slicing)")
     parser.add_argument("--num-jobs", type=int, default=None, help="Total number of parallel jobs (auto-computes offset/limit from dataset size)")
     parser.add_argument("--job-rank", type=int, default=None, help="This job's rank (0-indexed, used with --num-jobs)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     config_path = args.config or os.environ.get("CONFIG_PATH")
     if not config_path:

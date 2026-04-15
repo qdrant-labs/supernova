@@ -7,7 +7,7 @@ vectorforge uses SkyPilot for all distributed compute -- both embedding generati
 SkyPilot doesn't change any library code. `vectorforge/` stays the same. SkyPilot YAMLs are the orchestration layer for cloud jobs.
 
 ```
-SkyPilot YAML  ->  vectorforge CLI  ->  YAML config
+SkyPilot YAML  ->  vf CLI           ->  YAML config
 (infra/compute)    (our code)           (what to embed/load)
 ```
 
@@ -28,19 +28,19 @@ Uses SkyPilot [pools](https://docs.skypilot.co/en/stable/examples/pools.html) --
 
 ```bash
 # Preview the plan
-vectorforge-embed-distributed configs/embedder/my_dataset.yaml --dry-run
+vf embed-dist configs/embedder/my_dataset.yaml --dry-run
 
 # Run (default: A10G spot, auto-scales workers)
-vectorforge-embed-distributed configs/embedder/my_dataset.yaml
+vf embed-dist configs/embedder/my_dataset.yaml
 
 # Custom parallelism
-vectorforge-embed-distributed configs/embedder/my_dataset.yaml --num-jobs 20
+vf embed-dist configs/embedder/my_dataset.yaml --num-jobs 20
 
 # Named pool (reuse across runs)
-vectorforge-embed-distributed configs/embedder/my_dataset.yaml --pool-name my-gpu-pool
+vf embed-dist configs/embedder/my_dataset.yaml --pool-name my-gpu-pool
 ```
 
-Each job gets `$SKYPILOT_JOB_RANK` and `$SKYPILOT_NUM_JOBS` from SkyPilot. The `vectorforge` CLI auto-computes offset/limit from the dataset size and processes its slice.
+Each job gets `$SKYPILOT_JOB_RANK` and `$SKYPILOT_NUM_JOBS` from SkyPilot. The `vf` CLI auto-computes offset/limit from the dataset size and processes its slice.
 
 Override GPU resources in your config:
 
@@ -53,10 +53,10 @@ resources:
 
 ## Distributed loading
 
-The `vectorforge-load-distributed` command shards parquet files across CPU spot instances for parallel Qdrant loading:
+The `vf load-dist` command shards parquet files across CPU spot instances for parallel Qdrant loading:
 
 ```bash
-vectorforge-load-distributed configs/dispatch/my_dataset.yaml
+vf load-dist configs/dispatch/my_dataset.yaml
 ```
 
 See [Data Loading](data-loading.md) for full details.

@@ -35,7 +35,7 @@ Run locally:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-vectorforge configs/embedder/my_dataset.yaml
+vf embed configs/embedder/my_dataset.yaml
 ```
 
 This streams the dataset from HuggingFace, embeds each text with OpenAI, and uploads parquet files to S3.
@@ -43,7 +43,7 @@ This streams the dataset from HuggingFace, embeds each text with OpenAI, and upl
 For larger datasets, use SkyPilot to parallelize across GPU instances:
 
 ```bash
-vectorforge-embed-distributed configs/embedder/my_dataset.yaml
+vf embed-dist configs/embedder/my_dataset.yaml
 ```
 
 ## 2. Verify the output
@@ -90,7 +90,7 @@ Run:
 ```bash
 export QDRANT_URL=https://your-cluster.qdrant.io
 export QDRANT_API_KEY=your-key
-vectorforge-load configs/loader/my_dataset.yaml
+vf load configs/loader/my_dataset.yaml
 ```
 
 You'll see a progress bar as points are upserted:

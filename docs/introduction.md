@@ -38,10 +38,10 @@ The many parquet files on S3 are divided into N groups. Each group is assigned t
 
 | Component | Purpose |
 |-----------|---------|
-| `vectorforge` CLI | Run embedding pipelines locally |
-| `vectorforge-embed-distributed` CLI | Distribute embedding across SkyPilot GPU instances |
-| `vectorforge-load` CLI | Load pre-embedded data into vector stores |
-| `vectorforge-load-distributed` CLI | Distribute loading across SkyPilot spot instances |
+| `vf embed` CLI | Run embedding pipelines locally |
+| `vf embed-dist` CLI | Distribute embedding across SkyPilot GPU instances |
+| `vf load` CLI | Load pre-embedded data into vector stores |
+| `vf load-dist` CLI | Distribute loading across SkyPilot spot instances |
 
 ## Next steps
 

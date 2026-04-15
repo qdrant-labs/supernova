@@ -12,8 +12,8 @@ Three CLI tools operate at different scales:
 
 | Command | What it does | When to use |
 |---------|-------------|-------------|
-| `vectorforge-load` | Single-machine loader | Dev, small datasets, single VM |
-| `vectorforge-load-distributed` | Fan out across SkyPilot spot instances | Large datasets (100GB+) |
+| `vf load` | Single-machine loader | Dev, small datasets, single VM |
+| `vf load-dist` | Fan out across SkyPilot spot instances | Large datasets (100GB+) |
 
 ## Module Structure
 
@@ -31,7 +31,7 @@ vectorforge/loader/
 
 ## Data Flow
 
-### Single machine (`vectorforge-load`)
+### Single machine (`vf load`)
 
 ```
 1. DuckDB fetchmany(prefetch_size)     # large read from S3/HF, one I/O op
@@ -40,7 +40,7 @@ vectorforge/loader/
 4. Repeat until exhausted
 ```
 
-### Distributed (`vectorforge-load-distributed`)
+### Distributed (`vf load-dist`)
 
 ```
 Master (your laptop):
@@ -53,7 +53,7 @@ Master (your laptop):
   7. Enable indexing → wait for HNSW build → report
 
 Workers (SkyPilot spot instances):
-  - Run vectorforge-load --no-manage-indexing
+  - Run vf load --no-manage-indexing
   - Read only their assigned parquet files (file_list)
   - Upsert to shared Qdrant collection
   - No indexing lifecycle — master handles that
@@ -163,7 +163,7 @@ concurrency=8          →  8 upserts running in parallel
 
 ## Configuration Reference
 
-### Loader config (`vectorforge-load`)
+### Loader config (`vf load`)
 
 ```yaml
 datasource:
@@ -196,7 +196,7 @@ loader:
   concurrency: 8              # default
 ```
 
-### Dispatch config (`vectorforge-load-distributed`)
+### Dispatch config (`vf load-dist`)
 
 Same as loader config, plus:
 
