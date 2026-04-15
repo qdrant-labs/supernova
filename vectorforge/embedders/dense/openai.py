@@ -14,10 +14,14 @@ class OpenAIEmbedder(DenseEmbedder):
         batch_size: int = 128,
         max_concurrent: int = 2,
         max_retries: int = 5,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ):
         from openai import AsyncOpenAI
 
-        self.client = AsyncOpenAI()
+        # For local servers (llama.cpp, vLLM, Ollama) that don't need auth,
+        # pass api_key="none" in config to skip the OPENAI_API_KEY env var check.
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key or None)
         self._model = model
         self._dimensions = dimensions
         self._batch_size = batch_size

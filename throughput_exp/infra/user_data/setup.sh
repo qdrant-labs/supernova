@@ -7,6 +7,9 @@ echo "=== Setup starting (DLAMI — drivers + PyTorch already installed) ==="
 # setup uv
 # curl -LsSf https://astral.sh/uv/install.sh | sh
 
+# venv
+# uv venv
+
 # uv pip install \
 #     "datasets" \
 #     "pyarrow" \
