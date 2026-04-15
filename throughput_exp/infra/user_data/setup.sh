@@ -9,6 +9,7 @@ echo "=== Setup starting (DLAMI — drivers + PyTorch already installed) ==="
 
 # venv
 # uv venv
+# source .venv/bin/activate
 
 # uv pip install \
 #     "datasets" \

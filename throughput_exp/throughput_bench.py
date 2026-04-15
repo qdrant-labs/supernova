@@ -168,16 +168,22 @@ def main():
         tokenize_time = time.perf_counter() - t_tok
 
         for cutoff in cutoffs_to_test:
-            effective_cutoff = cutoff or max_tokens
-            cutoff_label = f"cutoff={cutoff}" if cutoff else "no cutoff"
+            # 1. Clamp the requested cutoff to the model's physical limit
+            actual_cutoff = min(cutoff, max_tokens) if cutoff else max_tokens
+            
+            # 2. Label it clearly so you know when a clamp occurred
+            if cutoff and cutoff > max_tokens:
+                cutoff_label = f"cutoff={cutoff} (clamped to {max_tokens})"
+            else:
+                cutoff_label = f"cutoff={cutoff}" if cutoff else "no cutoff"
 
-            # truncate tokens and decode back to text
+            # 3. Use actual_cutoff for text generation AND token counting
             if cutoff:
                 trial_texts = [
-                    tokenizer.decode(toks[:cutoff], skip_special_tokens=True) if len(toks) > cutoff else texts[i]
+                    tokenizer.decode(toks[:actual_cutoff], skip_special_tokens=True) if len(toks) > actual_cutoff else texts[i]
                     for i, toks in enumerate(all_token_ids)
                 ]
-                token_counts = [min(len(toks), cutoff) for toks in all_token_ids]
+                token_counts = [min(len(toks), actual_cutoff) for toks in all_token_ids]
             else:
                 trial_texts = texts
                 token_counts = [min(len(toks), max_tokens) for toks in all_token_ids]
