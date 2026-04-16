@@ -15,7 +15,7 @@ output "ssh_command" {
 
 output "scp_bench" {
   description = "Command to upload bench script"
-  value       = "scp ../bench.py ec2-user@${aws_instance.gpu.public_ip}:~/"
+  value       = "scp ../throughput_bench.py ec2-user@${aws_instance.gpu.public_ip}:~/"
 }
 
 output "my_ip" {

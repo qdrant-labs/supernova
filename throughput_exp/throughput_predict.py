@@ -263,7 +263,7 @@ def main() -> None:
     parser.add_argument("--gpu", default="a10g")
     parser.add_argument("--gpu-scale", type=float, default=1.0)
     parser.add_argument("--rate", type=float, default=None)
-    parser.add_argument("--cutoff", type=int, required=True)
+    parser.add_argument("--cutoff", type=int, nargs="+", required=True)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-batches", type=int, default=10_000)
     parser.add_argument("--total-rows", type=int, default=None)
@@ -285,43 +285,48 @@ def main() -> None:
     rate_per_hr = args.rate if args.rate is not None else gpu["rate_per_hr"]
     t_start = time.perf_counter()
 
-    log.info("[1/5] Sampling %s rows...", f"{args.sample:,}")
+    cutoffs = sorted(args.cutoff)
+
+    log.info("[1/4] Sampling %s rows...", f"{args.sample:,}")
     lengths = sample_token_lengths(args.dataset, hf_config, args.split, args.column, args.model, args.sample)
     token_stats = compute_token_stats(lengths)
 
-    log.info("\n[2/5] Fitting lognormal distribution...")
+    log.info("\n[2/4] Fitting lognormal distribution...")
     fit = fit_lognormal(lengths)
-
-    log.info("\n[3/5] Monte Carlo padding simulation...")
-    padding = simulate_padding(lengths, args.cutoff, args.batch_size, args.num_batches)
 
     if args.params:
         params, params_method = args.params, "user-provided"
     else:
-        log.info("\n[4/5] Counting parameters...")
+        log.info("\n[3/4] Counting parameters...")
         params, params_method = count_model_params(args.model)
-
-    log.info("\n[5/5] Predicting throughput...")
-    throughput = predict_throughput(params, gpu["effective_tflops_bf16"], args.cutoff, args.gpu_scale)
 
     total_rows, total_rows_source = args.total_rows, "user-provided" if args.total_rows else None
     if total_rows is None:
         total_rows = detect_total_rows(args.dataset, hf_config, args.split)
         total_rows_source = "dataset metadata" if total_rows else None
 
-    cost = estimate_cost(total_rows, args.cutoff, throughput["t_max_tok_s"], rate_per_hr, args.overhead) if total_rows else None
+    log.info("\n[4/4] Simulating & predicting for %d cutoff(s): %s", len(cutoffs), cutoffs)
+    results = []
+    for cutoff in cutoffs:
+        padding = simulate_padding(lengths, cutoff, args.batch_size, args.num_batches)
+        throughput = predict_throughput(params, gpu["effective_tflops_bf16"], cutoff, args.gpu_scale)
+        cost = estimate_cost(total_rows, cutoff, throughput["t_max_tok_s"], rate_per_hr, args.overhead) if total_rows else None
+
+        plot_distribution(lengths, fit, cutoff, args.output)
+        print_report(token_stats, fit, padding, throughput, cost, rate_per_hr, gpu, args.gpu_scale, args.model, params, params_method, args.dataset, hf_config, args.column, cutoff, total_rows, total_rows_source, args.num_gpus)
+
+        results.append({
+            "cutoff": cutoff, "prediction": throughput, "cost": cost, "padding": padding,
+        })
+
     t_end = time.perf_counter()
     log.info(f"\nTotal prediction time: {t_end - t_start:.1f} seconds")
 
-    plot_distribution(lengths, fit, args.cutoff, args.output)
-    print_report(token_stats, fit, padding, throughput, cost, rate_per_hr, gpu, args.gpu_scale, args.model, params, params_method, args.dataset, hf_config, args.column, args.cutoff, total_rows, total_rows_source, args.num_gpus)
-    
     if args.output:
         with open(args.output, "w") as f:
             json.dump({
-                "dataset": args.dataset, "hf_config": hf_config, "model": args.model, 
-                "gpu": gpu["name"], "cutoff": args.cutoff, "prediction": throughput,
-                "cost": cost, "padding": padding
+                "dataset": args.dataset, "hf_config": hf_config, "model": args.model,
+                "gpu": gpu["name"], "results": results,
             }, f, indent=2)
 
 if __name__ == "__main__":
