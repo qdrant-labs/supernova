@@ -6,6 +6,7 @@ Unified CLI for vectorforge.
   vf embed-dist <config>     # embed distributed via SkyPilot pool
   vf load <config>           # load into vector store
   vf load-dist <config>      # load distributed via SkyPilot
+  vf analysis <config>       # analyze a (distributed) embedding run
 """
 
 import sys
@@ -19,6 +20,7 @@ def main():
         print("  embed-dist  Embed distributed via SkyPilot pool")
         print("  load        Load pre-embedded data into a vector store")
         print("  load-dist   Distribute loading across SkyPilot instances")
+        print("  analysis    Analyze a (distributed) embedding run")
         sys.exit(0)
 
     command = sys.argv[1]
@@ -36,6 +38,9 @@ def main():
     elif command == "load-dist":
         from cli.run_load_distributed import main as load_dist_main
         load_dist_main(argv)
+    elif command == "analysis":
+        from cli.run_analysis import main as analysis_main
+        analysis_main(argv)
     else:
         print(f"unknown command: {command}")
         print("run 'vf --help' for available commands")

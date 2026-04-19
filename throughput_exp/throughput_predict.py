@@ -46,15 +46,25 @@ def detect_total_rows(dataset: str, hf_config: str | None, split: str) -> int | 
         pass
     return None
 
+def _render_text(row: dict, column: str | None, template: str | None) -> str | None:
+    if template:
+        try:
+            return template.format(**row)
+        except (KeyError, IndexError):
+            return None
+    return row.get(column) if column else None
+
+
 def sample_token_lengths(
-    dataset: str, hf_config: str | None, split: str, column: str, tokenizer_name: str, n: int
+    dataset: str, hf_config: str | None, split: str, column: str | None,
+    template: str | None, tokenizer_name: str, n: int,
 ) -> np.ndarray:
     ds = load_dataset(dataset, hf_config, split=split, streaming=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
 
     lengths: list[int] = []
     for row in tqdm(ds.shuffle(seed=42).take(n), total=n, desc="Tokenizing"):
-        text = row.get(column)
+        text = _render_text(row, column, template)
         if text and text.strip():
             lengths.append(len(tokenizer.encode(text, add_special_tokens=False)))
 
@@ -130,17 +140,25 @@ def count_model_params(model_name: str) -> tuple[int, str]:
     except Exception as e:
         raise RuntimeError(f"Could not determine parameter count for {model_name}. Error: {e}")
 
-def predict_throughput(params: int, gpu_tflops: float, cutoff: int, gpu_scale: float = 1.0) -> dict:
+def predict_throughput(
+    params: int, gpu_tflops: float, cutoff: int, gpu_scale: float = 1.0,
+    eta: float = 1.0, mean_tokens_per_text: float | None = None,
+) -> dict:
     effective_tflops = gpu_tflops * gpu_scale
     t_max = effective_tflops * 1e12 / (2 * params)
+    useful_tok_s = t_max * eta
+    # actual texts/s is bounded by useful tokens per second divided by the tokens
+    # we actually do work on per text (after truncation), not the padding-cutoff
+    denom = mean_tokens_per_text if mean_tokens_per_text else cutoff
     return {
         "t_max_tok_s": t_max,
-        "texts_per_s": t_max / cutoff,
+        "useful_tok_s": useful_tok_s,
+        "texts_per_s": useful_tok_s / denom,
         "effective_tflops": effective_tflops,
     }
 
-def estimate_cost(total_rows: int, cutoff: int, t_max: float, rate_per_hr: float, overhead: float = 1.2) -> dict:
-    gpu_seconds = total_rows * cutoff / t_max
+def estimate_cost(total_rows: int, texts_per_s: float, rate_per_hr: float, overhead: float = 1.2) -> dict:
+    gpu_seconds = total_rows / texts_per_s
     gpu_hours = gpu_seconds / 3600
     raw_cost = gpu_hours * rate_per_hr
     return {
@@ -192,7 +210,8 @@ def plot_distribution(lengths: np.ndarray, fit: dict, cutoff: int, output_path: 
 def print_report(
     token_stats: dict, fit: dict, padding: dict, throughput: dict, cost: dict | None,
     rate_per_hr: float, gpu: dict, gpu_scale: float, model_name: str, params: int,
-    params_method: str, dataset: str, config: str | None, column: str, cutoff: int,
+    params_method: str, dataset: str, config: str | None, column: str | None,
+    template: str | None, cutoff: int,
     total_rows: int | None, total_rows_source: str | None, num_gpus: int | None
 ) -> None:
     W = 64
@@ -202,7 +221,10 @@ def print_report(
 
     print("\n--- Dataset ---")
     print(f"  Dataset:          {dataset} (config={config})")
-    print(f"  Column:           {column}")
+    if template:
+        print(f"  Template:         {template!r}")
+    else:
+        print(f"  Column:           {column}")
     print(f"  Sampled:          {token_stats['count']:,} texts")
 
     print("\n--- Token Distribution ---")
@@ -255,7 +277,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Predict embedding throughput and cost.")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--config", default=None)
-    parser.add_argument("--column", default="text")
+    parser.add_argument("--column", default=None, help="Field name in the dataset row to tokenize")
+    parser.add_argument("--template", default=None,
+                        help="Python str.format() template rendered against each row, e.g. "
+                             "'Title: {title}\\n\\nReview: {description}'. Use instead of --column.")
     parser.add_argument("--split", default="train")
     parser.add_argument("--sample", type=int, default=100_000)
     parser.add_argument("--model", required=True)
@@ -280,6 +305,9 @@ def main() -> None:
     
     if gpu_key not in GPU_TABLE:
         parser.error(f"Unknown GPU '{args.gpu}'. Choose from: {', '.join(GPU_TABLE.keys())}")
+
+    if bool(args.column) == bool(args.template):
+        parser.error("Provide exactly one of --column or --template")
     
     gpu = GPU_TABLE[gpu_key]
     rate_per_hr = args.rate if args.rate is not None else gpu["rate_per_hr"]
@@ -288,7 +316,9 @@ def main() -> None:
     cutoffs = sorted(args.cutoff)
 
     log.info("[1/4] Sampling %s rows...", f"{args.sample:,}")
-    lengths = sample_token_lengths(args.dataset, hf_config, args.split, args.column, args.model, args.sample)
+    lengths = sample_token_lengths(
+        args.dataset, hf_config, args.split, args.column, args.template, args.model, args.sample,
+    )
     token_stats = compute_token_stats(lengths)
 
     log.info("\n[2/4] Fitting lognormal distribution...")
@@ -309,11 +339,14 @@ def main() -> None:
     results = []
     for cutoff in cutoffs:
         padding = simulate_padding(lengths, cutoff, args.batch_size, args.num_batches)
-        throughput = predict_throughput(params, gpu["effective_tflops_bf16"], cutoff, args.gpu_scale)
-        cost = estimate_cost(total_rows, cutoff, throughput["t_max_tok_s"], rate_per_hr, args.overhead) if total_rows else None
+        throughput = predict_throughput(
+            params, gpu["effective_tflops_bf16"], cutoff, args.gpu_scale,
+            eta=padding["eta"], mean_tokens_per_text=padding["mean_truncated_tokens"],
+        )
+        cost = estimate_cost(total_rows, throughput["texts_per_s"], rate_per_hr, args.overhead) if total_rows else None
 
         plot_distribution(lengths, fit, cutoff, args.output)
-        print_report(token_stats, fit, padding, throughput, cost, rate_per_hr, gpu, args.gpu_scale, args.model, params, params_method, args.dataset, hf_config, args.column, cutoff, total_rows, total_rows_source, args.num_gpus)
+        print_report(token_stats, fit, padding, throughput, cost, rate_per_hr, gpu, args.gpu_scale, args.model, params, params_method, args.dataset, hf_config, args.column, args.template, cutoff, total_rows, total_rows_source, args.num_gpus)
 
         results.append({
             "cutoff": cutoff, "prediction": throughput, "cost": cost, "padding": padding,

@@ -31,6 +31,8 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         device: str | None = None,
         dtype: str = "float32",
         trust_remote_code: bool = False,
+        max_tokens: int | None = None,
+        truncate: bool = False,
     ):
         self._device = device or _detect_device()
         torch_dtype = self.DTYPE_MAP.get(dtype, torch.float32)
@@ -44,7 +46,11 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         self._model_name = model
         self._batch_size = batch_size
         self._dimensions_val = self._model.get_sentence_embedding_dimension()
+        # override the model's seq-length cap if user set one
+        if max_tokens is not None:
+            self._model.max_seq_length = max_tokens
         self._max_tokens = self._model.max_seq_length
+        self._truncate = truncate
         # Separate tokenizer copy for split_text to avoid "Already borrowed"
         # race with the model's internal tokenizer used during encode()
         from transformers import AutoTokenizer
@@ -63,6 +69,13 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         return self._max_tokens
 
     def split_text(self, text: str) -> list[str]:
+        # truncate mode: let the encoder's tokenizer chop overlong input; emit one piece.
+        # useful for cutting long documents off to speed up inference
+        # at the cost of potentially worse embeddings (losing semantic content after the cutoff)
+        # if a dataset has many many long documents and is bottlenecked on encoding, this can be a useful speed/quality tradeoff to consider
+        if self._truncate:
+            return [text]
+
         tokens = self._splitter_tokenizer.encode(text, add_special_tokens=False)
 
         if len(tokens) <= self._max_tokens:
