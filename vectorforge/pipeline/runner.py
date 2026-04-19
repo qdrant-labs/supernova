@@ -28,6 +28,7 @@ async def run(
     max_text_length: int | None = None,
     dense_column: str | None = "dense_embedding",
     sparse_column: str | None = None,
+    filename_prefix: str = "",
 ):
     logger.info(
         "Starting pipeline: source=%s engine=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
@@ -49,6 +50,7 @@ async def run(
             records, output_dir, batch_counter,
             dense_column=dense_column,
             sparse_column=sparse_column,
+            filename_prefix=filename_prefix,
         )
         logger.info("Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path)
         batch_counter += 1
@@ -122,6 +124,6 @@ async def run(
     }
     await storage.upload_bytes(
         json.dumps(manifest, indent=2).encode(),
-        "_manifest.json",
+        f"{filename_prefix}_manifest.json" if filename_prefix else "_manifest.json",
     )
     logger.info("Uploaded manifest to %s", storage.destination)

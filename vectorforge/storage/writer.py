@@ -28,9 +28,10 @@ def write_batch(
     batch_id: int,
     dense_column: str | None = "dense_embedding",
     sparse_column: str | None = None,
+    filename_prefix: str = "",
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"batch_{batch_id:08d}.parquet"
+    filename = f"{filename_prefix}batch_{batch_id:08d}.parquet"
     path = os.path.join(output_dir, filename)
 
     # Fixed columns

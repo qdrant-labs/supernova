@@ -44,7 +44,13 @@ DEFAULT_RESOURCES = {
     "accelerators": "A10G:1",
     "cloud": "aws",
     "use_spot": True,
-     "any_of": [{"region": "us-east-1"}, {"region": "us-west-2"}, {"region": "us-east-2"}],
+    "disk_size": 150,
+    "image_id": {
+        "us-east-1": "ami-0038d79e7270bb987",
+        "us-west-2": "ami-08a03808395c1b31f",
+        "us-east-2": "ami-0a28b3d7e7c9192a7",
+    },
+    "any_of": [{"region": "us-east-1"}, {"region": "us-west-2"}, {"region": "us-east-2"}],
 }
 
 

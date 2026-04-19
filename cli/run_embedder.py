@@ -138,6 +138,7 @@ def main(argv: list[str] | None = None):
         config = yaml.safe_load(f)
 
     # support both explicit offset/limit and rank-based slicing
+    filename_prefix = ""
     if args.num_jobs is not None:
         job_rank = args.job_rank
         if job_rank is None:
@@ -162,6 +163,9 @@ def main(argv: list[str] | None = None):
         )
         config["source"]["offset"] = offset
         config["source"]["limit"] = limit
+
+        rank_width = max(2, len(str(args.num_jobs - 1)))
+        filename_prefix = f"rank{job_rank:0{rank_width}d}_"
 
     elif args.offset is not None or args.limit is not None:
         # just use what was provided, no auto-computation
@@ -193,6 +197,7 @@ def main(argv: list[str] | None = None):
             max_text_length=pipeline_cfg.get("max_text_length"),
             dense_column=dense_column,
             sparse_column=sparse_column,
+            filename_prefix=filename_prefix,
         )
     )
 
