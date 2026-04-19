@@ -44,6 +44,7 @@ DEFAULT_RESOURCES = {
     "accelerators": "A10G:1",
     "cloud": "aws",
     "use_spot": True,
+     "any_of": [{"region": "us-east-1"}, {"region": "us-west-2"}, {"region": "us-east-2"}],
 }
 
 
