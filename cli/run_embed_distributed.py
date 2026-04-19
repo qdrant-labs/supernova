@@ -50,7 +50,11 @@ DEFAULT_RESOURCES = {
         "us-west-2": "ami-08a03808395c1b31f",
         "us-east-2": "ami-0a28b3d7e7c9192a7",
     },
-    "any_of": [{"region": "us-east-1"}, {"region": "us-west-2"}, {"region": "us-east-2"}],
+    "any_of": [
+        {"region": "us-east-1"},
+        {"region": "us-west-2"},
+        # {"region": "us-east-2"} # --- has a lower quote right now for some reason, so skipping.
+    ],
 }
 
 
@@ -71,6 +75,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--pool-name", type=str, help="SkyPilot pool name (default: auto-generated)")
     parser.add_argument("--max-workers", type=int, help="Max pool workers for autoscaling (default: num-jobs)")
     parser.add_argument("--on-demand", action="store_true", help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota)")
+    parser.add_argument("--burst", action="store_true", help="Provision all workers at startup (min_workers=max_workers). Bypasses SkyPilot's slow autoscaler ramp; best for batch runs where you know the target worker count.")
     args = parser.parse_args(argv)
 
     with open(args.config) as f:
@@ -116,7 +121,7 @@ def main(argv: list[str] | None = None):
     # generate pool YAML
     pool_yaml = {
         "pool": {
-            "min_workers": 0,
+            "min_workers": max_workers if args.burst else 0,
             "max_workers": max_workers,
         },
         "resources": resources,

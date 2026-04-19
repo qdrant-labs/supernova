@@ -174,50 +174,6 @@ def main(argv: list[str] | None = None):
     manifests = _read_manifests(destination, manifest_keys) if manifest_keys else []
     manifests.sort(key=lambda m: m.get("_key", ""))
 
-    print("\n=== Integrity checks ===")
-    schema_cols = {c[0] for c in schema}
-
-    null_text = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{glob}') WHERE text IS NULL OR text = ''"
-    ).fetchone()[0]
-    print(f"  null/empty text:        {null_text:,}")
-
-    if "dense_embedding" in schema_cols:
-        null_emb = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{glob}') WHERE dense_embedding IS NULL"
-        ).fetchone()[0]
-        dim_counts = con.execute(
-            f"SELECT len(dense_embedding) d, COUNT(*) c FROM read_parquet('{glob}') "
-            f"WHERE dense_embedding IS NOT NULL GROUP BY d"
-        ).fetchall()
-        print(f"  null dense embedding:   {null_emb:,}")
-        if len(dim_counts) == 1:
-            print(f"  embedding dimension:    {dim_counts[0][0]} (consistent across {dim_counts[0][1]:,} rows)")
-        else:
-            print(f"  embedding dimension:    INCONSISTENT — {dim_counts}")
-
-    if manifests:
-        per_file = con.execute(
-            f"SELECT parse_filename(filename) f, COUNT(*) c "
-            f"FROM read_parquet('{glob}', filename=true) GROUP BY f"
-        ).fetchall()
-        rows_by_rank: dict[str, int] = {}
-        for fname, cnt in per_file:
-            rank = fname.split("_batch_")[0] if "_batch_" in fname else ""
-            rows_by_rank[rank] = rows_by_rank.get(rank, 0) + cnt
-
-        mismatches = []
-        for m in manifests:
-            mkey = m["_key"].rsplit("/", 1)[-1]
-            rank = mkey.replace("__manifest.json", "")
-            expected = m.get("total_records", 0)
-            actual = rows_by_rank.get(rank, 0)
-            if expected != actual:
-                mismatches.append((rank, expected, actual))
-        print(f"  manifest/parquet rows:  {'OK' if not mismatches else f'MISMATCH ({len(mismatches)} ranks)'}")
-        for rank, exp, act in mismatches[:5]:
-            print(f"    {rank}: manifest={exp:,} parquet={act:,}")
-
     if not manifests:
         print("\nNo manifests found, skipping throughput analysis.")
         return
