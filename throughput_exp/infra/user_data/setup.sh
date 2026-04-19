@@ -5,7 +5,7 @@ exec > /var/log/gpu-setup.log 2>&1
 echo "=== Setup starting (DLAMI — drivers + PyTorch already installed) ==="
 
 # setup uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # venv
 # uv venv

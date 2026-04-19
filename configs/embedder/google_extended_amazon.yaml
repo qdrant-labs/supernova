@@ -18,5 +18,5 @@ pipeline:
 storage:
   type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: arxiv-papers/gte-multilingual-base
+  s3_prefix: google--extended-amazon/embed-gte-multilingual-base
   output_dir: /tmp/vectorforge

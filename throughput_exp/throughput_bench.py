@@ -24,9 +24,10 @@ Usage:
   # Cap text length before splitting
   python3.11 throughput_bench.py --max-text-length 50000
 
+  # more specific examples:
   python throughput_bench.py --dataset HuggingFaceTB/dclm-edu --cutoffs 256,512,1024,2048,4096,8192 --batch-sizes 64 --sample 10000 --output dclm_cutoff_results.json --hf-config None
   python throughput_bench.py --dataset CohereLabs/wikipedia-2023-11-embed-multilingual-v3 --cutoffs 64,128,256 --batch-sizes 64 --sample 10000 --output results.json --hf-config en
-  python throughput_bench.py --dataset HuggingfaceTB/dclm-edu --cutoffs 256,512,1024,2048 --batch-sizes 64 --sample 10000 --output results.json --hf-config None --model Alibaba-NLP/gte-multilingual-base
+  python throughput_bench.py --dataset HuggingfaceTB/dclm-edu --cutoffs 256,512,1024,2048 --batch-sizes 32 --sample 10000 --output results.json --hf-config None --model Qwen/Qwen3-Embedding-4B
 
 """
 

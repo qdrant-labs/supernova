@@ -63,6 +63,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--chunk-size", type=int, help="Rows per job (used to auto-compute num-jobs)")
     parser.add_argument("--pool-name", type=str, help="SkyPilot pool name (default: auto-generated)")
     parser.add_argument("--max-workers", type=int, help="Max pool workers for autoscaling (default: num-jobs)")
+    parser.add_argument("--on-demand", action="store_true", help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota)")
     args = parser.parse_args(argv)
 
     with open(args.config) as f:
@@ -70,7 +71,9 @@ def main(argv: list[str] | None = None):
 
     source_cfg = config["source"]
     pipeline_cfg = config.get("pipeline", {})
-    resources = config.get("resources", DEFAULT_RESOURCES)
+    resources = config.get("resources", dict(DEFAULT_RESOURCES))
+    if args.on_demand:
+        resources["use_spot"] = False
 
     # get dataset size (source-agnostic)
     from cli.run_embedder import build_source
@@ -123,7 +126,7 @@ def main(argv: list[str] | None = None):
     job_yaml = {
         "name": f"embed-{config_name}",
         "resources": resources,
-        "run": f"cd /app && vf embed {args.config} --num-jobs {num_jobs}",
+        "run": f"cd /app && uv run vf embed {args.config} --num-jobs {num_jobs}",
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:

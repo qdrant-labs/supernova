@@ -57,8 +57,56 @@ class HuggingFaceSource(DatasetSource):
 
     def get_total_rows(self) -> int:
         from datasets import load_dataset_builder
+
         builder = load_dataset_builder(self.dataset_name, self.config)
-        return builder.info.splits[self.split].num_examples
+        splits = builder.info.splits or {}
+        split_info = splits.get(self.split)
+        if split_info is not None and split_info.num_examples:
+            return split_info.num_examples
+
+        return self._fetch_row_count_from_datasets_server()
+
+    def _fetch_row_count_from_datasets_server(self) -> int:
+        """
+        Ask the HF datasets-server for the row count.
+
+        Works for any dataset the Hub has indexed (the common case for public datasets
+        and private datasets the caller is authenticated to). Returns num_rows without
+        downloading any row data.
+        """
+        import requests
+        from huggingface_hub.utils import build_hf_headers
+
+        params: dict[str, str] = {"dataset": self.dataset_name}
+        if self.config:
+            params["config"] = self.config
+
+        resp = requests.get(
+            "https://datasets-server.huggingface.co/size",
+            params=params,
+            headers=build_hf_headers(),
+            timeout=30,
+        )
+        if resp.status_code == 202:
+            raise RuntimeError(
+                f"HF datasets-server is still computing size for {self.dataset_name!r}; "
+                "retry in a minute"
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+
+        splits = payload.get("size", {}).get("splits", []) or []
+        for entry in splits:
+            if entry.get("split") != self.split:
+                continue
+            if self.config is not None and entry.get("config") != self.config:
+                continue
+            return int(entry["num_rows"])
+
+        raise ValueError(
+            f"datasets-server has no row count for dataset={self.dataset_name!r} "
+            f"config={self.config!r} split={self.split!r}"
+        )
 
     def stream(self):
         ds = self._dataset
