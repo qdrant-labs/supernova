@@ -14,7 +14,7 @@ dense_embedder:
   truncate: true
 
 pipeline:
-  chunk_size: 100000
+  chunk_size: 10000 # chunk size for processing the dataset in batches
   num_workers: 2
 
 storage:
