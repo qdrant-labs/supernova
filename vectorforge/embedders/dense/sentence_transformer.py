@@ -48,7 +48,10 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         self._dimensions_val = self._model.get_sentence_embedding_dimension()
         # override the model's seq-length cap if user set one
         if max_tokens is not None:
-            self._model.max_seq_length = max_tokens
+            # clamp to the model's native max — exceeding it breaks the forward pass
+            # (position-embedding table size is fixed at training time)
+            # protect against user error here by capping it at the model's max if they set something too high
+            self._model.max_seq_length = min(self._model.max_seq_length, max_tokens)
         self._max_tokens = self._model.max_seq_length
         self._truncate = truncate
         # Separate tokenizer copy for split_text to avoid "Already borrowed"
