@@ -42,6 +42,7 @@ ENV_VARS_TO_FORWARD = [
 
 DEFAULT_RESOURCES = {
     "accelerators": "A10G:1",
+    "instance_type": "g5.4xlarge",  # 16 vCPU, 64GB RAM, 1x A10G — wider RAM headroom for long-text datasets
     "cloud": "aws",
     "use_spot": True,
     "disk_size": 150,
@@ -134,7 +135,9 @@ def main(argv: list[str] | None = None):
     with open(pool_path, "w") as f:
         yaml.dump(pool_yaml, f, default_flow_style=False, sort_keys=False)
 
-    # generate job YAML
+    # generate job YAML — pool-submitted jobs MUST specify resources (per the
+    # SkyPilot pools docs, else the job won't be able to use a GPU) but MUST
+    # NOT specify setup / file_mounts / workdir (those come from the pool).
     job_yaml = {
         "name": f"embed-{config_name}",
         "resources": resources,

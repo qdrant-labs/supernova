@@ -21,6 +21,6 @@ storage:
   output_dir: /tmp/vectorforge
 
 pipeline:
-  chunk_size: 10000
+  chunk_size: 1000
   num_workers: 2
   max_text_length: 8192
