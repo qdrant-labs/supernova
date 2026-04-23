@@ -114,7 +114,9 @@ def _ascii_histogram(values: list[float], bins: int = 10, width: int = 40) -> st
 
 
 def _configure_duckdb_for_s3(con: duckdb.DuckDBPyConnection):
-    """Install + load httpfs, configure AWS credentials for S3 reads."""
+    """
+    Install + load httpfs, configure AWS credentials for S3 reads.
+    """
     con.execute("INSTALL httpfs; LOAD httpfs;")
     # duckdb picks up default AWS credential chain via the aws extension
     try:
@@ -159,7 +161,7 @@ def main(argv: list[str] | None = None):
     con = duckdb.connect()
     if destination.startswith("s3://"):
         _configure_duckdb_for_s3(con)
-    glob = f"{destination}/*.parquet"
+    glob = f"{destination}/**/*.parquet" # account for possible subdirs (when we have multiple configs writing to the same destination)
 
     print("\n=== Schema ===")
     schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{glob}')").fetchall()
