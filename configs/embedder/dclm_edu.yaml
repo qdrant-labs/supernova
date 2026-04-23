@@ -1,0 +1,24 @@
+source:
+  type: huggingface
+  dataset_name: HuggingfaceTB/dclm-edu
+  split: train
+  text_template: "Title: {title}\n\nContents: {contents}"
+
+dense_embedder:
+  type: sentence_transformer
+  model: Alibaba-NLP/gte-multilingual-base
+  trust_remote_code: true
+  batch_size: 64
+  dtype: bfloat16
+  max_tokens: 512
+  truncate: true
+
+pipeline:
+  chunk_size: 10000 # chunk size for processing the dataset in batches
+  num_workers: 2
+
+storage:
+  type: s3
+  s3_bucket: qdrant--vectorforge
+  s3_prefix: huggingface-tb--dclm-edu/embed-gte-multilingual-base
+  output_dir: /tmp/vectorforge
