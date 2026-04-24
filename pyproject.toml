@@ -19,7 +19,9 @@ dependencies = [
     "transformers<5",
     "qdrant-client>=1.9.0",
     "boto3",
-    "skypilot[aws]"
+    "skypilot[aws]",
+    "FlagEmbedding",
+    "einops>=0.8.2",
 ]
 
 [build-system]

@@ -83,6 +83,29 @@ How to produce dense embeddings.
 
 ---
 
+## `multivector_embedder:`
+
+Multi-vector embeddings (ColBERT-style): each input text produces N vectors of D floats,
+where N varies with input length. Stored in parquet as `list<list<float32>>`.
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `type` | *required* | `bge_m3` (currently the only option). |
+| `model` | `BAAI/bge-m3` | HF model ID. Only models with a ColBERT-style multi-vector head are supported. |
+| `batch_size` | `32` | Records per forward pass. |
+| `dtype` | `float32` | `float32` or `float16`. `bfloat16` is not supported by the FlagEmbedding path. |
+| `max_tokens` | model native (8192 for bge-m3) | Lower = faster. |
+| `device` | auto-detect | `cuda` / `mps` / `cpu`. |
+
+Output column name is controlled by `pipeline.multivector_embedding_column` (default `multivector_embedding`).
+
+Multi-vector embedders run as an **additional** forward pass on top of any dense/sparse
+embedders. If you set all three (`dense_embedder`, `sparse_embedder`, `multivector_embedder`),
+the engine runs dense+sparse via the hybrid path (one pass) and multi-vector separately (a
+second pass). Multi-vector does not fuse with the hybrid path today.
+
+---
+
 ## `pipeline:`
 
 How the in-process pipeline is shaped. These are the main memory/throughput tuning knobs.
@@ -95,6 +118,7 @@ How the in-process pipeline is shaped. These are the main memory/throughput tuni
 | `max_text_length` | `None` | Character-level truncation applied before tokenization. Useful for bounding pathological outliers (docs with 100K+ chars). |
 | `dense_embedding_column` | `dense_embedding` | Output column name for dense vectors. |
 | `sparse_embedding_column` | `sparse_embedding` | Output column name for sparse vectors. |
+| `multivector_embedding_column` | `multivector_embedding` | Output column name for multi-vector embeddings. |
 
 ### Memory math
 

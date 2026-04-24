@@ -12,6 +12,16 @@ class SparseEmbedding:
 
 
 @dataclass
+class MultiVectorEmbedding:
+    """
+    Multi-vector representation: N vectors of D floats per text.
+    N varies per input (typically one vector per token). Used by ColBERT,
+    BAAI/bge-m3 multi-vector mode, etc.
+    """
+    vectors: list[list[float]]
+
+
+@dataclass
 class Record:
     """
     A single record from a dataset source, before embedding.
@@ -30,8 +40,8 @@ class Record:
 @dataclass
 class EmbeddedRecord:
     """
-    A Record after embedding. One or both of dense/sparse will be set
-    depending on which embedders are configured.
+    A Record after embedding. Any combination of dense/sparse/multivector
+    may be set depending on which embedders are configured.
     """
     row_id: int
     source_row_id: int
@@ -40,6 +50,7 @@ class EmbeddedRecord:
     text: str
     dense_embedding: list[float] | None = None
     sparse_embedding: SparseEmbedding | None = None
+    multivector_embedding: MultiVectorEmbedding | None = None
     columns: dict = field(default_factory=dict)
 
 

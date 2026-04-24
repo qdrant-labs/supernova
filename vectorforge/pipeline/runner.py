@@ -28,6 +28,7 @@ async def run(
     max_text_length: int | None = None,
     dense_column: str | None = "dense_embedding",
     sparse_column: str | None = None,
+    multivector_column: str | None = None,
     filename_prefix: str = "",
 ):
     logger.info(
@@ -50,6 +51,7 @@ async def run(
             records, output_dir, batch_counter,
             dense_column=dense_column,
             sparse_column=sparse_column,
+            multivector_column=multivector_column,
             filename_prefix=filename_prefix,
         )
         logger.info("Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path)
@@ -108,9 +110,11 @@ async def run(
         "source": source.source_name,
         "dense_embedder": engine.dense_model_name,
         "sparse_embedder": engine.sparse_model_name,
+        "multivector_embedder": engine.multivector_model_name,
         "dimensions": engine.dimensions,
         "dense_column": dense_column,
         "sparse_column": sparse_column,
+        "multivector_column": multivector_column,
         "chunk_size": chunk_size,
         "max_tokens": engine.max_tokens,
         "num_workers": num_workers,

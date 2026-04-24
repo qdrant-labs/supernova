@@ -9,6 +9,7 @@ from vectorforge.sources.huggingface import HuggingFaceSource
 from vectorforge.embedders.dense.openai import OpenAIEmbedder
 from vectorforge.embedders.dense.sentence_transformer import SentenceTransformerDenseEmbedder
 from vectorforge.embedders.sparse.sentence_transformer import SentenceTransformerSparseEmbedder
+from vectorforge.embedders.multivector.bge_m3 import BGEM3MultiVectorEmbedder
 from vectorforge.embedders.hybrid import SentenceTransformerHybridEmbedder
 from vectorforge.embedders.engine import EmbeddingEngine
 from vectorforge.storage.s3 import S3Backend
@@ -29,6 +30,10 @@ DENSE_EMBEDDER_REGISTRY = {
 
 SPARSE_EMBEDDER_REGISTRY = {
     "sentence_transformer": SentenceTransformerSparseEmbedder,
+}
+
+MULTIVECTOR_EMBEDDER_REGISTRY = {
+    "bge_m3": BGEM3MultiVectorEmbedder,
 }
 
 
@@ -54,6 +59,14 @@ def build_sparse_embedder(cfg: dict):
     return cls(**cfg)
 
 
+def build_multivector_embedder(cfg: dict):
+    embedder_type = cfg.pop("type")
+    cls = MULTIVECTOR_EMBEDDER_REGISTRY.get(embedder_type)
+    if cls is None:
+        raise ValueError(f"Unknown multivector embedder type: {embedder_type}. Available: {list(MULTIVECTOR_EMBEDDER_REGISTRY)}")
+    return cls(**cfg)
+
+
 def _can_hybrid(dense_cfg: dict, sparse_cfg: dict) -> bool:
     """
     Check if dense and sparse configs point to the same sentence_transformer model.
@@ -68,29 +81,33 @@ def build_engine(config: dict) -> EmbeddingEngine:
     """
     Build an EmbeddingEngine from config.
 
-    Supports:
-      - dense_embedder only
-      - sparse_embedder only
-      - both (auto-detects hybrid when same model)
-      - legacy 'embedder' key (treated as dense_embedder)
+    Supports any combination of:
+      - dense_embedder
+      - sparse_embedder
+      - multivector_embedder
+    dense + sparse with the same sentence_transformer model are auto-combined
+    into a single hybrid forward pass. Multivector is always built separately.
     """
     dense_cfg = dict(config.get("dense_embedder") or {})
     sparse_cfg = dict(config.get("sparse_embedder") or {})
+    multivector_cfg = dict(config.get("multivector_embedder") or {})
 
-    if not dense_cfg and not sparse_cfg:
-        raise ValueError("Config must specify at least one of: dense_embedder, sparse_embedder")
+    if not dense_cfg and not sparse_cfg and not multivector_cfg:
+        raise ValueError("Config must specify at least one of: dense_embedder, sparse_embedder, multivector_embedder")
 
-    # detect hybrid case: same model for both --> optimize for a single forfward pass
+    multivector = build_multivector_embedder(multivector_cfg) if multivector_cfg else None
+
+    # detect hybrid case: same model for both --> optimize for a single forward pass
     if dense_cfg and sparse_cfg and _can_hybrid(dense_cfg, sparse_cfg):
         hybrid_cfg = dict(dense_cfg)
         hybrid_cfg.pop("type") # remove the type
         hybrid = SentenceTransformerHybridEmbedder(**hybrid_cfg)
-        return EmbeddingEngine(hybrid=hybrid)
+        return EmbeddingEngine(hybrid=hybrid, multivector=multivector)
 
     # build separately (two distinct models, no optimization is possible)
     dense = build_dense_embedder(dense_cfg) if dense_cfg else None
     sparse = build_sparse_embedder(sparse_cfg) if sparse_cfg else None
-    return EmbeddingEngine(dense=dense, sparse=sparse)
+    return EmbeddingEngine(dense=dense, sparse=sparse, multivector=multivector)
 
 
 def build_storage(cfg: dict):
@@ -184,6 +201,7 @@ def main(argv: list[str] | None = None):
 
     dense_column = pipeline_cfg.get("dense_embedding_column", "dense_embedding") if engine.has_dense else None
     sparse_column = pipeline_cfg.get("sparse_embedding_column", "sparse_embedding") if engine.has_sparse else None
+    multivector_column = pipeline_cfg.get("multivector_embedding_column", "multivector_embedding") if engine.has_multivector else None
 
     asyncio.run(
         run(
@@ -197,6 +215,7 @@ def main(argv: list[str] | None = None):
             max_text_length=pipeline_cfg.get("max_text_length"),
             dense_column=dense_column,
             sparse_column=sparse_column,
+            multivector_column=multivector_column,
             filename_prefix=filename_prefix,
         )
     )

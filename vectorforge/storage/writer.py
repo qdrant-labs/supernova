@@ -19,6 +19,8 @@ SPARSE_EMBEDDING_TYPE = pa.struct([
     pa.field("values", pa.list_(pa.float32())),
 ])
 
+MULTIVECTOR_EMBEDDING_TYPE = pa.list_(pa.list_(pa.float32()))
+
 BASE_COLUMN_NAMES = {f.name for f in BASE_SCHEMA}
 
 
@@ -28,6 +30,7 @@ def write_batch(
     batch_id: int,
     dense_column: str | None = "dense_embedding",
     sparse_column: str | None = None,
+    multivector_column: str | None = None,
     filename_prefix: str = "",
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
@@ -58,10 +61,15 @@ def write_batch(
         ]
         schema_fields.append(pa.field(sparse_column, SPARSE_EMBEDDING_TYPE))
 
+    # Multivector embedding column (N vectors of D floats per row, N varies)
+    if multivector_column and records and records[0].multivector_embedding is not None:
+        data[multivector_column] = [r.multivector_embedding.vectors for r in records]
+        schema_fields.append(pa.field(multivector_column, MULTIVECTOR_EMBEDDING_TYPE))
+
     table = pa.table(data, schema=pa.schema(schema_fields))
 
     # Dynamic columns -- let PyArrow infer types from the data
-    embedding_columns = {dense_column, sparse_column} | BASE_COLUMN_NAMES
+    embedding_columns = {dense_column, sparse_column, multivector_column} | BASE_COLUMN_NAMES
     if records and records[0].columns:
         for col_name in records[0].columns:
             if col_name not in embedding_columns:
