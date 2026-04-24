@@ -28,3 +28,13 @@ pipeline:
   num_workers: 2
   max_text_length: 8192
   flush_threshold: 1000
+
+text_to_embed = "Title: {title}\nText: {text}".format(                                              
+    title=df[0]["title"][0],                                                                        
+    text=df[0]["text"][0],                                                                          
+)
+
+result = model.encode(
+      [text_to_embed],
+      return_dense=False, return_sparse=False, return_colbert_vecs=True,
+)

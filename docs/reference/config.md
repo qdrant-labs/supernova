@@ -201,6 +201,7 @@ How the in-process pipeline is shaped. These are the main memory/throughput tuni
 | `dense_embedding_column` | `dense_embedding` | Output column name for dense vectors. |
 | `sparse_embedding_column` | `sparse_embedding` | Output column name for sparse vectors. |
 | `multivector_embedding_column` | `multivector_embedding` | Output column name for multi-vector embeddings. |
+| `rendered_text_column` | `text` | Column name for the template-rendered string that gets sent to the embedder. Default shadows the source's raw `text` field (if it has one). Set to something else (e.g. `rendered_text`) to keep both — the raw field passes through under its original name. |
 
 ### Memory math
 
@@ -232,6 +233,20 @@ With `num_jobs=N` and `flush_threshold=F`:
 For 1B rows, `num_jobs=50`, `flush_threshold=1_000_000`: 50 workers × 20 parquets each = 1,000 files of 1M rows. Each job's slice must be **≥ flush_threshold** or you get one undersized parquet per job (the drain at end-of-pipeline flushes whatever remained).
 
 Parquet filenames are prefixed by rank in distributed mode: `rank042_batch_00000000.parquet`. Manifest is `rank042__manifest.json`. Single-job runs drop the prefix.
+
+### Rendered text vs. raw source text
+
+The `text` column in output parquets holds the **rendered template** (what was actually sent to the embedder), not the raw source field. If your source has a column named `text` (as HuggingFaceFW/finewiki does), it's shadowed by the rendered output at write time.
+
+To keep both in the parquet, rename the rendered column:
+
+```yaml
+pipeline:
+  rendered_text_column: rendered_text   # rendered template lands here
+  # `text` column now passes through from the source unshadowed
+```
+
+Template rendering itself is unaffected — `text_template: "Title: {title}\nText: {text}"` still uses the original HF field names. The rename only applies at parquet write time.
 
 ---
 

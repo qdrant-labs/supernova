@@ -5,13 +5,14 @@ import pyarrow.parquet as pq
 
 from vectorforge.models import EmbeddedRecord
 
-# Fixed columns that vectorforge always writes
-BASE_SCHEMA = [
+# Fixed columns that vectorforge always writes. Note that the rendered-template
+# text column's name is configurable (defaults to "text") to let the raw source
+# "text" field pass through without a name collision.
+BASE_SCHEMA_IDS = [
     pa.field("row_id", pa.int64()),
     pa.field("source_row_id", pa.int64()),
     pa.field("chunk_id", pa.int32()),
     pa.field("chunk_index", pa.int32()),
-    pa.field("text", pa.string()),
 ]
 
 SPARSE_EMBEDDING_TYPE = pa.struct([
@@ -21,7 +22,7 @@ SPARSE_EMBEDDING_TYPE = pa.struct([
 
 MULTIVECTOR_EMBEDDING_TYPE = pa.list_(pa.list_(pa.float32()))
 
-BASE_COLUMN_NAMES = {f.name for f in BASE_SCHEMA}
+BASE_ID_COLUMN_NAMES = {f.name for f in BASE_SCHEMA_IDS}
 
 
 def write_batch(
@@ -31,6 +32,7 @@ def write_batch(
     dense_column: str | None = "dense_embedding",
     sparse_column: str | None = None,
     multivector_column: str | None = None,
+    rendered_text_column: str = "text",
     filename_prefix: str = "",
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
@@ -43,10 +45,11 @@ def write_batch(
         "source_row_id": [r.source_row_id for r in records],
         "chunk_id":      [r.chunk_id for r in records],
         "chunk_index":   [r.chunk_index for r in records],
-        "text":          [r.text for r in records],
+        rendered_text_column: [r.text for r in records],
     }
 
-    schema_fields = list(BASE_SCHEMA)
+    schema_fields = list(BASE_SCHEMA_IDS)
+    schema_fields.append(pa.field(rendered_text_column, pa.string()))
 
     # Dense embedding column
     if dense_column and records and records[0].dense_embedding is not None:
@@ -75,11 +78,13 @@ def write_batch(
 
     table = pa.table(data, schema=pa.schema(schema_fields))
 
-    # Dynamic columns -- let PyArrow infer types from the data
-    embedding_columns = {dense_column, sparse_column, multivector_column} | BASE_COLUMN_NAMES
+    # Dynamic columns -- let PyArrow infer types from the data.
+    # Skip columns that collide with anything we've already written:
+    # the ID columns, any embedding columns, and the rendered-text column.
+    skip_names = {dense_column, sparse_column, multivector_column, rendered_text_column} | BASE_ID_COLUMN_NAMES
     if records and records[0].columns:
         for col_name in records[0].columns:
-            if col_name not in embedding_columns:
+            if col_name not in skip_names:
                 values = [r.columns.get(col_name) for r in records]
                 table = table.append_column(col_name, pa.array(values))
 

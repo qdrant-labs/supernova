@@ -254,6 +254,7 @@ def main(argv: list[str] | None = None):
             dense_column=dense_column,
             sparse_column=sparse_column,
             multivector_column=multivector_column,
+            rendered_text_column=pipeline_cfg.get("rendered_text_column", "text"),
             filename_prefix=filename_prefix,
         )
     )

@@ -29,6 +29,7 @@ async def run(
     dense_column: str | None = "dense_embedding",
     sparse_column: str | None = None,
     multivector_column: str | None = None,
+    rendered_text_column: str = "text",
     filename_prefix: str = "",
 ):
     logger.info(
@@ -52,6 +53,7 @@ async def run(
             dense_column=dense_column,
             sparse_column=sparse_column,
             multivector_column=multivector_column,
+            rendered_text_column=rendered_text_column,
             filename_prefix=filename_prefix,
         )
         logger.info("Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path)
