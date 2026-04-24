@@ -1,6 +1,6 @@
 import duckdb
 
-S3_PATH = "s3://qdrant--vectorforge/finewiki/embed-multilingual-e5-large/**/*.parquet"
+S3_PATH = "s3://qdrant--vectorforge/stanford-oval--ccnews/baai_bge_large_en_v1.5/**/*.parquet"
 
 con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")
@@ -24,3 +24,13 @@ f"""
     ORDER BY text_length DESC
     LIMIT 10
 """)
+
+# select fisrt 5 records with text
+con.sql(
+f"""
+    SELECT
+        text
+    FROM '{S3_PATH}'
+    WHERE text IS NOT NULL
+    LIMIT 5
+""").df()

@@ -47,10 +47,34 @@ Where to read rows from.
 | `text_template` | `None` | `str.format(**row)` template, e.g. `"Title: {title}\n\n{contents}"`. Use this OR `text_field`, not both. |
 | `text_field` | `None` | Single column name to use as text. Use when no template formatting is needed. |
 | `exclude_columns` | `[]` | Columns to drop from the output parquet. |
-| `offset` | `None` | Skip N rows. Set automatically by `--num-jobs` / `--job-rank`. |
-| `limit` | `None` | Take at most N rows. Set automatically by `--num-jobs` / `--job-rank`. |
+| `offset` | `None` | Skip N rows. Defines the start of a *window* inside the dataset (see below). |
+| `limit` | `None` | Embed at most N rows. Defines the window size. |
 
-Streaming caveat: for large datasets, `ds.skip(offset)` iterates one row at a time. Rank N pays O(N × rows_per_job) startup cost. Large ranks (e.g. rank 99 on a 45M-row dataset) can take 30+ min before producing their first chunk.
+### How `offset` / `limit` interact with `--num-jobs`
+
+`offset` and `limit` in the YAML define a **window** inside the full dataset. When `vf embed` is invoked with `--num-jobs N` (which is what `vf embed-dist` does for each worker), the `N` ranks divide *that window*, not the full dataset.
+
+- **No window set** (both `offset` and `limit` omitted) → the N ranks divide the full dataset. Normal case.
+- **Window set** (e.g. `offset: 0, limit: 100_000_000` on a 1B-row dataset) → the N ranks divide the 100M window. Useful for incremental embedding runs — see [Incremental / windowed runs](#incremental--windowed-runs) below.
+
+At the worker level, each rank's effective slice is computed as:
+
+```
+rank_offset = window_offset + rank * ceil(window_size / num_jobs)
+rank_limit  = min(ceil(window_size / num_jobs), window_size - rank * ceil(window_size / num_jobs))
+```
+
+Worker logs will print a line like:
+
+```
+Job 5/10: offset=50000000 limit=10000000 (window=[0,100000000), dataset_total=1000000000)
+```
+
+which makes the slicing auditable at a glance.
+
+### Streaming caveat
+
+For large datasets, `ds.skip(offset)` iterates one row at a time. Rank N pays O(N × rows_per_job) startup cost. Large ranks (e.g. rank 99 on a 45M-row dataset) can take 30+ min before producing their first chunk.
 
 ---
 
@@ -153,6 +177,68 @@ Parquet filenames are prefixed by rank in distributed mode: `rank042_batch_00000
 
 ---
 
+## Incremental / windowed runs
+
+For huge datasets (≥100M rows), you often don't want to commit to a single ~hours-long run. Embedding in increments lets you:
+
+- Verify the first window's output before spending on the next.
+- Recover from partial failures without reprocessing what succeeded.
+- Spread cost across days or budget periods.
+
+The pattern: one config per window, each with `source.offset` + `source.limit` defining the row range and `storage.s3_prefix` suffixed by the range so outputs don't collide.
+
+### Example: split a 1B-row dataset into 10 × 100M windows
+
+1. Start from a normal config that points at the full dataset (no offset/limit yet).
+2. Run the generator:
+
+   ```bash
+   python scripts/split_config_into_windows.py \
+     configs/embedder/your_config.yaml \
+     --window-size 100000000 --num-windows 10
+   ```
+
+3. This produces files next to the template:
+
+   ```
+   configs/embedder/your_config.rows-0000000000-0100000000.yaml
+   configs/embedder/your_config.rows-0100000000-0200000000.yaml
+   ...
+   configs/embedder/your_config.rows-0900000000-1000000000.yaml
+   ```
+
+   Each file has `source.offset` / `source.limit` set for its slice and `storage.s3_prefix` suffixed by `rows-<start>-<end>` so S3 outputs don't collide between windows.
+
+4. Run one increment at a time:
+
+   ```bash
+   vf embed-dist configs/embedder/your_config.rows-0000000000-0100000000.yaml \
+     --on-demand --num-jobs 10 --burst
+   vf analysis configs/embedder/your_config.rows-0000000000-0100000000.yaml
+   ./scripts/sky-killswitch.sh
+   # verify, then move on to the next window
+   ```
+
+### Each window's S3 layout
+
+```
+s3://bucket/<original-prefix>/rows-0000000000-0100000000/rank00_batch_00000000.parquet
+s3://bucket/<original-prefix>/rows-0000000000-0100000000/rank00__manifest.json
+s3://bucket/<original-prefix>/rows-0000000000-0100000000/rank01_...
+...
+s3://bucket/<original-prefix>/rows-0100000000-0200000000/rank00_...
+```
+
+Reads can union across windows with a glob: `s3://bucket/<prefix>/rows-*/*.parquet`.
+
+### Caveats
+
+- **Streaming skip cost**: window `[900M, 1B)` pays `ds.skip(900_000_000)` time before any worker can produce a chunk. For HF streaming, that's minutes-to-hours per worker. Expect late-window runs to have slow startup.
+- **Same-model reuse**: later windows re-download model weights per worker — SkyPilot workers are fresh VMs with fresh HF caches. The DLAMI ships with some common models preloaded but not ours. This is pool-creation overhead, not per-window overhead.
+- **Cost attribution**: each window produces its own `rank**__manifest.json`, so `vf analysis` per-window works exactly as before. Aggregating across windows requires reading all manifests or just running `vf analysis` on the whole parent prefix (TBD — not automated today).
+
+---
+
 ## `storage:`
 
 Where to write parquets + manifests.
@@ -239,3 +325,5 @@ Also set automatically by SkyPilot on each pool job:
 | Pipeline slower than predicted | Check `dtype` (should be `bfloat16` on GPU), check you're actually on GPU (look for `Loading ... on cuda` in logs) |
 | High-rank jobs take forever to start | HF streaming skip cost. Jobs with offset ≥ 10M can take 20+ min to begin producing chunks. |
 | Many small parquets | Increase `flush_threshold`. Each job must still have ≥`flush_threshold` rows (else one small parquet per job). |
+| Dataset too big for one run | Use [incremental / windowed runs](#incremental--windowed-runs). Generate per-window configs with `scripts/split_config_into_windows.py`. |
+| `--num-jobs` ignoring YAML `offset`/`limit` | Should be fixed (v0.1.0+). Look for `window=[X,Y)` in worker logs to confirm. If missing, you're on an older code revision — `uv sync` locally and rebuild the pool. |

@@ -15,17 +15,25 @@ vf embed-dist configs/embedder/arxiv_papers.yaml --num-jobs 20
 # Custom chunk size (smaller = more parallelism)
 vf embed-dist configs/embedder/arxiv_papers.yaml --chunk-size 50000
 
+# On-demand instead of spot (larger AWS quota, no preemption)
+vf embed-dist configs/embedder/arxiv_papers.yaml --on-demand
+
+# Burst: provision all workers in parallel instead of SkyPilot's slow one-at-a-time ramp
+vf embed-dist configs/embedder/arxiv_papers.yaml --burst
+
 # Named pool (for reuse across runs)
 vf embed-dist configs/embedder/arxiv_papers.yaml --pool-name my-gpu-pool
 ```
+
+For datasets too big to run in one shot (≥100M rows), use [incremental / windowed runs](../reference/config.md#incremental--windowed-runs) to split the embedding across separately-invoked increments.
 
 ## How it works
 
 1. **Plan** (runs locally): reads config, queries the source for dataset size
 2. **Pool**: creates a SkyPilot pool with autoscaling GPU workers (`min_workers: 0`, `max_workers: N`)
 3. **Submit**: submits N jobs to the pool via `sky jobs launch --num-jobs N`
-4. **Each job**: SkyPilot sets `$SKYPILOT_JOB_RANK` and `$SKYPILOT_NUM_JOBS`. The `vf embed` CLI uses these to auto-compute offset/limit and process its slice
-5. **Autoscale**: workers scale up to handle the queue, scale back to zero when done
+4. **Each job**: SkyPilot sets `$SKYPILOT_JOB_RANK` and `$SKYPILOT_NUM_JOBS`. The `vf embed` CLI uses these to compute offset/limit and process its slice. If the YAML sets `source.offset` / `source.limit`, the N ranks divide *that window* rather than the full dataset — this is how incremental runs work
+5. **Autoscale**: workers scale up to handle the queue, scale back to zero when done. With `--burst` all `max_workers` are provisioned at startup so you skip the autoscaler's slow ramp
 
 ## Custom resources
 

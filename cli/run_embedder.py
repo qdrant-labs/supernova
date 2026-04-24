@@ -167,16 +167,22 @@ def main(argv: list[str] | None = None):
 
         # build source to query total rows (source-agnostic)
         source_for_count = build_source(dict(config["source"]))
-        total_rows = source_for_count.get_total_rows()
+        dataset_total = source_for_count.get_total_rows()
 
-        # using the dataset size and num_jobs, compute offset and limit for this job
-        rows_per_job = math.ceil(total_rows / args.num_jobs)
-        offset = job_rank * rows_per_job
-        limit = min(rows_per_job, total_rows - offset)
+        # honor any YAML-level window: source.offset / source.limit bound the
+        # slice space that --num-jobs divides. no window => slice the full dataset.
+        window_offset = config["source"].get("offset") or 0
+        window_limit = config["source"].get("limit")
+        window_size = min(window_limit, dataset_total - window_offset) if window_limit else dataset_total - window_offset
+
+        # using the window size and num_jobs, compute offset and limit for this job
+        rows_per_job = math.ceil(window_size / args.num_jobs)
+        offset = window_offset + job_rank * rows_per_job
+        limit = min(rows_per_job, window_size - job_rank * rows_per_job)
 
         logging.getLogger("vectorforge").info(
-            "Job %d/%d: offset=%d limit=%d (total=%d)",
-            job_rank, args.num_jobs, offset, limit, total_rows,
+            "Job %d/%d: offset=%d limit=%d (window=[%d,%d), dataset_total=%d)",
+            job_rank, args.num_jobs, offset, limit, window_offset, window_offset + window_size, dataset_total,
         )
         config["source"]["offset"] = offset
         config["source"]["limit"] = limit

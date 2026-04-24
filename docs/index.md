@@ -44,4 +44,4 @@ The many parquet files on S3 are divided into N groups. Each group is assigned t
 | `vf load-dist` | Distribute loading across SkyPilot spot instances |
 | `vf analysis` | Analyze a completed embedding run (schema, throughput, cost) |
 
-See [config reference](reference/config.md) for every YAML knob and tuning advice, and [CLI reference](reference/cli.md) for all flags.
+See [config reference](reference/config.md) for every YAML knob and tuning advice, and [CLI reference](reference/cli.md) for all flags. For very large datasets (≥100M rows), see [incremental / windowed runs](reference/config.md#incremental--windowed-runs).
