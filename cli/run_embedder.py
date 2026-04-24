@@ -85,6 +85,8 @@ def build_engine(config: dict) -> EmbeddingEngine:
       - dense_embedder
       - sparse_embedder
       - multivector_embedder
+      - pooling (derive a dense column from the multivector output)
+
     dense + sparse with the same sentence_transformer model are auto-combined
     into a single hybrid forward pass. Multivector is always built separately.
     """
@@ -95,19 +97,43 @@ def build_engine(config: dict) -> EmbeddingEngine:
     if not dense_cfg and not sparse_cfg and not multivector_cfg:
         raise ValueError("Config must specify at least one of: dense_embedder, sparse_embedder, multivector_embedder")
 
+    # pooling lives inside multivector_embedder (it only applies in that context).
+    # pop it off so it isn't passed to the embedder constructor as an unknown kwarg.
+    pooling_cfg = dict(multivector_cfg.pop("pooling", None) or {})
+    if config.get("pooling"):
+        import warnings
+        warnings.warn(
+            "Top-level 'pooling:' key is ignored. Nest it under 'multivector_embedder:' instead.",
+            stacklevel=2,
+        )
+
     multivector = build_multivector_embedder(multivector_cfg) if multivector_cfg else None
+
+    pooling_type = pooling_cfg.get("type") if pooling_cfg else None
+    pooling_normalize = pooling_cfg.get("normalize", True) if pooling_cfg else True
 
     # detect hybrid case: same model for both --> optimize for a single forward pass
     if dense_cfg and sparse_cfg and _can_hybrid(dense_cfg, sparse_cfg):
         hybrid_cfg = dict(dense_cfg)
         hybrid_cfg.pop("type") # remove the type
         hybrid = SentenceTransformerHybridEmbedder(**hybrid_cfg)
-        return EmbeddingEngine(hybrid=hybrid, multivector=multivector)
+        return EmbeddingEngine(
+            hybrid=hybrid,
+            multivector=multivector,
+            multivector_pooling=pooling_type,
+            multivector_pooling_normalize=pooling_normalize,
+        )
 
     # build separately (two distinct models, no optimization is possible)
     dense = build_dense_embedder(dense_cfg) if dense_cfg else None
     sparse = build_sparse_embedder(sparse_cfg) if sparse_cfg else None
-    return EmbeddingEngine(dense=dense, sparse=sparse, multivector=multivector)
+    return EmbeddingEngine(
+        dense=dense,
+        sparse=sparse,
+        multivector=multivector,
+        multivector_pooling=pooling_type,
+        multivector_pooling_normalize=pooling_normalize,
+    )
 
 
 def build_storage(cfg: dict):
@@ -208,6 +234,12 @@ def main(argv: list[str] | None = None):
     dense_column = pipeline_cfg.get("dense_embedding_column", "dense_embedding") if engine.has_dense else None
     sparse_column = pipeline_cfg.get("sparse_embedding_column", "sparse_embedding") if engine.has_sparse else None
     multivector_column = pipeline_cfg.get("multivector_embedding_column", "multivector_embedding") if engine.has_multivector else None
+
+    # if pooling is configured (nested under multivector_embedder), its pooled_column_name
+    # overrides the default dense column
+    pooling_cfg = (config.get("multivector_embedder") or {}).get("pooling") or {}
+    if pooling_cfg and pooling_cfg.get("pooled_column_name"):
+        dense_column = pooling_cfg["pooled_column_name"]
 
     asyncio.run(
         run(

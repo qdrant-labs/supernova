@@ -2,31 +2,25 @@ source:
   type: huggingface
   dataset_name: HuggingFaceFW/finewiki
   split: train
-  config: "en"
+  config: "ban"
   text_template: "Title: {title}\nText: {text}"
-
-dense_embedder:
-  type: sentence_transformer
-  model: BAAI/bge-m3
-  trust_remote_code: true
-  batch_size: 64
-  dtype: bfloat16
-  max_tokens: 512
-  truncate: true
 
 multivector_embedder:
   type: bge_m3
   model: BAAI/bge-m3
-  trust_remote_code: true
   batch_size: 64
   dtype: bfloat16
-  max_tokens: 512
+  max_tokens: 768
   truncate: true
+  pooling:
+    type: mean
+    normalize: true
+    pooled_column_name: dense_embedding
 
 storage:
   type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: finewiki/embed-multilingual-e5-large/en
+  s3_prefix: finewiki/embed-bge-m3/ban
   output_dir: /tmp/vectorforge
 
 pipeline:

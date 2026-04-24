@@ -119,6 +119,7 @@ where N varies with input length. Stored in parquet as `list<list<float32>>`.
 | `batch_size` | `32` | Records per forward pass. |
 | `dtype` | `float32` | `float32` or `float16`. `bfloat16` is not supported by the FlagEmbedding path. |
 | `max_tokens` | model native (8192 for bge-m3) | Lower = faster. |
+| `truncate` | `false` | Same contract as the sentence_transformer embedder. `true` = chop long docs at `max_tokens`, emit one record. `false` = split long docs into `max_tokens`-sized pieces, emit one multivector record per piece. |
 | `device` | auto-detect | `cuda` / `mps` / `cpu`. |
 
 Output column name is controlled by `pipeline.multivector_embedding_column` (default `multivector_embedding`).
@@ -127,6 +128,63 @@ Multi-vector embedders run as an **additional** forward pass on top of any dense
 embedders. If you set all three (`dense_embedder`, `sparse_embedder`, `multivector_embedder`),
 the engine runs dense+sparse via the hybrid path (one pass) and multi-vector separately (a
 second pass). Multi-vector does not fuse with the hybrid path today.
+
+### Truncate vs. split behavior (multivector)
+
+Matches the dense sentence_transformer semantics:
+
+- **`truncate: false` (default)**: a 2000-token doc with `max_tokens=512` becomes 4 multivector records, each covering a distinct 512-token slice of the original. Useful when you want passage-level multivector coverage of long docs.
+- **`truncate: true`**: same doc becomes 1 multivector record covering only the first 512 tokens. Rest of the document is dropped. Faster, simpler indexing downstream.
+
+---
+
+### `multivector_embedder.pooling:` — derive a dense vector too
+
+You can opt in to pooling the multi-vector output down to a single dense vector — no extra
+forward pass. Useful when you want a standard dense column *and* multi-vector from the same
+model without paying for two separate embedders.
+
+Nested under `multivector_embedder` because it only applies in that context. Cannot be
+combined with a separate top-level `dense_embedder` (both would produce a dense column).
+
+```yaml
+multivector_embedder:
+  type: bge_m3
+  model: BAAI/bge-m3
+  batch_size: 64
+  dtype: bfloat16
+  max_tokens: 768
+  truncate: true
+  pooling:
+    type: mean                      # mean | max | cls | last
+    pooled_column_name: dense_embedding
+    normalize: true                 # L2-normalize after pooling. default: true.
+```
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `type` | *required* | `mean`, `max`, `cls` (first token), or `last` (last token). `mean` is the common retrieval choice. |
+| `pooled_column_name` | `dense_embedding` | Name of the dense column written to parquet. Overrides `pipeline.dense_embedding_column` when pooling is configured. |
+| `normalize` | `true` | L2-normalize each pooled vector so cosine similarity on the output is meaningful. |
+
+### Why pool?
+
+bge-m3 (and other models with a colbert-style head) produces N vectors per text. For some
+downstream systems you want a single vector per doc (standard dense retrieval, smaller index,
+simpler reranking). Rather than running a separate dense model, you can pool the multi-vector
+output and get a single vector "for free." Mean-pooling of L2-normalized token vectors followed
+by L2-normalization is the standard recipe and matches how most dense models are actually trained.
+
+### Resulting parquet
+
+When pooling is enabled, your parquet gets **both** columns:
+
+```
+multivector_embedding: list<list<float32>>     # N vectors per row
+dense_embedding: list<float32>                 # pooled, N → 1 vector
+```
+
+Downstream code reading only `dense_embedding` works unchanged.
 
 ---
 

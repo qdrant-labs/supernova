@@ -61,9 +61,16 @@ def write_batch(
         ]
         schema_fields.append(pa.field(sparse_column, SPARSE_EMBEDDING_TYPE))
 
-    # Multivector embedding column (N vectors of D floats per row, N varies)
+    # Multivector embedding column (N vectors of D floats per row, N varies).
+    # Embedders may keep .vectors as a 2D ndarray for efficient downstream math;
+    # pyarrow needs a list-of-1D-arrays here, so flatten per row.
     if multivector_column and records and records[0].multivector_embedding is not None:
-        data[multivector_column] = [r.multivector_embedding.vectors for r in records]
+        def _to_list_of_rows(v):
+            # accepts 2D ndarray or list[list[float]]; pyarrow wants per-vector objects
+            if hasattr(v, "tolist"):
+                return v.tolist()
+            return v
+        data[multivector_column] = [_to_list_of_rows(r.multivector_embedding.vectors) for r in records]
         schema_fields.append(pa.field(multivector_column, MULTIVECTOR_EMBEDDING_TYPE))
 
     table = pa.table(data, schema=pa.schema(schema_fields))

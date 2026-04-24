@@ -40,6 +40,7 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
         device: str | None = None,
         dtype: str = "float32",
         max_tokens: int | None = None,
+        truncate: bool = False,
     ):
         try:
             from FlagEmbedding import BGEM3FlagModel
@@ -65,6 +66,7 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
         # bge-m3 native max is 8192; allow user to clamp lower
         native_max = 8192
         self._max_tokens = min(native_max, max_tokens) if max_tokens else native_max
+        self._truncate = truncate
 
         from transformers import AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(model)
@@ -84,10 +86,21 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
         return self._max_tokens
 
     def split_text(self, text: str) -> list[str]:
-        # bge-m3 handles up to 8192 tokens natively; at that length we truncate.
-        # Splitting into multiple multivector records is unusual semantically, so
-        # we always emit one piece and let the encoder truncate.
-        return [text]
+        # truncate mode: emit one piece, let the encoder chop at max_tokens.
+        if self._truncate:
+            return [text]
+
+        # split mode: tokenize and break into max_tokens-sized pieces; each piece
+        # becomes its own multivector record. Useful when you want passage-level
+        # multivector coverage of long docs rather than truncating.
+        tokens = self._tokenizer.encode(text, add_special_tokens=False)
+        if len(tokens) <= self._max_tokens:
+            return [text]
+        pieces = []
+        for i in range(0, len(tokens), self._max_tokens):
+            chunk = tokens[i : i + self._max_tokens]
+            pieces.append(self._tokenizer.decode(chunk, skip_special_tokens=True))
+        return pieces
 
     def _encode(self, texts: list[str]) -> list[MultiVectorEmbedding]:
         output = self._model.encode(
@@ -98,11 +111,11 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
             return_sparse=False,
             return_colbert_vecs=True,
         )
-        # output["colbert_vecs"] is list[np.ndarray] with shape (num_tokens_i, 1024)
-        return [
-            MultiVectorEmbedding(vectors=vecs.tolist())
-            for vecs in output["colbert_vecs"]
-        ]
+        # output["colbert_vecs"] is list[np.ndarray] with shape (num_tokens_i, 1024).
+        # keep as ndarray -- pooling uses np.asarray (no-op on ndarray) and pyarrow
+        # writes ndarray directly to list<list<float32>>. avoids a wasteful
+        # ndarray -> list -> ndarray round-trip on the pooling path.
+        return [MultiVectorEmbedding(vectors=vecs) for vecs in output["colbert_vecs"]]
 
     async def embed(self, texts: list[str]) -> list[MultiVectorEmbedding]:
         return await asyncio.to_thread(self._encode, texts)

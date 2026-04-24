@@ -17,6 +17,11 @@ class MultiVectorEmbedding:
     Multi-vector representation: N vectors of D floats per text.
     N varies per input (typically one vector per token). Used by ColBERT,
     BAAI/bge-m3 multi-vector mode, etc.
+
+    `vectors` may be a nested Python list OR a numpy ndarray of shape (N, D).
+    Embedders that produce raw numpy arrays (e.g. bge_m3) pass them through
+    unconverted; pooling and pyarrow both accept either form. The type hint is
+    kept as list[list[float]] for interop / serialization clarity.
     """
     vectors: list[list[float]]
 

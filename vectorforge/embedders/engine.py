@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import numpy as np
+
 from vectorforge.embedders.dense.base import DenseEmbedder
 from vectorforge.embedders.sparse.base import SparseEmbedder
 from vectorforge.embedders.multivector.base import MultiVectorEmbedder
@@ -20,6 +22,29 @@ from vectorforge.embedders.hybrid import SentenceTransformerHybridEmbedder
 from vectorforge.models import MultiVectorEmbedding, SparseEmbedding
 
 logger = logging.getLogger(__name__)
+
+POOLING_TYPES = {"mean", "max", "cls", "last"}
+
+
+def pool_multivector(mv: MultiVectorEmbedding, pool_type: str, normalize: bool) -> list[float]:
+    arr = np.asarray(mv.vectors, dtype=np.float32)
+    if pool_type == "mean":
+        pooled = arr.mean(axis=0)
+    elif pool_type == "max":
+        pooled = arr.max(axis=0)
+    elif pool_type == "cls":
+        pooled = arr[0]
+    elif pool_type == "last":
+        pooled = arr[-1]
+    else:
+        raise ValueError(f"Unknown pooling type: {pool_type!r}. Choose from {sorted(POOLING_TYPES)}.")
+
+    if normalize:
+        norm = np.linalg.norm(pooled)
+        if norm > 0:
+            pooled = pooled / norm
+
+    return pooled.tolist()
 
 
 @dataclass
@@ -45,18 +70,33 @@ class EmbeddingEngine:
         sparse: SparseEmbedder | None = None,
         multivector: MultiVectorEmbedder | None = None,
         hybrid: SentenceTransformerHybridEmbedder | None = None,
+        multivector_pooling: str | None = None,
+        multivector_pooling_normalize: bool = True,
     ):
         if not dense and not sparse and not multivector and not hybrid:
             raise ValueError("Must provide at least one of: dense_embedder, sparse_embedder, multivector_embedder")
+
+        if multivector_pooling is not None:
+            if multivector_pooling not in POOLING_TYPES:
+                raise ValueError(f"Unknown pooling type: {multivector_pooling!r}. Choose from {sorted(POOLING_TYPES)}.")
+            if not multivector:
+                raise ValueError("pooling requires multivector_embedder to be set")
+            if dense or hybrid:
+                raise ValueError(
+                    "pooling produces a dense column from the multivector output; "
+                    "it conflicts with a separately-configured dense_embedder. Pick one."
+                )
 
         self.dense = dense
         self.sparse = sparse
         self.multivector = multivector
         self._hybrid = hybrid
+        self._multivector_pooling = multivector_pooling
+        self._multivector_pooling_normalize = multivector_pooling_normalize
 
     @property
     def has_dense(self) -> bool:
-        return self.dense is not None or self._hybrid is not None
+        return self.dense is not None or self._hybrid is not None or self._multivector_pooling is not None
 
     @property
     def has_sparse(self) -> bool:
@@ -87,6 +127,8 @@ class EmbeddingEngine:
             return self._hybrid.model_name
         if self.dense:
             return self.dense.model_name
+        if self._multivector_pooling and self.multivector:
+            return f"{self.multivector.model_name} ({self._multivector_pooling}-pooled)"
         return None
 
     @property
@@ -142,5 +184,11 @@ class EmbeddingEngine:
 
         if self.multivector:
             multivector_out = await self.multivector.embed(texts)
+            # derive a pooled dense vector from each multivector output, if configured
+            if self._multivector_pooling is not None:
+                dense_out = [
+                    pool_multivector(mv, self._multivector_pooling, self._multivector_pooling_normalize)
+                    for mv in multivector_out
+                ]
 
         return EmbedResult(dense=dense_out, sparse=sparse_out, multivector=multivector_out)
