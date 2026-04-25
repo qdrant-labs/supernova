@@ -6,6 +6,7 @@ import os
 import yaml
 
 from vectorforge.sources.huggingface import HuggingFaceSource
+from vectorforge.sources.huggingface_parquet import HuggingFaceParquetSource
 from vectorforge.embedders.dense.openai import OpenAIEmbedder
 from vectorforge.embedders.dense.sentence_transformer import SentenceTransformerDenseEmbedder
 from vectorforge.embedders.sparse.sentence_transformer import SentenceTransformerSparseEmbedder
@@ -21,6 +22,7 @@ from vectorforge.pipeline.runner import run
 # mapping from string identifiers in config → actual classes. Factored out to avoid circular imports and keep main() clean.
 SOURCE_REGISTRY = {
     "huggingface": HuggingFaceSource,
+    "huggingface_parquet": HuggingFaceParquetSource,
 }
 
 DENSE_EMBEDDER_REGISTRY = {
@@ -214,7 +216,11 @@ def main(argv: list[str] | None = None):
         config["source"]["limit"] = limit
 
         rank_width = max(2, len(str(args.num_jobs - 1)))
-        filename_prefix = f"rank{job_rank:0{rank_width}d}_"
+        shard_by_rank = bool(config.get("pipeline", {}).get("shard_by_rank"))
+        # shard_by_rank=true  -> "rank00/batch_*.parquet" (50 subdirs, ~N files each)
+        # shard_by_rank=false -> "rank00_batch_*.parquet" (flat, all in one dir)
+        separator = "/" if shard_by_rank else "_"
+        filename_prefix = f"rank{job_rank:0{rank_width}d}{separator}"
 
     elif args.offset is not None or args.limit is not None:
         # just use what was provided, no auto-computation
@@ -241,6 +247,10 @@ def main(argv: list[str] | None = None):
     if pooling_cfg and pooling_cfg.get("pooled_column_name"):
         dense_column = pooling_cfg["pooled_column_name"]
 
+    # expected_total_rows drives the progress bar's "X/Y chunks + pct" display.
+    # prefer the per-job limit (set by --num-jobs slicing); fall back to source-level limit.
+    expected_total_rows = config["source"].get("limit")
+
     asyncio.run(
         run(
             source=source,
@@ -256,6 +266,7 @@ def main(argv: list[str] | None = None):
             multivector_column=multivector_column,
             rendered_text_column=pipeline_cfg.get("rendered_text_column", "text"),
             filename_prefix=filename_prefix,
+            expected_total_rows=expected_total_rows,
         )
     )
 

@@ -1,16 +1,12 @@
 import duckdb
+import polars as pl
 
-S3_PATH = "s3://qdrant--vectorforge/stanford-oval--ccnews/baai_bge_large_en_v1.5/**/*.parquet"
+S3_PATH = "s3://qdrant--vectorforge/huggingface-tb--dclm-edu/embed-gte-multilingual-base/**/*.parquet"
 
 con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")
 
-con.sql(
-f"""
-    SELECT
-        count(*) AS total_records,
-    FROM '{S3_PATH}'
-""")
+con.sql(f"SELECT count(*) AS total_records FROM '{S3_PATH}'")
 con.sql(f"DESCRIBE SELECT * FROM '{S3_PATH}'")
 
 # query that counts length of 'abstract' text field
@@ -25,12 +21,14 @@ f"""
     LIMIT 10
 """)
 
+
+S3_PATH="s3://qdrant--vectorforge/huggingface-tb--dclm-edu/embed-gte-multilingual-base/rank25/batch_00000000.parquet"
 # select fisrt 5 records with text
+# convert to polars
 con.sql(
 f"""
-    SELECT
-        text
+    SELECT text, language, language_score
     FROM '{S3_PATH}'
     WHERE text IS NOT NULL
     LIMIT 5
-""").df()
+""")

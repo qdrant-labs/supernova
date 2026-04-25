@@ -40,7 +40,7 @@ Where to read rows from.
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `type` | *required* | Currently only `huggingface` is supported. |
+| `type` | *required* | `huggingface` (uses HF's streaming dataset API) or `huggingface_parquet` (file-level sharded reader, see below). |
 | `dataset_name` | *required* | HF hub ID, e.g. `corag/kilt-corpus`. |
 | `config` | `None` | HF dataset config name (for multi-config datasets). |
 | `split` | `train` | HF split. |
@@ -49,6 +49,7 @@ Where to read rows from.
 | `exclude_columns` | `[]` | Columns to drop from the output parquet. |
 | `offset` | `None` | Skip N rows. Defines the start of a *window* inside the dataset (see below). |
 | `limit` | `None` | Embed at most N rows. Defines the window size. |
+| `total_rows_override` | `None` | Manual total-row count to use instead of HF's auto-detected one. Required for very large datasets (≥5GB) where HF only converts a sample to parquet — `datasets-server.huggingface.co/size` will return the *partial* count (e.g., 1.1M for dclm-edu's 1B-row dataset), which makes window slicing wrong. Get the real total from the dataset's HF page ("Estimated number of rows") and paste it here. |
 
 ### How `offset` / `limit` interact with `--num-jobs`
 
@@ -75,6 +76,26 @@ which makes the slicing auditable at a glance.
 ### Streaming caveat
 
 For large datasets, `ds.skip(offset)` iterates one row at a time. Rank N pays O(N × rows_per_job) startup cost. Large ranks (e.g. rank 99 on a 45M-row dataset) can take 30+ min before producing their first chunk.
+
+For *very* large datasets (≥1B rows), HF's streaming `.skip()` is also outright **broken** — it silently no-ops and yields from offset 0 once the requested skip exceeds some internal threshold (~1.5M rows confirmed for `HuggingFaceTB/dclm-edu`). Use `type: huggingface_parquet` instead.
+
+### `huggingface` vs `huggingface_parquet`
+
+For most datasets `type: huggingface` works fine. Use `type: huggingface_parquet` when:
+
+- The dataset is **huge** (≥5GB / millions of rows) AND stored as native parquet on the Hub (most modern large datasets).
+- HF's `IterableDataset.skip()` is unreliable on it. Symptom: every distributed rank embeds the same data.
+
+`huggingface_parquet` lists the dataset's parquet files on the Hub, reads each file's parquet footer for row counts, and maps `(offset, limit)` to a contiguous file range — yielding rows by reading those files directly. Init cost: one HF list-repo call + parallel footer reads (~3-10s for ~1000 files). Per-rank streaming cost: O(1) jump to the right file, then sequential read.
+
+Extra keys available for `huggingface_parquet` only:
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `path_filter` | auto-match by `split` | Substring filter on parquet paths. Useful for repos that mix splits or configs at different paths. |
+| `metadata_workers` | `32` | Parallelism for the per-file footer fetches at init. |
+
+If unsure: start with `huggingface`. If you see distributed ranks producing identical output (a quick `LIMIT 1` query against rank0 vs another rank's parquet shows this), switch to `huggingface_parquet`.
 
 ---
 
@@ -202,6 +223,7 @@ How the in-process pipeline is shaped. These are the main memory/throughput tuni
 | `sparse_embedding_column` | `sparse_embedding` | Output column name for sparse vectors. |
 | `multivector_embedding_column` | `multivector_embedding` | Output column name for multi-vector embeddings. |
 | `rendered_text_column` | `text` | Column name for the template-rendered string that gets sent to the embedder. Default shadows the source's raw `text` field (if it has one). Set to something else (e.g. `rendered_text`) to keep both — the raw field passes through under its original name. |
+| `shard_by_rank` | `false` | Put each rank's output in its own subdir instead of a flat layout. Default: `rank42_batch_00000000.parquet`. With `true`: `rank42/batch_00000000.parquet`. Useful when producing thousands of parquets — avoids one enormous flat S3 directory. |
 
 ### Memory math
 
@@ -233,6 +255,8 @@ With `num_jobs=N` and `flush_threshold=F`:
 For 1B rows, `num_jobs=50`, `flush_threshold=1_000_000`: 50 workers × 20 parquets each = 1,000 files of 1M rows. Each job's slice must be **≥ flush_threshold** or you get one undersized parquet per job (the drain at end-of-pipeline flushes whatever remained).
 
 Parquet filenames are prefixed by rank in distributed mode: `rank042_batch_00000000.parquet`. Manifest is `rank042__manifest.json`. Single-job runs drop the prefix.
+
+With `shard_by_rank: true`, each rank writes into its own subdir: `rank042/batch_00000000.parquet` + `rank042/_manifest.json`. Recommended when you'd otherwise have thousands of parquets in a single S3 prefix — 50 ranks × 130 files each reads much nicer than 6500 siblings.
 
 ### Rendered text vs. raw source text
 

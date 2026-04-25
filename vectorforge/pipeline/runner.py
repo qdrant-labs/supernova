@@ -31,6 +31,7 @@ async def run(
     multivector_column: str | None = None,
     rendered_text_column: str = "text",
     filename_prefix: str = "",
+    expected_total_rows: int | None = None,
 ):
     logger.info(
         "Starting pipeline: source=%s engine=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
@@ -59,7 +60,10 @@ async def run(
         logger.info("Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path)
         batch_counter += 1
         total_records += len(records)
-        await storage.upload_file(local_path)
+        # preserve any subdir structure from filename_prefix (e.g. "rank00/") so
+        # storage backends can replicate the layout remotely.
+        remote_subpath = os.path.relpath(local_path, output_dir)
+        await storage.upload_file(local_path, remote_subpath=remote_subpath)
         os.remove(local_path)
 
     buffer = ResultBuffer(flush_fn=flush, flush_threshold=flush_threshold)
@@ -73,7 +77,10 @@ async def run(
             await work_queue.put(None)
 
     # drain: pulls from result queue into buffer until all workers are done
-    progress = tqdm(unit=" chunks", desc="Embedding")
+    expected_chunks = None
+    if expected_total_rows is not None and chunk_size > 0:
+        expected_chunks = (expected_total_rows + chunk_size - 1) // chunk_size
+    progress = tqdm(unit=" chunks", desc="Embedding", total=expected_chunks)
     embedded_records = 0
 
     async def drain_results():
@@ -87,7 +94,10 @@ async def run(
             await buffer.push(result)
             embedded_records += len(result.records)
             progress.update(1)
-            progress.set_postfix(records=f"{embedded_records:,}")
+            postfix = {"records": f"{embedded_records:,}"}
+            if expected_total_rows:
+                postfix["pct"] = f"{100 * embedded_records / expected_total_rows:.1f}%"
+            progress.set_postfix(**postfix)
         await buffer.drain()
         progress.close()
 

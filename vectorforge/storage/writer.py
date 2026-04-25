@@ -35,9 +35,10 @@ def write_batch(
     rendered_text_column: str = "text",
     filename_prefix: str = "",
 ) -> str:
-    os.makedirs(output_dir, exist_ok=True)
     filename = f"{filename_prefix}batch_{batch_id:08d}.parquet"
     path = os.path.join(output_dir, filename)
+    # filename_prefix may include '/' (shard_by_rank); ensure the subdir exists.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
     # Fixed columns
     data = {

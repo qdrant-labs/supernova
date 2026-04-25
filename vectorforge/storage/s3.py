@@ -30,9 +30,9 @@ class S3Backend(StorageBackend):
                 await client.create_bucket(Bucket=self.bucket)
         self._ready = True
 
-    async def upload_file(self, local_path: str) -> None:
-        filename = local_path.split("/")[-1]
-        key = f"{self.prefix}/{filename}"
+    async def upload_file(self, local_path: str, remote_subpath: str | None = None) -> None:
+        remote = remote_subpath or local_path.split("/")[-1]
+        key = f"{self.prefix}/{remote}"
 
         session = aiobotocore.session.get_session()
         async with session.create_client("s3") as client:

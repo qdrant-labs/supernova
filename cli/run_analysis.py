@@ -161,15 +161,17 @@ def main(argv: list[str] | None = None):
     con = duckdb.connect()
     if destination.startswith("s3://"):
         _configure_duckdb_for_s3(con)
-    glob = f"{destination}/**/*.parquet" # account for possible subdirs (when we have multiple configs writing to the same destination)
+    # pass both globs so the same script works for flat layouts (all parquets at the
+    # top of the prefix) and sharded layouts (rank00/batch_*.parquet).
+    globs = f"['{destination}/*.parquet', '{destination}/**/*.parquet']"
 
     print("\n=== Schema ===")
-    schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{glob}')").fetchall()
+    schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet({globs})").fetchall()
     for col in schema:
         name, dtype = col[0], col[1]
         print(f"  {name:30s} {dtype}")
 
-    row_count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{glob}')").fetchone()[0]
+    row_count = con.execute(f"SELECT COUNT(*) FROM read_parquet({globs})").fetchone()[0]
     print(f"\nTotal rows: {row_count:,}")
     print(f"Parquet files: {len(parquet_keys)}")
 

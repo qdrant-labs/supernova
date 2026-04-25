@@ -5,8 +5,14 @@ class StorageBackend(ABC):
     """Abstract base for all storage backends."""
 
     @abstractmethod
-    async def upload_file(self, local_path: str) -> None:
-        """Upload a local file (parquet batch)."""
+    async def upload_file(self, local_path: str, remote_subpath: str | None = None) -> None:
+        """
+        Upload a local file (parquet batch).
+
+        If `remote_subpath` is provided, it is used as the destination path under the
+        backend's base location (preserves directory structure). Defaults to the file's
+        basename for backward compatibility.
+        """
         pass
 
     @abstractmethod

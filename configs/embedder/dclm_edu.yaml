@@ -1,8 +1,9 @@
 source:
-  type: huggingface
-  dataset_name: HuggingfaceTB/dclm-edu
+  type: huggingface_parquet         # file-level sharded; bypasses HF streaming's broken .skip() for huge datasets
+  dataset_name: HuggingFaceTB/dclm-edu
   split: train
-  text_template: "Title: {title}\n\nContents: {contents}"
+  text_template: '{text}'
+  total_rows_override: 1000856429   # skip the metadata sweep at total-rows query time; per-file counts still read for slicing
 
 dense_embedder:
   type: sentence_transformer
@@ -16,6 +17,8 @@ dense_embedder:
 pipeline:
   chunk_size: 10000 # chunk size for processing the dataset in batches
   num_workers: 2
+  shard_by_rank: true
+  rendered_text_column: rendered_text
 
 storage:
   type: s3

@@ -29,3 +29,4 @@ pipeline:
   max_text_length: 8192
   flush_threshold: 1000
   rendered_text_column: rendered_text
+  shard_by_rank: true

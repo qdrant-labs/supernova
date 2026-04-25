@@ -37,6 +37,7 @@ class HuggingFaceSource(DatasetSource):
         exclude_columns: list[str] | None = None,
         offset: int | None = None,
         limit: int | None = None,
+        total_rows_override: int | None = None,
     ):
         self.dataset_name = dataset_name
         self.config = config
@@ -46,6 +47,7 @@ class HuggingFaceSource(DatasetSource):
         self.exclude_columns = set(exclude_columns or [])
         self._offset = offset
         self._limit = limit
+        self._total_rows_override = total_rows_override
         self._extract_text = _build_text_extractor(text_field, text_template)
         self._dataset = load_dataset(
             dataset_name, config, streaming=True, split=split
@@ -56,6 +58,12 @@ class HuggingFaceSource(DatasetSource):
         return self.dataset_name
 
     def get_total_rows(self) -> int:
+        # explicit override wins. Use this for huge datasets where HF only
+        # converts a sample to parquet (e.g. dclm-edu shows num_rows=1.1M but is
+        # really ~1B); the datasets-server / builder.info will both lie.
+        if self._total_rows_override is not None:
+            return self._total_rows_override
+
         from datasets import load_dataset_builder
 
         builder = load_dataset_builder(self.dataset_name, self.config)
@@ -117,7 +125,9 @@ class HuggingFaceSource(DatasetSource):
         yield from ds
 
     def extract_text(self, row: dict) -> str:
-        """Extract text from a row using text_template or text_field."""
+        """
+        Extract text from a row using text_template or text_field.
+        """
         return self._extract_text(row)
 
     def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
