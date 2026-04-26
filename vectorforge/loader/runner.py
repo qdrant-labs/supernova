@@ -13,9 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def _slice_batch(records: list[dict], batch_size: int) -> list[list[dict]]:
-    """
-    Slice a large prefetched chunk into upsert-sized batches.
-    """
+    """Slice a large prefetched chunk into upsert-sized batches."""
     return [records[i:i + batch_size] for i in range(0, len(records), batch_size)]
 
 
@@ -30,18 +28,20 @@ async def run_loader(
     """
     Stream pre-embedded parquet data into a vector store.
 
-    Reads large chunks (prefetch_size) from DuckDB to minimize remote I/O,
-    then slices into upsert-sized batches and writes them concurrently.
+    Producer reads chunks from DuckDB and pushes upsert-sized batches into a
+    bounded queue. ``concurrency`` worker tasks consume the queue and upsert
+    in parallel. The bounded queue provides backpressure -- the producer
+    blocks once the queue is full -- so memory is capped to roughly one
+    in-flight chunk plus (queue capacity + concurrency) batches.
 
-    When manage_indexing=False, skips collection creation and indexing lifecycle
-    (for distributed workers where the master handles this).
+    When manage_indexing=False, skips collection creation and indexing
+    lifecycle (for distributed workers where the master handles this).
     """
     if prefetch_size is None:
         prefetch_size = batch_size * 10
 
     logger.info(f"Loading into {store.name} (prefetch={prefetch_size:,}, batch={batch_size:,})")
 
-    # Get dimensions and total count for setup
     dimensions = reader.get_dimensions()
     total = reader.get_total_count()
     logger.info(f"Found {total:,} records (dims={dimensions})")
@@ -51,41 +51,40 @@ async def run_loader(
         logger.info("Deferring indexing for bulk load...")
         await store.defer_indexing()
 
-    sem = asyncio.Semaphore(concurrency)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=concurrency * 2)
     loaded = 0
-    t0 = time.perf_counter()
     errors = 0
-
-    async def _upsert(batch: list[dict]):
-        nonlocal loaded, errors
-        async with sem:
-            try:
-                await store.upsert_batch(batch)
-                loaded += len(batch)
-            except Exception:
-                errors += len(batch)
-                logger.exception(f"Failed to upsert batch of {len(batch)} points")
-
-    tasks: list[asyncio.Task] = []
     pbar = tqdm(total=total, desc="Loading", unit=" pts")
+    t0 = time.perf_counter()
+
+    async def worker():
+        nonlocal loaded, errors
+        while True:
+            batch = await queue.get()
+            try:
+                if batch is None:
+                    return
+                try:
+                    await store.upsert_batch(batch)
+                    loaded += len(batch)
+                except Exception:
+                    errors += len(batch)
+                    logger.exception(f"Failed to upsert batch of {len(batch)} points")
+                finally:
+                    pbar.update(len(batch))
+            finally:
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
 
     try:
-        # read large chunks from duckdb, slice into upsert batches
         for chunk in reader.read_batches(prefetch_size):
             for batch in _slice_batch(chunk, batch_size):
-                task = asyncio.create_task(_upsert(batch))
-                task.add_done_callback(lambda _, b=batch: pbar.update(len(b)))
-                tasks.append(task)
-
-            # Drain completed tasks between chunks to bound memory
-            done = [t for t in tasks if t.done()]
-            for t in done:
-                tasks.remove(t)
-                t.result()
-
-        # wait for remaining tasks
-        if tasks:
-            await asyncio.gather(*tasks)
+                await queue.put(batch)  # backpressure: blocks when queue is full
+        # tell workers to drain and exit
+        for _ in range(concurrency):
+            await queue.put(None)
+        await asyncio.gather(*workers)
     finally:
         pbar.close()
         reader.close()

@@ -1,3 +1,13 @@
+dispatch:
+  num_shards: 10
+  run_name: ccnews-bge-large
+
+resources:
+  cpus: 2
+  memory: 16
+  cloud: aws
+  use_spot: true
+
 vectors:
   dense:
     type: dense
@@ -22,5 +32,5 @@ vectorstore:
 
 loader:
   batch_size: 1000
-  prefetch_size: 100000
+  prefetch_size: 25000   # ~9 KiB/row × 25k = ~225 MiB chunk; safe on 8 GiB workers
   concurrency: 8

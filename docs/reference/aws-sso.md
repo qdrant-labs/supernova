@@ -47,7 +47,7 @@ After that, the workflow is:
 ```bash
 aws sso login --profile sandbox
 eval "$(aws configure export-credentials --profile sandbox --format env)"
-vf load configs/loader/cohere200M.yaml
+vf load configs/loader/ccnews_bge_large.yaml
 ```
 
 ## 3. SkyPilot Usage

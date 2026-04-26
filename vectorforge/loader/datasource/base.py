@@ -4,7 +4,7 @@ import json
 import logging
 
 from abc import ABC, abstractmethod
-from typing import Generator
+from typing import Generator, Iterable
 
 import duckdb
 
@@ -32,6 +32,8 @@ class DataReader(ABC):
         id_column: str = "row_id",
         vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
+        duckdb_memory_limit: str = "2GB",
+        duckdb_threads: int = 2,
     ):
         self._conn = None
         self.id_column = id_column
@@ -39,6 +41,8 @@ class DataReader(ABC):
             "dense": {"type": "dense", "column": "dense_embedding"},
         }
         self.payload_fields = payload_fields or {}
+        self.duckdb_memory_limit = duckdb_memory_limit
+        self.duckdb_threads = duckdb_threads
 
         for name, spec in self.vectors.items():
             vtype = spec.get("type")
@@ -56,13 +60,30 @@ class DataReader(ABC):
 
     @property
     def source_sql(self) -> str:
-        """DuckDB FROM-clause expression. Override for non-glob sources."""
+        """DuckDB FROM-clause expression spanning all parquet files. Used for
+        metadata queries (count, dimensions) where the parallel scan is cheap.
+        """
         return f"'{self.glob_path}'"
+
+    def _iter_sources(self) -> Iterable[str]:
+        """Yield FROM-clause expressions to iterate during a streaming read.
+
+        Default: yield ``source_sql`` once (single combined scan). Subclasses
+        with an explicit file list should override and yield one expression per
+        file -- this serializes per-file scans so DuckDB releases httpfs /
+        decode buffers between files instead of buffering all of them.
+        """
+        yield self.source_sql
 
     def _get_connection(self) -> duckdb.DuckDBPyConnection:
         if self._conn is None:
             self._conn = duckdb.connect()
             self._configure_connection()
+            # DuckDB defaults to ~80% of system RAM (and ignores it for httpfs
+            # buffers anyway). Both threads and memory_limit are capped low
+            # because the planner parallelizes parquet scans aggressively.
+            self._conn.execute(f"SET memory_limit = '{self.duckdb_memory_limit}';")
+            self._conn.execute(f"SET threads = {self.duckdb_threads};")
         return self._conn
 
     def _configure_connection(self) -> None:
@@ -126,53 +147,53 @@ class DataReader(ABC):
         """
         conn = self._get_connection()
         select_sql, vector_order, payload_keys = self._build_select()
-
-        logger.info(f"Reading batches from {self.source_sql}")
-        result = conn.execute(f"SELECT {select_sql} FROM {self.source_sql}")
-
-        logger.info(f"Starting fetchmany with batch size {batch_size}")
         n_vectors = len(vector_order)
-        while True:
-            batch = result.fetchmany(batch_size)
-            if not batch:
-                break
 
-            records = []
-            for row in batch:
-                row_id = row[0]
-                vector_values = row[1:1 + n_vectors]
-                payload_values = row[1 + n_vectors:]
+        for source in self._iter_sources():
+            logger.info(f"Reading batches from {source}")
+            conn.execute(f"SELECT {select_sql} FROM {source}")
 
-                vectors: dict[str, object] = {}
-                for (name, vtype), val in zip(vector_order, vector_values):
-                    if vtype == "sparse":
-                        # DuckDB returns parquet structs as dicts
-                        vectors[name] = {
-                            "indices": list(val["indices"]),
-                            "values": list(val["values"]),
-                        }
-                    else:
-                        vectors[name] = val
+            while True:
+                rows = conn.fetchmany(batch_size)
+                if not rows:
+                    break
 
-                payload: dict = {}
-                for key, val in zip(payload_keys, payload_values):
-                    # Unpack JSON-string columns (e.g. legacy "payload" blob)
-                    if isinstance(val, str):
-                        try:
-                            parsed = json.loads(val)
-                            if isinstance(parsed, dict):
-                                payload.update(parsed)
-                                continue
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                    payload[key] = val
+                records = []
+                for row in rows:
+                    row_id = row[0]
+                    vector_values = row[1:1 + n_vectors]
+                    payload_values = row[1 + n_vectors:]
 
-                records.append({
-                    "id": row_id,
-                    "vectors": vectors,
-                    "payload": payload,
-                })
-            yield records
+                    vectors: dict[str, object] = {}
+                    for (name, vtype), val in zip(vector_order, vector_values):
+                        if vtype == "sparse":
+                            # DuckDB returns parquet structs as dicts
+                            vectors[name] = {
+                                "indices": list(val["indices"]),
+                                "values": list(val["values"]),
+                            }
+                        else:
+                            vectors[name] = val
+
+                    payload: dict = {}
+                    for key, val in zip(payload_keys, payload_values):
+                        # Unpack JSON-string columns (e.g. legacy "payload" blob)
+                        if isinstance(val, str):
+                            try:
+                                parsed = json.loads(val)
+                                if isinstance(parsed, dict):
+                                    payload.update(parsed)
+                                    continue
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        payload[key] = val
+
+                    records.append({
+                        "id": row_id,
+                        "vectors": vectors,
+                        "payload": payload,
+                    })
+                yield records
 
     def close(self):
         if self._conn is not None:

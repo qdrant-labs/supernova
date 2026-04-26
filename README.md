@@ -23,10 +23,10 @@ vf embed configs/embedder/nick007x_arxiv_papers.yaml
 vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml
 
 # 3. Load into Qdrant
-vf load configs/loader/cohere200M.yaml
+vf load configs/loader/ccnews_bge_large.yaml
 
 # 4. Distributed loading (SkyPilot)
-vf load-dist configs/dispatch/cohere200M.yaml
+vf load-dist configs/loader/ccnews_bge_large.yaml
 ```
 
 ## Project structure
@@ -47,9 +47,8 @@ vectorforge/
     runner.py         # Loading orchestration
 
 configs/
-  embedder/           # Embedding pipeline configs
-  loader/             # Loading pipeline configs
-  dispatch/           # Distributed loading configs
+  embedder/           # Embedding pipeline configs (single + distributed)
+  loader/             # Loading pipeline configs (single + distributed)
 
 scripts/
   run_embedder.py           # vectorforge CLI
@@ -186,20 +185,24 @@ LIMIT 10;
 ### Configuration
 
 ```yaml
+vectors:                            # one entry per Qdrant vector name
+  dense:
+    type: dense                     # dense | sparse | multivector
+    column: dense_embedding         # parquet column to read
+    distance: cosine                # cosine | dot | euclid | manhattan
+
 datasource:
   type: s3                          # s3 or huggingface
   s3_bucket: qdrant--vectorforge
-  s3_prefix: cohere--wikipedia/embed-multilingual-v3
-  columns:                          # optional: override parquet column names
-    id: _id                         # default: row_id
-    embedding: dense_embedding      # default: dense_embedding
+  s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
+  id_column: row_id                 # default
   payload_fields:                   # what goes into the vector store payload
     text: text                      # payload key: parquet column name
-    source: source
+    title: title
 
 vectorstore:
   type: qdrant
-  collection_name: cohere-wikipedia
+  collection_name: ccnews-bge-large
   url: ${QDRANT_URL}                # env var substitution
   api_key: ${QDRANT_API_KEY}
 
@@ -212,7 +215,7 @@ loader:
 ### Running
 
 ```bash
-vf load configs/loader/cohere200M.yaml
+vf load configs/loader/ccnews_bge_large.yaml
 ```
 
 ### Datasources
@@ -240,9 +243,9 @@ vf load configs/loader/cohere200M.yaml
 For terabyte-scale datasets, fan out across SkyPilot spot instances:
 
 ```bash
-vf load-dist configs/dispatch/cohere200M.yaml
-vf load-dist configs/dispatch/cohere200M.yaml --dry-run
-vf load-dist configs/dispatch/cohere200M.yaml --num-shards 20
+vf load-dist configs/loader/ccnews_bge_large.yaml
+vf load-dist configs/loader/ccnews_bge_large.yaml --dry-run
+vf load-dist configs/loader/ccnews_bge_large.yaml --num-shards 20
 ```
 
 ---

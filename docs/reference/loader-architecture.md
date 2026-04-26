@@ -65,22 +65,27 @@ Base class for all parquet data sources. Handles DuckDB connection, SQL generati
 
 ### Key concepts
 
-**`columns`** — maps logical names to parquet column names:
+**`id_column`** — parquet column for the point id. Defaults to `row_id`.
 
-```python
-columns = {
-    "id": "row_id",        # default
-    "embedding": "embedding" # default
-}
-```
-
-Override when your parquet has different column names:
+**`vectors`** (top-level config) — declares one or more named vectors. Passed to both the reader (which knows the parquet column to read) and the vector store (which knows how to configure the collection):
 
 ```yaml
-columns:
-  id: _id
-  embedding: emb
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine            # cosine | dot | euclid | manhattan
+  sparse:
+    type: sparse
+    column: sparse_embedding
+  colbert:
+    type: multivector
+    column: multivector_embedding
+    distance: cosine
+    comparator: max_sim
 ```
+
+Each entry's key becomes the vector name in Qdrant. Records emitted by `read_batches` carry `vectors: {name: value}` rather than a single `embedding`.
 
 **`payload_fields`** — controls what goes into the vector store payload:
 
@@ -88,10 +93,10 @@ columns:
 payload_fields:
   abstract: text      # parquet "text" col → stored as "abstract"
   source: source      # parquet "source" col → stored as "source"
-  metadata: payload   # JSON string columns are auto-unpacked
+  metadata: payload   # JSON string columns that parse to a dict are unpacked
 ```
 
-Default: `{text: text}`.
+Default: `{}` (no payload).
 
 **`source_sql`** — the DuckDB FROM clause. Defaults to `'<glob_path>'` but S3DataReader overrides it with `read_parquet([...])` when `file_list` is set. This is how distributed workers read only their assigned files.
 
@@ -114,7 +119,7 @@ Default: `{text: text}`.
 
 | Method | Purpose | Called by |
 |--------|---------|----------|
-| `ensure_collection(dim)` | Create collection if it doesn't exist | Master or single-machine loader |
+| `ensure_collection(dimensions)` | Create collection if it doesn't exist (dimensions: dict[name, int] for dense+multivector) | Master or single-machine loader |
 | `defer_indexing()` | Set indexing_threshold=0 for fast bulk writes | Master or single-machine loader |
 | `upsert_batch(points)` | Insert points into collection | Every worker |
 | `enable_indexing()` | Restore threshold, trigger HNSW build | Master or single-machine loader |
@@ -163,9 +168,17 @@ concurrency=8          →  8 upserts running in parallel
 
 ## Configuration Reference
 
-### Loader config (`vf load`)
+`vf load` and `vf load-dist` consume the **same** config file from `configs/loader/`. The `dispatch:` and `resources:` blocks are read by `vf load-dist` only and ignored by the single-machine loader.
 
 ```yaml
+vectors:                      # required, at least one entry
+  dense:
+    type: dense               # dense | sparse | multivector
+    column: dense_embedding
+    distance: cosine          # dense/multivector: cosine | dot | euclid | manhattan
+    # multivector only:
+    # comparator: max_sim
+
 datasource:
   type: s3                    # s3 | huggingface
   # S3 options
@@ -175,12 +188,10 @@ datasource:
   repo_id: org/dataset
   subdir: en                  # optional subfolder
   # Common options
-  columns:                    # optional column name overrides
-    id: row_id                # default
-    embedding: embedding      # default
+  id_column: row_id           # default
   payload_fields:             # optional payload composition
-    text: text                # default
-  file_list:                  # optional explicit file list (used by dispatch)
+    text: text
+  file_list:                  # optional explicit file list (used by dispatch workers)
     - s3://bucket/file1.parquet
     - s3://bucket/file2.parquet
 
@@ -194,13 +205,8 @@ loader:
   batch_size: 1000            # default
   prefetch_size: 10000        # default: batch_size * 10
   concurrency: 8              # default
-```
 
-### Dispatch config (`vf load-dist`)
-
-Same as loader config, plus:
-
-```yaml
+# Optional, only consumed by `vf load-dist`:
 dispatch:
   num_shards: 10              # number of parallel SkyPilot workers
   run_name: my-run            # optional, defaults to config filename

@@ -6,13 +6,28 @@ vectorforge's loading pipeline streams pre-embedded parquet files from S3 or Hug
 
 ## Configuration
 
-Loader configs live in `configs/loader/` and have three sections:
+Loader configs live in `configs/loader/`. The same file is consumed by both `vf load` (single machine) and `vf load-dist` (distributed via SkyPilot); the distributed dispatcher reads the optional `dispatch:` and `resources:` blocks and the single-machine loader ignores them.
 
 ```yaml
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+  sparse:
+    type: sparse
+    column: sparse_embedding
+  colbert:
+    type: multivector
+    column: multivector_embedding
+    distance: cosine
+    comparator: max_sim
+
 datasource:
   type: s3                          # s3 or huggingface
   s3_bucket: my-bucket
   s3_prefix: dataset/model
+  id_column: row_id                 # default
   payload_fields:                   # what ends up in the vector store payload
     text: text                      # payload key: parquet column name
     source: source
@@ -45,7 +60,7 @@ Streams parquet files via DuckDB's httpfs extension. No local download.
 datasource:
   type: s3
   s3_bucket: my-bucket
-  s3_prefix: cohere--wikipedia/embed-multilingual-v3
+  s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
 ```
 
 Reads all parquet files matching `s3://bucket/prefix/**/*.parquet`.
@@ -61,21 +76,17 @@ datasource:
   subdir: en
 ```
 
-## Column mapping
+## Vectors
 
-Override default column names:
+The top-level `vectors:` block declares one or more named vectors. Each key becomes the vector name in Qdrant; each entry needs `type` (`dense`, `sparse`, or `multivector`) and `column` (the parquet column).
 
-```yaml
-datasource:
-  columns:
-    id: _id                         # parquet column "_id" is the point ID
-    embedding: dense_embedding      # parquet column for the vector
-```
+| Type | Distance | Other |
+|------|----------|-------|
+| `dense` | `cosine` (default), `dot`, `euclid`, `manhattan` | -- |
+| `sparse` | -- | -- |
+| `multivector` | same as dense | `comparator: max_sim` (default) |
 
-| Logical name | Default | Used for |
-|-------------|---------|----------|
-| `id` | `row_id` | Point ID in the vector store |
-| `embedding` | `embedding` | The vector |
+A collection with multiple named vectors lets you do hybrid retrieval (e.g. dense + sparse + late-interaction multivector).
 
 ## Payload composition
 
@@ -89,7 +100,7 @@ payload_fields:
   url: url
 ```
 
-JSON string columns are automatically unpacked. Default when omitted: `{text: text}`.
+JSON-string columns that parse to a dict are automatically unpacked into the payload.
 
 ## How it works
 

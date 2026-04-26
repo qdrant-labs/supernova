@@ -3,19 +3,19 @@
 For terabyte-scale datasets, distribute loading across SkyPilot spot instances using pools.
 
 ```bash
-vf load-dist configs/dispatch/cohere200M.yaml
-vf load-dist configs/dispatch/cohere200M.yaml --dry-run
-vf load-dist configs/dispatch/cohere200M.yaml --num-shards 20
+vf load-dist configs/loader/ccnews_bge_large.yaml
+vf load-dist configs/loader/ccnews_bge_large.yaml --dry-run
+vf load-dist configs/loader/ccnews_bge_large.yaml --num-shards 20
 ```
 
 ## Configuration
 
-Dispatch configs extend the standard loader config with `dispatch` and `resources` sections:
+Distributed runs use the same loader config as `vf load`, plus optional `dispatch` and `resources` blocks that the single-machine loader ignores:
 
 ```yaml
 dispatch:
   num_shards: 10                    # number of parallel workers
-  run_name: cohere200M
+  run_name: ccnews-bge-large
 
 resources:                          # SkyPilot VM spec
   cpus: 2
@@ -23,17 +23,24 @@ resources:                          # SkyPilot VM spec
   cloud: aws
   use_spot: true
 
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+
 datasource:
   type: s3
   s3_bucket: my-bucket
-  s3_prefix: cohere--wikipedia/embed-multilingual-v3
+  s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
   payload_fields:
     text: text
-    source: source
+    title: title
+    url: requested_url
 
 vectorstore:
   type: qdrant
-  collection_name: cohere-wikipedia
+  collection_name: ccnews-bge-large
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
 
@@ -53,7 +60,7 @@ loader:
 
 ```bash
 # After monitoring shows all jobs succeeded:
-vf load-dist configs/dispatch/cohere200M.yaml --finalize
+vf load-dist configs/loader/ccnews_bge_large.yaml --finalize
 ```
 
 ## Monitoring
@@ -70,7 +77,7 @@ sky jobs pool down <pool-name>
 Each run creates a directory:
 
 ```
-runs/2026-04-13T14-30_cohere200M/
+runs/2026-04-13T14-30_ccnews-bge-large/
   pool.yaml                  # pool config (resources, setup)
   job.yaml                   # job config (run command)
   manifest.json              # file counts, shard plan
@@ -82,7 +89,7 @@ Each worker runs a standard `vf load` command with `--num-jobs` and `--no-manage
 
 ```bash
 # Run shard 0 of 10
-vf load configs/dispatch/cohere200M.yaml --num-jobs 10 --job-rank 0 --no-manage-indexing
+vf load configs/loader/ccnews_bge_large.yaml --num-jobs 10 --job-rank 0 --no-manage-indexing
 ```
 
 ## Prerequisites

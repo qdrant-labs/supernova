@@ -9,11 +9,14 @@ parallel loading jobs. Each job discovers files and picks its shard via
 Also manages the Qdrant indexing lifecycle: defers indexing before loading,
 enables it after with --finalize.
 
+Reads the same configs as `vf load` (configs/loader/*.yaml). The single-machine
+loader ignores `dispatch:` / `resources:` blocks; this CLI consumes them.
+
 Usage:
-  vf load-dist configs/dispatch/cohere200M.yaml
-  vf load-dist configs/dispatch/cohere200M.yaml --dry-run
-  vf load-dist configs/dispatch/cohere200M.yaml --num-shards 20
-  vf load-dist configs/dispatch/cohere200M.yaml --finalize   # enable indexing after jobs complete
+  vf load-dist configs/loader/ccnews_bge_large.yaml
+  vf load-dist configs/loader/ccnews_bge_large.yaml --dry-run
+  vf load-dist configs/loader/ccnews_bge_large.yaml --num-shards 20
+  vf load-dist configs/loader/ccnews_bge_large.yaml --finalize   # enable indexing after jobs complete
 """
 
 import argparse
@@ -116,6 +119,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--dry-run", action="store_true", help="Generate configs and print plan, don't launch")
     parser.add_argument("--num-shards", type=int, help="Override number of shards")
     parser.add_argument("--pool-name", type=str, help="SkyPilot pool name (default: auto-generated)")
+    parser.add_argument("--on-demand", action="store_true",
+                        help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota)")
     parser.add_argument("--finalize", action="store_true",
                         help="Enable Qdrant indexing (run after all jobs complete)")
     args = parser.parse_args(argv)
@@ -144,7 +149,9 @@ def main(argv: list[str] | None = None):
         return
 
     dispatch_cfg = config["dispatch"]
-    resources = config["resources"]
+    resources = dict(config["resources"])
+    if args.on_demand:
+        resources["use_spot"] = False
     num_shards = args.num_shards or dispatch_cfg["num_shards"]
     config_name = Path(args.config).stem
     run_name = dispatch_cfg.get("run_name", config_name)
@@ -200,7 +207,7 @@ def main(argv: list[str] | None = None):
     job_yaml = {
         "name": f"load-{run_name}",
         "resources": resources,
-        "run": f"cd /app && vf load {args.config} --num-jobs {num_shards} --no-manage-indexing",
+        "run": f"cd /app && uv run vf load {args.config} --num-jobs {num_shards} --no-manage-indexing",
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:

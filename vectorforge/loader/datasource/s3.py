@@ -2,6 +2,8 @@
 
 import os
 
+from typing import Iterable
+
 from .base import DataReader
 
 
@@ -16,8 +18,16 @@ class S3DataReader(DataReader):
         vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
         file_list: list[str] | None = None,
+        duckdb_memory_limit: str = "2GB",
+        duckdb_threads: int = 2,
     ):
-        super().__init__(id_column=id_column, vectors=vectors, payload_fields=payload_fields)
+        super().__init__(
+            id_column=id_column,
+            vectors=vectors,
+            payload_fields=payload_fields,
+            duckdb_memory_limit=duckdb_memory_limit,
+            duckdb_threads=duckdb_threads,
+        )
         self.s3_bucket = s3_bucket
         self.s3_prefix = s3_prefix.rstrip("/")
         self.file_list = file_list
@@ -32,6 +42,17 @@ class S3DataReader(DataReader):
             files_literal = ", ".join(f"'{f}'" for f in self.file_list)
             return f"read_parquet([{files_literal}])"
         return f"'{self.glob_path}'"
+
+    def _iter_sources(self) -> Iterable[str]:
+        """When a file_list is provided, scan one file per query so DuckDB
+        releases httpfs / decode buffers between files. The combined
+        read_parquet([...]) form holds buffers for all files at once.
+        """
+        if self.file_list:
+            for f in self.file_list:
+                yield f"read_parquet('{f}')"
+        else:
+            yield self.source_sql
 
     def _configure_connection(self) -> None:
         conn = self._conn

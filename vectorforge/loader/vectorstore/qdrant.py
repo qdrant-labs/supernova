@@ -160,7 +160,7 @@ class QdrantVectorStore(VectorStore):
                 out[name] = val
         return out
 
-    async def upsert_batch(self, points: list[dict], max_retries: int = 3) -> None:
+    async def upsert_batch(self, points: list[dict], max_retries: int = 5) -> None:
         qdrant_points = [
             models.PointStruct(
                 id=p["id"],

@@ -17,8 +17,16 @@ class HuggingFaceDataReader(DataReader):
         id_column: str = "row_id",
         vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
+        duckdb_memory_limit: str = "2GB",
+        duckdb_threads: int = 2,
     ):
-        super().__init__(id_column=id_column, vectors=vectors, payload_fields=payload_fields)
+        super().__init__(
+            id_column=id_column,
+            vectors=vectors,
+            payload_fields=payload_fields,
+            duckdb_memory_limit=duckdb_memory_limit,
+            duckdb_threads=duckdb_threads,
+        )
         self.repo_id = repo_id
         self.subdir = subdir
 

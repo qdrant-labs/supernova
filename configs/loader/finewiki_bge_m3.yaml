@@ -1,3 +1,13 @@
+dispatch:
+  num_shards: 20
+  run_name: finewiki-bge-m3
+
+resources:
+  cpus: 2
+  memory: 8
+  cloud: aws
+  use_spot: true
+
 vectors:
   dense:
     type: dense
@@ -27,5 +37,5 @@ vectorstore:
 
 loader:
   batch_size: 1000
-  prefetch_size: 50000
+  prefetch_size: 10000   # multivectors are heavy — keep chunks small on 8 GiB workers
   concurrency: 8
