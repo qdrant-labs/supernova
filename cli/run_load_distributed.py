@@ -90,8 +90,8 @@ def discover_parquet_files(bucket: str, prefix: str) -> list[str]:
     return sorted(files)
 
 
-async def _setup_collection(store: QdrantVectorStore, dimension: int):
-    await store.ensure_collection(dimension)
+async def _setup_collection(store: QdrantVectorStore, dimensions: dict[str, int]):
+    await store.ensure_collection(dimensions)
     await store.defer_indexing()
     await store.close()
 
@@ -125,13 +125,17 @@ def main(argv: list[str] | None = None):
 
     resolved_config = resolve_config(config)
 
+    vectors_spec = resolved_config.get("vectors")
+    if not vectors_spec:
+        raise SystemExit("config is missing required top-level 'vectors:' block")
+
     # just enable indexing and exit
     if args.finalize:
         logger.info("Enabling Qdrant indexing...")
         vs_cfg = dict(resolved_config["vectorstore"])
         vs_cfg.pop("type", None)
         vs_cfg.pop("params", None)
-        store = QdrantVectorStore(**vs_cfg)
+        store = QdrantVectorStore(vectors=vectors_spec, **vs_cfg)
 
         t0 = time.perf_counter()
         asyncio.run(_enable_and_wait(store))
@@ -229,13 +233,13 @@ def main(argv: list[str] | None = None):
     vs_cfg = dict(resolved_config["vectorstore"])
     vs_cfg.pop("type", None)
     vs_cfg.pop("params", None)
-    store = QdrantVectorStore(**vs_cfg)
+    store = QdrantVectorStore(vectors=vectors_spec, **vs_cfg)
 
-    reader = S3DataReader(s3_bucket=bucket, s3_prefix=prefix)
-    dimension = reader.get_dimensions()
+    reader = S3DataReader(s3_bucket=bucket, s3_prefix=prefix, vectors=vectors_spec)
+    dimensions = reader.get_dimensions()
     reader.close()
 
-    asyncio.run(_setup_collection(store, dimension))
+    asyncio.run(_setup_collection(store, dimensions))
     logger.info("Qdrant collection ready (indexing deferred)")
 
     # build env flagsf

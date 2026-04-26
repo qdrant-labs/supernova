@@ -10,8 +10,15 @@ class HuggingFaceDataReader(DataReader):
     Reads pre-embedded parquet files from a HuggingFace dataset repo via DuckDB's hf:// protocol.
     """
 
-    def __init__(self, repo_id: str, subdir: str | None = None, columns: dict[str, str] | None = None, payload_fields: dict[str, str] | None = None):
-        super().__init__(columns=columns, payload_fields=payload_fields)
+    def __init__(
+        self,
+        repo_id: str,
+        subdir: str | None = None,
+        id_column: str = "row_id",
+        vectors: dict[str, dict] | None = None,
+        payload_fields: dict[str, str] | None = None,
+    ):
+        super().__init__(id_column=id_column, vectors=vectors, payload_fields=payload_fields)
         self.repo_id = repo_id
         self.subdir = subdir
 

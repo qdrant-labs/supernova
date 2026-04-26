@@ -8,6 +8,12 @@ resources:
   cloud: aws
   use_spot: true
 
+vectors:
+  dense:
+    type: dense
+    column: embedding
+    distance: cosine
+
 datasource:
   type: s3
   s3_bucket: qdrant--vectorforge

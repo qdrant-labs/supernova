@@ -51,15 +51,15 @@ def resolve_config(obj):
     return obj
 
 
-def build_reader(cfg: dict):
+def build_reader(cfg: dict, vectors: dict):
     source_type = cfg.pop("type", "s3")
     cls = DATASOURCE_REGISTRY.get(source_type)
     if cls is None:
         raise ValueError(f"Unknown datasource type: {source_type}. Available: {list(DATASOURCE_REGISTRY)}")
-    return cls(**cfg)
+    return cls(vectors=vectors, **cfg)
 
 
-def build_vectorstore(cfg: dict):
+def build_vectorstore(cfg: dict, vectors: dict):
     store_type = cfg.pop("type")
     cls = VECTORSTORE_REGISTRY.get(store_type)
     if cls is None:
@@ -71,7 +71,7 @@ def build_vectorstore(cfg: dict):
     collection_name = cfg.pop("collection_name", None)
     params = cfg.pop("params", {})
 
-    kwargs = {"params": params}
+    kwargs = {"params": params, "vectors": vectors}
     if url is not None:
         kwargs["url"] = url
     if api_key is not None:
@@ -83,7 +83,9 @@ def build_vectorstore(cfg: dict):
 
 
 def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]:
-    """Discover parquet files on S3 and return this job's shard."""
+    """
+    Discover parquet files on S3 and return this job's shard.
+    """
     import boto3
 
     bucket = ds_cfg["s3_bucket"]
@@ -99,7 +101,7 @@ def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]
                 files.append(f"s3://{bucket}/{key}")
     files.sort()
 
-    # Round-robin assignment
+    # round-robin assignment
     shard = [f for i, f in enumerate(files) if i % num_jobs == job_rank]
     logging.getLogger("vectorforge").info(
         "Job %d/%d: %d files (of %d total)", job_rank, num_jobs, len(shard), len(files),
@@ -148,8 +150,12 @@ def main(argv: list[str] | None = None):
             return
         config["datasource"]["file_list"] = shard_files
 
-    reader = build_reader(config["datasource"])
-    store = build_vectorstore(dict(config["vectorstore"]))
+    vectors = config.get("vectors")
+    if not vectors:
+        parser.error("config is missing required top-level 'vectors:' block")
+
+    reader = build_reader(config["datasource"], vectors)
+    store = build_vectorstore(dict(config["vectorstore"]), vectors)
 
     loader_cfg = config.get("loader", {})
 

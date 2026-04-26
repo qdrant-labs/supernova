@@ -7,8 +7,12 @@ class VectorStore(ABC):
     """Abstract base for all vector store backends used in loading."""
 
     @abstractmethod
-    async def ensure_collection(self, dimension: int) -> None:
-        """Create or verify the target collection/index exists."""
+    async def ensure_collection(self, dimensions: dict[str, int]) -> None:
+        """Create or verify the target collection/index exists.
+
+        dimensions: per-vector size (by vector name) for dense and multivector
+        vectors. Sparse vectors are absent.
+        """
 
     async def configure_index(self, params: dict) -> None:
         """Optionally configure the index after collection creation.
@@ -33,7 +37,7 @@ class VectorStore(ABC):
 
     @abstractmethod
     async def upsert_batch(self, points: list[dict]) -> None:
-        """Upsert a batch of points. Each point has: id, embedding, text, payload."""
+        """Upsert a batch of points. Each point: {id, vectors: {name: value}, payload}."""
 
     @abstractmethod
     async def close(self) -> None:

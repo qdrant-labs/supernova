@@ -10,14 +10,7 @@ import duckdb
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_COLUMNS = {
-    "id": "row_id",
-    "embedding": "embedding",
-}
-
-DEFAULT_PAYLOAD_FIELDS = {
-    "text": "text",
-}
+VECTOR_TYPES = {"dense", "sparse", "multivector"}
 
 
 class DataReader(ABC):
@@ -25,20 +18,36 @@ class DataReader(ABC):
     Abstract base for reading pre-embedded parquet files via DuckDB.
     Subclasses provide the DuckDB-readable path (S3, HF, local, etc.).
 
-    columns: maps logical names (id, embedding) to parquet column names
-    payload_fields: maps payload key -> parquet column name
-        e.g. {"abstract": "text", "source": "source"} produces
-        payload = {"abstract": <text col value>, "source": <source col value>}
+    id_column: parquet column that holds the point id.
+    vectors: dict of vector name -> spec, where each spec has:
+        - type: "dense" | "sparse" | "multivector"
+        - column: parquet column name
+        - distance / comparator are read by the vector store, ignored here
+    payload_fields: dict of payload key -> parquet column name. JSON-string
+        values that parse to a dict are unpacked into the payload.
     """
 
     def __init__(
         self,
-        columns: dict[str, str] | None = None,
+        id_column: str = "row_id",
+        vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
     ):
         self._conn = None
-        self.columns = {**DEFAULT_COLUMNS, **(columns or {})}
-        self.payload_fields = payload_fields if payload_fields is not None else {**DEFAULT_PAYLOAD_FIELDS}
+        self.id_column = id_column
+        self.vectors = vectors or {
+            "dense": {"type": "dense", "column": "dense_embedding"},
+        }
+        self.payload_fields = payload_fields or {}
+
+        for name, spec in self.vectors.items():
+            vtype = spec.get("type")
+            if vtype not in VECTOR_TYPES:
+                raise ValueError(
+                    f"vectors[{name!r}].type must be one of {sorted(VECTOR_TYPES)}, got {vtype!r}"
+                )
+            if "column" not in spec:
+                raise ValueError(f"vectors[{name!r}] is missing required 'column'")
 
     @property
     @abstractmethod
@@ -59,16 +68,33 @@ class DataReader(ABC):
     def _configure_connection(self) -> None:
         """Override to configure the DuckDB connection (e.g. S3 credentials)."""
 
-    def get_dimensions(self) -> int:
-        """Get vector dimensions by reading a single embedding from the data."""
+    def get_dimensions(self) -> dict[str, int]:
+        """
+        Return per-vector dimensions for dense and multivector vectors.
+        Sparse vectors have no fixed dimension and are omitted.
+        """
         conn = self._get_connection()
-        embedding_col = self.columns["embedding"]
-        result = conn.execute(
-            f"SELECT length({embedding_col}) as dim FROM {self.source_sql} LIMIT 1"
-        ).fetchone()
-        if result is None:
-            raise RuntimeError(f"No data found at {self.glob_path}")
-        return result[0]
+        dims: dict[str, int] = {}
+        for name, spec in self.vectors.items():
+            col = spec["column"]
+            vtype = spec["type"]
+            if vtype == "dense":
+                # length(list<float>) -> dim
+                sql = f"SELECT length({col}) FROM {self.source_sql} WHERE {col} IS NOT NULL LIMIT 1"
+            elif vtype == "multivector":
+                # column is list<list<float>>; inner-list length is the dim
+                sql = (
+                    f"SELECT length({col}[1]) FROM {self.source_sql} "
+                    f"WHERE {col} IS NOT NULL AND length({col}) > 0 LIMIT 1"
+                )
+            else:
+                # sparse: no fixed dim
+                continue
+            row = conn.execute(sql).fetchone()
+            if row is None or row[0] is None:
+                raise RuntimeError(f"No data found for vector {name!r} at {self.source_sql}")
+            dims[name] = row[0]
+        return dims
 
     def get_total_count(self) -> int:
         """Get the total number of records."""
@@ -78,31 +104,34 @@ class DataReader(ABC):
         ).fetchone()
         return result[0]
 
-    def _build_select(self) -> tuple[str, list[str]]:
-        """Build the SELECT clause and return (sql, payload_keys) for row parsing."""
-        id_col = self.columns["id"]
-        embedding_col = self.columns["embedding"]
+    def _build_select(self) -> tuple[str, list[tuple[str, str]], list[str]]:
+        """
+        Returns (select_sql, vector_order, payload_keys).
+        vector_order is [(name, type), ...] aligned with SELECT positions after id_column.
+        """
+        cols = [self.id_column]
+        vector_order: list[tuple[str, str]] = []
+        for name, spec in self.vectors.items():
+            cols.append(spec["column"])
+            vector_order.append((name, spec["type"]))
 
-        # Collect unique parquet columns needed for payload
-        payload_parquet_cols = list(self.payload_fields.values())
         payload_keys = list(self.payload_fields.keys())
-
-        select_parts = [id_col, embedding_col] + payload_parquet_cols
-        return ", ".join(select_parts), payload_keys
+        cols.extend(self.payload_fields.values())
+        return ", ".join(cols), vector_order, payload_keys
 
     def read_batches(self, batch_size: int = 1000) -> Generator[list[dict], None, None]:
         """
         Stream records in batches via DuckDB fetchmany.
+        Each record: {"id", "vectors": {name: value}, "payload": {...}}.
         """
         conn = self._get_connection()
-        select_sql, payload_keys = self._build_select()
+        select_sql, vector_order, payload_keys = self._build_select()
 
         logger.info(f"Reading batches from {self.source_sql}")
-        result = conn.execute(
-            f"SELECT {select_sql} FROM {self.source_sql}"
-        )
+        result = conn.execute(f"SELECT {select_sql} FROM {self.source_sql}")
 
         logger.info(f"Starting fetchmany with batch size {batch_size}")
+        n_vectors = len(vector_order)
         while True:
             batch = result.fetchmany(batch_size)
             if not batch:
@@ -111,12 +140,23 @@ class DataReader(ABC):
             records = []
             for row in batch:
                 row_id = row[0]
-                embedding = row[1]
-                payload_values = row[2:]
+                vector_values = row[1:1 + n_vectors]
+                payload_values = row[1 + n_vectors:]
 
-                payload = {}
+                vectors: dict[str, object] = {}
+                for (name, vtype), val in zip(vector_order, vector_values):
+                    if vtype == "sparse":
+                        # DuckDB returns parquet structs as dicts
+                        vectors[name] = {
+                            "indices": list(val["indices"]),
+                            "values": list(val["values"]),
+                        }
+                    else:
+                        vectors[name] = val
+
+                payload: dict = {}
                 for key, val in zip(payload_keys, payload_values):
-                    # Unpack JSON strings (e.g. the original "payload" column)
+                    # Unpack JSON-string columns (e.g. legacy "payload" blob)
                     if isinstance(val, str):
                         try:
                             parsed = json.loads(val)
@@ -129,7 +169,7 @@ class DataReader(ABC):
 
                 records.append({
                     "id": row_id,
-                    "embedding": embedding,
+                    "vectors": vectors,
                     "payload": payload,
                 })
             yield records

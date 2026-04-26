@@ -171,22 +171,30 @@ class HuggingFaceParquetSource(DatasetSource):
 
             for batch in pf.iter_batches(batch_size=10_000):
                 batch_len = len(batch)
+                
                 # batch is entirely before the intra-file offset
                 if intra_offset >= batch_len:
                     intra_offset -= batch_len
                     continue
 
-                rows = batch.to_pylist()
-                if intra_offset > 0:
-                    rows = rows[intra_offset:]
-                    intra_offset = 0
-
                 remaining_in_file = want_from_file - taken_from_file
-                if len(rows) > remaining_in_file:
-                    rows = rows[:remaining_in_file]
+                slice_len = min(batch_len - intra_offset, remaining_in_file)
+
+                # 1. Zero-copy Arrow slicing before converting to Python list
+                rows = batch.slice(intra_offset, slice_len).to_pylist()
+
+                # Calculate the exact global row index for the start of this slice
+                current_global_index = file_start + intra_offset + taken_from_file
+                
+                # Reset intra_offset since we've now entered the window
+                intra_offset = 0
 
                 for row in rows:
+                    # Inject global row index to bridge to format_record
+                    row["__source_row_id__"] = current_global_index
+                    current_global_index += 1
                     yield row
+                    
                 taken_from_file += len(rows)
                 rows_yielded += len(rows)
 
@@ -202,10 +210,14 @@ class HuggingFaceParquetSource(DatasetSource):
         return self._extract_text(row)
 
     def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
+        # 2. Extract the dynamically injected source_row_id
+        source_row_id = row.pop("__source_row_id__", 0)
+        
         columns = {k: v for k, v in row.items() if k not in self.exclude_columns}
+        
         return Record(
             row_id=row_id,
-            source_row_id=0,
+            source_row_id=source_row_id,
             chunk_id=chunk_id,
             chunk_index=0,
             text=self.extract_text(row),

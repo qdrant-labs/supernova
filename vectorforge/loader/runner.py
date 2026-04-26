@@ -42,12 +42,12 @@ async def run_loader(
     logger.info(f"Loading into {store.name} (prefetch={prefetch_size:,}, batch={batch_size:,})")
 
     # Get dimensions and total count for setup
-    dimension = reader.get_dimensions()
+    dimensions = reader.get_dimensions()
     total = reader.get_total_count()
-    logger.info(f"Found {total:,} vectors (dim={dimension})")
+    logger.info(f"Found {total:,} records (dims={dimensions})")
 
     if manage_indexing:
-        await store.ensure_collection(dimension)
+        await store.ensure_collection(dimensions)
         logger.info("Deferring indexing for bulk load...")
         await store.defer_indexing()
 
@@ -83,7 +83,7 @@ async def run_loader(
                 tasks.remove(t)
                 t.result()
 
-        # Wait for remaining tasks
+        # wait for remaining tasks
         if tasks:
             await asyncio.gather(*tasks)
     finally:

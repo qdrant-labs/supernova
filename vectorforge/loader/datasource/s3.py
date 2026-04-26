@@ -12,11 +12,12 @@ class S3DataReader(DataReader):
         self,
         s3_bucket: str,
         s3_prefix: str,
-        columns: dict[str, str] | None = None,
+        id_column: str = "row_id",
+        vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
         file_list: list[str] | None = None,
     ):
-        super().__init__(columns=columns, payload_fields=payload_fields)
+        super().__init__(id_column=id_column, vectors=vectors, payload_fields=payload_fields)
         self.s3_bucket = s3_bucket
         self.s3_prefix = s3_prefix.rstrip("/")
         self.file_list = file_list

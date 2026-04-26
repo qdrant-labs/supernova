@@ -1,7 +1,6 @@
 import duckdb
-import polars as pl
 
-S3_PATH = "s3://qdrant--vectorforge/huggingface-tb--dclm-edu/embed-gte-multilingual-base/**/*.parquet"
+S3_PATH = "s3://qdrant--vectorforge/stanford-oval--ccnews/baai_bge_large_en_v1.5/**/*.parquet"
 
 con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")

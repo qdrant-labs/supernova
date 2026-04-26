@@ -10,11 +10,32 @@ from .base import VectorStore
 logger = logging.getLogger(__name__)
 
 
+_DISTANCE_MAP = {
+    "cosine": models.Distance.COSINE,
+    "dot": models.Distance.DOT,
+    "euclid": models.Distance.EUCLID,
+    "manhattan": models.Distance.MANHATTAN,
+}
+
+_COMPARATOR_MAP = {
+    "max_sim": models.MultiVectorComparator.MAX_SIM,
+}
+
+
+def _resolve_distance(name: str | None) -> models.Distance:
+    return _DISTANCE_MAP[(name or "cosine").lower()]
+
+
+def _resolve_comparator(name: str | None) -> models.MultiVectorComparator:
+    return _COMPARATOR_MAP[(name or "max_sim").lower()]
+
+
 class QdrantVectorStore(VectorStore):
 
     def __init__(
         self,
         url: str,
+        vectors: dict[str, dict],
         api_key: str | None = None,
         collection_name: str = "default",
         params: dict | None = None,
@@ -22,10 +43,39 @@ class QdrantVectorStore(VectorStore):
         self.url = url
         self.api_key = api_key
         self.collection_name = collection_name
+        self.vectors = vectors
         self.params = params or {}
         self._client = AsyncQdrantClient(url=url, api_key=api_key, timeout=60)
 
-    async def ensure_collection(self, dimension: int) -> None:
+    def _build_vectors_config(
+        self, dimensions: dict[str, int]
+    ) -> tuple[dict[str, models.VectorParams], dict[str, models.SparseVectorParams]]:
+        vectors_config: dict[str, models.VectorParams] = {}
+        sparse_vectors_config: dict[str, models.SparseVectorParams] = {}
+
+        for name, spec in self.vectors.items():
+            vtype = spec["type"]
+            if vtype == "dense":
+                vectors_config[name] = models.VectorParams(
+                    size=dimensions[name],
+                    distance=_resolve_distance(spec.get("distance")),
+                )
+            elif vtype == "multivector":
+                vectors_config[name] = models.VectorParams(
+                    size=dimensions[name],
+                    distance=_resolve_distance(spec.get("distance")),
+                    multivector_config=models.MultiVectorConfig(
+                        comparator=_resolve_comparator(spec.get("comparator")),
+                    ),
+                )
+            elif vtype == "sparse":
+                sparse_vectors_config[name] = models.SparseVectorParams()
+            else:
+                raise ValueError(f"vectors[{name!r}] has unknown type {vtype!r}")
+
+        return vectors_config, sparse_vectors_config
+
+    async def ensure_collection(self, dimensions: dict[str, int]) -> None:
         collections = await self._client.get_collections()
         existing = [c.name for c in collections.collections]
 
@@ -33,14 +83,16 @@ class QdrantVectorStore(VectorStore):
             logger.info(f"Collection '{self.collection_name}' already exists, skipping creation")
             return
 
+        vectors_config, sparse_vectors_config = self._build_vectors_config(dimensions)
         await self._client.create_collection(
             collection_name=self.collection_name,
-            vectors_config=models.VectorParams(
-                size=dimension,
-                distance=models.Distance.COSINE,
-            ),
+            vectors_config=vectors_config,
+            sparse_vectors_config=sparse_vectors_config or None,
         )
-        logger.info(f"Created collection '{self.collection_name}' (dim={dimension})")
+        logger.info(
+            f"Created collection '{self.collection_name}' with vectors={list(vectors_config)}, "
+            f"sparse={list(sparse_vectors_config)}"
+        )
 
     async def defer_indexing(self) -> None:
         """
@@ -95,11 +147,24 @@ class QdrantVectorStore(VectorStore):
             )
         return None
 
+    def _build_point_vector(self, raw: dict) -> dict:
+        out: dict = {}
+        for name, val in raw.items():
+            vtype = self.vectors[name]["type"]
+            if vtype == "sparse":
+                out[name] = models.SparseVector(
+                    indices=val["indices"],
+                    values=val["values"],
+                )
+            else:
+                out[name] = val
+        return out
+
     async def upsert_batch(self, points: list[dict], max_retries: int = 3) -> None:
         qdrant_points = [
             models.PointStruct(
                 id=p["id"],
-                vector=p["embedding"],
+                vector=self._build_point_vector(p["vectors"]),
                 payload=p.get("payload", {}),
             )
             for p in points
