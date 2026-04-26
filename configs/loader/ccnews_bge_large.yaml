@@ -1,23 +1,26 @@
 vectors:
   dense:
     type: dense
-    column: embedding
+    column: dense_embedding
     distance: cosine
 
 datasource:
   type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: cohere--wikipedia/embed-multilingual-v3
+  s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
   payload_fields:
     text: text
-    source: source
+    title: title
+    url: requested_url
+    published_date: published_date
 
 vectorstore:
   type: qdrant
-  collection_name: cohere-wikipedia
+  collection_name: ccnews-bge-large
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
 
 loader:
   batch_size: 1000
+  prefetch_size: 100000
   concurrency: 8

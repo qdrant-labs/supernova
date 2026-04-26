@@ -1,6 +1,6 @@
 dispatch:
   num_shards: 10
-  run_name: cohere200M
+  run_name: ccnews-bge-large
 
 resources:
   cpus: 2
@@ -11,23 +11,22 @@ resources:
 vectors:
   dense:
     type: dense
-    column: embedding
+    column: dense_embedding
     distance: cosine
 
 datasource:
   type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: cohere--wikipedia/embed-multilingual-v3
+  s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
   payload_fields:
     text: text
-    source: source
-    row_id: row_id
-    chunk_id: chunk_id
-    chunk_index: chunk_index
+    title: title
+    url: requested_url
+    published_date: published_date
 
 vectorstore:
   type: qdrant
-  collection_name: cohere-wikipedia
+  collection_name: ccnews-bge-large
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
 
