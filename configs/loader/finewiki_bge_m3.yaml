@@ -23,6 +23,7 @@ datasource:
   type: s3
   s3_bucket: qdrant--vectorforge
   s3_prefix: finewiki/embed-bge-m3
+  id_expression: "hash(rendered_text)"   # content-deduped point ids
   payload_fields:
     text: rendered_text
     title: title

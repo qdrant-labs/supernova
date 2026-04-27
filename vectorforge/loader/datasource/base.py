@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 
 from abc import ABC, abstractmethod
 from typing import Generator, Iterable
@@ -12,13 +13,22 @@ logger = logging.getLogger(__name__)
 
 VECTOR_TYPES = {"dense", "sparse", "multivector"}
 
+# Word-boundary match so column "filename" matches but "myfilename" does not.
+_FILENAME_TOKEN = re.compile(r"\bfilename\b")
+
 
 class DataReader(ABC):
     """
     Abstract base for reading pre-embedded parquet files via DuckDB.
     Subclasses provide the DuckDB-readable path (S3, HF, local, etc.).
 
-    id_column: parquet column that holds the point id.
+    id_expression: DuckDB SQL expression that yields the point id for each row.
+        A bare column name is the simplest form (e.g. "row_id"); any DuckDB
+        expression that returns UBIGINT or a UUID string also works -- e.g.
+        ``hash(text)`` for content-deduplicated ids, ``hash(filename, row_id)``
+        for a globally-unique key across files, or ``uuid()`` for random
+        per-row UUIDs. If the expression references the ``filename`` column,
+        the loader auto-enables ``read_parquet(..., filename=true)``.
     vectors: dict of vector name -> spec, where each spec has:
         - type: "dense" | "sparse" | "multivector"
         - column: parquet column name
@@ -29,20 +39,21 @@ class DataReader(ABC):
 
     def __init__(
         self,
-        id_column: str = "row_id",
+        id_expression: str = "row_id",
         vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
         duckdb_memory_limit: str = "2GB",
         duckdb_threads: int = 2,
     ):
         self._conn = None
-        self.id_column = id_column
+        self.id_expression = id_expression
         self.vectors = vectors or {
             "dense": {"type": "dense", "column": "dense_embedding"},
         }
         self.payload_fields = payload_fields or {}
         self.duckdb_memory_limit = duckdb_memory_limit
         self.duckdb_threads = duckdb_threads
+        self._uses_filename = bool(_FILENAME_TOKEN.search(id_expression))
 
         for name, spec in self.vectors.items():
             vtype = spec.get("type")
@@ -128,9 +139,9 @@ class DataReader(ABC):
     def _build_select(self) -> tuple[str, list[tuple[str, str]], list[str]]:
         """
         Returns (select_sql, vector_order, payload_keys).
-        vector_order is [(name, type), ...] aligned with SELECT positions after id_column.
+        vector_order is [(name, type), ...] aligned with SELECT positions after id_expression.
         """
-        cols = [self.id_column]
+        cols = [self.id_expression]
         vector_order: list[tuple[str, str]] = []
         for name, spec in self.vectors.items():
             cols.append(spec["column"])

@@ -33,7 +33,7 @@ vf embed-dist <config> [options]
 | `--pool-name NAME` | SkyPilot pool name (default: auto-generated) |
 | `--max-workers N` | Max pool workers for autoscaling (default: num-jobs) |
 | `--on-demand` | Use on-demand instead of spot. Higher cost, no preemption, separate AWS quota (usually much more headroom). |
-| `--burst` | Set `min_workers = max_workers` so all workers provision in parallel at startup. Bypasses SkyPilot's one-at-a-time autoscaler ramp (~3 min per worker). Recommended for any batch run where you know the target worker count. |
+| `--ramp` | Opt into SkyPilot's gradual autoscaler (`min_workers = 0`). Default is burst (`min_workers = max_workers`) since EC2 provisioning is slow and the autoscaler ramps ~one replica per 3 minutes — only useful when you don't know the target worker count up front. |
 
 ## vf analysis
 

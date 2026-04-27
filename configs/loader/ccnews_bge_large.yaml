@@ -6,7 +6,6 @@ resources:
   cpus: 2
   memory: 16
   cloud: aws
-  use_spot: true
 
 vectors:
   dense:
@@ -18,6 +17,7 @@ datasource:
   type: s3
   s3_bucket: qdrant--vectorforge
   s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
+  id_expression: "hash(text)"   # content-deduped point ids; collapses ~2x article republishes
   payload_fields:
     text: text
     title: title

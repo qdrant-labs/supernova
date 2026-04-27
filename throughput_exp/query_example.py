@@ -8,16 +8,42 @@ con.execute("INSTALL httpfs; LOAD httpfs;")
 con.sql(f"SELECT count(*) AS total_records FROM '{S3_PATH}'")
 con.sql(f"DESCRIBE SELECT * FROM '{S3_PATH}'")
 
+con.sql("""
+  WITH t AS (                                               
+    SELECT text,                                                                                         
+           count(DISTINCT regexp_extract(filename, 'rank(\d+)', 1)) AS n_ranks
+    FROM read_parquet(                                                                                   
+      's3://qdrant--vectorforge/stanford-oval--ccnews/baai_bge_large_en_v1.5/2016/**/*.parquet',         
+      filename=true                                                                                      
+    )                                                                                                    
+    GROUP BY text                                                                                        
+  )                                                         
+  SELECT n_ranks, count(*) AS n_texts
+  FROM t
+  GROUP BY n_ranks
+  ORDER BY n_ranks;
+""")
+
 # query that counts length of 'abstract' text field
 con.sql(
-f"""
-    SELECT
-        length(text) AS text_length,
-        count(*) AS count
-    FROM '{S3_PATH}'
-    GROUP BY text_length
-    ORDER BY text_length DESC
-    LIMIT 10
+"""
+DESCRIBE SELECT * FROM read_parquet('s3://qdrant--vectorforge/stanford-oval--ccnews/baai_bge_large_en_v1.5/2016/rank00_batch_00000000.parquet');
+""")
+con.sql("""
+  -- (b) is (filename, row_id) the only true global key? must be -- row_id is a within-file counter      
+  SELECT count(*) AS total, count(DISTINCT (filename, row_id)) AS unique_file_rid
+  FROM read_parquet(
+    's3://qdrant--vectorforge/stanford-oval--ccnews/baai_bge_large_en_v1.5/2016/**/*.parquet',
+    filename=true
+  );
+""")
+
+con.sql("""
+select distinct filename
+from read_parquet(
+  's3://qdrant--vectorforge/stanford-oval--ccnews/baai_bge_large_en_v1.5/2016/**/*.parquet',
+  filename=true
+)
 """)
 
 

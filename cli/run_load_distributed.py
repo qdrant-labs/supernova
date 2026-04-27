@@ -121,6 +121,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--pool-name", type=str, help="SkyPilot pool name (default: auto-generated)")
     parser.add_argument("--on-demand", action="store_true",
                         help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota)")
+    parser.add_argument("--ramp", action="store_true",
+                        help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). Default is burst (min_workers=max_workers) since EC2 provisioning is slow and we know the target count up front.")
     parser.add_argument("--finalize", action="store_true",
                         help="Enable Qdrant indexing (run after all jobs complete)")
     args = parser.parse_args(argv)
@@ -183,14 +185,16 @@ def main(argv: list[str] | None = None):
     print(f"  Num shards:   {num_shards}")
     print(f"  Files/shard:  ~{len(files) // num_shards}")
     print(f"  Pool name:    {pool_name}")
+    print(f"  Provision:    {'ramp (autoscaler)' if args.ramp else 'burst (all workers at startup)'}")
     print(f"  Resources:    {resources}")
     print(f"  Run dir:      {run_dir}")
     print("=" * 60)
 
-    # generate pool YAML
+    # generate pool YAML — burst by default (provision all workers at startup);
+    # SkyPilot's autoscaler ramp is too slow when we know the target count up front.
     pool_yaml = {
         "pool": {
-            "min_workers": 0,
+            "min_workers": 0 if args.ramp else num_shards,
             "max_workers": num_shards,
         },
         "resources": resources,

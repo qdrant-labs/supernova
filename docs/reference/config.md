@@ -310,7 +310,7 @@ The pattern: one config per window, each with `source.offset` + `source.limit` d
 
    ```bash
    vf embed-dist configs/embedder/your_config.rows-0000000000-0100000000.yaml \
-     --on-demand --num-jobs 10 --burst
+     --on-demand --num-jobs 10
    vf analysis configs/embedder/your_config.rows-0000000000-0100000000.yaml
    ./scripts/sky-killswitch.sh
    # verify, then move on to the next window
@@ -388,10 +388,10 @@ done
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `pool.min_workers` | `0` (or `max_workers` with `--burst`) | Floor. Workers won't scale below this. |
+| `pool.min_workers` | `max_workers` (burst, default; `0` with `--ramp`) | Floor. Workers won't scale below this. |
 | `pool.max_workers` | `num_jobs` | Ceiling. SkyPilot autoscales up to here as jobs queue. |
 
-SkyPilot's autoscaler ramps **one replica per ~3-minute cycle** by default — way too slow for batch runs. Always use `--burst` for known-sized batch work.
+Burst is the default because SkyPilot's autoscaler ramps **one replica per ~3-minute cycle** — far too slow for known-sized batch runs. Pass `--ramp` if you actually want gradual provisioning.
 
 ---
 
@@ -417,7 +417,7 @@ Also set automatically by SkyPilot on each pool job:
 |---------|-------------------|
 | Worker OOM on long-text dataset | `chunk_size: 10000`, `num_workers: 1`, `flush_threshold: 50000` |
 | Worker OOM on short text | `num_workers: 1` (the second worker doubles model memory for ~0% speedup) |
-| Pool scales up slowly | `--burst` |
+| Pool scales up slowly | Burst is the default; check the plan output. Only `--ramp` opts out. |
 | Only a few workers come up | Check quota (spot vs on-demand), drop `use_spot`, request quota bump |
 | Pipeline slower than predicted | Check `dtype` (should be `bfloat16` on GPU), check you're actually on GPU (look for `Loading ... on cuda` in logs) |
 | High-rank jobs take forever to start | HF streaming skip cost. Jobs with offset ≥ 10M can take 20+ min to begin producing chunks. |

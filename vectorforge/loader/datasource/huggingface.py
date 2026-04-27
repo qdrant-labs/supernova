@@ -14,14 +14,14 @@ class HuggingFaceDataReader(DataReader):
         self,
         repo_id: str,
         subdir: str | None = None,
-        id_column: str = "row_id",
+        id_expression: str = "row_id",
         vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
         duckdb_memory_limit: str = "2GB",
         duckdb_threads: int = 2,
     ):
         super().__init__(
-            id_column=id_column,
+            id_expression=id_expression,
             vectors=vectors,
             payload_fields=payload_fields,
             duckdb_memory_limit=duckdb_memory_limit,
@@ -29,6 +29,18 @@ class HuggingFaceDataReader(DataReader):
         )
         self.repo_id = repo_id
         self.subdir = subdir
+
+    @property
+    def source_sql(self) -> str:
+        if self._uses_filename:
+            return f"read_parquet('{self.glob_path}', filename=true)"
+        return super().source_sql
+
+    def _iter_sources(self):
+        if self._uses_filename:
+            yield f"read_parquet('{self.glob_path}', filename=true)"
+        else:
+            yield self.source_sql
 
     @property
     def glob_path(self) -> str:

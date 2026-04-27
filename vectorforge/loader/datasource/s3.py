@@ -14,7 +14,7 @@ class S3DataReader(DataReader):
         self,
         s3_bucket: str,
         s3_prefix: str,
-        id_column: str = "row_id",
+        id_expression: str = "row_id",
         vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
         file_list: list[str] | None = None,
@@ -22,7 +22,7 @@ class S3DataReader(DataReader):
         duckdb_threads: int = 2,
     ):
         super().__init__(
-            id_column=id_column,
+            id_expression=id_expression,
             vectors=vectors,
             payload_fields=payload_fields,
             duckdb_memory_limit=duckdb_memory_limit,
@@ -37,10 +37,17 @@ class S3DataReader(DataReader):
         return f"s3://{self.s3_bucket}/{self.s3_prefix}/**/*.parquet"
 
     @property
+    def _filename_arg(self) -> str:
+        """", filename=true" if the id_expression needs the filename column, else ""."""
+        return ", filename=true" if self._uses_filename else ""
+
+    @property
     def source_sql(self) -> str:
         if self.file_list:
             files_literal = ", ".join(f"'{f}'" for f in self.file_list)
-            return f"read_parquet([{files_literal}])"
+            return f"read_parquet([{files_literal}]{self._filename_arg})"
+        if self._uses_filename:
+            return f"read_parquet('{self.glob_path}'{self._filename_arg})"
         return f"'{self.glob_path}'"
 
     def _iter_sources(self) -> Iterable[str]:
@@ -48,9 +55,12 @@ class S3DataReader(DataReader):
         releases httpfs / decode buffers between files. The combined
         read_parquet([...]) form holds buffers for all files at once.
         """
+        suffix = self._filename_arg
         if self.file_list:
             for f in self.file_list:
-                yield f"read_parquet('{f}')"
+                yield f"read_parquet('{f}'{suffix})"
+        elif self._uses_filename:
+            yield f"read_parquet('{self.glob_path}'{suffix})"
         else:
             yield self.source_sql
 
