@@ -22,13 +22,42 @@ of the pipeline (chunker, runner, writer) is untouched.
 
 from __future__ import annotations
 
+import fnmatch
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
 from vectorforge.sources.base import DatasetSource
 from vectorforge.sources.huggingface import _build_text_extractor
 from vectorforge.models import Record
+
+
+def _filter_paths(paths: list[str], pattern: str | list[str] | None) -> list[str]:
+    """
+    Apply a path filter to a list of HF parquet paths.
+
+    Patterns:
+      - None: pass-through.
+      - "regex:<expr>": treat <expr> as a Python regex (re.search).
+      - any other string: glob (fnmatch).
+      - list of patterns: union (a path matches if it matches any pattern).
+    """
+    if pattern is None:
+        return list(paths)
+    if isinstance(pattern, list):
+        out: list[str] = []
+        seen: set[str] = set()
+        for sub in pattern:
+            for p in _filter_paths(paths, sub):
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+        return out
+    if pattern.startswith("regex:"):
+        rx = re.compile(pattern[len("regex:"):])
+        return [p for p in paths if rx.search(p)]
+    return fnmatch.filter(paths, pattern)
 
 logger = logging.getLogger(__name__)
 
@@ -79,13 +108,21 @@ class HuggingFaceParquetSource(DatasetSource):
         api = HfApi()
         all_files = api.list_repo_files(dataset_name, repo_type="dataset")
 
-        parquet_paths = sorted(f for f in all_files if f.endswith(".parquet"))
-        # apply explicit filter if given, otherwise filter by split name when it
-        # naturally appears in paths (e.g. "train/0.parquet" or "data/train-...")
+        all_parquets = sorted(f for f in all_files if f.endswith(".parquet"))
+        # explicit path_filter wins (glob; "regex:..." for regex; list = union of patterns).
+        # otherwise fall back to filtering by split name when it appears in paths
+        # (e.g. "train/0.parquet" or "data/train-...").
         if path_filter is not None:
-            parquet_paths = [p for p in parquet_paths if path_filter in p]
-        elif any(split in p for p in parquet_paths):
-            parquet_paths = [p for p in parquet_paths if split in p]
+            parquet_paths = _filter_paths(all_parquets, path_filter)
+            if not parquet_paths:
+                raise ValueError(
+                    f"path_filter={path_filter!r} matched 0 files in {dataset_name}. "
+                    f"Sample of available paths: {all_parquets[:5]}"
+                )
+        elif any(split in p for p in all_parquets):
+            parquet_paths = [p for p in all_parquets if split in p]
+        else:
+            parquet_paths = all_parquets
 
         if not parquet_paths:
             raise ValueError(
@@ -106,13 +143,13 @@ class HuggingFaceParquetSource(DatasetSource):
 
         import pyarrow.parquet as pq
 
-        def fetch(path: str) -> tuple[str, int]:
+        def fetch(path: str) -> tuple[str, int | None]:
             try:
                 pf = pq.ParquetFile(f"datasets/{self.dataset_name}/{path}", filesystem=self._fs)
                 return path, pf.metadata.num_rows
             except Exception as e:
                 logger.warning("Failed to read row count for %s: %s", path, e)
-                return path, 0
+                return path, None
 
         logger.info(
             "Reading parquet footers for %d files (parallel=%d)...",
@@ -120,13 +157,30 @@ class HuggingFaceParquetSource(DatasetSource):
         )
         with ThreadPoolExecutor(max_workers=self._metadata_workers) as ex:
             results = list(ex.map(fetch, self._parquet_paths))
-        # filter out failed / zero-row files so they don't break offset math
-        results = [(p, n) for p, n in results if n > 0]
-        self._files_with_counts = results
+
+        failed = [p for p, n in results if n is None]
+        if failed:
+            # Silently dropping files would corrupt the offset table -- offsets are
+            # derived from cumulative sum of file row counts. Better to fail loud
+            # so the user knows their slice is incomplete.
+            raise RuntimeError(
+                f"Footer read failed for {len(failed)}/{len(results)} parquet files in "
+                f"{self.dataset_name}. First failures: {failed[:5]}. "
+                "Retry, or pass a tighter path_filter to skip them explicitly."
+            )
+
+        # zero-row files are real and ok (just empty), but we drop them from the
+        # offset table to keep the math clean.
+        self._files_with_counts = [(p, n) for p, n in results if n > 0]
         logger.info(
             "Indexed %d parquet files, %d total rows",
-            len(results), sum(n for _, n in results),
+            len(self._files_with_counts), sum(n for _, n in self._files_with_counts),
         )
+
+    def list_files(self) -> list[tuple[str, int]]:
+        """Public accessor for (path, row_count) pairs. Used by `--list-files`."""
+        self._ensure_counts()
+        return list(self._files_with_counts)
 
     def get_total_rows(self) -> int:
         if self._total_rows_override is not None:
