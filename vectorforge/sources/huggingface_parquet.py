@@ -66,7 +66,6 @@ class HuggingFaceParquetSource(DatasetSource):
     def __init__(
         self,
         dataset_name: str,
-        config: str | None = None,
         split: str = "train",
         text_field: str | None = "text",
         text_template: str | None = None,
@@ -92,7 +91,6 @@ class HuggingFaceParquetSource(DatasetSource):
             metadata_workers: parallelism for the per-file footer fetches.
         """
         self.dataset_name = dataset_name
-        self.config = config
         self.split = split
         self.text_field = text_field
         self.text_template = text_template

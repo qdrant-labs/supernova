@@ -16,7 +16,7 @@ import re
 import sys
 from pathlib import Path
 
-CONFIG_DIR = Path("configs/embedder/finewiki_intfloat_multilingual")
+CONFIG_DIR = Path("configs/embedder/finewiki_gte_multilingual")
 TEMPLATE_NAME = "en.yaml"
 MANIFEST_NAME = "_manifest.json"
 
@@ -62,7 +62,7 @@ def main():
     # extract the storage prefix stem once (everything before the trailing language)
     # so we can rewrite it per language. E.g. "finewiki/embed-multilingual-e5-large/en" -> "finewiki/embed-multilingual-e5-large"
     s3_prefix_stem_re = re.compile(r"(s3_prefix:\s*)(.+?)/[a-zA-Z0-9_]+(\s*)$", re.M)
-    config_re = re.compile(r'(config:\s*")[^"]+(")')
+    path_filter_re = re.compile(r'(path_filter:\s*"data/)[^/]+(/\*")')
 
     written = 0
     skipped = 0
@@ -73,7 +73,7 @@ def main():
             continue  # keep the user's original en.yaml untouched
 
         body = template
-        body = config_re.sub(rf'\g<1>{code}\g<2>', body)
+        body = path_filter_re.sub(rf'\g<1>{code}wiki\g<2>', body)
         body = s3_prefix_stem_re.sub(rf'\g<1>\g<2>/{code}\g<3>', body)
 
         out_path.write_text(body)
