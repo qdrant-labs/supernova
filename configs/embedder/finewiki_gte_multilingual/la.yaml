@@ -3,6 +3,7 @@ source:
   dataset_name: HuggingFaceFW/finewiki
   split: train
   path_filter: "data/lawiki/*"
+  prefetch: true
   text_template: "Title: {title}\nText: {text}"
 
 dense_embedder:
@@ -13,6 +14,11 @@ dense_embedder:
   dtype: bfloat16
   max_tokens: 768
   truncate: true
+
+sparse_embedder:                                                                                        
+  type: fastembed                                                                                     
+  model: Qdrant/bm25                                                                                  
+  batch_size: 256
 
 storage:
   type: s3
@@ -25,3 +31,4 @@ pipeline:
   num_workers: 2
   max_text_length: 8192
   shard_by_rank: true
+  rendered_text_column: rendered_text

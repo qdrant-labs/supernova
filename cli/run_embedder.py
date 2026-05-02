@@ -10,6 +10,7 @@ from vectorforge.sources.huggingface_parquet import HuggingFaceParquetSource
 from vectorforge.embedders.dense.openai import OpenAIEmbedder
 from vectorforge.embedders.dense.sentence_transformer import SentenceTransformerDenseEmbedder
 from vectorforge.embedders.sparse.sentence_transformer import SentenceTransformerSparseEmbedder
+from vectorforge.embedders.sparse.fastembed import FastEmbedSparseEmbedder
 from vectorforge.embedders.multivector.bge_m3 import BGEM3MultiVectorEmbedder
 from vectorforge.embedders.hybrid import SentenceTransformerHybridEmbedder
 from vectorforge.embedders.engine import EmbeddingEngine
@@ -32,6 +33,7 @@ DENSE_EMBEDDER_REGISTRY = {
 
 SPARSE_EMBEDDER_REGISTRY = {
     "sentence_transformer": SentenceTransformerSparseEmbedder,
+    "fastembed": FastEmbedSparseEmbedder,
 }
 
 MULTIVECTOR_EMBEDDER_REGISTRY = {

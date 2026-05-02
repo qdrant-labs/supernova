@@ -141,7 +141,12 @@ def main(argv: list[str] | None = None):
         "--cost-per-hour",
         type=float,
         default=0.38,
-        help="Per-worker hourly cost in USD (default: 0.38 = g5.xlarge A10G spot)"\
+        help="Per-worker hourly cost in USD (default: 0.38 = g5.xlarge A10G spot)",
+    )
+    parser.add_argument(
+        "--check-duplicates",
+        action="store_true",
+        help="Check source_row_id uniqueness and report any duplicate or missing rows",
     )
     args = parser.parse_args(argv)
 
@@ -163,7 +168,7 @@ def main(argv: list[str] | None = None):
         _configure_duckdb_for_s3(con)
     # pass both globs so the same script works for flat layouts (all parquets at the
     # top of the prefix) and sharded layouts (rank00/batch_*.parquet).
-    globs = f"['{destination}/*.parquet', '{destination}/**/*.parquet']"
+    globs = f"'{destination}/**/*.parquet'"
 
     print("\n=== Schema ===")
     schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet({globs})").fetchall()
@@ -240,6 +245,38 @@ def main(argv: list[str] | None = None):
 
     print("\n=== rows/s distribution ===")
     print(_ascii_histogram(rps_values, bins=10))
+
+    if args.check_duplicates:
+        print("\n=== Duplicate / coverage check (source_row_id) ===")
+        stats = con.execute(f"""
+            SELECT
+                COUNT(*)                          AS total_rows,
+                COUNT(DISTINCT source_row_id)     AS unique_source_rows,
+                COUNT(*) - COUNT(DISTINCT source_row_id) AS duplicate_count,
+                MIN(source_row_id)                AS min_source_row_id,
+                MAX(source_row_id)                AS max_source_row_id
+            FROM read_parquet({globs})
+        """).fetchone()
+        total, unique, dupes, min_id, max_id = stats
+        print(f"  total rows:         {total:,}")
+        print(f"  unique source_row_id: {unique:,}")
+        print(f"  duplicates:         {dupes:,}  {'✓ none' if dupes == 0 else '✗ FOUND'}")
+        print(f"  source_row_id range: [{min_id:,}, {max_id:,}]  (span: {max_id - min_id + 1:,})")
+        coverage_gap = (max_id - min_id + 1) - unique
+        print(f"  gaps in range:      {coverage_gap:,}  {'✓ none' if coverage_gap == 0 else '(missing rows)'}")
+
+        if dupes > 0:
+            print("\n  First 10 duplicated source_row_ids:")
+            rows = con.execute(f"""
+                SELECT source_row_id, COUNT(*) AS cnt
+                FROM read_parquet({globs})
+                GROUP BY source_row_id
+                HAVING cnt > 1
+                ORDER BY cnt DESC
+                LIMIT 10
+            """).fetchall()
+            for src_id, cnt in rows:
+                print(f"    source_row_id={src_id:,}  appears {cnt}x")
 
 
 if __name__ == "__main__":

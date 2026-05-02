@@ -22,6 +22,7 @@ dependencies = [
     "skypilot[aws]",
     "FlagEmbedding",
     "einops>=0.8.2",
+    "fastembed",
 ]
 
 [build-system]

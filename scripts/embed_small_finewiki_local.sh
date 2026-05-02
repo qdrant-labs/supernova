@@ -21,7 +21,7 @@ for arg in "$@"; do
   esac
 done
 
-CONFIG_DIR="configs/embedder/finewiki_intfloat_multilingual"
+CONFIG_DIR="configs/embedder/finewiki_gte_multilingual"
 MANIFEST="${CONFIG_DIR}/_manifest.json"
 
 if [[ ! -f "${MANIFEST}" ]]; then

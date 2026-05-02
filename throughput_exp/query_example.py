@@ -1,6 +1,6 @@
 import duckdb
 
-S3_PATH = "s3://qdrant--vectorforge/stanford-oval--ccnews/baai_bge_large_en_v1.5/**/*.parquet"
+S3_PATH = "s3://qdrant--vectorforge/finewiki/embed-gte-multilingual-base/en/**/*.parquet"
 
 con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")

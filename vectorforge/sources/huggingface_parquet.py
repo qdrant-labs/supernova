@@ -25,6 +25,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
@@ -74,13 +75,13 @@ class HuggingFaceParquetSource(DatasetSource):
         limit: int | None = None,
         total_rows_override: int | None = None,
         path_filter: str | None = None,
-        metadata_workers: int = 32,
+        metadata_workers: int = 4,
+        prefetch: bool = False,
+        prefetch_dir: str = "/tmp/vectorforge_parquet",
     ):
         """
         Args:
             dataset_name: HF Hub repo id, e.g. "HuggingFaceTB/dclm-edu".
-            config: HF config name (only used for filtering when relevant — many
-                native-parquet datasets have a single default config).
             split: HF split name. The path_filter (or default split-name match)
                 determines which files are read.
             offset / limit: applied as a row-window across all selected files.
@@ -88,7 +89,15 @@ class HuggingFaceParquetSource(DatasetSource):
                 trusting this number; metadata is still read per-file as we go.
             path_filter: substring filter on parquet file paths (e.g. "train/").
                 Defaults to filtering by the split name when present in paths.
-            metadata_workers: parallelism for the per-file footer fetches.
+            metadata_workers: parallelism for the per-file footer fetches. Keep
+                this low (default 4) to avoid bursting HF resolver rate limits
+                when many jobs start simultaneously.
+            prefetch: download parquet files for this rank's window to local disk
+                before streaming. Eliminates per-batch HTTP range requests (422
+                row groups × 14 columns = thousands of requests per file) at the
+                cost of a one-time sequential download (~2.5 GB/file). Strongly
+                recommended for multi-job runs.
+            prefetch_dir: local directory for downloaded parquet files.
         """
         self.dataset_name = dataset_name
         self.split = split
@@ -99,6 +108,9 @@ class HuggingFaceParquetSource(DatasetSource):
         self._limit = limit
         self._total_rows_override = total_rows_override
         self._metadata_workers = metadata_workers
+        self._prefetch = prefetch
+        self._prefetch_dir = prefetch_dir
+        self._local_paths: dict[str, str] = {}
         self._extract_text = _build_text_extractor(text_field, text_template)
 
         from huggingface_hub import HfApi, HfFileSystem
@@ -142,12 +154,24 @@ class HuggingFaceParquetSource(DatasetSource):
         import pyarrow.parquet as pq
 
         def fetch(path: str) -> tuple[str, int | None]:
-            try:
-                pf = pq.ParquetFile(f"datasets/{self.dataset_name}/{path}", filesystem=self._fs)
-                return path, pf.metadata.num_rows
-            except Exception as e:
-                logger.warning("Failed to read row count for %s: %s", path, e)
-                return path, None
+            url = f"datasets/{self.dataset_name}/{path}"
+            for attempt in range(6):
+                try:
+                    pf = pq.ParquetFile(url, filesystem=self._fs)
+                    return path, pf.metadata.num_rows
+                except Exception as e:
+                    if "429" in str(e) or "Too Many Requests" in str(e):
+                        wait = min(5 * 2 ** attempt, 120)
+                        logger.warning(
+                            "Rate limited reading footer for %s (attempt %d/%d), retrying in %ds",
+                            path, attempt + 1, 6, wait,
+                        )
+                        time.sleep(wait)
+                    else:
+                        logger.warning("Failed to read row count for %s: %s", path, e)
+                        return path, None
+            logger.warning("Giving up on footer read for %s after 6 rate-limit retries", path)
+            return path, None
 
         logger.info(
             "Reading parquet footers for %d files (parallel=%d)...",
@@ -186,10 +210,43 @@ class HuggingFaceParquetSource(DatasetSource):
         self._ensure_counts()
         return sum(n for _, n in self._files_with_counts)
 
+    def _prefetch_files(self) -> None:
+        """Download only the parquet files overlapping this rank's window to local disk."""
+        import os
+        from pathlib import Path
+
+        self._ensure_counts()
+        offset = self._offset
+        limit = self._limit
+
+        cumulative = 0
+        to_download = []
+        for path, num_rows in self._files_with_counts:
+            file_end = cumulative + num_rows
+            if file_end > offset and (limit is None or cumulative < offset + limit):
+                to_download.append(path)
+            cumulative = file_end
+
+        Path(self._prefetch_dir).mkdir(parents=True, exist_ok=True)
+
+        for path in to_download:
+            safe_name = path.replace("/", "__")
+            local_path = os.path.join(self._prefetch_dir, safe_name)
+            if os.path.exists(local_path):
+                logger.info("Already cached: %s", path)
+            else:
+                remote = f"datasets/{self.dataset_name}/{path}"
+                logger.info("Downloading %s -> %s", remote, local_path)
+                self._fs.get(remote, local_path)
+                logger.info("Downloaded %s (%.1f GB)", path, os.path.getsize(local_path) / 1e9)
+            self._local_paths[path] = local_path
+
     def stream(self) -> Iterator[dict]:
         import pyarrow.parquet as pq
 
         self._ensure_counts()
+        if self._prefetch and not self._local_paths:
+            self._prefetch_files()
         offset = self._offset
         limit = self._limit
         rows_yielded = 0
@@ -217,13 +274,18 @@ class HuggingFaceParquetSource(DatasetSource):
             if want_from_file <= 0:
                 continue
 
-            url = f"datasets/{self.dataset_name}/{path}"
-            pf = pq.ParquetFile(url, filesystem=self._fs)
+            if path in self._local_paths:
+                pf = pq.ParquetFile(self._local_paths[path])
+            else:
+                pf = pq.ParquetFile(f"datasets/{self.dataset_name}/{path}", filesystem=self._fs)
             taken_from_file = 0
+            # intra_offset is decremented as batches are skipped, so save the
+            # original value now to correctly anchor the global row index later.
+            original_intra_offset = intra_offset
 
             for batch in pf.iter_batches(batch_size=10_000):
                 batch_len = len(batch)
-                
+
                 # batch is entirely before the intra-file offset
                 if intra_offset >= batch_len:
                     intra_offset -= batch_len
@@ -235,9 +297,10 @@ class HuggingFaceParquetSource(DatasetSource):
                 # 1. Zero-copy Arrow slicing before converting to Python list
                 rows = batch.slice(intra_offset, slice_len).to_pylist()
 
-                # Calculate the exact global row index for the start of this slice
-                current_global_index = file_start + intra_offset + taken_from_file
-                
+                # Use the pre-skip intra_offset so the global index is anchored
+                # at file_start + original_intra_offset, not the depleted remainder.
+                current_global_index = file_start + original_intra_offset + taken_from_file
+
                 # Reset intra_offset since we've now entered the window
                 intra_offset = 0
 

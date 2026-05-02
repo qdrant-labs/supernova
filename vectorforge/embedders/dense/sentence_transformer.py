@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 
 import torch
 from sentence_transformers import SentenceTransformer
@@ -54,6 +55,7 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
             self._model.max_seq_length = min(self._model.max_seq_length, max_tokens)
         self._max_tokens = self._model.max_seq_length
         self._truncate = truncate
+        self._encode_lock = threading.Lock()
         # Separate tokenizer copy for split_text to avoid "Already borrowed"
         # race with the model's internal tokenizer used during encode()
         from transformers import AutoTokenizer
@@ -91,12 +93,13 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         return chunks
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
-        embeddings = self._model.encode(
-            texts,
-            batch_size=self._batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
+        with self._encode_lock:
+            embeddings = self._model.encode(
+                texts,
+                batch_size=self._batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
         return embeddings.tolist()
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
