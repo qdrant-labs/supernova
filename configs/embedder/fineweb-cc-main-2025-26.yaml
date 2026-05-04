@@ -8,11 +8,10 @@ source:
 
 dense_embedder:
   type: sentence_transformer
-  model: Alibaba-NLP/gte-multilingual-base
-  trust_remote_code: true
+  model: BAAI/bge-large-en-v1.5
   batch_size: 64
   dtype: bfloat16
-  max_tokens: 1024
+  max_tokens: 512
   truncate: true
 
 sparse_embedder:                                                                                        
@@ -23,7 +22,7 @@ sparse_embedder:
 storage:
   type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: fineweb/embed-gte-multilingual-base/100BT
+  s3_prefix: fineweb/embedder-bge-large-en-v1.5/cc-main-2025-26/
   output_dir: /tmp/vectorforge
 
 pipeline:
