@@ -1,0 +1,34 @@
+source:
+  type: huggingface_parquet
+  dataset_name: HuggingFaceFW/fineweb
+  split: train
+  prefetch: true
+  path_filter: 'data/CC-MAIN-2025-26/*'
+  text_template: '{text}'
+
+dense_embedder:
+  type: sentence_transformer
+  model: Alibaba-NLP/gte-multilingual-base
+  trust_remote_code: true
+  batch_size: 64
+  dtype: bfloat16
+  max_tokens: 1024
+  truncate: true
+
+sparse_embedder:                                                                                        
+  type: fastembed                                                                                     
+  model: Qdrant/bm25                                                                                  
+  batch_size: 256
+
+storage:
+  type: s3
+  s3_bucket: qdrant--vectorforge
+  s3_prefix: fineweb/embed-gte-multilingual-base/100BT
+  output_dir: /tmp/vectorforge
+
+pipeline:
+  chunk_size: 1000
+  num_workers: 2
+  max_text_length: 8192
+  shard_by_rank: true
+  rendered_text_column: rendered_text
