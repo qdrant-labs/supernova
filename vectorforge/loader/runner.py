@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 
 
 def _slice_batch(records: list[dict], batch_size: int) -> list[list[dict]]:
-    """Slice a large prefetched chunk into upsert-sized batches."""
+    """
+    Slice a large prefetched chunk into upsert-sized batches.
+    """
     return [records[i:i + batch_size] for i in range(0, len(records), batch_size)]
 
 

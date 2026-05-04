@@ -176,11 +176,14 @@ class QdrantVectorStore(VectorStore):
                     points=qdrant_points,
                 )
                 return
-            except Exception:
+            except Exception as e:
                 if attempt == max_retries - 1:
                     raise
                 wait = 2 ** attempt
-                logger.warning(f"Upsert failed (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                logger.warning(
+                    "Upsert failed (attempt %d/%d), retrying in %ds: %s",
+                    attempt + 1, max_retries, wait, e,
+                )
                 await asyncio.sleep(wait)
 
     async def close(self) -> None:

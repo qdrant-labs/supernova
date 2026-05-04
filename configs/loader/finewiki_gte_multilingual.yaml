@@ -27,7 +27,7 @@ datasource:
     title: title
     url: url
     wikidata_id: wikidata_id
-    in_language: language
+    in_language: in_language
     date_modified: date_modified
     has_math: has_math
 
@@ -38,5 +38,5 @@ vectorstore:
   api_key: ${QDRANT_API_KEY}
  
 loader:
-  batch_size: 1000
-  concurrency: 8
+  batch_size: 256
+  concurrency: 4
