@@ -174,6 +174,7 @@ class QdrantVectorStore(VectorStore):
                 await self._client.upsert(
                     collection_name=self.collection_name,
                     points=qdrant_points,
+                    wait=False
                 )
                 return
             except Exception as e:
