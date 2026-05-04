@@ -1,10 +1,13 @@
 """S3 parquet data reader."""
 
+import logging
 import os
 
 from typing import Iterable
 
 from .base import DataReader
+
+logger = logging.getLogger(__name__)
 
 
 class S3DataReader(DataReader):
@@ -20,6 +23,8 @@ class S3DataReader(DataReader):
         file_list: list[str] | None = None,
         duckdb_memory_limit: str = "2GB",
         duckdb_threads: int = 2,
+        prefetch: bool = False,
+        prefetch_dir: str = "/tmp/vectorforge_loader",
     ):
         super().__init__(
             id_expression=id_expression,
@@ -31,6 +36,10 @@ class S3DataReader(DataReader):
         self.s3_bucket = s3_bucket
         self.s3_prefix = s3_prefix.rstrip("/")
         self.file_list = file_list
+        self.prefetch = prefetch
+        self.prefetch_dir = prefetch_dir
+        # maps source_expr -> local_path for cleanup after each file is exhausted
+        self._prefetch_map: dict[str, str] = {}
 
     @property
     def glob_path(self) -> str:
@@ -50,19 +59,55 @@ class S3DataReader(DataReader):
             return f"read_parquet('{self.glob_path}'{self._filename_arg})"
         return f"'{self.glob_path}'"
 
+    def _download_file(self, s3_uri: str) -> str:
+        """Download an S3 file to local disk and return the local path."""
+        import boto3
+
+        os.makedirs(self.prefetch_dir, exist_ok=True)
+        safe_name = s3_uri.replace("s3://", "").replace("/", "__")
+        local_path = os.path.join(self.prefetch_dir, safe_name)
+
+        if os.path.exists(local_path):
+            logger.info("Already cached: %s", s3_uri)
+            return local_path
+
+        # s3_uri = "s3://bucket/key/..."
+        without_scheme = s3_uri[5:]  # strip "s3://"
+        bucket, _, key = without_scheme.partition("/")
+        s3 = boto3.client("s3")
+        logger.info("Downloading %s -> %s", s3_uri, local_path)
+        s3.download_file(bucket, key, local_path)
+        size_gb = os.path.getsize(local_path) / 1e9
+        logger.info("Downloaded %.2f GB: %s", size_gb, os.path.basename(local_path))
+        return local_path
+
     def _iter_sources(self) -> Iterable[str]:
-        """When a file_list is provided, scan one file per query so DuckDB
-        releases httpfs / decode buffers between files. The combined
-        read_parquet([...]) form holds buffers for all files at once.
+        """Yield one FROM-clause expression per file.
+
+        With prefetch=True: downloads each S3 file to local disk before
+        yielding the local path expression. _after_source() deletes it once
+        all batches from that file have been consumed.
         """
         suffix = self._filename_arg
         if self.file_list:
             for f in self.file_list:
-                yield f"read_parquet('{f}'{suffix})"
+                if self.prefetch:
+                    local_path = self._download_file(f)
+                    expr = f"read_parquet('{local_path}'{suffix})"
+                    self._prefetch_map[expr] = local_path
+                    yield expr
+                else:
+                    yield f"read_parquet('{f}'{suffix})"
         elif self._uses_filename:
             yield f"read_parquet('{self.glob_path}'{suffix})"
         else:
             yield self.source_sql
+
+    def _after_source(self, source: str) -> None:
+        local_path = self._prefetch_map.pop(source, None)
+        if local_path and os.path.exists(local_path):
+            os.remove(local_path)
+            logger.info("Deleted local file: %s", local_path)
 
     def _configure_connection(self) -> None:
         conn = self._conn

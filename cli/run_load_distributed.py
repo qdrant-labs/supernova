@@ -119,12 +119,9 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--dry-run", action="store_true", help="Generate configs and print plan, don't launch")
     parser.add_argument("--num-shards", type=int, help="Override number of shards")
     parser.add_argument("--pool-name", type=str, help="SkyPilot pool name (default: auto-generated)")
-    parser.add_argument("--on-demand", action="store_true",
-                        help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota)")
-    parser.add_argument("--ramp", action="store_true",
-                        help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). Default is burst (min_workers=max_workers) since EC2 provisioning is slow and we know the target count up front.")
-    parser.add_argument("--finalize", action="store_true",
-                        help="Enable Qdrant indexing (run after all jobs complete)")
+    parser.add_argument("--on-demand", action="store_true", help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota)")
+    parser.add_argument("--ramp", action="store_true", help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). Default is burst (min_workers=max_workers) since EC2 provisioning is slow and we know the target count up front.")
+    parser.add_argument("--finalize", action="store_true", help="Enable Qdrant indexing (run after all jobs complete)")
     args = parser.parse_args(argv)
 
     with open(args.config) as f:
@@ -201,7 +198,7 @@ def main(argv: list[str] | None = None):
         "file_mounts": {
             "/app": ".",
         },
-        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync",
+        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync --extra load",
     }
     pool_path = run_dir / "pool.yaml"
     with open(pool_path, "w") as f:

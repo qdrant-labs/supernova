@@ -4,9 +4,8 @@ dispatch:
 
 resources:
   cpus: 2
-  memory: 8
+  memory: 16
   cloud: aws
-  use_spot: true
 
 vectors:
   dense:
@@ -22,6 +21,7 @@ datasource:
   s3_bucket: qdrant--vectorforge
   s3_prefix: finewiki/embed-gte-multilingual-base/
   id_expression: "hash(text)"   # stable content-based IDs
+  prefetch: true
   payload_fields:
     text: text
     title: title

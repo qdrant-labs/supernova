@@ -5,24 +5,42 @@ description = "Stream massive datasets, embed at scale, store as parquet in S3."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "datasets",
+    # true core -- needed by all workers and local dev
     "pyarrow",
-    "aiobotocore",
-    "openai",
     "pyyaml",
-    "tiktoken>=0.12.0",
     "tqdm",
+    "boto3",
     "huggingface_hub",
-    "duckdb>=1.5.1",
+]
+
+[project.optional-dependencies]
+# ML pipeline -- embed workers
+embed = [
+    "datasets",
+    "aiobotocore",
+    "tiktoken>=0.12.0",
+    "openai",
     "sentence-transformers",
     "torch",
     "transformers<5",
-    "qdrant-client>=1.9.0",
-    "boto3",
-    "skypilot[aws]",
     "FlagEmbedding",
     "einops>=0.8.2",
     "fastembed",
+]
+# Pipeline infra only -- partition workers (no ML models, no fastembed)
+partition = [
+    "datasets",
+    "aiobotocore",
+    "tiktoken>=0.12.0",
+]
+# Vector store loading -- loader workers
+load = [
+    "duckdb>=1.5.1",
+    "qdrant-client>=1.9.0",
+]
+# Distributed job dispatch -- local / Hetzner only, never on workers
+dist = [
+    "skypilot[aws]",
 ]
 
 [build-system]

@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None):
         "file_mounts": {
             "/app": ".",
         },
-        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync",
+        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync --extra partition",
     }
     pool_path = run_dir / "pool.yaml"
     with open(pool_path, "w") as f:
