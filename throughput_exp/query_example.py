@@ -1,6 +1,7 @@
 import duckdb
 
 S3_PATH = "s3://qdrant--vectorforge/finewiki/embed-gte-multilingual-base/**/*.parquet"
+S3_PATH = "s3://qdrant--vectorforge/fineweb/embedder-bge-large-en-v1.5/cc-main-2025-26/**/*.parquet"
 
 con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")
@@ -10,9 +11,8 @@ con.sql(f"DESCRIBE SELECT * FROM '{S3_PATH}'")
 
 # select first 5 rows (text, dense_embedding, sparse_embedding
 con.sql(f"""
-    SELECT title, text, dense_embedding, sparse_embedding as bm25, in_language
+    SELECT text, dense_embedding, sparse_embedding as bm25
     FROM '{S3_PATH}'
-    WHERE in_language = 'en'
     LIMIT 5
     OFFSET 1000000
 """)
