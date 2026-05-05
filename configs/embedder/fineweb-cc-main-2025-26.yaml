@@ -22,7 +22,7 @@ sparse_embedder:
 storage:
   type: s3
   s3_bucket: qdrant--vectorforge
-  s3_prefix: fineweb/embedder-bge-large-en-v1.5/cc-main-2025-26/
+  s3_prefix: fineweb/embedder-bge-large-en-v1.5/cc-main-2025-26
   output_dir: /tmp/vectorforge
 
 pipeline:

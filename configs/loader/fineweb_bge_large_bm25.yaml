@@ -1,0 +1,41 @@
+dispatch:
+  num_shards: 20
+  run_name: fineweb-bge-large-bm25
+
+resources:
+  cpus: 2
+  memory: 16
+  cloud: aws
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+  sparse:
+    type: sparse
+    column: sparse_embedding
+
+datasource:
+  type: s3
+  s3_bucket: qdrant--vectorforge
+  s3_prefix: fineweb/embedder-bge-large-en-v1.5/cc-main-2025-26
+  id_expression: "hash(rendered_text)"   # content-deduped point ids
+  prefetch: true
+  payload_fields:
+    text: rendered_text
+    title: id
+    url: url
+    date: date
+    language: language
+    language_score: language_score
+
+vectorstore:
+  type: qdrant
+  collection_name: fineweb-bge-large-bm25
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+
+loader:
+  batch_size: 256
+  concurrency: 4
