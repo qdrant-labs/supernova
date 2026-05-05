@@ -1,5 +1,5 @@
 dispatch:
-  num_shards: 20
+  num_shards: 25
   run_name: fineweb-bge-large-bm25
 
 resources:

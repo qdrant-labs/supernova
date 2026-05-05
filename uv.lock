@@ -4653,24 +4653,37 @@ name = "vectorforge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "aiobotocore" },
     { name = "boto3" },
+    { name = "huggingface-hub" },
+    { name = "pyarrow" },
+    { name = "pyyaml" },
+    { name = "tqdm" },
+]
+
+[package.optional-dependencies]
+dist = [
+    { name = "skypilot", extra = ["aws"] },
+]
+embed = [
+    { name = "aiobotocore" },
     { name = "datasets" },
-    { name = "duckdb" },
     { name = "einops" },
     { name = "fastembed" },
     { name = "flagembedding" },
-    { name = "huggingface-hub" },
     { name = "openai" },
-    { name = "pyarrow" },
-    { name = "pyyaml" },
-    { name = "qdrant-client" },
     { name = "sentence-transformers" },
-    { name = "skypilot", extra = ["aws"] },
     { name = "tiktoken" },
     { name = "torch" },
-    { name = "tqdm" },
     { name = "transformers" },
+]
+load = [
+    { name = "duckdb" },
+    { name = "qdrant-client" },
+]
+partition = [
+    { name = "aiobotocore" },
+    { name = "datasets" },
+    { name = "tiktoken" },
 ]
 
 [package.dev-dependencies]
@@ -4682,25 +4695,29 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiobotocore" },
+    { name = "aiobotocore", marker = "extra == 'embed'" },
+    { name = "aiobotocore", marker = "extra == 'partition'" },
     { name = "boto3" },
-    { name = "datasets" },
-    { name = "duckdb", specifier = ">=1.5.1" },
-    { name = "einops", specifier = ">=0.8.2" },
-    { name = "fastembed" },
-    { name = "flagembedding" },
+    { name = "datasets", marker = "extra == 'embed'" },
+    { name = "datasets", marker = "extra == 'partition'" },
+    { name = "duckdb", marker = "extra == 'load'", specifier = ">=1.5.1" },
+    { name = "einops", marker = "extra == 'embed'", specifier = ">=0.8.2" },
+    { name = "fastembed", marker = "extra == 'embed'" },
+    { name = "flagembedding", marker = "extra == 'embed'" },
     { name = "huggingface-hub" },
-    { name = "openai" },
+    { name = "openai", marker = "extra == 'embed'" },
     { name = "pyarrow" },
     { name = "pyyaml" },
-    { name = "qdrant-client", specifier = ">=1.9.0" },
-    { name = "sentence-transformers" },
-    { name = "skypilot", extras = ["aws"] },
-    { name = "tiktoken", specifier = ">=0.12.0" },
-    { name = "torch" },
+    { name = "qdrant-client", marker = "extra == 'load'", specifier = ">=1.9.0" },
+    { name = "sentence-transformers", marker = "extra == 'embed'" },
+    { name = "skypilot", extras = ["aws"], marker = "extra == 'dist'" },
+    { name = "tiktoken", marker = "extra == 'embed'", specifier = ">=0.12.0" },
+    { name = "tiktoken", marker = "extra == 'partition'", specifier = ">=0.12.0" },
+    { name = "torch", marker = "extra == 'embed'" },
     { name = "tqdm" },
-    { name = "transformers", specifier = "<5" },
+    { name = "transformers", marker = "extra == 'embed'", specifier = "<5" },
 ]
+provides-extras = ["embed", "partition", "load", "dist"]
 
 [package.metadata.requires-dev]
 dev = [

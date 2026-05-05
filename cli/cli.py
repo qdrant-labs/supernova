@@ -8,6 +8,8 @@ Unified CLI for vectorforge.
   vf partition-dist <config>  # distributed no-op partition via SkyPilot pool
   vf load <config>            # load into vector store
   vf load-dist <config>       # load distributed via SkyPilot
+  vf push-hf <s3> <repo>      # upload S3 parquets to HuggingFace Hub
+  vf push-hf-dist <s3> <repo> # distributed HF upload via SkyPilot pool
   vf analysis <config>        # analyze a (distributed) embedding run
 """
 
@@ -24,6 +26,8 @@ def main():
         print("  partition-dist  Distributed partition via SkyPilot pool")
         print("  load            Load pre-embedded data into a vector store")
         print("  load-dist       Distribute loading across SkyPilot instances")
+        print("  push-hf         Upload S3 parquets to a HuggingFace Hub dataset")
+        print("  push-hf-dist    Distribute HF upload across SkyPilot instances")
         print("  analysis        Analyze a (distributed) embedding run")
         sys.exit(0)
 
@@ -48,6 +52,12 @@ def main():
     elif command == "load-dist":
         from cli.run_load_distributed import main as load_dist_main
         load_dist_main(argv)
+    elif command == "push-hf":
+        from cli.run_push_hf import main as push_hf_main
+        push_hf_main(argv)
+    elif command == "push-hf-dist":
+        from cli.run_push_hf_distributed import main as push_hf_dist_main
+        push_hf_dist_main(argv)
     elif command == "analysis":
         from cli.run_analysis import main as analysis_main
         analysis_main(argv)
