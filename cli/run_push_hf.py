@@ -23,7 +23,7 @@ import tempfile
 from pathlib import Path
 
 import boto3
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, CommitOperationAdd
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,8 @@ def main(argv: list[str] | None = None):
                         help="Total parallel jobs — each takes a round-robin slice of files")
     parser.add_argument("--job-rank", type=int, default=None,
                         help="This job's rank (0-indexed). Defaults to $SKYPILOT_JOB_RANK")
+    parser.add_argument("--commit-batch-size", type=int, default=10,
+                        help="Files per HF commit (default: 10). HF limits to 128 commits/hr.")
     args = parser.parse_args(argv)
 
     if not args.s3_uri.startswith("s3://"):
@@ -108,12 +110,38 @@ def main(argv: list[str] | None = None):
     s3 = boto3.client("s3")
     skipped = 0
     uploaded = 0
+    batch_num = 0
+
+    # Batch files into groups to stay within HF's 128 commits/hr limit.
+    # Each group is downloaded, committed in one shot, then deleted.
+    batch_size = args.commit_batch_size
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        pending: list[tuple[str, str, str]] = []  # (key, relative, local_path)
+
+        def flush_batch():
+            nonlocal uploaded, batch_num
+            if not pending:
+                return
+            operations = [
+                CommitOperationAdd(path_in_repo=f"{args.subfolder}/{rel}", path_or_fileobj=lp)
+                for _, rel, lp in pending
+            ]
+            batch_num += 1
+            logger.info("Committing batch %d (%d files)...", batch_num, len(operations))
+            api.create_commit(
+                repo_id=args.repo_id,
+                repo_type="dataset",
+                operations=operations,
+                commit_message=f"Add {len(operations)} files (batch {batch_num})",
+            )
+            for _, _, lp in pending:
+                os.remove(lp)
+            uploaded += len(pending)
+            pending.clear()
+            logger.info("  Committed [%d uploaded, %d skipped so far]", uploaded, skipped)
+
         for i, key in enumerate(keys):
-            # Preserve S3 directory structure relative to the given prefix.
-            # e.g. key="fineweb/embed/cc-main/rank00/batch_0.parquet", prefix="fineweb/embed"
-            #   -> path_in_repo="data/cc-main/rank00/batch_0.parquet"
             relative = key[len(prefix):].lstrip("/")
             path_in_repo = f"{args.subfolder}/{relative}"
 
@@ -125,25 +153,18 @@ def main(argv: list[str] | None = None):
                 continue
 
             local_path = os.path.join(tmpdir, Path(key).name)
-
             logger.info("[%d/%d] Downloading s3://%s/%s...", i + 1, len(keys), bucket, key)
             s3.download_file(bucket, key, local_path)
             size_gb = os.path.getsize(local_path) / 1e9
-            logger.info("  %.2f GB — uploading to %s", size_gb, path_in_repo)
+            logger.info("  %.2f GB downloaded", size_gb)
+            pending.append((key, relative, local_path))
 
-            api.upload_file(
-                path_or_fileobj=local_path,
-                path_in_repo=path_in_repo,
-                repo_id=args.repo_id,
-                repo_type="dataset",
-                commit_message=f"Add {relative}",
-            )
+            if len(pending) >= batch_size:
+                flush_batch()
 
-            os.remove(local_path)
-            uploaded += 1
-            logger.info("  Done [%d uploaded, %d skipped]", uploaded, skipped)
+        flush_batch()  # commit any remaining files
 
-    print(f"Finished: {uploaded} uploaded, {skipped} skipped")
+    print(f"Finished: {uploaded} uploaded in {batch_num} commits, {skipped} skipped")
     if job_rank is None or job_rank == 0:
         print(f"Dataset: https://huggingface.co/datasets/{args.repo_id}")
 
