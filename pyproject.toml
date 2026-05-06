@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     # true core -- needed by all workers and local dev
     "pyarrow",
+    "numpy",
     "pyyaml",
     "tqdm",
     "boto3",
@@ -37,6 +38,10 @@ partition = [
 load = [
     "duckdb>=1.5.1",
     "qdrant-client>=1.9.0",
+]
+# Recall evaluation -- brute-force nearest-neighbor search (GPU)
+eval = [
+    "torch",
 ]
 # Distributed job dispatch -- local / Hetzner only, never on workers
 dist = [

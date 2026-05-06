@@ -11,6 +11,7 @@ Unified CLI for vectorforge.
   vf push-hf <s3> <repo>        # upload S3 parquets to HuggingFace Hub
   vf push-hf-dist <s3> <repo>   # distributed HF upload via SkyPilot pool
   vf generate-queries <s3> -n N # sample N rows as eval queries (runs on EC2)
+  vf brute-force <s3> --queries # exhaustive nearest-neighbor search (GPU EC2)
   vf analysis <config>          # analyze a (distributed) embedding run
 """
 
@@ -30,6 +31,7 @@ def main():
         print("  push-hf          Upload S3 parquets to a HuggingFace Hub dataset")
         print("  push-hf-dist     Distribute HF upload across SkyPilot instances")
         print("  generate-queries Sample N rows as eval queries (launches EC2, --local to run here)")
+        print("  brute-force      Exhaustive nearest-neighbor search for recall eval (GPU EC2)")
         print("  analysis         Analyze a (distributed) embedding run")
         sys.exit(0)
 
@@ -63,6 +65,9 @@ def main():
     elif command == "generate-queries":
         from cli.run_generate_queries import main as gen_queries_main
         gen_queries_main(argv)
+    elif command == "brute-force":
+        from cli.run_brute_force import main as brute_force_main
+        brute_force_main(argv)
     elif command == "analysis":
         from cli.run_analysis import main as analysis_main
         analysis_main(argv)
