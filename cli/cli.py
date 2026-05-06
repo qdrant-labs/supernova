@@ -2,15 +2,16 @@
 """
 Unified CLI for vectorforge.
 
-  vf embed <config>           # embed locally
-  vf embed-dist <config>      # embed distributed via SkyPilot pool
-  vf partition <config>       # run the embed pipeline with a no-op embedder
-  vf partition-dist <config>  # distributed no-op partition via SkyPilot pool
-  vf load <config>            # load into vector store
-  vf load-dist <config>       # load distributed via SkyPilot
-  vf push-hf <s3> <repo>      # upload S3 parquets to HuggingFace Hub
-  vf push-hf-dist <s3> <repo> # distributed HF upload via SkyPilot pool
-  vf analysis <config>        # analyze a (distributed) embedding run
+  vf embed <config>             # embed locally
+  vf embed-dist <config>        # embed distributed via SkyPilot pool
+  vf partition <config>         # run the embed pipeline with a no-op embedder
+  vf partition-dist <config>    # distributed no-op partition via SkyPilot pool
+  vf load <config>              # load into vector store
+  vf load-dist <config>         # load distributed via SkyPilot
+  vf push-hf <s3> <repo>        # upload S3 parquets to HuggingFace Hub
+  vf push-hf-dist <s3> <repo>   # distributed HF upload via SkyPilot pool
+  vf generate-queries <s3> -n N # sample N rows as eval queries (runs on EC2)
+  vf analysis <config>          # analyze a (distributed) embedding run
 """
 
 import sys
@@ -26,9 +27,10 @@ def main():
         print("  partition-dist  Distributed partition via SkyPilot pool")
         print("  load            Load pre-embedded data into a vector store")
         print("  load-dist       Distribute loading across SkyPilot instances")
-        print("  push-hf         Upload S3 parquets to a HuggingFace Hub dataset")
-        print("  push-hf-dist    Distribute HF upload across SkyPilot instances")
-        print("  analysis        Analyze a (distributed) embedding run")
+        print("  push-hf          Upload S3 parquets to a HuggingFace Hub dataset")
+        print("  push-hf-dist     Distribute HF upload across SkyPilot instances")
+        print("  generate-queries Sample N rows as eval queries (launches EC2, --local to run here)")
+        print("  analysis         Analyze a (distributed) embedding run")
         sys.exit(0)
 
     command = sys.argv[1]
@@ -58,6 +60,9 @@ def main():
     elif command == "push-hf-dist":
         from cli.run_push_hf_distributed import main as push_hf_dist_main
         push_hf_dist_main(argv)
+    elif command == "generate-queries":
+        from cli.run_generate_queries import main as gen_queries_main
+        gen_queries_main(argv)
     elif command == "analysis":
         from cli.run_analysis import main as analysis_main
         analysis_main(argv)

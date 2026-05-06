@@ -261,6 +261,7 @@ def main(argv: list[str] | None = None):
             chunk_size=pipeline_cfg.get("chunk_size", 10_000),
             num_workers=pipeline_cfg.get("num_workers", 8),
             flush_threshold=pipeline_cfg.get("flush_threshold", 100_000),
+            row_group_size=pipeline_cfg.get("row_group_size"),
             output_dir=storage_cfg.get("output_dir", "/tmp/vectorforge"),
             max_text_length=pipeline_cfg.get("max_text_length"),
             dense_column=dense_column,

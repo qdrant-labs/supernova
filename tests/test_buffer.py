@@ -9,11 +9,7 @@ def _make_chunk(chunk_id: int, num_records: int = 3) -> ChunkResult:
         chunk_id=chunk_id,
         records=[
             EmbeddedRecord(
-                row_id=chunk_id * 10 + i,
-                source_row_id=chunk_id * 10 + i,
-                chunk_id=chunk_id,
-                chunk_index=0,
-                text=f"text {i}",
+                text=f"c{chunk_id}r{i}",
                 dense_embedding=[0.0],
             )
             for i in range(num_records)
@@ -42,7 +38,7 @@ async def test_buffer_preserves_order():
     flushed_batches = []
 
     async def flush_fn(records):
-        flushed_batches.append([r.chunk_id for r in records])
+        flushed_batches.append([r.text for r in records])
 
     buffer = ResultBuffer(flush_fn=flush_fn, flush_threshold=100)
 
@@ -52,7 +48,7 @@ async def test_buffer_preserves_order():
 
     await buffer.drain()
     assert len(flushed_batches) == 1
-    assert flushed_batches[0] == [0, 0, 0, 1, 1, 1, 2, 2, 2]
+    assert flushed_batches[0] == ["c0r0", "c0r1", "c0r2", "c1r0", "c1r1", "c1r2", "c2r0", "c2r1", "c2r2"]
 
 
 @pytest.mark.asyncio

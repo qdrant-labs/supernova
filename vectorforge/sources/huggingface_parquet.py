@@ -305,8 +305,6 @@ class HuggingFaceParquetSource(DatasetSource):
                 intra_offset = 0
 
                 for row in rows:
-                    # Inject global row index to bridge to format_record
-                    row["__source_row_id__"] = current_global_index
                     current_global_index += 1
                     yield row
                     
@@ -324,17 +322,6 @@ class HuggingFaceParquetSource(DatasetSource):
     def extract_text(self, row: dict) -> str:
         return self._extract_text(row)
 
-    def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
-        # 2. Extract the dynamically injected source_row_id
-        source_row_id = row.pop("__source_row_id__", 0)
-        
+    def format_record(self, row: dict) -> Record:
         columns = {k: v for k, v in row.items() if k not in self.exclude_columns}
-        
-        return Record(
-            row_id=row_id,
-            source_row_id=source_row_id,
-            chunk_id=chunk_id,
-            chunk_index=0,
-            text=self.extract_text(row),
-            columns=columns,
-        )
+        return Record(text=self.extract_text(row), columns=columns)

@@ -31,3 +31,4 @@ pipeline:
   max_text_length: 8192
   shard_by_rank: true
   rendered_text_column: rendered_text
+  row_group_size: 5000

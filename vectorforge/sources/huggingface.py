@@ -130,13 +130,6 @@ class HuggingFaceSource(DatasetSource):
         """
         return self._extract_text(row)
 
-    def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
+    def format_record(self, row: dict) -> Record:
         columns = {k: v for k, v in row.items() if k not in self.exclude_columns}
-        return Record(
-            row_id=row_id,
-            source_row_id=0,
-            chunk_id=chunk_id,
-            chunk_index=0,
-            text=self.extract_text(row),
-            columns=columns,
-        )
+        return Record(text=self.extract_text(row), columns=columns)

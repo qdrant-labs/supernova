@@ -24,10 +24,6 @@ async def worker(
 
         embedded = [
             EmbeddedRecord(
-                row_id=r.row_id,
-                source_row_id=r.source_row_id,
-                chunk_id=r.chunk_id,
-                chunk_index=r.chunk_index,
                 text=r.text,
                 dense_embedding=result.dense[i] if result.dense else None,
                 sparse_embedding=result.sparse[i] if result.sparse else None,

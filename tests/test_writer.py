@@ -11,19 +11,11 @@ from vectorforge.storage.writer import write_batch
 def test_write_batch_dense_only():
     records = [
         EmbeddedRecord(
-            row_id=0,
-            source_row_id=0,
-            chunk_id=0,
-            chunk_index=0,
             text="hello world",
             dense_embedding=[0.1, 0.2, 0.3],
             columns={"title": "greeting", "url": "http://example.com"},
         ),
         EmbeddedRecord(
-            row_id=1,
-            source_row_id=0,
-            chunk_id=0,
-            chunk_index=1,
             text="another record",
             dense_embedding=[0.4, 0.5, 0.6],
             columns={"title": "second", "url": "http://example.com/2"},
@@ -39,9 +31,6 @@ def test_write_batch_dense_only():
         table = pq.read_table(path)
         assert table.num_rows == 2
         assert table.column("text").to_pylist() == ["hello world", "another record"]
-        assert table.column("source_row_id").to_pylist() == [0, 0]
-        assert table.column("chunk_index").to_pylist() == [0, 1]
-        assert table.column("row_id").to_pylist() == [0, 1]
 
         # Dynamic columns from source data
         assert table.column("title").to_pylist() == ["greeting", "second"]
@@ -54,10 +43,6 @@ def test_write_batch_dense_only():
 def test_write_batch_sparse_only():
     records = [
         EmbeddedRecord(
-            row_id=0,
-            source_row_id=0,
-            chunk_id=0,
-            chunk_index=0,
             text="hello",
             sparse_embedding=SparseEmbedding(indices=[0, 5, 10], values=[1.0, 0.5, 0.3]),
         ),
@@ -77,10 +62,6 @@ def test_write_batch_sparse_only():
 def test_write_batch_both():
     records = [
         EmbeddedRecord(
-            row_id=0,
-            source_row_id=0,
-            chunk_id=0,
-            chunk_index=0,
             text="hello",
             dense_embedding=[0.1, 0.2],
             sparse_embedding=SparseEmbedding(indices=[0, 1], values=[1.0, 0.5]),

@@ -27,12 +27,5 @@ class S3Source(DatasetSource):
     def stream(self):
         raise NotImplementedError("S3Source.stream() not yet implemented")
 
-    def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
-        return Record(
-            row_id=row_id,
-            source_row_id=0,
-            chunk_id=chunk_id,
-            chunk_index=0,
-            text=row[self.text_field],
-            columns=dict(row),
-        )
+    def format_record(self, row: dict) -> Record:
+        return Record(text=row[self.text_field], columns=dict(row))

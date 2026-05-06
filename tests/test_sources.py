@@ -39,15 +39,8 @@ class FakeSource(DatasetSource):
     def stream(self):
         yield from self._rows
 
-    def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
-        return Record(
-            row_id=row_id,
-            source_row_id=0,
-            chunk_id=chunk_id,
-            chunk_index=0,
-            text=row[self._text_field],
-            columns=dict(row),
-        )
+    def format_record(self, row: dict) -> Record:
+        return Record(text=row[self._text_field], columns=dict(row))
 
 
 engine = EmbeddingEngine(dense=FakeDenseEmbedder())
@@ -62,9 +55,7 @@ def test_get_chunks_single_chunk():
     assert chunk_id == 0
     assert len(records) == 5
     assert records[0].text == "row 0"
-    assert records[4].row_id == 4
-    assert records[0].source_row_id == 0
-    assert records[4].source_row_id == 4
+    assert records[4].text == "row 4"
 
 
 def test_get_chunks_multiple_chunks():
@@ -90,10 +81,9 @@ def test_get_chunks_exact_boundary():
 
 
 def test_chunk_index_for_short_texts():
-    """Short texts should all have chunk_index=0."""
     rows = [{"text": "short"} for _ in range(3)]
     source = FakeSource(rows)
     chunks = list(source.get_chunks(engine, chunk_size=10))
-    for _, records in chunks:
-        for r in records:
-            assert r.chunk_index == 0
+    assert len(chunks) == 1
+    _, records = chunks[0]
+    assert len(records) == 3

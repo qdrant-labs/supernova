@@ -32,6 +32,7 @@ async def run(
     rendered_text_column: str = "text",
     filename_prefix: str = "",
     expected_total_rows: int | None = None,
+    row_group_size: int | None = None,
 ):
     logger.info(
         "Starting pipeline: source=%s engine=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
@@ -56,6 +57,7 @@ async def run(
             multivector_column=multivector_column,
             rendered_text_column=rendered_text_column,
             filename_prefix=filename_prefix,
+            row_group_size=row_group_size,
         )
         logger.info("Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path)
         batch_counter += 1

@@ -20,7 +20,7 @@ class DatasetSource(ABC):
         pass
 
     @abstractmethod
-    def format_record(self, row: dict, row_id: int, chunk_id: int) -> Record:
+    def format_record(self, row: dict) -> Record:
         """
         Convert a raw row into a Record.
         The implementor decides which field(s) become `text`.
@@ -50,40 +50,24 @@ class DatasetSource(ABC):
         """
         chunk: list[Record] = []
         chunk_id = 0
-        row_id = 0
-        source_row_id = 0
 
         for raw_row in self.stream():
-            base_record = self.format_record(raw_row, row_id, chunk_id)
+            base_record = self.format_record(raw_row)
 
             if not base_record.text or not base_record.text.strip():
-                source_row_id += 1
                 continue
 
             text = base_record.text
             if max_text_length and len(text) > max_text_length:
                 text = text[:max_text_length]
 
-            text_pieces = engine.split_text(text)
-
-            for chunk_index, piece in enumerate(text_pieces):
-                record = Record(
-                    row_id=row_id,
-                    source_row_id=source_row_id,
-                    chunk_id=chunk_id,
-                    chunk_index=chunk_index,
-                    text=piece,
-                    columns=base_record.columns,
-                )
-                chunk.append(record)
-                row_id += 1
+            for piece in engine.split_text(text):
+                chunk.append(Record(text=piece, columns=base_record.columns))
 
                 if len(chunk) == chunk_size:
                     yield chunk_id, chunk
                     chunk = []
                     chunk_id += 1
-
-            source_row_id += 1
 
         if chunk:
             yield chunk_id, chunk

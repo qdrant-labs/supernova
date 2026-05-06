@@ -34,10 +34,6 @@ class Record:
 
     `columns` carries all original source columns (after exclude_columns filtering).
     """
-    row_id: int
-    source_row_id: int
-    chunk_id: int
-    chunk_index: int
     text: str
     columns: dict = field(default_factory=dict)
 
@@ -48,10 +44,6 @@ class EmbeddedRecord:
     A Record after embedding. Any combination of dense/sparse/multivector
     may be set depending on which embedders are configured.
     """
-    row_id: int
-    source_row_id: int
-    chunk_id: int
-    chunk_index: int
     text: str
     dense_embedding: list[float] | None = None
     sparse_embedding: SparseEmbedding | None = None
