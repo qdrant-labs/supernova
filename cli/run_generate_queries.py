@@ -24,10 +24,8 @@ import bisect
 import logging
 import os
 import random
-import subprocess
 import tempfile
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 
 from tqdm import tqdm
@@ -38,15 +36,10 @@ import pyarrow.parquet as pq
 import pyarrow.fs as pafs
 import yaml
 
-logger = logging.getLogger(__name__)
+from cli.skypilot_utils import build_env_flags, make_run_dir, launch_single_job
+from vectorforge.utils import get_bucket_region
 
-ENV_VARS_TO_FORWARD = [
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-]
+logger = logging.getLogger(__name__)
 
 # "n"-family = enhanced networking (25-100Gbps). S3 reads that take
 # minutes locally finish in seconds in-region.
@@ -223,11 +216,6 @@ def run_pipeline(
     print(f"Pushed to s3://{bucket}/{s3_key}")
 
 
-def get_bucket_region(bucket: str) -> str:
-    resp = boto3.client("s3").get_bucket_location(Bucket=bucket)
-    return resp["LocationConstraint"] or "us-east-1"
-
-
 def launch_on_ec2(
     s3_uri: str,
     bucket: str,
@@ -250,9 +238,7 @@ def launch_on_ec2(
     if prefetch:
         worker_flags += " --prefetch"
 
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M")
-    run_dir = Path("runs") / f"{timestamp}_generate-queries"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir("generate-queries")
 
     job_yaml = {
         "name": "vf-generate-queries",
@@ -288,13 +274,7 @@ def launch_on_ec2(
         print(f"To run manually: sky jobs launch -y {job_path}")
         return
 
-    env_flags = []
-    for var in ENV_VARS_TO_FORWARD:
-        val = os.environ.get(var)
-        if val:
-            env_flags.extend(["--env", f"{var}={val}"])
-
-    subprocess.run(["sky", "jobs", "launch", "-y", str(job_path), *env_flags], check=True)
+    launch_single_job(job_path, build_env_flags())
 
     print(f"\nOutput will be at s3://{bucket}/{prefix}/{output}")
     print("Monitor: sky jobs logs")

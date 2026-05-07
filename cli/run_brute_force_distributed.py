@@ -15,10 +15,6 @@ Usage:
 import argparse
 import logging
 import math
-import os
-import subprocess
-
-from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -29,20 +25,13 @@ from cli.run_brute_force import (
     DEFAULT_INSTANCE_TYPE,
     DEFAULT_K,
     DistanceMetric,
-    get_bucket_region,
     list_corpus_parquets,
     partial_prefix,
 )
+from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_monitor
+from vectorforge.utils import get_bucket_region
 
 logger = logging.getLogger(__name__)
-
-ENV_VARS_TO_FORWARD = [
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-]
 
 DEFAULT_NUM_JOBS = 50
 
@@ -93,10 +82,8 @@ def main(argv: list[str] | None = None):
     corpus_keys = list_corpus_parquets(bucket, prefix)
     files_per_worker = math.ceil(len(corpus_keys) / args.num_jobs)
 
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M")
     pool_name = args.pool_name or f"vf-bf-{queries_stem}"
-    run_dir = Path("runs") / f"{timestamp}_brute-force-dist"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir("brute-force-dist")
 
     resources = {
         "cloud": "aws",
@@ -167,26 +154,10 @@ def main(argv: list[str] | None = None):
         print(f"[dry run] Job config:  {job_path}")
         return
 
-    env_flags = []
-    for var in ENV_VARS_TO_FORWARD:
-        val = os.environ.get(var)
-        if val:
-            env_flags.extend(["--env", f"{var}={val}"])
-
-    subprocess.run(
-        ["sky", "jobs", "pool", "apply", "-p", pool_name, str(pool_path), *env_flags],
-        check=True,
-    )
-    subprocess.run(
-        ["sky", "jobs", "launch", "-p", pool_name,
-         "--num-jobs", str(args.num_jobs), "-y", str(job_path), *env_flags],
-        check=True,
-    )
+    launch_pool_and_jobs(pool_name, pool_path, job_path, args.num_jobs, build_env_flags())
 
     print(f"Submitted {args.num_jobs} workers to pool '{pool_name}'")
-    print(f"Monitor:  sky jobs pool status {pool_name}")
-    print(f"Logs:     sky jobs pool logs {pool_name}")
-    print(f"Teardown: sky jobs pool down {pool_name}")
+    print_monitor(pool_name)
     print(f"\nWhen done: {merge_cmd}")
 
 

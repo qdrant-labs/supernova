@@ -56,6 +56,12 @@ def s3_rel_key(key: str, bucket: str, prefix: str) -> str:
     return key
 
 
+def get_bucket_region(bucket: str) -> str:
+    """Return the AWS region of an S3 bucket."""
+    resp = boto3.client("s3").get_bucket_location(Bucket=bucket)
+    return resp["LocationConstraint"] or "us-east-1"
+
+
 def make_point_id(source_file: str, source_row: int) -> str:
     """
     Stable, deterministic point ID used across the pipeline:

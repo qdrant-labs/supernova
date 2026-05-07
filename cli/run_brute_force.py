@@ -30,11 +30,9 @@ import argparse
 import logging
 import math
 import os
-import subprocess
 import tempfile
 
 from collections import defaultdict
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from queue import Queue
@@ -49,29 +47,16 @@ import yaml
 
 from tqdm import tqdm
 
-from vectorforge.utils import make_point_id, s3_rel_key
+from cli.skypilot_utils import CUDA_IMAGE_IDS, build_env_flags, make_run_dir, launch_single_job
+from vectorforge.utils import get_bucket_region, make_point_id, s3_rel_key
 
 logger = logging.getLogger(__name__)
-
-ENV_VARS_TO_FORWARD = [
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-]
 
 DEFAULT_INSTANCE_TYPE = "g4dn.2xlarge"  # 1× T4 GPU, 32GB RAM, 25Gbps
 DEFAULT_ACCELERATOR = "T4:1"
 DEFAULT_K = 1000
 PREFETCH_QUEUE_SIZE = 4
 MAX_ROWS_PER_FILE = 10_000_000  # upper bound for global ID encoding
-
-CUDA_IMAGE_IDS = {
-    "us-east-1": "ami-0038d79e7270bb987",
-    "us-west-2": "ami-08a03808395c1b31f",
-    "us-east-2": "ami-0a28b3d7e7c9192a7",
-}
 
 
 class DistanceMetric(str, Enum):
@@ -349,11 +334,6 @@ def merge_results(
     _save_and_push(result, local_out, bucket, f"{prefix}/eval/{output}")
 
 
-def get_bucket_region(bucket: str) -> str:
-    resp = boto3.client("s3").get_bucket_location(Bucket=bucket)
-    return resp["LocationConstraint"] or "us-east-1"
-
-
 def launch_on_ec2(
     s3_uri: str,
     bucket: str,
@@ -376,9 +356,7 @@ def launch_on_ec2(
         f"--output {output} --local"
     )
 
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M")
-    run_dir = Path("runs") / f"{timestamp}_brute-force"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir("brute-force")
 
     image_id = CUDA_IMAGE_IDS.get(region)
     if image_id is None:
@@ -422,13 +400,7 @@ def launch_on_ec2(
         print(f"To run manually: sky jobs launch -y {job_path}")
         return
 
-    env_flags = []
-    for var in ENV_VARS_TO_FORWARD:
-        val = os.environ.get(var)
-        if val:
-            env_flags.extend(["--env", f"{var}={val}"])
-
-    subprocess.run(["sky", "jobs", "launch", "-y", str(job_path), *env_flags], check=True)
+    launch_single_job(job_path, build_env_flags())
     print(f"\nOutput will be at s3://{bucket}/{prefix}/{output}")
     print("Monitor: sky jobs logs")
     print("Cancel:  sky jobs cancel -a")

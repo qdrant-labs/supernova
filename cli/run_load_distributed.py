@@ -25,29 +25,16 @@ import json
 import logging
 import os
 import re
-import subprocess
 import time
-
-from datetime import datetime
 from pathlib import Path
 
 import yaml
 
+from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_dry_run, print_monitor
 from vectorforge.loader.datasource.s3 import S3DataReader
 from vectorforge.loader.vectorstore.qdrant import QdrantVectorStore
 
 logger = logging.getLogger(__name__)
-
-ENV_VARS_TO_FORWARD = [
-    "QDRANT_URL",
-    "QDRANT_API_KEY",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "HF_TOKEN",
-]
 
 
 def resolve_env_vars(value: str) -> str:
@@ -149,10 +136,8 @@ def main(argv: list[str] | None = None):
     pool_name = args.pool_name or f"vf-load-{run_name}"
 
     # create run directory
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M")
-    run_id = f"{timestamp}_{run_name}"
-    run_dir = Path("runs") / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir(run_name)
+    run_id = run_dir.name
 
     # discover parquet files
     ds_cfg = config["datasource"]
@@ -220,12 +205,7 @@ def main(argv: list[str] | None = None):
     logger.info(f"Generated configs in {run_dir}/")
 
     if args.dry_run:
-        print(f"\n[dry run] Would create pool '{pool_name}' and submit {num_shards} jobs")
-        print(f"  Pool config: {pool_path}")
-        print(f"  Job config:  {job_path}")
-        print("\nTo run manually:")
-        print(f"  sky jobs pool apply -p {pool_name} {pool_path}")
-        print(f"  sky jobs launch -p {pool_name} --num-jobs {num_shards} {job_path}")
+        print_dry_run(pool_name, num_shards, pool_path, job_path)
         return
 
     # Setup Qdrant: create collection + defer indexing
@@ -245,31 +225,13 @@ def main(argv: list[str] | None = None):
     asyncio.run(_setup_collection(store, dimensions))
     logger.info("Qdrant collection ready (indexing deferred)")
 
-    # build env flagsf
-    env_flags = []
-    for var in ENV_VARS_TO_FORWARD:
-        val = os.environ.get(var)
-        if val:
-            env_flags.extend(["--env", f"{var}={val}"])
-
-    # create pool
+    env_flags = build_env_flags(["QDRANT_URL", "QDRANT_API_KEY", "HF_TOKEN"])
     logger.info(f"Creating pool '{pool_name}'...")
-    subprocess.run(
-        ["sky", "jobs", "pool", "apply", "-p", pool_name, str(pool_path), *env_flags],
-        check=True,
-    )
-
-    # submit jobs
     logger.info(f"Submitting {num_shards} jobs to pool '{pool_name}'...")
-    subprocess.run(
-        ["sky", "jobs", "launch", "-p", pool_name, "--num-jobs", str(num_shards), "-y", str(job_path), *env_flags],
-        check=True,
-    )
+    launch_pool_and_jobs(pool_name, pool_path, job_path, num_shards, env_flags)
 
     print(f"\nSubmitted {num_shards} loading jobs to pool '{pool_name}'")
-    print(f"\nMonitor:    sky jobs pool status {pool_name}")
-    print(f"View logs:  sky jobs pool logs {pool_name}")
-    print(f"Tear down:  sky jobs pool down {pool_name}")
+    print_monitor(pool_name)
     print("\nAfter all jobs complete, enable Qdrant indexing:")
     print(f"  vf load-dist {args.config} --finalize")
 

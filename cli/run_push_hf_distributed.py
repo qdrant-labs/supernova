@@ -15,25 +15,14 @@ Usage:
 import argparse
 import json
 import logging
-import os
-import subprocess
-
-from datetime import datetime
 from pathlib import Path
 
 import boto3
 import yaml
 
-logger = logging.getLogger(__name__)
+from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_dry_run, print_monitor
 
-ENV_VARS_TO_FORWARD = [
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "HF_TOKEN",
-]
+logger = logging.getLogger(__name__)
 
 DEFAULT_RESOURCES = {
     "cpus": 2,
@@ -95,10 +84,8 @@ def main(argv: list[str] | None = None):
     repo_slug = args.repo_id.replace("/", "--")
     pool_name = args.pool_name or f"vf-push-hf-{repo_slug}"
 
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M")
-    run_id = f"{timestamp}_{pool_name}"
-    run_dir = Path("runs") / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir(pool_name)
+    run_id = run_dir.name
 
     print("=" * 60)
     print("vectorforge distributed HuggingFace push plan")
@@ -160,36 +147,16 @@ def main(argv: list[str] | None = None):
         json.dump(manifest, f, indent=2)
 
     if args.dry_run:
-        print(f"\n[dry run] Would create pool '{pool_name}' and submit {num_jobs} jobs")
-        print(f"  Pool config: {pool_path}")
-        print(f"  Job config:  {job_path}")
-        print("\nTo run manually:")
-        print(f"  sky jobs pool apply -p {pool_name} {pool_path}")
-        print(f"  sky jobs launch -p {pool_name} --num-jobs {num_jobs} {job_path}")
+        print_dry_run(pool_name, num_jobs, pool_path, job_path)
         return
 
-    env_flags = []
-    for var in ENV_VARS_TO_FORWARD:
-        val = os.environ.get(var)
-        if val:
-            env_flags.extend(["--env", f"{var}={val}"])
-
+    env_flags = build_env_flags(["HF_TOKEN"])
     logger.info("Creating pool '%s'...", pool_name)
-    subprocess.run(
-        ["sky", "jobs", "pool", "apply", "-p", pool_name, str(pool_path), *env_flags],
-        check=True,
-    )
-
     logger.info("Submitting %d jobs to pool '%s'...", num_jobs, pool_name)
-    subprocess.run(
-        ["sky", "jobs", "launch", "-p", pool_name, "--num-jobs", str(num_jobs), "-y", str(job_path), *env_flags],
-        check=True,
-    )
+    launch_pool_and_jobs(pool_name, pool_path, job_path, num_jobs, env_flags)
 
     print(f"\nSubmitted {num_jobs} upload jobs to pool '{pool_name}'")
-    print(f"Monitor with: sky jobs pool status {pool_name}")
-    print(f"View logs:    sky jobs pool logs {pool_name}")
-    print(f"Tear down:    sky jobs pool down {pool_name}")
+    print_monitor(pool_name)
     print(f"Dataset:      https://huggingface.co/datasets/{args.repo_id}")
 
 
