@@ -20,7 +20,7 @@ datasource:
   type: s3
   s3_bucket: qdrant--vectorforge
   s3_prefix: fineweb/embedder-bge-large-en-v1.5/cc-main-2025-26
-  id_expression: "hash(rendered_text)"   # content-deduped point ids
+  id_expression: "vf_point_id(filename, ROW_NUMBER() OVER (PARTITION BY filename) - 1)"
   prefetch: true
   payload_fields:
     text: rendered_text

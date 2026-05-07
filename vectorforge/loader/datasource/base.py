@@ -90,12 +90,30 @@ class DataReader(ABC):
         if self._conn is None:
             self._conn = duckdb.connect()
             self._configure_connection()
+            self._register_macros()
             # DuckDB defaults to ~80% of system RAM (and ignores it for httpfs
             # buffers anyway). Both threads and memory_limit are capped low
             # because the planner parallelizes parquet scans aggressively.
             self._conn.execute(f"SET memory_limit = '{self.duckdb_memory_limit}';")
             self._conn.execute(f"SET threads = {self.duckdb_threads};")
         return self._conn
+
+    def _register_macros(self) -> None:
+        """Register DuckDB macros available in all id_expression / payload SQL."""
+        conn = self._conn
+        # UUID formatting: 32-char hex → xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        conn.execute("""
+            CREATE OR REPLACE MACRO vf_uuid_from_hex(h) AS (
+                substr(h, 1, 8) || '-' || substr(h, 9, 4) || '-' ||
+                substr(h, 13, 4) || '-' || substr(h, 17, 4) || '-' || substr(h, 21, 12)
+            )
+        """)
+        # Matches vectorforge.utils.make_point_id exactly: md5(file:row) as UUID
+        conn.execute("""
+            CREATE OR REPLACE MACRO make_point_id(source_file, source_row) AS (
+                vf_uuid_from_hex(md5(source_file || ':' || CAST(source_row AS VARCHAR)))
+            )
+        """)
 
     def _configure_connection(self) -> None:
         """Override to configure the DuckDB connection (e.g. S3 credentials)."""

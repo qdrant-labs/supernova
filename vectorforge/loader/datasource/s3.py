@@ -81,19 +81,39 @@ class S3DataReader(DataReader):
         logger.info("Downloaded %.2f GB: %s", size_gb, os.path.basename(local_path))
         return local_path
 
+    def _register_macros(self) -> None:
+        super()._register_macros()
+        # vf_point_id(filename, row_num) → UUID matching make_point_id(rel_key, row_num)
+        # Strips s3://bucket/prefix/ from filename to get the relative corpus key.
+        bucket_prefix = f"s3://{self.s3_bucket}/{self.s3_prefix}/"
+        prefix_len = len(bucket_prefix)
+        self._conn.execute(f"""
+            CREATE OR REPLACE MACRO vf_point_id(fname, rnum) AS (
+                make_point_id(substr(fname, {prefix_len + 1}), rnum)
+            )
+        """)
+
     def _iter_sources(self) -> Iterable[str]:
         """Yield one FROM-clause expression per file.
 
         With prefetch=True: downloads each S3 file to local disk before
         yielding the local path expression. _after_source() deletes it once
         all batches from that file have been consumed.
+
+        When id_expression uses `filename`, prefetch mode injects the original
+        S3 URI as a literal column so vf_point_id gets the real path, not the
+        local temp path.
         """
         suffix = self._filename_arg
         if self.file_list:
             for f in self.file_list:
                 if self.prefetch:
                     local_path = self._download_file(f)
-                    expr = f"read_parquet('{local_path}'{suffix})"
+                    if self._uses_filename:
+                        # Inject original S3 URI so vf_point_id sees the real path
+                        expr = f"(SELECT *, '{f}' AS filename FROM read_parquet('{local_path}'))"
+                    else:
+                        expr = f"read_parquet('{local_path}')"
                     self._prefetch_map[expr] = local_path
                     yield expr
                 else:
