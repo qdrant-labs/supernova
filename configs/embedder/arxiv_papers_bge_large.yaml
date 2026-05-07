@@ -1,0 +1,32 @@
+source:
+  type: huggingface_parquet
+  dataset_name: nick007x/arxiv-papers
+  split: train
+  text_template: 'Title: {title}\nAbstract: {abstract}'
+
+dense_embedder:
+  type: sentence_transformer
+  model: BAAI/bge-large-en-v1.5
+  batch_size: 64
+  dtype: bfloat16
+  max_tokens: 512
+  truncate: true
+
+sparse_embedder:                                                                                        
+  type: fastembed                                                                                     
+  model: Qdrant/bm25                                                                                  
+  batch_size: 256
+
+storage:
+  type: s3
+  s3_bucket: qdrant--vectorforge
+  s3_prefix: arxiv-papers/embedder-bge-large-en-v1.5
+  output_dir: /tmp/vectorforge
+
+pipeline:
+  chunk_size: 1000
+  num_workers: 2
+  max_text_length: 8192
+  shard_by_rank: true
+  rendered_text_column: rendered_text
+  row_group_size: 10000

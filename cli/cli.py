@@ -15,6 +15,7 @@ Unified CLI for vectorforge.
   vf brute-force-dist <s3> --queries    # distributed brute-force via GPU pool
   vf brute-force-merge <s3> --queries   # merge partial results from dist run
   vf analysis <config>                  # analyze a (distributed) embedding run
+  vf throughput-predict <config>        # predict embedding throughput + cost from a config
 """
 
 import sys
@@ -37,6 +38,7 @@ def main():
         print("  brute-force-dist   Distributed brute-force via SkyPilot GPU pool")
         print("  brute-force-merge  Merge partial results from a distributed run")
         print("  analysis           Analyze a (distributed) embedding run")
+        print("  throughput-predict Predict embedding throughput + cost from a config")
         sys.exit(0)
 
     command = sys.argv[1]
@@ -81,6 +83,9 @@ def main():
     elif command == "analysis":
         from cli.run_analysis import main as analysis_main
         analysis_main(argv)
+    elif command == "throughput-predict":
+        from cli.run_throughput_predict import main as throughput_predict_main
+        throughput_predict_main(argv)
     else:
         print(f"unknown command: {command}")
         print("run 'vf --help' for available commands")
