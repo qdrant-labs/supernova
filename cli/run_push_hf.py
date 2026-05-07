@@ -34,7 +34,7 @@ def list_s3_parquets(bucket: str, prefix: str) -> list[str]:
     keys = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
+            if obj["Key"].endswith(".parquet") and "/eval/" not in obj["Key"]:
                 keys.append(obj["Key"])
     return sorted(keys)
 

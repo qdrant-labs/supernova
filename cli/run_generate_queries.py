@@ -8,7 +8,7 @@ from parquet footers, fetch the actual row data, push queries.parquet to S3.
 
 Use --local to run the full pipeline in-process (also what the EC2 job calls).
 
-Output: s3://bucket/prefix/queries_<n>.parquet
+Output: s3://bucket/prefix/eval/queries_<n>.parquet
   All original parquet columns (dense_embedding, sparse_embedding, text, …)
   plus __source_file__ and __source_row__ for provenance.
 
@@ -58,7 +58,7 @@ def list_s3_parquets(bucket: str, prefix: str) -> list[str]:
     keys = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
+            if obj["Key"].endswith(".parquet") and "/eval/" not in obj["Key"]:
                 keys.append(obj["Key"])
     return sorted(keys)
 
@@ -227,7 +227,7 @@ def run_pipeline(
 
     buf = pa.BufferOutputStream()
     pq.write_table(result, buf, compression="snappy")
-    s3_key = f"{prefix}/{output}"
+    s3_key = f"{prefix}/eval/{output}"
     boto3.client("s3").put_object(
         Bucket=bucket, Key=s3_key, Body=bytes(buf.getvalue())
     )
@@ -290,7 +290,7 @@ def launch_on_ec2(
     print(f"  Instance:    {instance_type}  ({'on-demand' if on_demand else 'spot'})")
     print(f"  Columns:     {columns or 'all'}")
     print(f"  Fetch mode:  {'prefetch (download-first)' if prefetch else 'range requests'}")
-    print(f"  Output:      s3://{bucket}/{prefix}/{output}")
+    print(f"  Output:      s3://{bucket}/{prefix}/eval/{output}")
     print(f"  Run dir:     {run_dir}")
     print("=" * 60)
 

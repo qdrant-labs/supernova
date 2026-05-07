@@ -97,7 +97,7 @@ def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
-            if key.endswith(".parquet"):
+            if key.endswith(".parquet") and "/eval/" not in key:
                 files.append(f"s3://{bucket}/{key}")
     files.sort()
 
