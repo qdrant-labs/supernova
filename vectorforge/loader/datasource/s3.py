@@ -46,17 +46,12 @@ class S3DataReader(DataReader):
         return f"s3://{self.s3_bucket}/{self.s3_prefix}/**/*.parquet"
 
     @property
-    def _filename_arg(self) -> str:
-        """", filename=true" if the id_expression needs the filename column, else ""."""
-        return ", filename=true" if self._uses_filename else ""
-
-    @property
     def source_sql(self) -> str:
         if self.file_list:
             files_literal = ", ".join(f"'{f}'" for f in self.file_list)
-            return f"read_parquet([{files_literal}]{self._filename_arg})"
-        if self._uses_filename:
-            return f"read_parquet('{self.glob_path}'{self._filename_arg})"
+            return f"read_parquet([{files_literal}]{self._parquet_kwargs})"
+        if self._parquet_kwargs:
+            return f"read_parquet('{self.glob_path}'{self._parquet_kwargs})"
         return f"'{self.glob_path}'"
 
     def _download_file(self, s3_uri: str) -> str:
@@ -103,23 +98,26 @@ class S3DataReader(DataReader):
 
         When id_expression uses `filename`, prefetch mode injects the original
         S3 URI as a literal column so vf_point_id gets the real path, not the
-        local temp path.
+        local temp path. `file_row_number` is enabled directly on the inner
+        read_parquet so it reflects the physical row index.
         """
-        suffix = self._filename_arg
+        suffix = self._parquet_kwargs
         if self.file_list:
             for f in self.file_list:
                 if self.prefetch:
                     local_path = self._download_file(f)
+                    inner_args = ", file_row_number=true" if self._uses_file_row_number else ""
+                    inner = f"read_parquet('{local_path}'{inner_args})"
                     if self._uses_filename:
                         # Inject original S3 URI so vf_point_id sees the real path
-                        expr = f"(SELECT *, '{f}' AS filename FROM read_parquet('{local_path}'))"
+                        expr = f"(SELECT *, '{f}' AS filename FROM {inner})"
                     else:
-                        expr = f"read_parquet('{local_path}')"
+                        expr = inner
                     self._prefetch_map[expr] = local_path
                     yield expr
                 else:
                     yield f"read_parquet('{f}'{suffix})"
-        elif self._uses_filename:
+        elif self._parquet_kwargs:
             yield f"read_parquet('{self.glob_path}'{suffix})"
         else:
             yield self.source_sql

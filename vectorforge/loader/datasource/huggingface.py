@@ -32,13 +32,13 @@ class HuggingFaceDataReader(DataReader):
 
     @property
     def source_sql(self) -> str:
-        if self._uses_filename:
-            return f"read_parquet('{self.glob_path}', filename=true)"
+        if self._parquet_kwargs:
+            return f"read_parquet('{self.glob_path}'{self._parquet_kwargs})"
         return super().source_sql
 
     def _iter_sources(self):
-        if self._uses_filename:
-            yield f"read_parquet('{self.glob_path}', filename=true)"
+        if self._parquet_kwargs:
+            yield f"read_parquet('{self.glob_path}'{self._parquet_kwargs})"
         else:
             yield self.source_sql
 

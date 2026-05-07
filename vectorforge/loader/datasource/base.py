@@ -15,6 +15,7 @@ VECTOR_TYPES = {"dense", "sparse", "multivector"}
 
 # Word-boundary match so column "filename" matches but "myfilename" does not.
 _FILENAME_TOKEN = re.compile(r"\bfilename\b")
+_FILE_ROW_NUMBER_TOKEN = re.compile(r"\bfile_row_number\b")
 
 
 class DataReader(ABC):
@@ -27,8 +28,13 @@ class DataReader(ABC):
         expression that returns UBIGINT or a UUID string also works -- e.g.
         ``hash(text)`` for content-deduplicated ids, ``hash(filename, row_id)``
         for a globally-unique key across files, or ``uuid()`` for random
-        per-row UUIDs. If the expression references the ``filename`` column,
-        the loader auto-enables ``read_parquet(..., filename=true)``.
+        per-row UUIDs. If the expression references ``filename`` or
+        ``file_row_number``, the loader auto-enables the matching
+        ``read_parquet(..., filename=true, file_row_number=true)`` flags so
+        those virtual columns are available. Use ``file_row_number`` for the
+        physical row index within the parquet (matches pyarrow's order); do
+        NOT use ``ROW_NUMBER() OVER (PARTITION BY filename)`` -- that reflects
+        DuckDB's parallel scan order and will not match brute-force IDs.
     vectors: dict of vector name -> spec, where each spec has:
         - type: "dense" | "sparse" | "multivector"
         - column: parquet column name
@@ -54,6 +60,7 @@ class DataReader(ABC):
         self.duckdb_memory_limit = duckdb_memory_limit
         self.duckdb_threads = duckdb_threads
         self._uses_filename = bool(_FILENAME_TOKEN.search(id_expression))
+        self._uses_file_row_number = bool(_FILE_ROW_NUMBER_TOKEN.search(id_expression))
 
         for name, spec in self.vectors.items():
             vtype = spec.get("type")
@@ -68,6 +75,17 @@ class DataReader(ABC):
     @abstractmethod
     def glob_path(self) -> str:
         """DuckDB-readable glob path to the parquet files."""
+
+    @property
+    def _parquet_kwargs(self) -> str:
+        """Comma-prefixed kwargs to pass to ``read_parquet`` based on which
+        virtual columns the id_expression references. Returns "" when none."""
+        parts = []
+        if self._uses_filename:
+            parts.append("filename=true")
+        if self._uses_file_row_number:
+            parts.append("file_row_number=true")
+        return (", " + ", ".join(parts)) if parts else ""
 
     @property
     def source_sql(self) -> str:
