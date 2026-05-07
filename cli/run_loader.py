@@ -91,15 +91,8 @@ def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]
     bucket = ds_cfg["s3_bucket"]
     prefix = ds_cfg["s3_prefix"].rstrip("/")
 
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    files = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".parquet") and "/eval/" not in key:
-                files.append(f"s3://{bucket}/{key}")
-    files.sort()
+    from vectorforge.utils import discover_corpus_parquets
+    files = [f"s3://{bucket}/{k}" for k in discover_corpus_parquets(bucket, prefix)]
 
     # round-robin assignment
     shard = [f for i, f in enumerate(files) if i % num_jobs == job_rank]

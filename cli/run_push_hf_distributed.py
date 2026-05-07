@@ -48,14 +48,8 @@ DEFAULT_RESOURCES = {
 
 
 def list_s3_parquets(bucket: str, prefix: str) -> list[str]:
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
-                keys.append(obj["Key"])
-    return sorted(keys)
+    from vectorforge.utils import discover_corpus_parquets
+    return discover_corpus_parquets(bucket, prefix)
 
 
 def main(argv: list[str] | None = None):

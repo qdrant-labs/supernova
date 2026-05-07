@@ -85,15 +85,8 @@ def partial_prefix(prefix: str, queries_stem: str, k: int) -> str:
 
 
 def list_corpus_parquets(bucket: str, prefix: str) -> list[str]:
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".parquet") and "/eval/" not in key:
-                keys.append(key)
-    return sorted(keys)
+    from vectorforge.utils import discover_corpus_parquets
+    return discover_corpus_parquets(bucket, prefix)
 
 
 def load_queries(
@@ -282,7 +275,7 @@ def run_pipeline(
         for enc in q_enc:
             f_idx = int(enc) // MAX_ROWS_PER_FILE
             r_idx = int(enc) % MAX_ROWS_PER_FILE
-            ids.append(make_point_id(s3_rel_key(all_corpus_keys[f_idx], bucket, prefix), r_idx))
+            ids.append(make_point_id(all_corpus_keys[f_idx], r_idx))
         hit_ids_out.append(ids)
         hit_scores_out.append(q_scores.tolist())
 

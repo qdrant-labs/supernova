@@ -83,13 +83,14 @@ class S3DataReader(DataReader):
 
     def _register_macros(self) -> None:
         super()._register_macros()
-        # vf_point_id(filename, row_num) → UUID matching make_point_id(rel_key, row_num)
-        # Strips s3://bucket/prefix/ from filename to get the relative corpus key.
-        bucket_prefix = f"s3://{self.s3_bucket}/{self.s3_prefix}/"
-        prefix_len = len(bucket_prefix)
+        # vf_point_id(filename, row_num) → UUID matching make_point_id(key, row_num)
+        # Strips s3://bucket/ from filename, keeping the full key path so IDs
+        # are stable regardless of what prefix is passed to the loader.
+        bucket_uri = f"s3://{self.s3_bucket}/"
+        uri_len = len(bucket_uri)
         self._conn.execute(f"""
             CREATE OR REPLACE MACRO vf_point_id(fname, rnum) AS (
-                make_point_id(substr(fname, {prefix_len + 1}), rnum)
+                make_point_id(substr(fname, {uri_len + 1}), rnum)
             )
         """)
 

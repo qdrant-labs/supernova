@@ -31,7 +31,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import boto3
 import yaml
 
 from vectorforge.loader.datasource.s3 import S3DataReader
@@ -81,16 +80,9 @@ def resolve_config(obj: str | dict | list):
 
 
 def discover_parquet_files(bucket: str, prefix: str) -> list[str]:
-    """List all .parquet files under an S3 prefix."""
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    files = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".parquet"):
-                files.append(f"s3://{bucket}/{key}")
-    return sorted(files)
+    """List all corpus .parquet files under an S3 prefix, excluding eval/ artifacts."""
+    from vectorforge.utils import discover_corpus_parquets
+    return [f"s3://{bucket}/{k}" for k in discover_corpus_parquets(bucket, prefix)]
 
 
 async def _setup_collection(store: QdrantVectorStore, dimensions: dict[str, int]):
@@ -243,7 +235,10 @@ def main(argv: list[str] | None = None):
     vs_cfg.pop("params", None)
     store = QdrantVectorStore(vectors=vectors_spec, **vs_cfg)
 
-    reader = S3DataReader(s3_bucket=bucket, s3_prefix=prefix, vectors=vectors_spec)
+    # Use the first corpus file to probe vector dimensions. Assumes all files
+    # share the same schema (guaranteed by the embedding pipeline) and avoids
+    # the glob hitting eval/ parquets that have a different schema entirely.
+    reader = S3DataReader(s3_bucket=bucket, s3_prefix=prefix, vectors=vectors_spec, file_list=[files[0]])
     dimensions = reader.get_dimensions()
     reader.close()
 

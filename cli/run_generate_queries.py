@@ -53,14 +53,8 @@ ENV_VARS_TO_FORWARD = [
 DEFAULT_INSTANCE_TYPE = "r5n.2xlarge"  # 8 vCPU, 64GB RAM, 25Gbps
 
 def list_s3_parquets(bucket: str, prefix: str) -> list[str]:
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet") and "/eval/" not in obj["Key"]:
-                keys.append(obj["Key"])
-    return sorted(keys)
+    from vectorforge.utils import discover_corpus_parquets
+    return discover_corpus_parquets(bucket, prefix)
 
 
 def build_manifest(bucket: str, keys: list[str]) -> tuple[list[dict], int]:
@@ -82,19 +76,22 @@ def build_manifest(bucket: str, keys: list[str]) -> tuple[list[dict], int]:
 
 
 def sample_offsets(
-    manifest: list[dict], total_rows: int, n: int, seed: int, prefix: str,
+    manifest: list[dict], total_rows: int, n: int, seed: int,
 ) -> dict[str, list[int]]:
-    """Sample n global indices, return as {relative_key: [local_offsets]}."""
+    """Sample n global indices, return as {full_s3_key: [local_offsets]}.
+
+    Stores the full S3 key (no scheme, no bucket) so __source_file__ is
+    absolute and make_point_id produces stable IDs regardless of what prefix
+    is passed to downstream tools.
+    """
     rng = random.Random(seed)
     global_indices = sorted(rng.sample(range(total_rows), n))
     cum_ends = [e["global_start"] + e["row_count"] for e in manifest]
-    rel_prefix = prefix + "/"
     file_map: dict[str, list[int]] = defaultdict(list)
     for gi in global_indices:
         fi = bisect.bisect_right(cum_ends, gi)
         entry = manifest[fi]
-        rel_key = entry["key"].removeprefix(rel_prefix)
-        file_map[rel_key].append(gi - entry["global_start"])
+        file_map[entry["key"]].append(gi - entry["global_start"])
     return dict(file_map)
 
 
@@ -132,33 +129,25 @@ def _extract_rows(
 def fetch_file_rows_s3(
     fs: pafs.S3FileSystem,
     bucket: str,
-    prefix: str,
-    source_file: str,
+    key: str,
     row_offsets: list[int],
     columns: list[str] | None,
 ) -> list[tuple[int, pa.Table]]:
-    """
-    Range-request mode: fetch only needed row groups via S3FileSystem.
-    """
-    with fs.open_input_file(f"{bucket}/{prefix}/{source_file}") as f:
+    """Range-request mode: fetch only needed row groups via S3FileSystem."""
+    with fs.open_input_file(f"{bucket}/{key}") as f:
         return _extract_rows(pq.ParquetFile(f), row_offsets, columns)
 
 
 def fetch_file_rows_prefetch(
     s3_client,
     bucket: str,
-    prefix: str,
-    source_file: str,
+    key: str,
     row_offsets: list[int],
     columns: list[str] | None,
     tmpdir: str,
 ) -> list[tuple[int, pa.Table]]:
-    """
-    Prefetch mode: download the full file first (boto3 multipart, saturates
-    bandwidth), read locally, then delete. Best when row groups are large.
-    """
-    key = f"{prefix}/{source_file}"
-    local_path = os.path.join(tmpdir, source_file.replace("/", "_"))
+    """Prefetch mode: download full file first, read locally, then delete."""
+    local_path = os.path.join(tmpdir, key.replace("/", "_"))
     s3_client.download_file(bucket, key, local_path)
     try:
         return _extract_rows(pq.ParquetFile(local_path), row_offsets, columns)
@@ -191,7 +180,7 @@ def run_pipeline(
         print(f"Warning: only {total_rows} rows available, capping at {actual_n}.")
 
     print(f"Sampling {actual_n} query pointers (seed={seed})...")
-    file_map = sample_offsets(manifest, total_rows, actual_n, seed, prefix)
+    file_map = sample_offsets(manifest, total_rows, actual_n, seed)
     total_files = len(file_map)
 
     mode = "prefetch (download-first)" if prefetch else "range requests"
@@ -203,7 +192,7 @@ def run_pipeline(
             s3_client = boto3.client("s3")
             with tempfile.TemporaryDirectory() as tmpdir:
                 for src, offsets in file_map.items():
-                    for lo, t in fetch_file_rows_prefetch(s3_client, bucket, prefix, src, offsets, columns, tmpdir):
+                    for lo, t in fetch_file_rows_prefetch(s3_client, bucket, src, offsets, columns, tmpdir):
                         t = t.append_column("__source_file__", pa.array([src]))
                         t = t.append_column("__source_row__", pa.array([lo], type=pa.int64()))
                         all_slices.append(t)
@@ -212,7 +201,7 @@ def run_pipeline(
         else:
             fs = pafs.S3FileSystem()
             for src, offsets in file_map.items():
-                for lo, t in fetch_file_rows_s3(fs, bucket, prefix, src, offsets, columns):
+                for lo, t in fetch_file_rows_s3(fs, bucket, src, offsets, columns):
                     t = t.append_column("__source_file__", pa.array([src]))
                     t = t.append_column("__source_row__", pa.array([lo], type=pa.int64()))
                     all_slices.append(t)
