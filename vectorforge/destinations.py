@@ -246,6 +246,28 @@ def bare_key_for_uri(uri: str) -> str:
 
       s3://bucket/prefix/file.parquet      -> prefix/file.parquet
       hf://datasets/ns/name/data/file.pq   -> data/file.pq
+
+    --- ID space anchoring (intentional design) ---
+    The anchor is the top-level container: the S3 bucket, or the HF dataset
+    repo. Two consequences fall out of this choice:
+
+      Stable across SCOPE within a container. Loading just
+      `s3://b/fineweb/cc-2025-26/...` and loading the wider
+      `s3://b/fineweb/...` give the *same* IDs for the same physical rows,
+      because both produce bare keys like `fineweb/cc-2025-26/rank00/x.pq`.
+      You can do incremental / partial loads without invalidating earlier
+      ground-truth.
+
+      Reset across CONTAINERS. Migrating data S3-bucket-A → S3-bucket-B,
+      or S3 → HF, changes the anchor and therefore the IDs. Recall
+      ground-truth (queries + brute-force results) must be regenerated on
+      the new side; you cannot reuse Qdrant collections across migrations.
+
+    There is no unforced way to make a hash span containers without
+    introducing an external "logical dataset id" registry. The current
+    choice prioritises the workflow that's actually common (scoped loads
+    within one bucket / repo) over the one that's rare (cross-backend
+    migrations). See docs/reference/loader-architecture.md#id-space-anchoring.
     """
     if uri.startswith("s3://"):
         rest = uri[len("s3://"):]

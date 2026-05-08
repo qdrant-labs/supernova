@@ -115,6 +115,23 @@ Default: `{}` (no payload).
 - Optional `subdir` to scope to a subfolder
 - Requires `HF_TOKEN` env var for authenticated access
 
+## ID space anchoring
+
+Point IDs are `md5(bare_key + ":" + row_index)` as a UUID. The same `bare_key` form is computed by *three* places that must agree: the loader's `vf_point_id` macro (when writing to Qdrant), `generate-queries` (when stamping `__source_file__` on sampled rows), and `brute-force` (when emitting hit IDs). If any of those drifts, recall@k breaks silently — payloads still match but UUIDs don't.
+
+The bare key is anchored at the **top-level container**: the S3 bucket, or the HF dataset repo. So:
+
+- `s3://bucket/prefix/path/file.parquet` → bare key `prefix/path/file.parquet`
+- `hf://datasets/ns/repo/data/path/file.parquet` → bare key `data/path/file.parquet`
+
+Two consequences fall out of this anchor choice:
+
+**Stable across scope within a container.** Loading just `s3://b/fineweb/cc-2025-26/...` and loading the wider `s3://b/fineweb/...` produce the *same* IDs for the same physical rows. You can do incremental or partial loads, then later widen the scope, without invalidating earlier ground-truth or fragmenting the ID space.
+
+**Reset across containers.** Migrating S3 bucket A → S3 bucket B, or S3 → HF, changes the anchor and therefore the IDs. The recall ground-truth (`queries_*.parquet`, `brute_force_*.parquet`) must be regenerated on the new side; you cannot reuse a Qdrant collection across container migrations.
+
+This is a deliberate trade-off, not an oversight. There is no unforced way to make a hash function span containers — they're literally different ID universes — without introducing an external "logical dataset name" registry that someone has to set correctly per run. The current scheme prioritises the workflow that's actually common (scoped loads within one bucket/repo) over the one that's rare (cross-backend migrations). The seam where this is implemented is `DataReader._root_uri_prefix()` and `vectorforge.destinations.bare_key_for_uri()` — both must strip the same prefix.
+
 ## VectorStore
 
 ### Lifecycle methods
