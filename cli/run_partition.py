@@ -120,17 +120,10 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
 )
 @click.argument("config", required=False)
 @click.option(
-    "--offset",
-    type=int,
-    default=None,
-    help="Skip this many rows (for explicit slicing).",
-)
-@click.option("--limit", type=int, default=None, help="Process at most this many rows.")
-@click.option(
     "--num-jobs",
     type=int,
     default=None,
-    help="Total parallel jobs (auto-computes offset/limit per rank).",
+    help="Total parallel jobs (auto-computes per-rank slice from dataset size).",
 )
 @click.option(
     "--job-rank",
@@ -144,7 +137,7 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
     is_flag=True,
     help="Dry-run: list matched files + per-rank plan and exit. No S3 writes.",
 )
-def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
+def partition(config, num_jobs, job_rank, list_files_flag):
     """Run the embed pipeline with the no-op embedder for partition validation."""
     logging.basicConfig(
         level=logging.WARNING,
@@ -162,11 +155,16 @@ def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
+    if "offset" in cfg.get("source", {}) or "limit" in cfg.get("source", {}):
+        raise click.UsageError(
+            "source.offset / source.limit are no longer supported in YAML. "
+            "Use --num-jobs / --job-rank for distributed slicing."
+        )
+
     if list_files_flag:
         _print_list_files_plan(cfg, num_jobs)
         return
 
-    # rank-based slicing (mirrors run_embedder.embed)
     filename_prefix = ""
     if num_jobs is not None:
         if job_rank is None:
@@ -178,26 +176,16 @@ def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
         source_for_count = build_source(dict(cfg["source"]))
         dataset_total = source_for_count.get_total_rows()
 
-        window_offset = cfg["source"].get("offset") or 0
-        window_limit = cfg["source"].get("limit")
-        window_size = (
-            min(window_limit, dataset_total - window_offset)
-            if window_limit
-            else dataset_total - window_offset
-        )
-
-        rows_per_job = math.ceil(window_size / num_jobs)
-        slice_offset = window_offset + job_rank * rows_per_job
-        slice_limit = min(rows_per_job, window_size - job_rank * rows_per_job)
+        rows_per_job = math.ceil(dataset_total / num_jobs)
+        slice_offset = job_rank * rows_per_job
+        slice_limit = min(rows_per_job, dataset_total - slice_offset)
 
         logging.getLogger("vectorforge").info(
-            "Job %d/%d: offset=%d limit=%d (window=[%d,%d), dataset_total=%d)",
+            "Job %d/%d: offset=%d limit=%d (dataset_total=%d)",
             job_rank,
             num_jobs,
             slice_offset,
             slice_limit,
-            window_offset,
-            window_offset + window_size,
             dataset_total,
         )
         cfg["source"]["offset"] = slice_offset
@@ -207,11 +195,6 @@ def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
         shard_by_rank = bool(cfg.get("pipeline", {}).get("shard_by_rank"))
         separator = "/" if shard_by_rank else "_"
         filename_prefix = f"rank{job_rank:0{rank_width}d}{separator}"
-    elif offset is not None or limit is not None:
-        if offset is not None:
-            cfg["source"]["offset"] = offset
-        if limit is not None:
-            cfg["source"]["limit"] = limit
 
     source = build_source(dict(cfg["source"]))
     engine = build_noop_engine(cfg)

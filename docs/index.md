@@ -80,4 +80,4 @@ All subcommands are dispatched through a single `vf` entrypoint (a click group).
 | `vf analysis` | Analyze a completed embedding run (schema, throughput, cost) |
 | `vf throughput-predict` | Predict embedding throughput + cost from a config |
 
-See [CLI reference](reference/cli.md) for all flags, [config reference](reference/config.md) for every YAML knob and tuning advice, and [S3 layout](reference/s3-layout.md) for how corpora and eval artifacts are organised. For very large datasets (≥100M rows), see [incremental / windowed runs](reference/config.md#incremental--windowed-runs).
+See [CLI reference](reference/cli.md) for all flags, [config reference](reference/config.md) for every YAML knob and tuning advice, and [S3 layout](reference/s3-layout.md) for how corpora and eval artifacts are organised.

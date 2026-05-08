@@ -47,32 +47,25 @@ Where to read rows from.
 | `text_template` | `None` | `str.format(**row)` template, e.g. `"Title: {title}\n\n{contents}"`. Use this OR `text_field`, not both. |
 | `text_field` | `None` | Single column name to use as text. Use when no template formatting is needed. |
 | `exclude_columns` | `[]` | Columns to drop from the output parquet. |
-| `offset` | `None` | Skip N rows. Defines the start of a *window* inside the dataset (see below). |
-| `limit` | `None` | Embed at most N rows. Defines the window size. |
 | `total_rows_override` | `None` | Manual total-row count to use instead of the auto-detected one. Useful when the dataset's metadata reports a partial row count (e.g., HF's parquet-conversion sampling). Get the real total from the dataset's HF page ("Estimated number of rows") and paste it here. |
 | `path_filter` | auto-match by `split` | Glob (or `regex:<expr>`, or list of either) over parquet paths. Useful for repos that mix splits or configs at different paths. |
 | `metadata_workers` | `4` | Parallelism for the per-file footer fetches at init. Kept low by default to avoid bursting HF resolver rate limits when many ranks start simultaneously. |
 | `prefetch` | `false` | Download each parquet to local disk before streaming. Eliminates per-batch HTTP range requests at the cost of a one-time sequential download — strongly recommended for multi-rank runs. |
 | `prefetch_dir` | `/tmp/vectorforge_parquet` | Local directory for prefetched files. |
 
-### How `offset` / `limit` interact with `--num-jobs`
+### How `--num-jobs` slices the dataset
 
-`offset` and `limit` in the YAML define a **window** inside the full dataset. When `vf embed` is invoked with `--num-jobs N` (which is what `vf embed-dist` does for each worker), the `N` ranks divide *that window*, not the full dataset.
-
-- **No window set** (both `offset` and `limit` omitted) → the N ranks divide the full dataset. Normal case.
-- **Window set** (e.g. `offset: 0, limit: 100_000_000` on a 1B-row dataset) → the N ranks divide the 100M window. Useful for incremental embedding runs — see [Incremental / windowed runs](#incremental--windowed-runs) below.
-
-At the worker level, each rank's effective slice is computed as:
+When `vf embed` is invoked with `--num-jobs N` (which is what `vf embed-dist` does for each worker), the `N` ranks divide the full dataset evenly:
 
 ```
-rank_offset = window_offset + rank * ceil(window_size / num_jobs)
-rank_limit  = min(ceil(window_size / num_jobs), window_size - rank * ceil(window_size / num_jobs))
+rank_offset = rank * ceil(dataset_total / num_jobs)
+rank_limit  = min(ceil(dataset_total / num_jobs), dataset_total - rank_offset)
 ```
 
 Worker logs will print a line like:
 
 ```
-Job 5/10: offset=50000000 limit=10000000 (window=[0,100000000), dataset_total=1000000000)
+Job 5/10: offset=500000 limit=100000 (dataset_total=1000000)
 ```
 
 which makes the slicing auditable at a glance.
@@ -260,68 +253,6 @@ Template rendering itself is unaffected — `text_template: "Title: {title}\nTex
 
 ---
 
-## Incremental / windowed runs
-
-For huge datasets (≥100M rows), you often don't want to commit to a single ~hours-long run. Embedding in increments lets you:
-
-- Verify the first window's output before spending on the next.
-- Recover from partial failures without reprocessing what succeeded.
-- Spread cost across days or budget periods.
-
-The pattern: one config per window, each with `source.offset` + `source.limit` defining the row range and `storage.prefix` suffixed by the range so outputs don't collide.
-
-### Example: split a 1B-row dataset into 10 × 100M windows
-
-1. Start from a normal config that points at the full dataset (no offset/limit yet).
-2. Run the generator:
-
-   ```bash
-   python scripts/split_config_into_windows.py \
-     configs/embedder/your_config.yaml \
-     --window-size 100000000 --num-windows 10
-   ```
-
-3. This produces files next to the template:
-
-   ```
-   configs/embedder/your_config.rows-0000000000-0100000000.yaml
-   configs/embedder/your_config.rows-0100000000-0200000000.yaml
-   ...
-   configs/embedder/your_config.rows-0900000000-1000000000.yaml
-   ```
-
-   Each file has `source.offset` / `source.limit` set for its slice and `storage.prefix` suffixed by `rows-<start>-<end>` so S3 outputs don't collide between windows.
-
-4. Run one increment at a time:
-
-   ```bash
-   vf embed-dist configs/embedder/your_config.rows-0000000000-0100000000.yaml \
-     --on-demand --num-jobs 10
-   vf analysis configs/embedder/your_config.rows-0000000000-0100000000.yaml
-   ./scripts/sky-killswitch.sh
-   # verify, then move on to the next window
-   ```
-
-### Each window's S3 layout
-
-```
-s3://bucket/<original-prefix>/rows-0000000000-0100000000/rank00_batch_00000000.parquet
-s3://bucket/<original-prefix>/rows-0000000000-0100000000/rank00__manifest.json
-s3://bucket/<original-prefix>/rows-0000000000-0100000000/rank01_...
-...
-s3://bucket/<original-prefix>/rows-0100000000-0200000000/rank00_...
-```
-
-Reads can union across windows with a glob: `s3://bucket/<prefix>/rows-*/*.parquet`.
-
-### Caveats
-
-- **Per-worker prefetch cost**: with `prefetch: true`, each worker downloads its window's parquets up front before the first chunk is emitted. Bigger windows = longer cold start.
-- **Same-model reuse**: later windows re-download model weights per worker — SkyPilot workers are fresh VMs with fresh HF caches. The DLAMI ships with some common models preloaded but not ours. This is pool-creation overhead, not per-window overhead.
-- **Cost attribution**: each window produces its own `rank**__manifest.json`, so `vf analysis` per-window works exactly as before. Aggregating across windows requires reading all manifests or just running `vf analysis` on the whole parent prefix (TBD — not automated today).
-
----
-
 ## `storage:`
 
 Where to write parquets + manifests.
@@ -408,5 +339,3 @@ Also set automatically by SkyPilot on each pool job:
 | Pipeline slower than predicted | Check `dtype` (should be `bfloat16` on GPU), check you're actually on GPU (look for `Loading ... on cuda` in logs) |
 | High-rank jobs take forever to start | If using `prefetch: true`, each worker downloads its slice up front — that's expected. Without prefetch, check that footer-fetching at init isn't being rate-limited (lower `metadata_workers`). |
 | Many small parquets | Increase `flush_threshold`. Each job must still have ≥`flush_threshold` rows (else one small parquet per job). |
-| Dataset too big for one run | Use [incremental / windowed runs](#incremental--windowed-runs). Generate per-window configs with `scripts/split_config_into_windows.py`. |
-| `--num-jobs` ignoring YAML `offset`/`limit` | Should be fixed (v0.1.0+). Look for `window=[X,Y)` in worker logs to confirm. If missing, you're on an older code revision — `uv sync` locally and rebuild the pool. |

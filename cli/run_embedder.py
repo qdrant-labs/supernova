@@ -184,22 +184,10 @@ def build_storage(cfg: dict):
 @click.command(name="embed", help="Embed a dataset locally.")
 @click.argument("config", required=False)
 @click.option(
-    "--offset",
-    type=int,
-    default=None,
-    help="Skip this many rows (for distributed slicing).",
-)
-@click.option(
-    "--limit",
-    type=int,
-    default=None,
-    help="Process at most this many rows (for distributed slicing).",
-)
-@click.option(
     "--num-jobs",
     type=int,
     default=None,
-    help="Total number of parallel jobs (auto-computes offset/limit from dataset size).",
+    help="Total number of parallel jobs (auto-computes per-rank slice from dataset size).",
 )
 @click.option(
     "--job-rank",
@@ -207,7 +195,7 @@ def build_storage(cfg: dict):
     default=None,
     help="This job's rank (0-indexed, used with --num-jobs).",
 )
-def embed(config, offset, limit, num_jobs, job_rank):
+def embed(config, num_jobs, job_rank):
     """Run a vectorforge embedding pipeline."""
     logging.basicConfig(
         level=logging.WARNING,
@@ -225,7 +213,12 @@ def embed(config, offset, limit, num_jobs, job_rank):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    # support both explicit offset/limit and rank-based slicing
+    if "offset" in cfg.get("source", {}) or "limit" in cfg.get("source", {}):
+        raise click.UsageError(
+            "source.offset / source.limit are no longer supported in YAML. "
+            "Use --num-jobs / --job-rank for distributed slicing."
+        )
+
     filename_prefix = ""
     if num_jobs is not None:
         if job_rank is None:
@@ -239,29 +232,16 @@ def embed(config, offset, limit, num_jobs, job_rank):
         source_for_count = build_source(dict(cfg["source"]))
         dataset_total = source_for_count.get_total_rows()
 
-        # honor any YAML-level window: source.offset / source.limit bound the
-        # slice space that --num-jobs divides. no window => slice the full dataset.
-        window_offset = cfg["source"].get("offset") or 0
-        window_limit = cfg["source"].get("limit")
-        window_size = (
-            min(window_limit, dataset_total - window_offset)
-            if window_limit
-            else dataset_total - window_offset
-        )
-
-        # using the window size and num_jobs, compute offset and limit for this job
-        rows_per_job = math.ceil(window_size / num_jobs)
-        slice_offset = window_offset + job_rank * rows_per_job
-        slice_limit = min(rows_per_job, window_size - job_rank * rows_per_job)
+        rows_per_job = math.ceil(dataset_total / num_jobs)
+        slice_offset = job_rank * rows_per_job
+        slice_limit = min(rows_per_job, dataset_total - slice_offset)
 
         logging.getLogger("vectorforge").info(
-            "Job %d/%d: offset=%d limit=%d (window=[%d,%d), dataset_total=%d)",
+            "Job %d/%d: offset=%d limit=%d (dataset_total=%d)",
             job_rank,
             num_jobs,
             slice_offset,
             slice_limit,
-            window_offset,
-            window_offset + window_size,
             dataset_total,
         )
         cfg["source"]["offset"] = slice_offset
@@ -273,13 +253,6 @@ def embed(config, offset, limit, num_jobs, job_rank):
         # shard_by_rank=false -> "rank00_batch_*.parquet" (flat, all in one dir)
         separator = "/" if shard_by_rank else "_"
         filename_prefix = f"rank{job_rank:0{rank_width}d}{separator}"
-
-    elif offset is not None or limit is not None:
-        # just use what was provided, no auto-computation
-        if offset is not None:
-            cfg["source"]["offset"] = offset
-        if limit is not None:
-            cfg["source"]["limit"] = limit
 
     source = build_source(dict(cfg["source"]))
     engine = build_engine(cfg)

@@ -25,8 +25,6 @@ vf embed-dist configs/embedder/arxiv_papers.yaml --ramp
 vf embed-dist configs/embedder/arxiv_papers.yaml --pool-name my-gpu-pool
 ```
 
-For datasets too big to run in one shot (≥100M rows), use [incremental / windowed runs](../reference/config.md#incremental--windowed-runs) to split the embedding across separately-invoked increments.
-
 ## How it works
 
 1. **Plan** (runs locally): reads config, queries the source for dataset size
