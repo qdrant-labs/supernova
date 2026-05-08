@@ -30,7 +30,7 @@ vf embed-dist configs/embedder/arxiv_papers.yaml --pool-name my-gpu-pool
 1. **Plan** (runs locally): reads config, queries the source for dataset size
 2. **Pool**: creates a SkyPilot pool with `min_workers: max_workers: N` (burst by default — all workers come up in parallel; pass `--ramp` for `min_workers: 0` and gradual autoscaling instead)
 3. **Submit**: submits N jobs to the pool via `sky jobs launch --num-jobs N`
-4. **Each job**: SkyPilot sets `$SKYPILOT_JOB_RANK` and `$SKYPILOT_NUM_JOBS`. The `vf embed` CLI uses these to compute offset/limit and process its slice. If the YAML sets `source.offset` / `source.limit`, the N ranks divide *that window* rather than the full dataset — this is how incremental runs work
+4. **Each job**: SkyPilot sets `$SKYPILOT_JOB_RANK` and `$SKYPILOT_NUM_JOBS`. The `vf embed` CLI uses these to compute its per-rank slice and process it
 5. **Autoscale**: with `--ramp`, workers scale up to handle the queue and scale back to zero when done. The default burst mode skips the autoscaler's ~3-minute-per-replica ramp.
 
 ## Custom resources

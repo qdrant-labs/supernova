@@ -21,9 +21,7 @@ vf embed <config> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--offset N` | Skip N rows (manual slicing). |
-| `--limit N` | Process at most N rows. |
-| `--num-jobs N` | Total parallel jobs (auto-computes offset/limit from dataset size). |
+| `--num-jobs N` | Total parallel jobs (auto-computes per-rank slice from dataset size). |
 | `--job-rank N` | This job's rank (reads `$SKYPILOT_JOB_RANK` if omitted). |
 
 The config path can also be supplied via `VF_CONFIG_PATH`.
@@ -56,9 +54,7 @@ vf partition <config> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--offset N` | Skip N rows. |
-| `--limit N` | Process at most N rows. |
-| `--num-jobs N` | Total parallel jobs (auto-computes offset/limit per rank). |
+| `--num-jobs N` | Total parallel jobs (auto-computes per-rank slice from dataset size). |
 | `--job-rank N` | This job's rank (defaults to `$SKYPILOT_JOB_RANK`). |
 | `--list-files` | Dry-run: list matched parquet files + per-rank plan and exit. Meaningful for `source.type=huggingface` or its alias `huggingface_parquet`. |
 
