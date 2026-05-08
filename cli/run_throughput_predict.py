@@ -27,8 +27,9 @@ def _derive_from_config(config: dict) -> dict:
     if not dataset:
         raise ValueError("config: source.dataset_name is required")
 
-    # huggingface source has an HF dataset config; huggingface_parquet does not.
-    hf_config = source.get("config")
+    # `config` from legacy YAMLs maps to path_filter in the new parquet-based
+    # HuggingFaceSource (treated as a glob/substring over parquet paths).
+    hf_config = source.get("config") or source.get("path_filter")
 
     split = source.get("split", "train")
     column = source.get("text_field")

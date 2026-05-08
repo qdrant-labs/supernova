@@ -77,8 +77,8 @@ def test_loader_id_matches_brute_force_id():
         _write_multi_rg_parquet(path, n=n, row_group_size=100)
 
         reader = S3DataReader(
-            s3_bucket=bucket,
-            s3_prefix="unused-when-file-list-is-set",
+            bucket=bucket,
+            prefix="unused-when-file-list-is-set",
             id_expression="vf_point_id(filename, file_row_number)",
             vectors={"dense": {"type": "dense", "column": "dense_embedding"}},
             payload_fields={"id": "id"},

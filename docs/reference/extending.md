@@ -45,7 +45,7 @@ class CommonCrawlSource(DatasetSource):
 
     def get_total_rows(self) -> int:
         # Used for distributed slicing. If unknown, return a best estimate or
-        # implement total_rows_override via the config (see HuggingFaceParquetSource).
+        # implement total_rows_override via the config (see HuggingFaceSource).
         return self._count_rows()
 ```
 
@@ -56,8 +56,8 @@ class CommonCrawlSource(DatasetSource):
 ```python
 SOURCE_REGISTRY = {
     "huggingface": HuggingFaceSource,
-    "huggingface_parquet": HuggingFaceParquetSource,
-    "common_crawl": CommonCrawlSource,   # new
+    "huggingface_parquet": HuggingFaceSource,   # alias of huggingface
+    "common_crawl": CommonCrawlSource,          # new
 }
 ```
 
@@ -77,7 +77,7 @@ source:
 - Default chunking via `DatasetSource.get_chunks()` — splits long texts using the embedder's tokenizer, batches by `chunk_size`, drops empties.
 - Distributed slicing via `--num-jobs` / `--job-rank` — auto-computes per-job offset/limit from `get_total_rows()`.
 
-If your source has unusual chunking needs (e.g. group records by a key before chunking), override `get_chunks()` directly — see `HuggingFaceParquetSource` for a non-default example.
+If your source has unusual chunking needs (e.g. group records by a key before chunking), override `get_chunks()` directly — see `HuggingFaceSource` for a non-default example.
 
 ---
 
@@ -135,7 +135,7 @@ Sketch:
 def parse_destination(uri: str) -> Destination:
     if uri.startswith("s3://"):
         ...
-    if uri.startswith("hf://datasets/"):
+    if uri.startswith("hf://buckets/"):
         ...
     if uri.startswith("gs://"):
         rest = uri[len("gs://"):]
@@ -204,11 +204,11 @@ class GcsBackend(StorageBackend):
 
     async def upload_bytes(self, data: bytes, filename: str) -> None:
         # Used for manifest JSON. Per-backend convention: where does it live?
-        # S3Backend puts it under prefix; HuggingFaceBackend puts it at repo root
-        # (so HF auto-detection only picks up data/ as the dataset).
+        # S3Backend and HuggingFaceBackend both put it under the prefix alongside
+        # the parquets — bucket URIs are flat, no auto-detection subdir needed.
 ```
 
-Decide consciously: does your backend have a "dataset auto-detection" convention like HF's `data/` directory? If not, mirror `S3Backend` and dump everything under the prefix. If yes, mirror `HuggingFaceBackend` and write parquets to the auto-detected subdir while keeping manifests/READMEs at root.
+Most backends just dump everything under the prefix. If your backend has a "dataset auto-detection" subdir convention, write parquets to the auto-detected subdir while keeping manifests/READMEs wherever the backend expects them.
 
 Register in `cli/run_embedder.py:build_storage`:
 
@@ -392,6 +392,6 @@ vectorstore:
 - [ ] ABC implemented; abstract methods covered.
 - [ ] Registry updated in `cli/run_*.py` (which one depends on layer — see table at top).
 - [ ] Tests added: at minimum, URI parse round-trip + eval-URI placement for destinations; backend-specific behavior for storage / readers / vector stores.
-- [ ] If the backend has a "dataset auto-detection" convention (HF's `data/`), make sure eval artifacts live *outside* it.
+- [ ] If the backend has any "dataset auto-detection" subdir convention, make sure eval artifacts live *outside* it.
 - [ ] If the new reader uses an unusual auth pattern, mirror the env-var injection in `_configure_connection()`.
 - [ ] Add a config example under `configs/` so future-you remembers the YAML shape.

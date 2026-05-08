@@ -41,31 +41,37 @@ def test_parse_s3_strips_trailing_slash():
     assert parse_destination("s3://b/p/").prefix == "p"
 
 
-def test_parse_hf_dataset_uri():
-    dest = parse_destination("hf://datasets/qdrant/fineweb-bge-large")
+def test_parse_hf_bucket_uri():
+    dest = parse_destination("hf://buckets/qdrant/fineweb-bge-large")
     assert isinstance(dest, HfDestination)
-    assert dest.repo_id == "qdrant/fineweb-bge-large"
+    assert dest.bucket_id == "qdrant/fineweb-bge-large"
     assert dest.subdir == ""
-    assert dest.root_uri == "hf://datasets/qdrant/fineweb-bge-large"
+    assert dest.root_uri == "hf://buckets/qdrant/fineweb-bge-large"
 
 
-def test_parse_hf_dataset_with_subdir():
-    dest = parse_destination("hf://datasets/ns/name/cc-main-2025-26")
+def test_parse_hf_bucket_with_subdir():
+    dest = parse_destination("hf://buckets/ns/name/cc-main-2025-26")
     assert isinstance(dest, HfDestination)
-    assert dest.repo_id == "ns/name"
+    assert dest.bucket_id == "ns/name"
     assert dest.subdir == "cc-main-2025-26"
-    # Note: subdir lives under data/ for HF
-    assert dest.root_uri == "hf://datasets/ns/name/data/cc-main-2025-26"
+    assert dest.root_uri == "hf://buckets/ns/name/cc-main-2025-26"
 
 
 def test_parse_hf_rejects_missing_namespace_or_name():
     with pytest.raises(ValueError, match="hf://"):
-        parse_destination("hf://datasets/just-namespace")
+        parse_destination("hf://buckets/just-namespace")
 
 
 def test_parse_unknown_scheme():
     with pytest.raises(ValueError, match="Unknown URI scheme"):
         parse_destination("bb://bucket/key")
+
+
+def test_parse_legacy_dataset_uri_rejected():
+    # hf://datasets/... was the previous storage scheme (git-backed dataset
+    # repos). We no longer write to dataset repos; new code must use buckets.
+    with pytest.raises(ValueError, match="Unknown URI scheme"):
+        parse_destination("hf://datasets/ns/name")
 
 
 def test_parse_file_uri():
@@ -96,29 +102,37 @@ def test_s3_eval_uri():
     )
 
 
-def test_hf_eval_uri_lives_at_repo_root_not_under_data():
-    dest = HfDestination(repo_id="ns/name")
-    # MUST NOT be under data/, otherwise load_dataset() would treat eval
-    # artifacts as dataset rows.
+def test_hf_eval_uri_at_bucket_root():
+    dest = HfDestination(bucket_id="ns/name")
     assert (
         dest.eval_uri("queries_1000.parquet")
-        == "hf://datasets/ns/name/eval/queries_1000.parquet"
+        == "hf://buckets/ns/name/eval/queries_1000.parquet"
     )
 
 
 def test_hf_eval_uri_ignores_subdir():
-    # subdir applies to the corpus tree under data/; eval is a sibling.
-    dest = HfDestination(repo_id="ns/name", subdir="cc-2025")
+    # subdir applies to the corpus tree; eval is a sibling at bucket root
+    # so brute-force / generate-queries can find it deterministically.
+    dest = HfDestination(bucket_id="ns/name", subdir="cc-2025")
     assert (
-        dest.eval_uri("queries.parquet") == "hf://datasets/ns/name/eval/queries.parquet"
+        dest.eval_uri("queries.parquet")
+        == "hf://buckets/ns/name/eval/queries.parquet"
     )
 
 
-def test_hf_child_uri_goes_under_data():
-    dest = HfDestination(repo_id="ns/name")
+def test_hf_child_uri_under_subdir():
+    dest = HfDestination(bucket_id="ns/name", subdir="cc-2025")
     assert (
         dest.child_uri("rank00/batch_0.parquet")
-        == "hf://datasets/ns/name/data/rank00/batch_0.parquet"
+        == "hf://buckets/ns/name/cc-2025/rank00/batch_0.parquet"
+    )
+
+
+def test_hf_child_uri_no_subdir():
+    dest = HfDestination(bucket_id="ns/name")
+    assert (
+        dest.child_uri("rank00/batch_0.parquet")
+        == "hf://buckets/ns/name/rank00/batch_0.parquet"
     )
 
 
@@ -148,19 +162,15 @@ def test_bare_key_s3_no_prefix():
 
 
 def test_bare_key_hf():
-    # The HF bare key includes the data/ component, mirroring how S3 keys
-    # include their prefix. Both sides (loader macro + brute-force) must
-    # produce this exact form for IDs to match.
     assert (
-        bare_key_for_uri("hf://datasets/ns/name/data/file.parquet")
-        == "data/file.parquet"
+        bare_key_for_uri("hf://buckets/ns/name/file.parquet") == "file.parquet"
     )
 
 
 def test_bare_key_hf_nested():
     assert (
-        bare_key_for_uri("hf://datasets/ns/name/data/cc-2025/rank00/batch_0.parquet")
-        == "data/cc-2025/rank00/batch_0.parquet"
+        bare_key_for_uri("hf://buckets/ns/name/cc-2025/rank00/batch_0.parquet")
+        == "cc-2025/rank00/batch_0.parquet"
     )
 
 
@@ -189,8 +199,8 @@ def test_fs_path_s3():
 
 def test_fs_path_hf():
     assert (
-        fs_path_for_uri("hf://datasets/ns/name/data/file.parquet")
-        == "datasets/ns/name/data/file.parquet"
+        fs_path_for_uri("hf://buckets/ns/name/file.parquet")
+        == "buckets/ns/name/file.parquet"
     )
 
 

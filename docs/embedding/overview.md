@@ -30,8 +30,8 @@ pipeline:
 
 storage:
   type: s3                         # s3, hf, or local
-  s3_bucket: my-bucket
-  s3_prefix: arxiv-papers/gte-multilingual-base
+  bucket: my-bucket
+  prefix: arxiv-papers/gte-multilingual-base
   output_dir: /tmp/vectorforge
 ```
 
@@ -79,8 +79,8 @@ source:
 ```yaml
 storage:
   type: s3
-  s3_bucket: my-bucket
-  s3_prefix: dataset-name/model-name
+  bucket: my-bucket
+  prefix: dataset-name/model-name
 ```
 
 Each chunk produces one parquet file, uploaded as `batch_00000000.parquet`, `batch_00000001.parquet`, etc. Auto-creates the bucket if it doesn't exist.

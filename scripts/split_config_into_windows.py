@@ -3,7 +3,7 @@
 Split an embedder YAML config into N windows of a fixed row count.
 
 Produces one config per window with `source.offset` / `source.limit` set
-and `storage.s3_prefix` suffixed by the row range so each window writes
+and `storage.prefix` suffixed by the row range so each window writes
 to a distinct S3 destination.
 
 Usage:
@@ -66,10 +66,10 @@ def main():
     with open(args.template) as f:
         template = yaml.safe_load(f)
 
-    original_s3_prefix = template.get("storage", {}).get("s3_prefix", "")
-    if not original_s3_prefix:
+    original_prefix = template.get("storage", {}).get("prefix", "")
+    if not original_prefix:
         print(
-            "Template's storage.s3_prefix is empty; can't derive per-window prefixes.",
+            "Template's storage.prefix is empty; can't derive per-window prefixes.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -94,7 +94,7 @@ def main():
         cfg["source"]["offset"] = offset
         cfg["source"]["limit"] = limit
         cfg.setdefault("storage", {})
-        cfg["storage"]["s3_prefix"] = f"{original_s3_prefix}/{rng}"
+        cfg["storage"]["prefix"] = f"{original_prefix}/{rng}"
 
         out_path = out_dir / f"{stem}.{rng}.yaml"
         print(f"  [{i + 1:>3}/{args.num_windows}] {rng}  ->  {out_path}")

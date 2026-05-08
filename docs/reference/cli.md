@@ -2,10 +2,11 @@
 
 Every subcommand is dispatched through the `vf` entrypoint, a click group defined in `cli/cli.py`. `vf --help` lists every command; `vf <command> --help` prints flags for one. Subcommand modules are imported lazily so `vf --help` returns in tens of milliseconds even though heavy ML libraries are involved.
 
-Corpora and destinations are addressed by URI. Three schemes are supported today:
+Corpora and destinations are addressed by URI. The schemes supported today:
 
 - `s3://bucket/prefix`
-- `hf://datasets/namespace/name[/subdir]`
+- `hf://buckets/namespace/name[/subdir]` — HuggingFace Storage Buckets (write + read)
+- `hf://datasets/namespace/name[/subdir]` — read-only, for legacy corpora already in dataset repos (the loader's DuckDB httpfs extension only supports this form)
 - `file:///abs/path`
 
 ---
@@ -59,7 +60,7 @@ vf partition <config> [options]
 | `--limit N` | Process at most N rows. |
 | `--num-jobs N` | Total parallel jobs (auto-computes offset/limit per rank). |
 | `--job-rank N` | This job's rank (defaults to `$SKYPILOT_JOB_RANK`). |
-| `--list-files` | Dry-run: list matched parquet files + per-rank plan and exit. Only meaningful for `source.type=huggingface_parquet`. |
+| `--list-files` | Dry-run: list matched parquet files + per-rank plan and exit. Meaningful for `source.type=huggingface` or its alias `huggingface_parquet`. |
 
 ## vf partition-dist
 
@@ -181,40 +182,6 @@ vf brute-force-merge <corpus_uri> [options]
 | Option | Description |
 |--------|-------------|
 | `--queries FILE`, `-k N`, `--output FILE` | Same as `vf brute-force`. |
-
----
-
-## vf push-hf
-
-Upload S3 parquets to a HuggingFace Hub dataset. Files are batched into commits to stay under the HF API's commit-rate limit.
-
-```bash
-vf push-hf <s3_uri> <repo_id> [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--subfolder DIR` | Folder inside the HF repo (default `data`). |
-| `--private` | Create the repo as private. |
-| `--skip-existing/--no-skip-existing` | Skip files already present in the repo (default on). |
-| `--num-jobs N` | Total parallel workers (round-robin slice over the file list). |
-| `--job-rank N` | This worker's rank (defaults to `$SKYPILOT_JOB_RANK`). |
-| `--commit-batch-size N` | Files per HF commit (default 10). HF caps at ~128 commits/hr. |
-
-## vf push-hf-dist
-
-Distribute the upload across a SkyPilot CPU pool. Each worker downloads its slice from S3 (in-region, effectively free) then streams to HF directly from the data centre, bypassing your laptop's upload bandwidth.
-
-```bash
-vf push-hf-dist <s3_uri> <repo_id> [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--num-jobs N` | Worker count (default: auto from `--files-per-job`). |
-| `--files-per-job N` | Files per worker when auto-computing `--num-jobs` (default 20). |
-| `--subfolder`, `--private` | As above. |
-| `--pool-name`, `--on-demand`, `--ramp`, `--dry-run` | As above. |
 
 ---
 

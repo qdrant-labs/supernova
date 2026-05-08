@@ -27,8 +27,8 @@ pipeline:
 
 storage:
   type: s3
-  s3_bucket: qdrant--vectorforge
-  s3_prefix: corag--kilt-corpus/embed-multilingual-e5-large
+  bucket: qdrant--vectorforge
+  prefix: corag--kilt-corpus/embed-multilingual-e5-large
   output_dir: /tmp/vectorforge
 ```
 
@@ -40,7 +40,7 @@ Where to read rows from.
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `type` | *required* | `huggingface` (uses HF's streaming dataset API) or `huggingface_parquet` (file-level sharded reader, see below). |
+| `type` | *required* | `huggingface` (file-level sharded parquet reader). `huggingface_parquet` is accepted as a legacy alias for the same source. |
 | `dataset_name` | *required* | HF hub ID, e.g. `corag/kilt-corpus`. |
 | `config` | `None` | HF dataset config name (for multi-config datasets). |
 | `split` | `train` | HF split. |
@@ -49,7 +49,11 @@ Where to read rows from.
 | `exclude_columns` | `[]` | Columns to drop from the output parquet. |
 | `offset` | `None` | Skip N rows. Defines the start of a *window* inside the dataset (see below). |
 | `limit` | `None` | Embed at most N rows. Defines the window size. |
-| `total_rows_override` | `None` | Manual total-row count to use instead of HF's auto-detected one. Required for very large datasets (≥5GB) where HF only converts a sample to parquet — `datasets-server.huggingface.co/size` will return the *partial* count (e.g., 1.1M for dclm-edu's 1B-row dataset), which makes window slicing wrong. Get the real total from the dataset's HF page ("Estimated number of rows") and paste it here. |
+| `total_rows_override` | `None` | Manual total-row count to use instead of the auto-detected one. Useful when the dataset's metadata reports a partial row count (e.g., HF's parquet-conversion sampling). Get the real total from the dataset's HF page ("Estimated number of rows") and paste it here. |
+| `path_filter` | auto-match by `split` | Glob (or `regex:<expr>`, or list of either) over parquet paths. Useful for repos that mix splits or configs at different paths. |
+| `metadata_workers` | `4` | Parallelism for the per-file footer fetches at init. Kept low by default to avoid bursting HF resolver rate limits when many ranks start simultaneously. |
+| `prefetch` | `false` | Download each parquet to local disk before streaming. Eliminates per-batch HTTP range requests at the cost of a one-time sequential download — strongly recommended for multi-rank runs. |
+| `prefetch_dir` | `/tmp/vectorforge_parquet` | Local directory for prefetched files. |
 
 ### How `offset` / `limit` interact with `--num-jobs`
 
@@ -73,31 +77,11 @@ Job 5/10: offset=50000000 limit=10000000 (window=[0,100000000), dataset_total=10
 
 which makes the slicing auditable at a glance.
 
-### Streaming caveat
+### How it works
 
-For large datasets, `ds.skip(offset)` iterates one row at a time. Rank N pays O(N × rows_per_job) startup cost. Large ranks (e.g. rank 99 on a 45M-row dataset) can take 30+ min before producing their first chunk.
+The source lists the dataset's parquet files on the Hub, reads each file's parquet footer for row counts, and maps `(offset, limit)` to a contiguous file range — yielding rows by reading those files directly. Init cost: one HF list-repo call + parallel footer reads (~3-10s for ~1000 files). Per-rank streaming cost: O(1) jump to the right file, then sequential read.
 
-For *very* large datasets (≥1B rows), HF's streaming `.skip()` is also outright **broken** — it silently no-ops and yields from offset 0 once the requested skip exceeds some internal threshold (~1.5M rows confirmed for `HuggingFaceTB/dclm-edu`). Use `type: huggingface_parquet` instead.
-
-### `huggingface` vs `huggingface_parquet`
-
-For most datasets `type: huggingface` works fine. Use `type: huggingface_parquet` when:
-
-- The dataset is **huge** (≥5GB / millions of rows) AND stored as native parquet on the Hub (most modern large datasets).
-- HF's `IterableDataset.skip()` is unreliable on it. Symptom: every distributed rank embeds the same data.
-
-`huggingface_parquet` lists the dataset's parquet files on the Hub, reads each file's parquet footer for row counts, and maps `(offset, limit)` to a contiguous file range — yielding rows by reading those files directly. Init cost: one HF list-repo call + parallel footer reads (~3-10s for ~1000 files). Per-rank streaming cost: O(1) jump to the right file, then sequential read.
-
-Extra keys available for `huggingface_parquet` only:
-
-| Key | Default | Notes |
-|-----|---------|-------|
-| `path_filter` | auto-match by `split` | Glob (or `regex:<expr>`, or list of either) over parquet paths. Useful for repos that mix splits or configs at different paths. |
-| `metadata_workers` | `4` | Parallelism for the per-file footer fetches at init. Kept low by default to avoid bursting HF resolver rate limits when many ranks start simultaneously. |
-| `prefetch` | `false` | Download each parquet to local disk before streaming. Eliminates per-batch HTTP range requests at the cost of a one-time sequential download — strongly recommended for multi-rank runs. |
-| `prefetch_dir` | `/tmp/vectorforge_parquet` | Local directory for prefetched files. |
-
-If unsure: start with `huggingface`. If you see distributed ranks producing identical output (a quick `LIMIT 1` query against rank0 vs another rank's parquet shows this), switch to `huggingface_parquet`.
+For multi-rank runs, set `prefetch: true` so each worker downloads its assigned files to local disk once instead of issuing per-batch HTTP range requests.
 
 ---
 
@@ -284,7 +268,7 @@ For huge datasets (≥100M rows), you often don't want to commit to a single ~ho
 - Recover from partial failures without reprocessing what succeeded.
 - Spread cost across days or budget periods.
 
-The pattern: one config per window, each with `source.offset` + `source.limit` defining the row range and `storage.s3_prefix` suffixed by the range so outputs don't collide.
+The pattern: one config per window, each with `source.offset` + `source.limit` defining the row range and `storage.prefix` suffixed by the range so outputs don't collide.
 
 ### Example: split a 1B-row dataset into 10 × 100M windows
 
@@ -306,7 +290,7 @@ The pattern: one config per window, each with `source.offset` + `source.limit` d
    configs/embedder/your_config.rows-0900000000-1000000000.yaml
    ```
 
-   Each file has `source.offset` / `source.limit` set for its slice and `storage.s3_prefix` suffixed by `rows-<start>-<end>` so S3 outputs don't collide between windows.
+   Each file has `source.offset` / `source.limit` set for its slice and `storage.prefix` suffixed by `rows-<start>-<end>` so S3 outputs don't collide between windows.
 
 4. Run one increment at a time:
 
@@ -332,7 +316,7 @@ Reads can union across windows with a glob: `s3://bucket/<prefix>/rows-*/*.parqu
 
 ### Caveats
 
-- **Streaming skip cost**: window `[900M, 1B)` pays `ds.skip(900_000_000)` time before any worker can produce a chunk. For HF streaming, that's minutes-to-hours per worker. Expect late-window runs to have slow startup.
+- **Per-worker prefetch cost**: with `prefetch: true`, each worker downloads its window's parquets up front before the first chunk is emitted. Bigger windows = longer cold start.
 - **Same-model reuse**: later windows re-download model weights per worker — SkyPilot workers are fresh VMs with fresh HF caches. The DLAMI ships with some common models preloaded but not ours. This is pool-creation overhead, not per-window overhead.
 - **Cost attribution**: each window produces its own `rank**__manifest.json`, so `vf analysis` per-window works exactly as before. Aggregating across windows requires reading all manifests or just running `vf analysis` on the whole parent prefix (TBD — not automated today).
 
@@ -345,9 +329,9 @@ Where to write parquets + manifests.
 | Key | Default | Notes |
 |-----|---------|-------|
 | `type` | `s3` | `s3`, `hf`, or `local`. |
-| `s3_bucket` | *required (s3)* | |
-| `s3_prefix` | *required (s3)* | |
-| `repo_id` | *required (hf)* | For `type: hf`. |
+| `bucket` | *required (s3)* | S3 bucket name. |
+| `prefix` | *required (s3)*, `""` (hf) | S3 key prefix, or sub-path inside an HF bucket. |
+| `bucket_id` | *required (hf)* | HF Storage Bucket id, `namespace/bucket-name`. Writes land at `hf://buckets/{bucket_id}/...`. |
 | `token` | `None` | HF access token; falls back to `$HF_TOKEN` if unset. |
 | `private` | `true` | For `type: hf`. |
 | `output_dir` | `/tmp/vectorforge` | Local scratch dir where parquets are written before upload. Auto-cleaned after each flush. |
@@ -422,7 +406,7 @@ Also set automatically by SkyPilot on each pool job:
 | Pool scales up slowly | Burst is the default; check the plan output. Only `--ramp` opts out. |
 | Only a few workers come up | Check quota (spot vs on-demand), drop `use_spot`, request quota bump |
 | Pipeline slower than predicted | Check `dtype` (should be `bfloat16` on GPU), check you're actually on GPU (look for `Loading ... on cuda` in logs) |
-| High-rank jobs take forever to start | HF streaming skip cost. Jobs with offset ≥ 10M can take 20+ min to begin producing chunks. |
+| High-rank jobs take forever to start | If using `prefetch: true`, each worker downloads its slice up front — that's expected. Without prefetch, check that footer-fetching at init isn't being rate-limited (lower `metadata_workers`). |
 | Many small parquets | Increase `flush_threshold`. Each job must still have ≥`flush_threshold` rows (else one small parquet per job). |
 | Dataset too big for one run | Use [incremental / windowed runs](#incremental--windowed-runs). Generate per-window configs with `scripts/split_config_into_windows.py`. |
 | `--num-jobs` ignoring YAML `offset`/`limit` | Should be fixed (v0.1.0+). Look for `window=[X,Y)` in worker logs to confirm. If missing, you're on an older code revision — `uv sync` locally and rebuild the pool. |

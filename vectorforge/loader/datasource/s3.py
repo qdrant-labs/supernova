@@ -15,8 +15,8 @@ class S3DataReader(DataReader):
 
     def __init__(
         self,
-        s3_bucket: str,
-        s3_prefix: str,
+        bucket: str,
+        prefix: str,
         id_expression: str = "row_id",
         vectors: dict[str, dict] | None = None,
         payload_fields: dict[str, str] | None = None,
@@ -33,8 +33,8 @@ class S3DataReader(DataReader):
             duckdb_memory_limit=duckdb_memory_limit,
             duckdb_threads=duckdb_threads,
         )
-        self.s3_bucket = s3_bucket
-        self.s3_prefix = s3_prefix.rstrip("/")
+        self.bucket = bucket
+        self.prefix = prefix.rstrip("/")
         self.file_list = file_list
         self.prefetch = prefetch
         self.prefetch_dir = prefetch_dir
@@ -43,7 +43,7 @@ class S3DataReader(DataReader):
 
     @property
     def glob_path(self) -> str:
-        return f"s3://{self.s3_bucket}/{self.s3_prefix}/**/*.parquet"
+        return f"s3://{self.bucket}/{self.prefix}/**/*.parquet"
 
     @property
     def source_sql(self) -> str:
@@ -81,8 +81,8 @@ class S3DataReader(DataReader):
     def _root_uri_prefix(self) -> str:
         # vf_point_id strips this from filename, so the bare key passed into
         # make_point_id is the full S3 key (prefix + path), independent of
-        # what s3_prefix was used to scope this loader.
-        return f"s3://{self.s3_bucket}/"
+        # what prefix was used to scope this loader.
+        return f"s3://{self.bucket}/"
 
     def _iter_sources(self) -> Iterable[str]:
         """

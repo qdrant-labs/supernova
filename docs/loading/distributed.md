@@ -31,8 +31,8 @@ vectors:
 
 datasource:
   type: s3
-  s3_bucket: my-bucket
-  s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
+  bucket: my-bucket
+  prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
   payload_fields:
     text: text
     title: title

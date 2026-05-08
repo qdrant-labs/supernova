@@ -7,7 +7,6 @@ import click
 import yaml
 
 from vectorforge.sources.huggingface import HuggingFaceSource
-from vectorforge.sources.huggingface_parquet import HuggingFaceParquetSource
 from vectorforge.embedders.dense.openai import OpenAIEmbedder
 from vectorforge.embedders.dense.sentence_transformer import (
     SentenceTransformerDenseEmbedder,
@@ -28,7 +27,9 @@ from vectorforge.pipeline.runner import run
 # mapping from string identifiers in config → actual classes. Factored out to avoid circular imports and keep main() clean.
 SOURCE_REGISTRY = {
     "huggingface": HuggingFaceSource,
-    "huggingface_parquet": HuggingFaceParquetSource,
+    # Legacy alias: pre-rename the parquet streamer was registered as
+    # "huggingface_parquet". Existing configs keep working unchanged.
+    "huggingface_parquet": HuggingFaceSource,
 }
 
 DENSE_EMBEDDER_REGISTRY = {
@@ -159,12 +160,16 @@ def build_storage(cfg: dict):
     storage_type = cfg.pop("type", "s3")
     if storage_type == "s3":
         return S3Backend(
-            bucket=cfg["s3_bucket"],
-            prefix=cfg["s3_prefix"],
+            bucket=cfg["bucket"],
+            prefix=cfg["prefix"],
         )
     elif storage_type == "hf":
+        bucket_id = cfg.get("bucket_id") or cfg.get("repo_id")
+        if not bucket_id:
+            raise ValueError("storage.type='hf' requires 'bucket_id' (HF bucket like 'owner/name')")
         return HuggingFaceBackend(
-            repo_id=cfg["repo_id"],
+            bucket_id=bucket_id,
+            prefix=cfg.get("prefix", ""),
             token=cfg.get("token"),
             private=cfg.get("private", True),
         )

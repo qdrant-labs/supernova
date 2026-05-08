@@ -2,14 +2,14 @@
 Destination abstraction for corpus + eval artifact storage.
 
 A ``Destination`` is a logical location for a vectorforge corpus: today
-either an S3 bucket+prefix or a HuggingFace dataset repo. The same pipelines
-(embed, load, generate-queries, brute-force) run over either.
+either an S3 bucket+prefix, an HF Storage Bucket, or a local directory.
+The same pipelines (embed, load, generate-queries, brute-force) run over any.
 
 URI schemes
 -----------
 Today:
   s3://bucket/prefix/...
-  hf://datasets/namespace/repo[/subdir/...]
+  hf://buckets/namespace/name[/subdir/...]
   file:///abs/path/...
 
 To add another (gs://, az://, bb://) wire it through ``parse_destination``,
@@ -19,17 +19,16 @@ Conventions
 -----------
 - Corpus parquets live under the destination's "data root":
     s3://bucket/prefix/rank00/batch_*.parquet
-    hf://datasets/repo/data/rank00/batch_*.parquet  (HF auto-detects data/)
-  Callers that read from S3 see flat keys; for HF the StorageBackend hides
-  the data/ prefix when *writing* (vectorforge.storage.huggingface), and
-  the discovery here surfaces only data/ files when *listing*.
+    hf://buckets/owner/name[/subdir]/rank00/batch_*.parquet
 - Eval artifacts (queries, brute-force results) live under
   ``{root}/eval/...``:
     s3://bucket/prefix/eval/queries_1000.parquet
-    hf://datasets/repo/eval/queries_1000.parquet      (NOT data/eval/ —
-                                                       that would make
-                                                       load_dataset() try
-                                                       to read evals as rows)
+    hf://buckets/owner/name/eval/queries_1000.parquet
+
+HF Storage Buckets are HF's S3-like object storage (powered by Xet);
+they are non-versioned, mutable, and addressed by ``hf://buckets/...`` rather
+than the git-backed ``hf://datasets/...`` scheme. We don't write to dataset
+repos anymore.
 """
 
 from __future__ import annotations
@@ -42,7 +41,6 @@ if TYPE_CHECKING:
 
 
 EVAL_SUBDIR = "eval"
-HF_DATA_SUBDIR = "data"
 
 
 @dataclass(frozen=True)
@@ -90,8 +88,10 @@ class LocalDestination:
 
 @dataclass(frozen=True)
 class HfDestination:
-    repo_id: str  # "namespace/dataset-name"
-    subdir: str = ""  # path within the data/ root (empty = the whole data/ tree)
+    """An HF Storage Bucket, optionally scoped to a sub-path within the bucket."""
+
+    bucket_id: str  # "namespace/bucket-name"
+    subdir: str = ""  # path within the bucket (empty = bucket root)
 
     @property
     def scheme(self) -> str:
@@ -100,24 +100,19 @@ class HfDestination:
     @property
     def root_uri(self) -> str:
         if self.subdir:
-            return (
-                f"hf://datasets/{self.repo_id}/{HF_DATA_SUBDIR}/{self.subdir}".rstrip(
-                    "/"
-                )
-            )
-        return f"hf://datasets/{self.repo_id}"
+            return f"hf://buckets/{self.bucket_id}/{self.subdir}".rstrip("/")
+        return f"hf://buckets/{self.bucket_id}"
 
     def child_uri(self, sub: str) -> str:
-        """URI for a corpus parquet (lives under data/)."""
         sub = sub.lstrip("/")
         if self.subdir:
-            return f"hf://datasets/{self.repo_id}/{HF_DATA_SUBDIR}/{self.subdir}/{sub}"
-        return f"hf://datasets/{self.repo_id}/{HF_DATA_SUBDIR}/{sub}"
+            return f"hf://buckets/{self.bucket_id}/{self.subdir}/{sub}"
+        return f"hf://buckets/{self.bucket_id}/{sub}"
 
     def eval_uri(self, filename: str) -> str:
-        # eval lives at repo root, sibling of data/ — so load_dataset() won't
-        # try to read it as rows.
-        return f"hf://datasets/{self.repo_id}/{EVAL_SUBDIR}/{filename}"
+        # Eval lives under {bucket}/eval/ regardless of subdir, so brute-force
+        # / generate-queries always find it at a stable location.
+        return f"hf://buckets/{self.bucket_id}/{EVAL_SUBDIR}/{filename}"
 
 
 Destination = Union[S3Destination, HfDestination, LocalDestination]
@@ -125,17 +120,14 @@ Destination = Union[S3Destination, HfDestination, LocalDestination]
 
 def parse_destination(uri: str) -> Destination:
     """
-    Parse an s3://, hf://datasets/, or file:// URI into a Destination.
+    Parse an s3://, hf://buckets/, or file:// URI into a Destination.
 
     Accepts:
       s3://bucket
       s3://bucket/prefix/...
-      hf://datasets/namespace/name
-      hf://datasets/namespace/name/subdir/...
+      hf://buckets/namespace/name
+      hf://buckets/namespace/name/subdir/...
       file:///abs/path[/...]
-
-    For hf:// any segments past ``namespace/name`` are treated as a *data/*
-    sub-tree (i.e. they reference paths under data/, not the repo root).
     """
     if uri.startswith("s3://"):
         rest = uri[len("s3://") :]
@@ -144,17 +136,17 @@ def parse_destination(uri: str) -> Destination:
             raise ValueError(f"s3:// URI is missing bucket: {uri!r}")
         return S3Destination(bucket=bucket, prefix=prefix.rstrip("/"))
 
-    if uri.startswith("hf://datasets/"):
-        rest = uri[len("hf://datasets/") :]
+    if uri.startswith("hf://buckets/"):
+        rest = uri[len("hf://buckets/") :]
         parts = rest.split("/", 2)
         if len(parts) < 2 or not parts[0] or not parts[1]:
             raise ValueError(
-                "hf:// URI must be hf://datasets/{namespace}/{name}[/{subdir}], "
+                "hf:// URI must be hf://buckets/{namespace}/{name}[/{subdir}], "
                 f"got {uri!r}"
             )
-        repo_id = f"{parts[0]}/{parts[1]}"
+        bucket_id = f"{parts[0]}/{parts[1]}"
         subdir = parts[2].rstrip("/") if len(parts) == 3 else ""
-        return HfDestination(repo_id=repo_id, subdir=subdir)
+        return HfDestination(bucket_id=bucket_id, subdir=subdir)
 
     if uri.startswith("file://"):
         # Standard form is file:///abs/path (3 slashes = scheme + empty host +
@@ -168,7 +160,7 @@ def parse_destination(uri: str) -> Destination:
         return LocalDestination(root=rest.rstrip("/"))
 
     raise ValueError(
-        f"Unknown URI scheme in {uri!r}. Supported: s3://, hf://datasets/, file://"
+        f"Unknown URI scheme in {uri!r}. Supported: s3://, hf://buckets/, file://"
     )
 
 
@@ -218,23 +210,21 @@ def _discover_local(dest: LocalDestination) -> list[str]:
 
 
 def _discover_hf(dest: HfDestination) -> list[str]:
-    from huggingface_hub import HfApi
+    from huggingface_hub import list_bucket_tree
 
-    api = HfApi()
-    paths = api.list_repo_files(dest.repo_id, repo_type="dataset")
-
-    data_prefix = f"{HF_DATA_SUBDIR}/"
-    if dest.subdir:
-        data_prefix = f"{HF_DATA_SUBDIR}/{dest.subdir.rstrip('/')}/"
-
+    prefix = dest.subdir.rstrip("/") if dest.subdir else None
+    eval_segment = f"/{EVAL_SUBDIR}/"
     uris: list[str] = []
-    for path in paths:
-        if not path.endswith(".parquet"):
+    for entry in list_bucket_tree(dest.bucket_id, prefix=prefix, recursive=True):
+        path = getattr(entry, "path", None)
+        if not path or not path.endswith(".parquet"):
             continue
-        if not path.startswith(data_prefix):
-            # eval/ at repo root, README files, etc. — skip
+        # Skip eval artifacts (sibling tree at bucket root). Match either a
+        # leading "eval/" or any "/eval/" segment so we don't grab
+        # bucket/eval/queries.parquet when the caller scoped to bucket root.
+        if path.startswith(f"{EVAL_SUBDIR}/") or eval_segment in f"/{path}":
             continue
-        uris.append(f"hf://datasets/{dest.repo_id}/{path}")
+        uris.append(f"hf://buckets/{dest.bucket_id}/{path}")
     return sorted(uris)
 
 
@@ -268,7 +258,7 @@ def fs_path_for_uri(uri: str) -> str:
     Strip the scheme from a URI to get the path the filesystem expects.
 
     pyarrow.fs.S3FileSystem expects:    bucket/key/...
-    huggingface_hub.HfFileSystem expects: datasets/repo/path
+    huggingface_hub.HfFileSystem expects: buckets/owner/name/path
     pyarrow.fs.LocalFileSystem expects: /abs/path
     """
     if uri.startswith("s3://"):
@@ -285,22 +275,22 @@ def bare_key_for_uri(uri: str) -> str:
     The "bare key" used as the per-file identifier in
     ``make_point_id(bare_key, row_index)``.
 
-    Strips the scheme + bucket-or-repo identifier; keeps everything else.
+    Strips the scheme + bucket-or-bucket-name identifier; keeps everything else.
     Brute-force, generate-queries, and the loader's vf_point_id macro must
     all agree on this form so IDs match across pipelines.
 
-      s3://bucket/prefix/file.parquet      -> prefix/file.parquet
-      hf://datasets/ns/name/data/file.pq   -> data/file.pq
-      file:///abs/path/file.parquet        -> /abs/path/file.parquet
+      s3://bucket/prefix/file.parquet           -> prefix/file.parquet
+      hf://buckets/ns/name/sub/file.pq          -> sub/file.pq
+      file:///abs/path/file.parquet             -> /abs/path/file.parquet
 
     For file:// the "container" is the filesystem itself, so the bare key is
     the absolute path. IDs are therefore machine-specific — the same corpus
     moved to a different mount point will hash to different IDs. This matches
-    the S3/HF behavior (changing bucket/repo also changes IDs).
+    the S3/HF behavior (changing bucket also changes IDs).
 
     --- ID space anchoring (intentional design) ---
-    The anchor is the top-level container: the S3 bucket, or the HF dataset
-    repo. Two consequences fall out of this choice:
+    The anchor is the top-level container: the S3 bucket, or the HF
+    bucket repo. Two consequences fall out of this choice:
 
       Stable across SCOPE within a container. Loading just
       `s3://b/fineweb/cc-2025-26/...` and loading the wider
@@ -324,8 +314,8 @@ def bare_key_for_uri(uri: str) -> str:
         rest = uri[len("s3://") :]
         _, _, key = rest.partition("/")
         return key
-    if uri.startswith("hf://datasets/"):
-        rest = uri[len("hf://datasets/") :]
+    if uri.startswith("hf://buckets/"):
+        rest = uri[len("hf://buckets/") :]
         # Skip namespace/name; keep everything after.
         parts = rest.split("/", 2)
         return parts[2] if len(parts) == 3 else ""
@@ -354,24 +344,22 @@ def list_parquets_under(prefix_uri: str) -> list[str]:
                     uris.append(f"s3://{bucket}/{obj['Key']}")
         return sorted(uris)
 
-    if prefix_uri.startswith("hf://datasets/"):
-        from huggingface_hub import HfApi
+    if prefix_uri.startswith("hf://buckets/"):
+        from huggingface_hub import list_bucket_tree
 
-        rest = prefix_uri[len("hf://datasets/") :]
+        rest = prefix_uri[len("hf://buckets/") :]
         parts = rest.split("/", 2)
         if len(parts) < 2:
             raise ValueError(f"Bad hf:// prefix: {prefix_uri!r}")
-        repo_id = f"{parts[0]}/{parts[1]}"
-        in_repo_prefix = parts[2] if len(parts) == 3 else ""
-        api = HfApi()
-        paths = api.list_repo_files(repo_id, repo_type="dataset")
+        bucket_id = f"{parts[0]}/{parts[1]}"
+        in_bucket_prefix = parts[2] if len(parts) == 3 else None
         uris: list[str] = []
-        for path in paths:
-            if not path.endswith(".parquet"):
-                continue
-            if in_repo_prefix and not path.startswith(in_repo_prefix):
-                continue
-            uris.append(f"hf://datasets/{repo_id}/{path}")
+        for entry in list_bucket_tree(
+            bucket_id, prefix=in_bucket_prefix, recursive=True
+        ):
+            path = getattr(entry, "path", None)
+            if path and path.endswith(".parquet"):
+                uris.append(f"hf://buckets/{bucket_id}/{path}")
         return sorted(uris)
 
     if prefix_uri.startswith("file://"):
@@ -401,21 +389,16 @@ def upload_file_to_uri(local_path: str, dest_uri: str) -> None:
         boto3.client("s3").upload_file(local_path, bucket, key)
         return
 
-    if dest_uri.startswith("hf://datasets/"):
-        from huggingface_hub import HfApi
+    if dest_uri.startswith("hf://buckets/"):
+        from huggingface_hub import batch_bucket_files
 
-        rest = dest_uri[len("hf://datasets/") :]
+        rest = dest_uri[len("hf://buckets/") :]
         parts = rest.split("/", 2)
         if len(parts) < 3:
-            raise ValueError(f"hf:// upload URI needs in-repo path: {dest_uri!r}")
-        repo_id = f"{parts[0]}/{parts[1]}"
-        path_in_repo = parts[2]
-        HfApi().upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=path_in_repo,
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
+            raise ValueError(f"hf:// upload URI needs in-bucket path: {dest_uri!r}")
+        bucket_id = f"{parts[0]}/{parts[1]}"
+        path_in_bucket = parts[2]
+        batch_bucket_files(bucket_id, add=[(local_path, path_in_bucket)])
         return
 
     if dest_uri.startswith("file://"):
@@ -440,21 +423,16 @@ def upload_bytes_to_uri(data: bytes, dest_uri: str) -> None:
         boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=data)
         return
 
-    if dest_uri.startswith("hf://datasets/"):
-        from huggingface_hub import HfApi
+    if dest_uri.startswith("hf://buckets/"):
+        from huggingface_hub import batch_bucket_files
 
-        rest = dest_uri[len("hf://datasets/") :]
+        rest = dest_uri[len("hf://buckets/") :]
         parts = rest.split("/", 2)
         if len(parts) < 3:
-            raise ValueError(f"hf:// upload URI needs in-repo path: {dest_uri!r}")
-        repo_id = f"{parts[0]}/{parts[1]}"
-        path_in_repo = parts[2]
-        HfApi().upload_file(
-            path_or_fileobj=data,
-            path_in_repo=path_in_repo,
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
+            raise ValueError(f"hf:// upload URI needs in-bucket path: {dest_uri!r}")
+        bucket_id = f"{parts[0]}/{parts[1]}"
+        path_in_bucket = parts[2]
+        batch_bucket_files(bucket_id, add=[(data, path_in_bucket)])
         return
 
     if dest_uri.startswith("file://"):
@@ -480,12 +458,17 @@ def datasource_to_destination(ds_cfg: dict) -> Destination:
     ds_type = ds_cfg.get("type", "s3")
     if ds_type == "s3":
         return S3Destination(
-            bucket=ds_cfg["s3_bucket"],
-            prefix=ds_cfg.get("s3_prefix", "").rstrip("/"),
+            bucket=ds_cfg["bucket"],
+            prefix=ds_cfg.get("prefix", "").rstrip("/"),
         )
     if ds_type == "huggingface":
+        bucket_id = ds_cfg.get("bucket_id") or ds_cfg.get("repo_id")
+        if not bucket_id:
+            raise ValueError(
+                "datasource type='huggingface' requires 'bucket_id' (HF bucket like 'owner/name')"
+            )
         return HfDestination(
-            repo_id=ds_cfg["repo_id"],
+            bucket_id=bucket_id,
             subdir=ds_cfg.get("subdir") or "",
         )
     if ds_type == "local":

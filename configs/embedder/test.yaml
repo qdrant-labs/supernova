@@ -1,0 +1,29 @@
+source:
+  type: huggingface_parquet
+  dataset_name: mteb/tweet_sentiment_extraction
+  split: train
+  text_field: text
+
+dense_embedder:
+  type: sentence_transformer
+  model: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 128
+  dtype: bfloat16
+
+sparse_embedder:                                                                                        
+  type: fastembed                                                                                     
+  model: Qdrant/bm25                                                                                  
+  batch_size: 256
+
+storage:
+  type: s3
+  bucket: qdrant--vectorforge
+  prefix: sqale2/embed-all-MiniLM-L6-v2
+  output_dir: /tmp/vectorforge
+
+pipeline:
+  chunk_size: 1000
+  num_workers: 2
+  max_text_length: 8192
+  shard_by_rank: true
+  flush_threshold: 1000

@@ -34,15 +34,21 @@ cost         = gpu_hours * price_per_gpu_hour
 wall_time    = gpu_hours / num_gpus
 ```
 
-For a confidence interval on `mean_tokens_per_row`, profile a sample of the source with your model's tokenizer:
+For a confidence interval on `mean_tokens_per_row`, profile a sample of the source with your model's tokenizer using vectorforge's parquet-level source:
 
 ```python
-from datasets import load_dataset
 from transformers import AutoTokenizer
+from vectorforge.sources.huggingface import HuggingFaceSource
 
 tok = AutoTokenizer.from_pretrained("Alibaba-NLP/gte-multilingual-base", trust_remote_code=True)
-ds = load_dataset("HuggingFaceFW/finewiki", "en", split="train", streaming=True)
-lengths = [len(tok.encode(r["text"])) for r in ds.take(100_000)]
+src = HuggingFaceSource(
+    dataset_name="HuggingFaceFW/finewiki",
+    split="train",
+    path_filter="en",
+    text_field="text",
+    limit=100_000,
+)
+lengths = [len(tok.encode(r["text"])) for r in src.stream()]
 mean_tokens = sum(lengths) / len(lengths)
 ```
 

@@ -83,8 +83,8 @@ pipeline:
 
 storage:
   type: s3                      # or hf, local
-  s3_bucket: qdrant--vectorforge
-  s3_prefix: arxiv-papers/gte-multilingual-base
+  bucket: qdrant--vectorforge
+  prefix: arxiv-papers/gte-multilingual-base
   output_dir: /tmp/vectorforge
 ```
 
@@ -122,8 +122,8 @@ The OpenAI embedder supports any OpenAI-compatible API via `base_url` (llama.cpp
 
 | Type | Config key | Notes |
 |------|-----------|-------|
-| S3 | `s3` | `s3_bucket`, `s3_prefix` |
-| HuggingFace Hub | `hf` | `repo_id`, `private` |
+| S3 | `s3` | `bucket`, `prefix` |
+| HuggingFace Storage Buckets | `hf` | `bucket_id`, optional `prefix`, `private`. Writes to `hf://buckets/{bucket_id}/...` |
 | Local | `local` | `output_dir` |
 
 ### Running locally
@@ -193,8 +193,8 @@ vectors:                            # one entry per Qdrant vector name
 
 datasource:
   type: s3                          # s3 or huggingface
-  s3_bucket: qdrant--vectorforge
-  s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
+  bucket: qdrant--vectorforge
+  prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
   id_column: row_id                 # default
   payload_fields:                   # what goes into the vector store payload
     text: text                      # payload key: parquet column name
@@ -222,7 +222,7 @@ vf load configs/loader/ccnews_bge_large.yaml
 
 | Type | Config key | Notes |
 |------|-----------|-------|
-| S3 | `s3` | `s3_bucket`, `s3_prefix`. Streams via DuckDB httpfs |
+| S3 | `s3` | `bucket`, `prefix`. Streams via DuckDB httpfs |
 | HuggingFace | `huggingface` | `repo_id`, optional `subdir`. Streams via DuckDB `hf://` protocol |
 
 ### Vector stores

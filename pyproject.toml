@@ -11,14 +11,15 @@ dependencies = [
     "pyyaml",
     "tqdm",
     "boto3",
-    "huggingface_hub",
+    # 1.5+ ships the Storage Buckets API (create_bucket, batch_bucket_files,
+    # sync_bucket, list_bucket_tree, copy_files, hf://buckets/... paths).
+    "huggingface_hub>=1.5",
     "click>=8.1",
 ]
 
 [project.optional-dependencies]
 # ML pipeline -- embed workers
 embed = [
-    "datasets",
     # Pinned: aiobotocore 3.5.0 (released 2026-04-21) might have introduced a regression
     # where streaming a sync file handle as Body=f to put_object hangs and
     # eventually fails with aiohttp ClientConnectionResetError("Cannot write
@@ -32,20 +33,19 @@ embed = [
     "openai",
     "sentence-transformers",
     "torch",
-    "transformers<5",
+    "transformers",
     "FlagEmbedding",
     "einops>=0.8.2",
     "fastembed",
     # Rust client for multi-part parallel HF downloads. Activated by
     # HF_HUB_ENABLE_HF_TRANSFER=1; without the env var, huggingface_hub
     # falls back to single-stream HTTP. Worth the install on every embed
-    # worker because huggingface_parquet's prefetch path otherwise tops
+    # worker because the parquet source's prefetch path otherwise tops
     # out at ~10 MB/s on a 10 Gbps NIC.
     "hf_transfer",
 ]
 # Pipeline infra only -- partition workers (no ML models, no fastembed)
 partition = [
-    "datasets",
     "aiobotocore<3.5",
     "aiohttp<3.13.5",
     "tiktoken>=0.12.0",

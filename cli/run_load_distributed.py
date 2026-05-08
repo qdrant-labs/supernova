@@ -253,8 +253,8 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
         from vectorforge.loader.datasource.s3 import S3DataReader
 
         reader = S3DataReader(
-            s3_bucket=dest.bucket,
-            s3_prefix=dest.prefix,
+            bucket=dest.bucket,
+            prefix=dest.prefix,
             vectors=vectors_spec,
             file_list=[files[0]],
         )

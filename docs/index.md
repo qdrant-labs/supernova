@@ -20,10 +20,10 @@ Destinations and corpora are addressed by URI. Three schemes are supported today
 | Scheme | Used for |
 |--------|----------|
 | `s3://bucket/prefix` | S3 buckets (the typical production destination) |
-| `hf://datasets/ns/name[/subdir]` | HuggingFace Hub datasets (good for community sharing) |
+| `hf://buckets/ns/name[/subdir]` | HuggingFace Storage Buckets (mutable object storage on the Hub, good for community sharing) |
 | `file:///abs/path` | Local filesystem (handy for tests and single-machine flows) |
 
-The same URI is recognised by every command that operates on a corpus -- `vf load`, `vf brute-force`, `vf generate-queries`, `vf push-hf`, etc.
+The same URI is recognised by every command that operates on a corpus -- `vf load`, `vf brute-force`, `vf generate-queries`, etc.
 
 ### Embedding pipeline
 
@@ -73,12 +73,10 @@ All subcommands are dispatched through a single `vf` entrypoint (a click group).
 | `vf brute-force-dist` | Distribute brute-force across a SkyPilot GPU pool, writing partial results |
 | `vf brute-force-merge` | Merge per-rank partial results into the final top-K parquet |
 
-### Publish + introspect
+### Introspect
 
 | Command | Purpose |
 |---------|---------|
-| `vf push-hf` | Upload S3 parquets to a HuggingFace Hub dataset (batch-committed) |
-| `vf push-hf-dist` | Distribute the HF upload across a CPU pool (S3→EC2 in-region, then EC2→HF) |
 | `vf analysis` | Analyze a completed embedding run (schema, throughput, cost) |
 | `vf throughput-predict` | Predict embedding throughput + cost from a config |
 

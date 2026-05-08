@@ -35,14 +35,6 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
         "cli.run_load_distributed:load_dist",
         "Distribute loading across SkyPilot instances.",
     ),
-    "push-hf": (
-        "cli.run_push_hf:push_hf",
-        "Upload S3 parquets to a HuggingFace Hub dataset.",
-    ),
-    "push-hf-dist": (
-        "cli.run_push_hf_distributed:push_hf_dist",
-        "Distribute HF upload across SkyPilot instances.",
-    ),
     "generate-queries": (
         "cli.run_generate_queries:generate_queries",
         "Sample N rows as eval queries (launches EC2; --local to run here).",

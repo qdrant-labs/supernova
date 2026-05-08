@@ -128,6 +128,8 @@ Default: `{}` (no payload).
 - Optional `subdir` to scope to a subfolder
 - Requires `HF_TOKEN` env var for authenticated access
 
+Note: the embed-side storage backend now writes to `hf://buckets/...` (HF Storage Buckets), but the loader still reads from `hf://datasets/...` because DuckDB's `httpfs` extension only supports the dataset/space form of `hf://` ("DuckDB only supports querying datasets or spaces"). Legacy corpora already in dataset repos load fine; new corpora written to buckets cannot be loaded into Qdrant via `vf load` until DuckDB adds bucket support upstream.
+
 ## ID space anchoring
 
 Point IDs are `md5(bare_key + ":" + row_index)` as a UUID. The same `bare_key` form is computed by *three* places that must agree: the loader's `vf_point_id` macro (when writing to Qdrant), `generate-queries` (when stamping `__source_file__` on sampled rows), and `brute-force` (when emitting hit IDs). If any of those drifts, recall@k breaks silently — payloads still match but UUIDs don't.
@@ -214,8 +216,8 @@ vectors:                      # required, at least one entry
 datasource:
   type: s3                    # s3 | huggingface
   # S3 options
-  s3_bucket: my-bucket
-  s3_prefix: my-dataset
+  bucket: my-bucket
+  prefix: my-dataset
   # HuggingFace options
   repo_id: org/dataset
   subdir: en                  # optional subfolder

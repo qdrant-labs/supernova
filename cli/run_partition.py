@@ -57,15 +57,11 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
     source_cfg = dict(config["source"])
     source_type = source_cfg.get("type")
 
-    if source_type != "huggingface_parquet":
-        # streaming HF source has no file-listing concept
+    if source_type not in ("huggingface", "huggingface_parquet"):
         click.echo(
-            f"--list-files only supports source.type=huggingface_parquet (got {source_type!r})."
+            f"--list-files only supports source.type in (huggingface, huggingface_parquet); "
+            f"got {source_type!r}."
         )
-        click.echo(
-            "For streaming HF sources, partition assignment is offset-based -- run a partition"
-        )
-        click.echo("with --num-jobs and inspect the S3 output instead.")
         return
 
     source = build_source(source_cfg)

@@ -31,7 +31,7 @@ def _resolve_destination(config: str | None, path: str | None) -> str:
     storage = cfg.get("storage", {})
     stype = storage.get("type", "s3")
     if stype == "s3":
-        return f"s3://{storage['s3_bucket']}/{storage['s3_prefix']}".rstrip("/")
+        return f"s3://{storage['bucket']}/{storage['prefix']}".rstrip("/")
     if stype == "local":
         return storage["output_dir"].rstrip("/")
     raise ValueError(f"Unsupported storage type for analysis: {stype}")

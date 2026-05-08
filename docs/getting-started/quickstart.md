@@ -26,8 +26,8 @@ pipeline:
 
 storage:
   type: s3
-  s3_bucket: my-bucket
-  s3_prefix: tweet-sentiment/openai-3-small
+  bucket: my-bucket
+  prefix: tweet-sentiment/openai-3-small
   output_dir: /tmp/vectorforge
 ```
 
@@ -70,8 +70,8 @@ vectors:                              # required: declare each named vector
 
 datasource:
   type: s3
-  s3_bucket: my-bucket
-  s3_prefix: tweet-sentiment/openai-3-small
+  bucket: my-bucket
+  prefix: tweet-sentiment/openai-3-small
   id_expression: "vf_point_id(filename, file_row_number)"
   payload_fields:
     text: text

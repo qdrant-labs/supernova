@@ -17,9 +17,10 @@ import time
 import numpy as np
 
 from scipy import stats as sp_stats
-from datasets import load_dataset
 from transformers import AutoTokenizer, AutoConfig
 from tqdm import tqdm
+
+from vectorforge.sources.huggingface import HuggingFaceSource
 
 log = logging.getLogger(__name__)
 
@@ -61,14 +62,20 @@ GPU_TABLE: dict[str, dict] = {
 
 
 def detect_total_rows(dataset: str, hf_config: str | None, split: str) -> int | None:
+    # hf_config is now folded into a path_filter glob if the caller relied on
+    # it (e.g. "20231101.en" for wikipedia configs). Most native-parquet repos
+    # use one parquet tree per split and ignore config entirely.
     try:
-        ds = load_dataset(dataset, hf_config, split=split, streaming=True)
-        n = ds.info.splits[split].num_examples
-        if n and n > 0:
-            return n
+        src = HuggingFaceSource(
+            dataset_name=dataset,
+            split=split,
+            path_filter=hf_config,
+            text_field="__never__",  # placeholder; we never call extract_text here
+        )
+        n = src.get_total_rows()
+        return n if n and n > 0 else None
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _render_text(row: dict, column: str | None, template: str | None) -> str | None:
@@ -89,11 +96,18 @@ def sample_token_lengths(
     tokenizer_name: str,
     n: int,
 ) -> np.ndarray:
-    ds = load_dataset(dataset, hf_config, split=split, streaming=True)
+    src = HuggingFaceSource(
+        dataset_name=dataset,
+        split=split,
+        path_filter=hf_config,
+        text_field=column,
+        text_template=template,
+        limit=n,
+    )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
 
     lengths: list[int] = []
-    for row in tqdm(ds.shuffle(seed=42).take(n), total=n, desc="Tokenizing"):
+    for row in tqdm(src.stream(), total=n, desc="Tokenizing"):
         text = _render_text(row, column, template)
         if text and text.strip():
             lengths.append(len(tokenizer.encode(text, add_special_tokens=False)))

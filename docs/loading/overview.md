@@ -25,8 +25,8 @@ vectors:
 
 datasource:
   type: s3                          # s3 or huggingface
-  s3_bucket: my-bucket
-  s3_prefix: dataset/model
+  bucket: my-bucket
+  prefix: dataset/model
   id_expression: "vf_point_id(filename, file_row_number)"   # see below
   payload_fields:                   # what ends up in the vector store payload
     text: text                      # payload key: parquet column name
@@ -59,8 +59,8 @@ Streams parquet files via DuckDB's httpfs extension. No local download.
 ```yaml
 datasource:
   type: s3
-  s3_bucket: my-bucket
-  s3_prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
+  bucket: my-bucket
+  prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
 ```
 
 Reads all parquet files matching `s3://bucket/prefix/**/*.parquet`.

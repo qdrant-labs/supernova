@@ -19,8 +19,8 @@ The actual pipelines live under optional extras so embed workers don't pull in q
 
 | Extra | Installs | Use when |
 |-------|----------|----------|
-| `embed` | datasets, sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `vf embed` / `vf partition` workers locally |
-| `partition` | datasets, aiobotocore, tiktoken | CPU partition workers (no ML models, no fastembed) |
+| `embed` | sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `vf embed` / `vf partition` workers locally |
+| `partition` | aiobotocore, tiktoken | CPU partition workers (no ML models, no fastembed) |
 | `load` | duckdb, qdrant-client | Running `vf load` (loader workers) |
 | `eval` | torch | `vf brute-force --local` |
 | `dist` | skypilot[aws] | Dispatching distributed jobs from your laptop / Hetzner box |
@@ -41,7 +41,7 @@ uv sync --extra load
 uv sync --all-extras
 ```
 
-The dispatch CLIs (`vf embed-dist`, `vf load-dist`, `vf brute-force-dist`, `vf push-hf-dist`) bake the right `uv sync --extra ...` into the pool's `setup:` script, so workers install the right slice automatically.
+The dispatch CLIs (`vf embed-dist`, `vf load-dist`, `vf brute-force-dist`) bake the right `uv sync --extra ...` into the pool's `setup:` script, so workers install the right slice automatically.
 
 ## Environment variables
 
@@ -54,7 +54,7 @@ Set the variables relevant to your workflow.
 | `OPENAI_API_KEY` | OpenAI embedder |
 | `AWS_ACCESS_KEY_ID` | S3 storage backend |
 | `AWS_SECRET_ACCESS_KEY` | S3 storage backend |
-| `HF_TOKEN` | HuggingFace Hub storage backend / private dataset reads |
+| `HF_TOKEN` | HuggingFace Storage Buckets (write) and reads from `hf://buckets/...` or `hf://datasets/...` (private source datasets / legacy corpora) |
 
 ### Loading pipeline
 
@@ -66,7 +66,7 @@ Set the variables relevant to your workflow.
 | `AWS_REGION` | S3 region (defaults to `us-east-1`) |
 | `QDRANT_URL` | Qdrant cluster URL |
 | `QDRANT_API_KEY` | Qdrant API key |
-| `HF_TOKEN` | Reading private corpora from `hf://datasets/...` |
+| `HF_TOKEN` | Reading private corpora from `hf://buckets/...` (new) or `hf://datasets/...` (legacy) |
 
 ## SkyPilot setup
 
@@ -82,7 +82,7 @@ SkyPilot requires IAM permissions to launch EC2 instances. See the [SkyPilot AWS
 ## Verify installation
 
 ```bash
-vf --help                # lists all 14 subcommands; should run in well under a second
+vf --help                # lists every subcommand; should run in well under a second
 vf embed --help
 vf load --help
 vf brute-force --help
