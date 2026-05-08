@@ -59,7 +59,10 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         # Separate tokenizer copy for split_text to avoid "Already borrowed"
         # race with the model's internal tokenizer used during encode()
         from transformers import AutoTokenizer
-        self._splitter_tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
+
+        self._splitter_tokenizer = AutoTokenizer.from_pretrained(
+            model, trust_remote_code=trust_remote_code
+        )
 
     @property
     def model_name(self) -> str:
@@ -89,7 +92,9 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         chunks = []
         for i in range(0, len(tokens), self._max_tokens):
             chunk_tokens = tokens[i : i + self._max_tokens]
-            chunks.append(self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True))
+            chunks.append(
+                self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            )
         return chunks
 
     def _encode(self, texts: list[str]) -> list[list[float]]:

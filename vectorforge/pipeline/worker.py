@@ -27,7 +27,9 @@ async def worker(
                 text=r.text,
                 dense_embedding=result.dense[i] if result.dense else None,
                 sparse_embedding=result.sparse[i] if result.sparse else None,
-                multivector_embedding=result.multivector[i] if result.multivector else None,
+                multivector_embedding=result.multivector[i]
+                if result.multivector
+                else None,
                 columns=r.columns,
             )
             for i, r in enumerate(records)

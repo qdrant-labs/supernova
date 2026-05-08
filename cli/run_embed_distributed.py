@@ -15,7 +15,13 @@ from pathlib import Path
 import click
 import yaml
 
-from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_dry_run, print_monitor
+from cli.skypilot_utils import (
+    build_env_flags,
+    make_run_dir,
+    launch_pool_and_jobs,
+    print_dry_run,
+    print_monitor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,22 +46,45 @@ DEFAULT_RESOURCES = {
 
 @click.command(name="embed-dist", help="Embed distributed via SkyPilot pool.")
 @click.argument("config")
-@click.option("--dry-run", is_flag=True, help="Generate configs and print plan, don't launch.")
-@click.option("--num-jobs", type=int, default=None,
-              help="Number of parallel jobs (default: auto from dataset size).")
-@click.option("--chunk-size", type=int, default=None,
-              help="Rows per job (used to auto-compute num-jobs).")
-@click.option("--pool-name", default=None,
-              help="SkyPilot pool name (default: auto-generated).")
-@click.option("--max-workers", type=int, default=None,
-              help="Max pool workers for autoscaling (default: num-jobs).")
-@click.option("--on-demand", is_flag=True,
-              help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota).")
-@click.option("--ramp", is_flag=True,
-              help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). "
-                   "Default is burst (min_workers=max_workers) since EC2 provisioning is "
-                   "slow and we know the target count up front.")
-def embed_dist(config, dry_run, num_jobs, chunk_size, pool_name, max_workers, on_demand, ramp):
+@click.option(
+    "--dry-run", is_flag=True, help="Generate configs and print plan, don't launch."
+)
+@click.option(
+    "--num-jobs",
+    type=int,
+    default=None,
+    help="Number of parallel jobs (default: auto from dataset size).",
+)
+@click.option(
+    "--chunk-size",
+    type=int,
+    default=None,
+    help="Rows per job (used to auto-compute num-jobs).",
+)
+@click.option(
+    "--pool-name", default=None, help="SkyPilot pool name (default: auto-generated)."
+)
+@click.option(
+    "--max-workers",
+    type=int,
+    default=None,
+    help="Max pool workers for autoscaling (default: num-jobs).",
+)
+@click.option(
+    "--on-demand",
+    is_flag=True,
+    help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota).",
+)
+@click.option(
+    "--ramp",
+    is_flag=True,
+    help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). "
+    "Default is burst (min_workers=max_workers) since EC2 provisioning is "
+    "slow and we know the target count up front.",
+)
+def embed_dist(
+    config, dry_run, num_jobs, chunk_size, pool_name, max_workers, on_demand, ramp
+):
     """Dispatch distributed embedding via SkyPilot pools."""
     logging.basicConfig(
         level=logging.WARNING,
@@ -76,6 +105,7 @@ def embed_dist(config, dry_run, num_jobs, chunk_size, pool_name, max_workers, on
 
     # get dataset size (source-agnostic)
     from cli.run_embedder import build_source
+
     source = build_source(dict(source_cfg))
     total_rows = source.get_total_rows()
 
@@ -99,7 +129,9 @@ def embed_dist(config, dry_run, num_jobs, chunk_size, pool_name, max_workers, on
     click.echo(f"  Rows/job:     ~{math.ceil(total_rows / num_jobs_eff):,}")
     click.echo(f"  Max workers:  {max_workers_eff}")
     click.echo(f"  Pool name:    {pool_name_eff}")
-    click.echo(f"  Provision:    {'ramp (autoscaler)' if ramp else 'burst (all workers at startup)'}")
+    click.echo(
+        f"  Provision:    {'ramp (autoscaler)' if ramp else 'burst (all workers at startup)'}"
+    )
     click.echo(f"  Resources:    {resources}")
     click.echo(f"  Run dir:      {run_dir}")
     click.echo("=" * 60)

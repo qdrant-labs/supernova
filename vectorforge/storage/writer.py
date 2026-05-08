@@ -5,10 +5,12 @@ import pyarrow.parquet as pq
 
 from vectorforge.models import EmbeddedRecord
 
-SPARSE_EMBEDDING_TYPE = pa.struct([
-    pa.field("indices", pa.list_(pa.uint32())),
-    pa.field("values", pa.list_(pa.float32())),
-])
+SPARSE_EMBEDDING_TYPE = pa.struct(
+    [
+        pa.field("indices", pa.list_(pa.uint32())),
+        pa.field("values", pa.list_(pa.float32())),
+    ]
+)
 
 MULTIVECTOR_EMBEDDING_TYPE = pa.list_(pa.list_(pa.float32()))
 
@@ -52,12 +54,16 @@ def write_batch(
     # Embedders may keep .vectors as a 2D ndarray for efficient downstream math;
     # pyarrow needs a list-of-1D-arrays here, so flatten per row.
     if multivector_column and records and records[0].multivector_embedding is not None:
+
         def _to_list_of_rows(v):
             # accepts 2D ndarray or list[list[float]]; pyarrow wants per-vector objects
             if hasattr(v, "tolist"):
                 return v.tolist()
             return v
-        data[multivector_column] = [_to_list_of_rows(r.multivector_embedding.vectors) for r in records]
+
+        data[multivector_column] = [
+            _to_list_of_rows(r.multivector_embedding.vectors) for r in records
+        ]
         schema_fields.append(pa.field(multivector_column, MULTIVECTOR_EMBEDDING_TYPE))
 
     table = pa.table(data, schema=pa.schema(schema_fields))

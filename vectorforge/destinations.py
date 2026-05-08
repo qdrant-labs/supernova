@@ -38,11 +38,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
-    import pyarrow.fs
+    import pyarrow.fs  # noqa: F401
 
 
 EVAL_SUBDIR = "eval"
 HF_DATA_SUBDIR = "data"
+
+
 @dataclass(frozen=True)
 class S3Destination:
     bucket: str
@@ -98,7 +100,11 @@ class HfDestination:
     @property
     def root_uri(self) -> str:
         if self.subdir:
-            return f"hf://datasets/{self.repo_id}/{HF_DATA_SUBDIR}/{self.subdir}".rstrip("/")
+            return (
+                f"hf://datasets/{self.repo_id}/{HF_DATA_SUBDIR}/{self.subdir}".rstrip(
+                    "/"
+                )
+            )
         return f"hf://datasets/{self.repo_id}"
 
     def child_uri(self, sub: str) -> str:
@@ -116,6 +122,7 @@ class HfDestination:
 
 Destination = Union[S3Destination, HfDestination, LocalDestination]
 
+
 def parse_destination(uri: str) -> Destination:
     """
     Parse an s3://, hf://datasets/, or file:// URI into a Destination.
@@ -131,14 +138,14 @@ def parse_destination(uri: str) -> Destination:
     sub-tree (i.e. they reference paths under data/, not the repo root).
     """
     if uri.startswith("s3://"):
-        rest = uri[len("s3://"):]
+        rest = uri[len("s3://") :]
         bucket, _, prefix = rest.partition("/")
         if not bucket:
             raise ValueError(f"s3:// URI is missing bucket: {uri!r}")
         return S3Destination(bucket=bucket, prefix=prefix.rstrip("/"))
 
     if uri.startswith("hf://datasets/"):
-        rest = uri[len("hf://datasets/"):]
+        rest = uri[len("hf://datasets/") :]
         parts = rest.split("/", 2)
         if len(parts) < 2 or not parts[0] or not parts[1]:
             raise ValueError(
@@ -153,7 +160,7 @@ def parse_destination(uri: str) -> Destination:
         # Standard form is file:///abs/path (3 slashes = scheme + empty host +
         # absolute path). After stripping "file://" the remainder must start
         # with "/", giving the absolute filesystem path.
-        rest = uri[len("file://"):]
+        rest = uri[len("file://") :]
         if not rest.startswith("/"):
             raise ValueError(
                 f"file:// URI must be absolute (file:///abs/path), got {uri!r}"
@@ -243,12 +250,15 @@ def filesystem_for_uri(uri: str):
     """
     if uri.startswith("s3://"):
         import pyarrow.fs as pafs
+
         return pafs.S3FileSystem()
     if uri.startswith("hf://"):
         from huggingface_hub import HfFileSystem
+
         return HfFileSystem()
     if uri.startswith("file://"):
         import pyarrow.fs as pafs
+
         return pafs.LocalFileSystem()
     raise ValueError(f"Unknown URI scheme in {uri!r}")
 
@@ -262,11 +272,11 @@ def fs_path_for_uri(uri: str) -> str:
     pyarrow.fs.LocalFileSystem expects: /abs/path
     """
     if uri.startswith("s3://"):
-        return uri[len("s3://"):]
+        return uri[len("s3://") :]
     if uri.startswith("hf://"):
-        return uri[len("hf://"):]
+        return uri[len("hf://") :]
     if uri.startswith("file://"):
-        return uri[len("file://"):]
+        return uri[len("file://") :]
     raise ValueError(f"Unknown URI scheme in {uri!r}")
 
 
@@ -311,16 +321,16 @@ def bare_key_for_uri(uri: str) -> str:
     migrations). See docs/reference/loader-architecture.md#id-space-anchoring.
     """
     if uri.startswith("s3://"):
-        rest = uri[len("s3://"):]
+        rest = uri[len("s3://") :]
         _, _, key = rest.partition("/")
         return key
     if uri.startswith("hf://datasets/"):
-        rest = uri[len("hf://datasets/"):]
+        rest = uri[len("hf://datasets/") :]
         # Skip namespace/name; keep everything after.
         parts = rest.split("/", 2)
         return parts[2] if len(parts) == 3 else ""
     if uri.startswith("file://"):
-        return uri[len("file://"):]
+        return uri[len("file://") :]
     raise ValueError(f"Unknown URI scheme in {uri!r}")
 
 
@@ -332,7 +342,8 @@ def list_parquets_under(prefix_uri: str) -> list[str]:
     """
     if prefix_uri.startswith("s3://"):
         import boto3
-        rest = prefix_uri[len("s3://"):]
+
+        rest = prefix_uri[len("s3://") :]
         bucket, _, prefix = rest.partition("/")
         s3 = boto3.client("s3")
         paginator = s3.get_paginator("list_objects_v2")
@@ -345,7 +356,8 @@ def list_parquets_under(prefix_uri: str) -> list[str]:
 
     if prefix_uri.startswith("hf://datasets/"):
         from huggingface_hub import HfApi
-        rest = prefix_uri[len("hf://datasets/"):]
+
+        rest = prefix_uri[len("hf://datasets/") :]
         parts = rest.split("/", 2)
         if len(parts) < 2:
             raise ValueError(f"Bad hf:// prefix: {prefix_uri!r}")
@@ -364,7 +376,8 @@ def list_parquets_under(prefix_uri: str) -> list[str]:
 
     if prefix_uri.startswith("file://"):
         import os
-        root = prefix_uri[len("file://"):]
+
+        root = prefix_uri[len("file://") :]
         uris: list[str] = []
         for dirpath, _dirs, files in os.walk(root):
             for name in files:
@@ -382,14 +395,16 @@ def upload_file_to_uri(local_path: str, dest_uri: str) -> None:
     """
     if dest_uri.startswith("s3://"):
         import boto3
-        rest = dest_uri[len("s3://"):]
+
+        rest = dest_uri[len("s3://") :]
         bucket, _, key = rest.partition("/")
         boto3.client("s3").upload_file(local_path, bucket, key)
         return
 
     if dest_uri.startswith("hf://datasets/"):
         from huggingface_hub import HfApi
-        rest = dest_uri[len("hf://datasets/"):]
+
+        rest = dest_uri[len("hf://datasets/") :]
         parts = rest.split("/", 2)
         if len(parts) < 3:
             raise ValueError(f"hf:// upload URI needs in-repo path: {dest_uri!r}")
@@ -406,7 +421,8 @@ def upload_file_to_uri(local_path: str, dest_uri: str) -> None:
     if dest_uri.startswith("file://"):
         import os
         import shutil
-        target = dest_uri[len("file://"):]
+
+        target = dest_uri[len("file://") :]
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.copyfile(local_path, target)
         return
@@ -418,14 +434,16 @@ def upload_bytes_to_uri(data: bytes, dest_uri: str) -> None:
     """Same as upload_file_to_uri but for in-memory bytes."""
     if dest_uri.startswith("s3://"):
         import boto3
-        rest = dest_uri[len("s3://"):]
+
+        rest = dest_uri[len("s3://") :]
         bucket, _, key = rest.partition("/")
         boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=data)
         return
 
     if dest_uri.startswith("hf://datasets/"):
         from huggingface_hub import HfApi
-        rest = dest_uri[len("hf://datasets/"):]
+
+        rest = dest_uri[len("hf://datasets/") :]
         parts = rest.split("/", 2)
         if len(parts) < 3:
             raise ValueError(f"hf:// upload URI needs in-repo path: {dest_uri!r}")
@@ -441,7 +459,8 @@ def upload_bytes_to_uri(data: bytes, dest_uri: str) -> None:
 
     if dest_uri.startswith("file://"):
         import os
-        target = dest_uri[len("file://"):]
+
+        target = dest_uri[len("file://") :]
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "wb") as f:
             f.write(data)

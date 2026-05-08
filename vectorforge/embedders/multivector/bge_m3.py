@@ -54,7 +54,12 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
         torch_dtype = self.DTYPE_MAP.get(dtype, torch.float32)
         use_fp16 = torch_dtype == torch.float16
 
-        logger.info("Loading %s (multi-vector mode) on %s (dtype=%s)", model, self._device, dtype)
+        logger.info(
+            "Loading %s (multi-vector mode) on %s (dtype=%s)",
+            model,
+            self._device,
+            dtype,
+        )
         self._model = BGEM3FlagModel(
             model,
             use_fp16=use_fp16,
@@ -69,6 +74,7 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
         self._truncate = truncate
 
         from transformers import AutoTokenizer
+
         self._tokenizer = AutoTokenizer.from_pretrained(model)
         # per-vector dimension is known: colbert head of bge-m3 outputs 1024
         self._dimensions = 1024

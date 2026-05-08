@@ -93,6 +93,7 @@ def load_queries(
 def _compute_scores(Q, C, metric: DistanceMetric):
     import torch
     import torch.nn.functional as F
+
     if metric == DistanceMetric.COSINE:
         return F.normalize(Q, dim=1) @ F.normalize(C, dim=1).T
     elif metric == DistanceMetric.DOT:
@@ -177,7 +178,9 @@ def run_brute_force(
 
     logger.info(
         "Device: %s  Metric: %s  K: %d%s",
-        device, metric.value, k,
+        device,
+        metric.value,
+        k,
         f"  Rank: {job_rank}/{num_jobs}" if num_jobs else "",
     )
 
@@ -194,8 +197,12 @@ def run_brute_force(
         corpus_uris = all_corpus_uris[start : start + chunk]
         logger.info(
             "Rank %d/%d: %d files (index %d–%d of %d)",
-            job_rank, num_jobs, len(corpus_uris),
-            start, start + len(corpus_uris) - 1, len(all_corpus_uris),
+            job_rank,
+            num_jobs,
+            len(corpus_uris),
+            start,
+            start + len(corpus_uris) - 1,
+            len(all_corpus_uris),
         )
     else:
         corpus_uris = all_corpus_uris
@@ -282,15 +289,19 @@ def run_brute_force(
         hit_ids_out.append(ids)
         hit_scores_out.append(q_scores.tolist())
 
-    result = pa.table({
-        "query_id": pa.array(query_ids, type=pa.string()),
-        "hit_ids": pa.array(hit_ids_out, type=pa.list_(pa.string())),
-        "hit_scores": pa.array(hit_scores_out, type=pa.list_(pa.float32())),
-    })
+    result = pa.table(
+        {
+            "query_id": pa.array(query_ids, type=pa.string()),
+            "hit_ids": pa.array(hit_ids_out, type=pa.list_(pa.string())),
+            "hit_scores": pa.array(hit_scores_out, type=pa.list_(pa.float32())),
+        }
+    )
 
     if num_jobs is not None:
         rank_width = max(3, len(str(num_jobs - 1)))
-        partial_path = f"{partial_subkey(queries_stem, k)}/rank{job_rank:0{rank_width}d}.parquet"
+        partial_path = (
+            f"{partial_subkey(queries_stem, k)}/rank{job_rank:0{rank_width}d}.parquet"
+        )
         dest_uri = dest.eval_uri(partial_path)
         local_out = f"/tmp/rank{job_rank:0{rank_width}d}.parquet"
     else:
@@ -336,7 +347,8 @@ def merge_results(
 
     logger.info(
         "Sorting %d queries × up to %d candidates...",
-        len(candidates), len(partial_uris) * k,
+        len(candidates),
+        len(partial_uris) * k,
     )
     query_ids = sorted(candidates)
     hit_ids_out, hit_scores_out = [], []
@@ -345,11 +357,13 @@ def merge_results(
         hit_ids_out.append([h for _, h in top])
         hit_scores_out.append([s for s, _ in top])
 
-    result = pa.table({
-        "query_id": pa.array(query_ids, type=pa.string()),
-        "hit_ids": pa.array(hit_ids_out, type=pa.list_(pa.string())),
-        "hit_scores": pa.array(hit_scores_out, type=pa.list_(pa.float32())),
-    })
+    result = pa.table(
+        {
+            "query_id": pa.array(query_ids, type=pa.string()),
+            "hit_ids": pa.array(hit_ids_out, type=pa.list_(pa.string())),
+            "hit_scores": pa.array(hit_scores_out, type=pa.list_(pa.float32())),
+        }
+    )
 
     local_out = f"/tmp/{output}"
     _save_and_push(result, local_out, dest.eval_uri(output))

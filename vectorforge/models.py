@@ -7,6 +7,7 @@ class SparseEmbedding:
     Sparse vector representation: parallel lists of token indices and weights.
     Used by BM25, SPLADE, and other sparse retrieval models.
     """
+
     indices: list[int]
     values: list[float]
 
@@ -23,6 +24,7 @@ class MultiVectorEmbedding:
     unconverted; pooling and pyarrow both accept either form. The type hint is
     kept as list[list[float]] for interop / serialization clarity.
     """
+
     vectors: list[list[float]]
 
 
@@ -34,6 +36,7 @@ class Record:
 
     `columns` carries all original source columns (after exclude_columns filtering).
     """
+
     text: str
     columns: dict = field(default_factory=dict)
 
@@ -44,6 +47,7 @@ class EmbeddedRecord:
     A Record after embedding. Any combination of dense/sparse/multivector
     may be set depending on which embedders are configured.
     """
+
     text: str
     dense_embedding: list[float] | None = None
     sparse_embedding: SparseEmbedding | None = None
@@ -56,5 +60,6 @@ class ChunkResult:
     """
     What comes back from a worker after embedding a full chunk.
     """
+
     chunk_id: int
     records: list[EmbeddedRecord]

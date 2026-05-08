@@ -9,12 +9,17 @@ from the datacenter, bypassing your local machine's upload bandwidth entirely.
 
 import json
 import logging
-from pathlib import Path
 
 import click
 import yaml
 
-from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_dry_run, print_monitor
+from cli.skypilot_utils import (
+    build_env_flags,
+    make_run_dir,
+    launch_pool_and_jobs,
+    print_dry_run,
+    print_monitor,
+)
 from vectorforge.destinations import S3Destination, discover_corpus_parquets
 
 logger = logging.getLogger(__name__)
@@ -35,28 +40,55 @@ def list_s3_parquets(bucket: str, prefix: str) -> list[str]:
     """Return bare S3 keys (no scheme, no bucket) for every corpus parquet."""
     dest = S3Destination(bucket=bucket, prefix=prefix.rstrip("/"))
     scheme_prefix = f"s3://{bucket}/"
-    return [u[len(scheme_prefix):] for u in discover_corpus_parquets(dest)]
+    return [u[len(scheme_prefix) :] for u in discover_corpus_parquets(dest)]
 
 
-@click.command(name="push-hf-dist", help="Distribute HF upload across SkyPilot instances.")
+@click.command(
+    name="push-hf-dist", help="Distribute HF upload across SkyPilot instances."
+)
 @click.argument("s3_uri")
 @click.argument("repo_id")
-@click.option("--num-jobs", type=int, default=None,
-              help="Number of parallel workers (default: auto from file count).")
-@click.option("--files-per-job", type=int, default=20, show_default=True,
-              help="Files per worker when auto-computing num-jobs.")
-@click.option("--subfolder", default="data", show_default=True,
-              help="Folder inside the HF repo.")
+@click.option(
+    "--num-jobs",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: auto from file count).",
+)
+@click.option(
+    "--files-per-job",
+    type=int,
+    default=20,
+    show_default=True,
+    help="Files per worker when auto-computing num-jobs.",
+)
+@click.option(
+    "--subfolder", default="data", show_default=True, help="Folder inside the HF repo."
+)
 @click.option("--private", is_flag=True, help="Create HF repo as private.")
-@click.option("--pool-name", default=None,
-              help="SkyPilot pool name (default: auto-generated).")
+@click.option(
+    "--pool-name", default=None, help="SkyPilot pool name (default: auto-generated)."
+)
 @click.option("--on-demand", is_flag=True, help="Use on-demand instead of spot.")
-@click.option("--ramp", is_flag=True,
-              help="Ramp workers gradually (min_workers=0). Default is burst.")
-@click.option("--dry-run", is_flag=True,
-              help="Print plan and generate configs, don't launch.")
-def push_hf_dist(s3_uri, repo_id, num_jobs, files_per_job, subfolder, private,
-                 pool_name, on_demand, ramp, dry_run):
+@click.option(
+    "--ramp",
+    is_flag=True,
+    help="Ramp workers gradually (min_workers=0). Default is burst.",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Print plan and generate configs, don't launch."
+)
+def push_hf_dist(
+    s3_uri,
+    repo_id,
+    num_jobs,
+    files_per_job,
+    subfolder,
+    private,
+    pool_name,
+    on_demand,
+    ramp,
+    dry_run,
+):
     """Dispatch distributed HF Hub uploads via SkyPilot."""
     logging.basicConfig(
         level=logging.WARNING,
@@ -98,7 +130,9 @@ def push_hf_dist(s3_uri, repo_id, num_jobs, files_per_job, subfolder, private,
     click.echo(f"  HF repo:      {repo_id}")
     click.echo(f"  Subfolder:    {subfolder}")
     click.echo(f"  Pool name:    {pool_name_eff}")
-    click.echo(f"  Provision:    {'ramp (autoscaler)' if ramp else 'burst (all workers at startup)'}")
+    click.echo(
+        f"  Provision:    {'ramp (autoscaler)' if ramp else 'burst (all workers at startup)'}"
+    )
     click.echo(f"  Resources:    {resources}")
     click.echo(f"  Run dir:      {run_dir}")
     click.echo("=" * 60)

@@ -45,7 +45,9 @@ def list_parquet_files(bucket: str, prefix: str) -> list[str]:
 def configure_duckdb(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("INSTALL httpfs; LOAD httpfs;")
 
-    region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    region = os.environ.get(
+        "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    )
     conn.execute(f"SET s3_region = '{region}';")
 
     key = os.environ.get("AWS_ACCESS_KEY_ID", "")
@@ -66,22 +68,41 @@ def configure_duckdb(conn: duckdb.DuckDBPyConnection) -> None:
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     if not uri.startswith("s3://"):
         raise ValueError(f"Expected s3://bucket/prefix, got {uri!r}")
-    rest = uri[len("s3://"):]
+    rest = uri[len("s3://") :]
     bucket, _, prefix = rest.partition("/")
     return bucket, prefix
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("s3_uri", help="s3://bucket/prefix (recursively scanned for *.parquet)")
-    p.add_argument("--id-column", default="row_id",
-                   help="Column whose uniqueness defines a row id (default: row_id)")
-    p.add_argument("--content-columns", nargs="+", default=["text", "dense_embedding"],
-                   help="Columns to hash for content-duplicate detection. Pass --content-columns '' to skip.")
-    p.add_argument("--batch-size", type=int, default=10000,
-                   help="Rows per fetchmany (default: 10000)")
-    p.add_argument("--max-examples", type=int, default=10,
-                   help="Number of duplicate examples to print (default: 10)")
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument(
+        "s3_uri", help="s3://bucket/prefix (recursively scanned for *.parquet)"
+    )
+    p.add_argument(
+        "--id-column",
+        default="row_id",
+        help="Column whose uniqueness defines a row id (default: row_id)",
+    )
+    p.add_argument(
+        "--content-columns",
+        nargs="+",
+        default=["text", "dense_embedding"],
+        help="Columns to hash for content-duplicate detection. Pass --content-columns '' to skip.",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=10000,
+        help="Rows per fetchmany (default: 10000)",
+    )
+    p.add_argument(
+        "--max-examples",
+        type=int,
+        default=10,
+        help="Number of duplicate examples to print (default: 10)",
+    )
     args = p.parse_args(argv)
 
     bucket, prefix = parse_s3_uri(args.s3_uri)
@@ -141,11 +162,13 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         seen_content.add(content_hash)
 
-        pbar.set_postfix({
-            "rows": f"{total_rows:,}",
-            "dup_ids": len(duplicate_id_counts),
-            "dup_content": duplicate_content_count,
-        })
+        pbar.set_postfix(
+            {
+                "rows": f"{total_rows:,}",
+                "dup_ids": len(duplicate_id_counts),
+                "dup_content": duplicate_content_count,
+            }
+        )
 
     pbar.close()
 
@@ -155,8 +178,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Unique row_ids ({args.id_column}): {len(seen_ids):,}")
     if track_content:
         print(f"Unique content hashes:     {len(seen_content):,}")
-    print(f"Duplicate row_ids:         {len(duplicate_id_counts):,}"
-          f" (with {sum(duplicate_id_counts.values()):,} extra occurrences)")
+    print(
+        f"Duplicate row_ids:         {len(duplicate_id_counts):,}"
+        f" (with {sum(duplicate_id_counts.values()):,} extra occurrences)"
+    )
     if track_content:
         print(f"Duplicate content rows:    {duplicate_content_count:,}")
     if file_errors:
@@ -164,13 +189,17 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 60)
 
     if duplicate_id_counts:
-        print(f"\nFirst {min(args.max_examples, len(duplicate_id_examples))} duplicate row_id examples:")
+        print(
+            f"\nFirst {min(args.max_examples, len(duplicate_id_examples))} duplicate row_id examples:"
+        )
         for rid, file_uri in list(duplicate_id_examples.items())[: args.max_examples]:
             extra = duplicate_id_counts[rid]
-            print(f"  row_id={rid} (saw {extra + 1} times; second occurrence in {file_uri})")
+            print(
+                f"  row_id={rid} (saw {extra + 1} times; second occurrence in {file_uri})"
+            )
 
     if file_errors:
-        print(f"\nFile read errors:")
+        print("\nFile read errors:")
         for file_uri, err in file_errors[:5]:
             print(f"  {file_uri}: {err}")
         if len(file_errors) > 5:

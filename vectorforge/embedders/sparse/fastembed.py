@@ -25,6 +25,7 @@ class FastEmbedSparseEmbedder(SparseEmbedder):
         cache_dir: str | None = None,
     ):
         from fastembed import SparseTextEmbedding
+
         logger.info("Loading fastembed sparse model %s", model)
         self._model = SparseTextEmbedding(
             model_name=model,

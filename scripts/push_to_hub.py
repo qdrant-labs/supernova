@@ -47,13 +47,24 @@ def already_uploaded(api: HfApi, repo_id: str, path_in_repo: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Copy S3 parquets to HuggingFace Hub")
-    parser.add_argument("s3_uri", help="s3://bucket/prefix (all .parquet files under prefix are uploaded)")
+    parser.add_argument(
+        "s3_uri",
+        help="s3://bucket/prefix (all .parquet files under prefix are uploaded)",
+    )
     parser.add_argument("repo_id", help="HF repo id, e.g. 'username/dataset-name'")
-    parser.add_argument("--subfolder", default="data", help="Folder inside the HF repo (default: data)")
+    parser.add_argument(
+        "--subfolder", default="data", help="Folder inside the HF repo (default: data)"
+    )
     parser.add_argument("--private", action="store_true", help="Create repo as private")
-    parser.add_argument("--skip-existing", action="store_true", default=True,
-                        help="Skip files already present in the repo (default: True)")
-    parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        default=True,
+        help="Skip files already present in the repo (default: True)",
+    )
+    parser.add_argument(
+        "--no-skip-existing", dest="skip_existing", action="store_false"
+    )
     args = parser.parse_args()
 
     if not args.s3_uri.startswith("s3://"):
@@ -89,18 +100,18 @@ def main():
             # e.g. prefix="fineweb/embed-bge" key="fineweb/embed-bge/cc-main/rank00/batch_0.parquet"
             #   -> relative="cc-main/rank00/batch_0.parquet"
             #   -> path_in_repo="data/cc-main/rank00/batch_0.parquet"
-            relative = key[len(prefix):].lstrip("/")
+            relative = key[len(prefix) :].lstrip("/")
             path_in_repo = f"{args.subfolder}/{relative}"
 
             if args.skip_existing and already_uploaded(api, args.repo_id, path_in_repo):
-                print(f"[{i+1}/{len(keys)}] Skipping (already uploaded): {relative}")
+                print(f"[{i + 1}/{len(keys)}] Skipping (already uploaded): {relative}")
                 skipped += 1
                 continue
 
             # Use a flat temp filename to avoid needing to recreate subdirs locally
             local_path = os.path.join(tmpdir, Path(key).name)
 
-            print(f"[{i+1}/{len(keys)}] Downloading s3://{bucket}/{key}...")
+            print(f"[{i + 1}/{len(keys)}] Downloading s3://{bucket}/{key}...")
             s3.download_file(bucket, key, local_path)
             size_gb = os.path.getsize(local_path) / 1e9
             print(f"  Downloaded {size_gb:.2f} GB — uploading to {path_in_repo}...")

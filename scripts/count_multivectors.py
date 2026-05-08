@@ -35,6 +35,7 @@ def _list_parquets(prefix: str) -> tuple[list[str], S3FileSystem | None]:
     if not prefix.startswith("s3://"):
         # local dir
         from pathlib import Path
+
         root = Path(prefix)
         return sorted(str(p) for p in root.rglob("*.parquet")), None
 
@@ -52,12 +53,22 @@ def _list_parquets(prefix: str) -> tuple[list[str], S3FileSystem | None]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Count multi-vector tokens across parquets in an S3 prefix.")
-    parser.add_argument("prefix", help="S3 prefix (e.g. s3://bucket/path/to/dir/) or local directory.")
-    parser.add_argument("--column", default="multivector_embedding",
-                        help="Multi-vector column name. Default: multivector_embedding.")
-    parser.add_argument("--per-file", action="store_true",
-                        help="Print stats per parquet file in addition to the total.")
+    parser = argparse.ArgumentParser(
+        description="Count multi-vector tokens across parquets in an S3 prefix."
+    )
+    parser.add_argument(
+        "prefix", help="S3 prefix (e.g. s3://bucket/path/to/dir/) or local directory."
+    )
+    parser.add_argument(
+        "--column",
+        default="multivector_embedding",
+        help="Multi-vector column name. Default: multivector_embedding.",
+    )
+    parser.add_argument(
+        "--per-file",
+        action="store_true",
+        help="Print stats per parquet file in addition to the total.",
+    )
     args = parser.parse_args()
 
     prefix = args.prefix.rstrip("/")
@@ -75,7 +86,9 @@ def main():
     max_n = 0
 
     if args.per_file:
-        print(f"  {'file':<60} {'docs':>10} {'vectors':>15} {'min':>5} {'avg':>8} {'max':>6}")
+        print(
+            f"  {'file':<60} {'docs':>10} {'vectors':>15} {'min':>5} {'avg':>8} {'max':>6}"
+        )
 
     for path in parquets:
         pf = pq.ParquetFile(path, filesystem=fs)
@@ -101,13 +114,19 @@ def main():
 
         total_docs += file_docs
         total_vectors += file_vectors
-        min_n = file_min if min_n is None else min(min_n, file_min if file_min is not None else min_n)
+        min_n = (
+            file_min
+            if min_n is None
+            else min(min_n, file_min if file_min is not None else min_n)
+        )
         max_n = max(max_n, file_max)
 
         if args.per_file:
             name = path.rsplit("/", 1)[-1]
             avg = file_vectors / file_docs if file_docs else 0
-            print(f"  {name[:60]:<60} {file_docs:>10,} {file_vectors:>15,} {file_min or 0:>5} {avg:>8.1f} {file_max:>6}")
+            print(
+                f"  {name[:60]:<60} {file_docs:>10,} {file_vectors:>15,} {file_min or 0:>5} {avg:>8.1f} {file_max:>6}"
+            )
 
     avg_n = total_vectors / total_docs if total_docs else 0
 

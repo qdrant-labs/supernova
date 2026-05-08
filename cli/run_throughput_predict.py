@@ -62,47 +62,127 @@ def _derive_from_config(config: dict) -> dict:
     }
 
 
-@click.command(name="throughput-predict",
-               help="Predict embedding throughput + cost from a config.")
+@click.command(
+    name="throughput-predict", help="Predict embedding throughput + cost from a config."
+)
 @click.argument("config")
 # GPU + cost knobs (not in the YAML)
-@click.option("--gpu", default="a10g", show_default=True,
-              help=f"GPU key. One of: {', '.join(GPU_TABLE.keys())}")
-@click.option("--gpu-scale", type=float, default=1.0, show_default=True,
-              help="Multiplier on effective TFLOPS (e.g. 0.85 for thermal headroom).")
-@click.option("--rate", type=float, default=None,
-              help="$/hr override (default: GPU_TABLE entry).")
-@click.option("--num-gpus", type=int, default=None,
-              help="Parallel GPUs for wall-clock estimate (default: single).")
-@click.option("--overhead", type=float, default=1.2, show_default=True,
-              help="Cost overhead multiplier.")
+@click.option(
+    "--gpu",
+    default="a10g",
+    show_default=True,
+    help=f"GPU key. One of: {', '.join(GPU_TABLE.keys())}",
+)
+@click.option(
+    "--gpu-scale",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Multiplier on effective TFLOPS (e.g. 0.85 for thermal headroom).",
+)
+@click.option(
+    "--rate", type=float, default=None, help="$/hr override (default: GPU_TABLE entry)."
+)
+@click.option(
+    "--num-gpus",
+    type=int,
+    default=None,
+    help="Parallel GPUs for wall-clock estimate (default: single).",
+)
+@click.option(
+    "--overhead",
+    type=float,
+    default=1.2,
+    show_default=True,
+    help="Cost overhead multiplier.",
+)
 # Overrides for config-derived values
-@click.option("--cutoff", type=int, multiple=True, default=(),
-              help="Override dense_embedder.max_tokens. Repeat for sweep: --cutoff 256 --cutoff 512.")
-@click.option("--model", "model_override", default=None,
-              help="Override the model used for tokenization + param count.")
-@click.option("--hf-config", "hf_config_override", default=None,
-              help="Override the HuggingFace dataset config (e.g. 20231101.en).")
+@click.option(
+    "--cutoff",
+    type=int,
+    multiple=True,
+    default=(),
+    help="Override dense_embedder.max_tokens. Repeat for sweep: --cutoff 256 --cutoff 512.",
+)
+@click.option(
+    "--model",
+    "model_override",
+    default=None,
+    help="Override the model used for tokenization + param count.",
+)
+@click.option(
+    "--hf-config",
+    "hf_config_override",
+    default=None,
+    help="Override the HuggingFace dataset config (e.g. 20231101.en).",
+)
 @click.option("--split", "split_override", default=None, help="Override source.split.")
-@click.option("--column", "column_override", default=None, help="Override source.text_field.")
-@click.option("--template", "template_override", default=None, help="Override source.text_template.")
-@click.option("--total-rows", type=int, default=None,
-              help="Override source.total_rows_override / HF metadata.")
-@click.option("--params", type=int, default=None,
-              help="Override the model parameter count (skips the AutoConfig lookup).")
+@click.option(
+    "--column", "column_override", default=None, help="Override source.text_field."
+)
+@click.option(
+    "--template",
+    "template_override",
+    default=None,
+    help="Override source.text_template.",
+)
+@click.option(
+    "--total-rows",
+    type=int,
+    default=None,
+    help="Override source.total_rows_override / HF metadata.",
+)
+@click.option(
+    "--params",
+    type=int,
+    default=None,
+    help="Override the model parameter count (skips the AutoConfig lookup).",
+)
 # Simulation knobs
-@click.option("--sample", type=int, default=100_000, show_default=True,
-              help="Number of rows to tokenize for the empirical distribution.")
-@click.option("--batch-size", "batch_size_override", type=int, default=None,
-              help="Override dense_embedder.batch_size for padding simulation.")
-@click.option("--num-batches", type=int, default=10_000, show_default=True,
-              help="Number of synthetic batches to draw in the simulation.")
+@click.option(
+    "--sample",
+    type=int,
+    default=100_000,
+    show_default=True,
+    help="Number of rows to tokenize for the empirical distribution.",
+)
+@click.option(
+    "--batch-size",
+    "batch_size_override",
+    type=int,
+    default=None,
+    help="Override dense_embedder.batch_size for padding simulation.",
+)
+@click.option(
+    "--num-batches",
+    type=int,
+    default=10_000,
+    show_default=True,
+    help="Number of synthetic batches to draw in the simulation.",
+)
 @click.option("--output", default=None, help="Write JSON results + plot to this path.")
 @click.option("-v", "--verbose", is_flag=True)
-def throughput_predict(config, gpu, gpu_scale, rate, num_gpus, overhead, cutoff,
-                       model_override, hf_config_override, split_override, column_override,
-                       template_override, total_rows, params, sample, batch_size_override,
-                       num_batches, output, verbose):
+def throughput_predict(
+    config,
+    gpu,
+    gpu_scale,
+    rate,
+    num_gpus,
+    overhead,
+    cutoff,
+    model_override,
+    hf_config_override,
+    split_override,
+    column_override,
+    template_override,
+    total_rows,
+    params,
+    sample,
+    batch_size_override,
+    num_batches,
+    output,
+    verbose,
+):
     """Predict embedding throughput and cost from a vectorforge embedder config."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -136,7 +216,9 @@ def throughput_predict(config, gpu, gpu_scale, rate, num_gpus, overhead, cutoff,
         )
 
     column = column_override if column_override is not None else derived["column"]
-    template = template_override if template_override is not None else derived["template"]
+    template = (
+        template_override if template_override is not None else derived["template"]
+    )
     if column_override or template_override:
         # Explicit CLI override resets the other side to avoid ambiguity.
         if column_override:
@@ -155,7 +237,9 @@ def throughput_predict(config, gpu, gpu_scale, rate, num_gpus, overhead, cutoff,
             dataset=derived["dataset"],
             model=model,
             cutoffs=cutoffs,
-            hf_config=hf_config_override if hf_config_override is not None else derived["hf_config"],
+            hf_config=hf_config_override
+            if hf_config_override is not None
+            else derived["hf_config"],
             split=split_override or derived["split"],
             column=column,
             template=template,
@@ -166,7 +250,9 @@ def throughput_predict(config, gpu, gpu_scale, rate, num_gpus, overhead, cutoff,
             batch_size=batch_size_override or derived["batch_size"] or 64,
             num_batches=num_batches,
             total_rows=total_rows if total_rows is not None else derived["total_rows"],
-            total_rows_source="config" if (total_rows is None and derived["total_rows"]) else None,
+            total_rows_source="config"
+            if (total_rows is None and derived["total_rows"])
+            else None,
             num_gpus=num_gpus,
             overhead=overhead,
             params=params,

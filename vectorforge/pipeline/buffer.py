@@ -38,7 +38,9 @@ class ResultBuffer:
             self._next_expected += 1
 
             if self._pending_count >= self._flush_threshold:
-                logger.info("Buffer hit threshold (%d records), flushing", self._pending_count)
+                logger.info(
+                    "Buffer hit threshold (%d records), flushing", self._pending_count
+                )
                 await self._flush()
 
     async def _flush(self):

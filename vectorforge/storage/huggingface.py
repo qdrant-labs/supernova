@@ -22,6 +22,7 @@ class HuggingFaceBackend(StorageBackend):
     def _get_api(self):
         if self._api is None:
             from huggingface_hub import HfApi
+
             self._api = HfApi(token=self.token)
         return self._api
 
@@ -43,7 +44,9 @@ class HuggingFaceBackend(StorageBackend):
         logger.info("HF dataset repo ready: %s", self.repo_id)
         self._ready = True
 
-    async def upload_file(self, local_path: str, remote_subpath: str | None = None) -> None:
+    async def upload_file(
+        self, local_path: str, remote_subpath: str | None = None
+    ) -> None:
         remote = remote_subpath or local_path.split("/")[-1]
         api = self._get_api()
         await self.ensure_ready()
@@ -54,7 +57,9 @@ class HuggingFaceBackend(StorageBackend):
             repo_id=self.repo_id,
             repo_type="dataset",
         )
-        logger.info("Uploaded %s to hf://datasets/%s/data/%s", remote, self.repo_id, remote)
+        logger.info(
+            "Uploaded %s to hf://datasets/%s/data/%s", remote, self.repo_id, remote
+        )
 
     async def upload_bytes(self, data: bytes, filename: str) -> None:
         api = self._get_api()
@@ -66,4 +71,6 @@ class HuggingFaceBackend(StorageBackend):
             repo_id=self.repo_id,
             repo_type="dataset",
         )
-        logger.info("Uploaded %s to hf://datasets/%s/%s", filename, self.repo_id, filename)
+        logger.info(
+            "Uploaded %s to hf://datasets/%s/%s", filename, self.repo_id, filename
+        )

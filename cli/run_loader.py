@@ -26,6 +26,7 @@ def resolve_env_vars(value: str) -> str:
     """
     Replace ${VAR_NAME} references with environment variable values.
     """
+
     def _replace(match):
         var_name = match.group(1)
         val = os.environ.get(var_name)
@@ -55,7 +56,9 @@ def build_reader(cfg: dict, vectors: dict):
     source_type = cfg.pop("type", "s3")
     cls = DATASOURCE_REGISTRY.get(source_type)
     if cls is None:
-        raise ValueError(f"Unknown datasource type: {source_type}. Available: {list(DATASOURCE_REGISTRY)}")
+        raise ValueError(
+            f"Unknown datasource type: {source_type}. Available: {list(DATASOURCE_REGISTRY)}"
+        )
     return cls(vectors=vectors, **cfg)
 
 
@@ -63,7 +66,9 @@ def build_vectorstore(cfg: dict, vectors: dict):
     store_type = cfg.pop("type")
     cls = VECTORSTORE_REGISTRY.get(store_type)
     if cls is None:
-        raise ValueError(f"Unknown vectorstore type: {store_type}. Available: {list(VECTORSTORE_REGISTRY)}")
+        raise ValueError(
+            f"Unknown vectorstore type: {store_type}. Available: {list(VECTORSTORE_REGISTRY)}"
+        )
 
     # Extract known top-level fields, pass rest as params
     url = cfg.pop("url", None)
@@ -87,7 +92,10 @@ def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]
     Discover parquet files at the destination (S3 or HF) and return this
     job's shard. Returns absolute URIs (s3:// or hf://datasets/...).
     """
-    from vectorforge.destinations import datasource_to_destination, discover_corpus_parquets
+    from vectorforge.destinations import (
+        datasource_to_destination,
+        discover_corpus_parquets,
+    )
 
     dest = datasource_to_destination(ds_cfg)
     files = discover_corpus_parquets(dest)
@@ -95,21 +103,38 @@ def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]
     # round-robin assignment
     shard = [f for i, f in enumerate(files) if i % num_jobs == job_rank]
     logging.getLogger("vectorforge").info(
-        "Job %d/%d: %d files (of %d total)", job_rank, num_jobs, len(shard), len(files),
+        "Job %d/%d: %d files (of %d total)",
+        job_rank,
+        num_jobs,
+        len(shard),
+        len(files),
     )
     return shard
 
 
 @click.command(name="load", help="Load pre-embedded data into a vector store.")
 @click.argument("config", required=False)
-@click.option("--dry-run", "-d", is_flag=True,
-              help="Parse config and print info without loading.")
-@click.option("--no-manage-indexing", "no_manage_indexing", is_flag=True,
-              help="Skip collection creation and indexing lifecycle (for distributed workers).")
-@click.option("--num-jobs", type=int, default=None,
-              help="Total number of parallel jobs (auto-shards files by rank).")
-@click.option("--job-rank", type=int, default=None,
-              help="This job's rank (0-indexed, used with --num-jobs).")
+@click.option(
+    "--dry-run", "-d", is_flag=True, help="Parse config and print info without loading."
+)
+@click.option(
+    "--no-manage-indexing",
+    "no_manage_indexing",
+    is_flag=True,
+    help="Skip collection creation and indexing lifecycle (for distributed workers).",
+)
+@click.option(
+    "--num-jobs",
+    type=int,
+    default=None,
+    help="Total number of parallel jobs (auto-shards files by rank).",
+)
+@click.option(
+    "--job-rank",
+    type=int,
+    default=None,
+    help="This job's rank (0-indexed, used with --num-jobs).",
+)
 def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
     """Load pre-embedded data into a vector store."""
     logging.basicConfig(
@@ -121,7 +146,9 @@ def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
 
     config_path = config or os.environ.get("LOADER_CONFIG_PATH")
     if not config_path:
-        raise click.UsageError("Provide a config path as argument or set LOADER_CONFIG_PATH env var")
+        raise click.UsageError(
+            "Provide a config path as argument or set LOADER_CONFIG_PATH env var"
+        )
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
@@ -136,7 +163,9 @@ def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
 
         shard_files = _discover_and_shard(cfg["datasource"], num_jobs, job_rank)
         if not shard_files:
-            logging.getLogger("vectorforge").info("No files assigned to this shard, exiting.")
+            logging.getLogger("vectorforge").info(
+                "No files assigned to this shard, exiting."
+            )
             return
         cfg["datasource"]["file_list"] = shard_files
 
@@ -150,7 +179,9 @@ def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
     loader_cfg = cfg.get("loader", {})
 
     if dry_run:
-        click.echo("Config parsed successfully. Reader and VectorStore instances created.")
+        click.echo(
+            "Config parsed successfully. Reader and VectorStore instances created."
+        )
         click.echo(f"Reader: {reader}")
         click.echo(f"VectorStore: {store}")
         return

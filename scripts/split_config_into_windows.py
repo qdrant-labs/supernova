@@ -33,16 +33,30 @@ def format_range(offset: int, limit: int, width: int = 10) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Split an embedder YAML into N row-window configs.")
+    parser = argparse.ArgumentParser(
+        description="Split an embedder YAML into N row-window configs."
+    )
     parser.add_argument("template", type=Path, help="Path to a template embedder YAML.")
-    parser.add_argument("--window-size", type=int, required=True,
-                        help="Rows per window, e.g. 100_000_000.")
-    parser.add_argument("--num-windows", type=int, required=True,
-                        help="Number of windows to generate.")
-    parser.add_argument("--start-offset", type=int, default=0,
-                        help="Starting offset for window 0. Defaults to 0.")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print what would be generated, don't write files.")
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        required=True,
+        help="Rows per window, e.g. 100_000_000.",
+    )
+    parser.add_argument(
+        "--num-windows", type=int, required=True, help="Number of windows to generate."
+    )
+    parser.add_argument(
+        "--start-offset",
+        type=int,
+        default=0,
+        help="Starting offset for window 0. Defaults to 0.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be generated, don't write files.",
+    )
     args = parser.parse_args()
 
     if not args.template.exists():
@@ -54,14 +68,19 @@ def main():
 
     original_s3_prefix = template.get("storage", {}).get("s3_prefix", "")
     if not original_s3_prefix:
-        print("Template's storage.s3_prefix is empty; can't derive per-window prefixes.", file=sys.stderr)
+        print(
+            "Template's storage.s3_prefix is empty; can't derive per-window prefixes.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     stem = args.template.stem
     out_dir = args.template.parent
 
     print(f"Template: {args.template}")
-    print(f"Windows: {args.num_windows} × {args.window_size:,} rows starting at offset {args.start_offset:,}")
+    print(
+        f"Windows: {args.num_windows} × {args.window_size:,} rows starting at offset {args.start_offset:,}"
+    )
     print()
 
     for i in range(args.num_windows):
@@ -78,7 +97,7 @@ def main():
         cfg["storage"]["s3_prefix"] = f"{original_s3_prefix}/{rng}"
 
         out_path = out_dir / f"{stem}.{rng}.yaml"
-        print(f"  [{i+1:>3}/{args.num_windows}] {rng}  ->  {out_path}")
+        print(f"  [{i + 1:>3}/{args.num_windows}] {rng}  ->  {out_path}")
 
         if not args.dry_run:
             with open(out_path, "w") as f:

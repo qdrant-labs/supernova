@@ -60,6 +60,7 @@ def _list_keys(destination: str) -> tuple[list[str], list[str]]:
 
     # local
     from pathlib import Path
+
     root = Path(destination)
     parquets = [str(p) for p in root.rglob("*.parquet")]
     manifests = [str(p) for p in root.rglob("*_manifest.json")]
@@ -124,12 +125,23 @@ def _configure_duckdb_for_s3(con: duckdb.DuckDBPyConnection):
 
 @click.command(name="analysis", help="Analyze a (distributed) embedding run.")
 @click.argument("config", required=False)
-@click.option("--path", default=None,
-              help="Override: direct s3://bucket/prefix or local dir to analyze.")
-@click.option("--cost-per-hour", type=float, default=0.38, show_default=True,
-              help="Per-worker hourly cost in USD (default: g5.xlarge A10G spot).")
-@click.option("--check-duplicates", is_flag=True,
-              help="Check source_row_id uniqueness and report any duplicate or missing rows.")
+@click.option(
+    "--path",
+    default=None,
+    help="Override: direct s3://bucket/prefix or local dir to analyze.",
+)
+@click.option(
+    "--cost-per-hour",
+    type=float,
+    default=0.38,
+    show_default=True,
+    help="Per-worker hourly cost in USD (default: g5.xlarge A10G spot).",
+)
+@click.option(
+    "--check-duplicates",
+    is_flag=True,
+    help="Check source_row_id uniqueness and report any duplicate or missing rows.",
+)
 def analysis(config, path, cost_per_hour, check_duplicates):
     """Analyze a vectorforge embedding run."""
     logging.basicConfig(
@@ -146,7 +158,9 @@ def analysis(config, path, cost_per_hour, check_duplicates):
     click.echo(f"Analyzing: {destination}\n")
 
     parquet_keys, manifest_keys = _list_keys(destination)
-    click.echo(f"Found {len(parquet_keys)} parquet files, {len(manifest_keys)} manifests")
+    click.echo(
+        f"Found {len(parquet_keys)} parquet files, {len(manifest_keys)} manifests"
+    )
     if not parquet_keys:
         click.echo("No parquet files found. Nothing to analyze.")
         sys.exit(1)
@@ -220,8 +234,10 @@ def analysis(config, path, cost_per_hour, check_duplicates):
         click.echo(f"  elapsed mean:   {statistics.mean(elapsed_values):.1f}s")
     if starts and ends:
         wall = max(e.timestamp() for e in ends) - min(starts)
-        click.echo(f"  wall clock:     {wall:.1f}s ({wall/60:.1f} min)")
-        click.echo(f"  sum cpu time:   {sum(elapsed_values):.1f}s (parallel speedup: {sum(elapsed_values)/wall:.1f}x)")
+        click.echo(f"  wall clock:     {wall:.1f}s ({wall / 60:.1f} min)")
+        click.echo(
+            f"  sum cpu time:   {sum(elapsed_values):.1f}s (parallel speedup: {sum(elapsed_values) / wall:.1f}x)"
+        )
 
     if elapsed_values:
         total_worker_hours = sum(elapsed_values) / 3600.0
@@ -230,8 +246,12 @@ def analysis(config, path, cost_per_hour, check_duplicates):
         click.echo(f"  worker-hours:   {total_worker_hours:.2f}")
         click.echo(f"  estimated cost: ${est_cost:.2f}")
         if sum(records_values):
-            click.echo(f"  cost per 1M rec: ${(est_cost / sum(records_values) * 1_000_000):.2f}")
-        click.echo("  note: sums per-job elapsed time; doesn't include idle worker time between jobs")
+            click.echo(
+                f"  cost per 1M rec: ${(est_cost / sum(records_values) * 1_000_000):.2f}"
+            )
+        click.echo(
+            "  note: sums per-job elapsed time; doesn't include idle worker time between jobs"
+        )
 
     click.echo("\n=== rows/s distribution ===")
     click.echo(_ascii_histogram(rps_values, bins=10))
@@ -250,10 +270,16 @@ def analysis(config, path, cost_per_hour, check_duplicates):
         total, unique, dupes, min_id, max_id = stats
         click.echo(f"  total rows:         {total:,}")
         click.echo(f"  unique source_row_id: {unique:,}")
-        click.echo(f"  duplicates:         {dupes:,}  {'✓ none' if dupes == 0 else '✗ FOUND'}")
-        click.echo(f"  source_row_id range: [{min_id:,}, {max_id:,}]  (span: {max_id - min_id + 1:,})")
+        click.echo(
+            f"  duplicates:         {dupes:,}  {'✓ none' if dupes == 0 else '✗ FOUND'}"
+        )
+        click.echo(
+            f"  source_row_id range: [{min_id:,}, {max_id:,}]  (span: {max_id - min_id + 1:,})"
+        )
         coverage_gap = (max_id - min_id + 1) - unique
-        click.echo(f"  gaps in range:      {coverage_gap:,}  {'✓ none' if coverage_gap == 0 else '(missing rows)'}")
+        click.echo(
+            f"  gaps in range:      {coverage_gap:,}  {'✓ none' if coverage_gap == 0 else '(missing rows)'}"
+        )
 
         if dupes > 0:
             click.echo("\n  First 10 duplicated source_row_ids:")

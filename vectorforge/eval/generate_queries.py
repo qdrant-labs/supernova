@@ -45,17 +45,22 @@ def build_manifest(uris: list[str]) -> tuple[list[dict], int]:
         fs = filesystem_for_uri(uri)
         fs_path = fs_path_for_uri(uri)
         meta = pq.read_metadata(fs_path, filesystem=fs)
-        manifest.append({
-            "uri": uri,
-            "global_start": global_offset,
-            "row_count": meta.num_rows,
-        })
+        manifest.append(
+            {
+                "uri": uri,
+                "global_start": global_offset,
+                "row_count": meta.num_rows,
+            }
+        )
         global_offset += meta.num_rows
     return manifest, global_offset
 
 
 def sample_offsets(
-    manifest: list[dict], total_rows: int, n: int, seed: int,
+    manifest: list[dict],
+    total_rows: int,
+    n: int,
+    seed: int,
 ) -> dict[str, list[int]]:
     """Sample n global indices, return as {file_uri: [local_offsets]}."""
     rng = random.Random(seed)
@@ -92,10 +97,15 @@ def _extract_rows(
             sliced = table.slice(lo - rg_start, 1)
             # slice() is zero-copy and keeps the entire row group buffer alive.
             # Rebuild each column from Python values to break that reference.
-            copied = pa.table({
-                name: pa.array(sliced.column(name).to_pylist(), type=sliced.schema.field(name).type)
-                for name in sliced.schema.names
-            })
+            copied = pa.table(
+                {
+                    name: pa.array(
+                        sliced.column(name).to_pylist(),
+                        type=sliced.schema.field(name).type,
+                    )
+                    for name in sliced.schema.names
+                }
+            )
             results.append((lo, copied))
     return results
 
@@ -125,7 +135,11 @@ def fetch_file_rows_prefetch(
     fs_path = fs_path_for_uri(uri)
     # fsspec / pyarrow filesystem both support open_input_file → read; for
     # download we use fsspec's get_file when available, else read+write.
-    with fs.open_input_file(fs_path) if hasattr(fs, "open_input_file") else fs.open(fs_path, "rb") as src:
+    with (
+        fs.open_input_file(fs_path)
+        if hasattr(fs, "open_input_file")
+        else fs.open(fs_path, "rb") as src
+    ):
         with open(local_path, "wb") as dst:
             while True:
                 chunk = src.read(8 * 1024 * 1024)
@@ -180,9 +194,13 @@ def generate_queries(
             with tempfile.TemporaryDirectory() as tmpdir:
                 for src_uri, offsets in file_map.items():
                     src_key = bare_key_for_uri(src_uri)
-                    for lo, t in fetch_file_rows_prefetch(src_uri, offsets, columns, tmpdir):
+                    for lo, t in fetch_file_rows_prefetch(
+                        src_uri, offsets, columns, tmpdir
+                    ):
                         t = t.append_column("__source_file__", pa.array([src_key]))
-                        t = t.append_column("__source_row__", pa.array([lo], type=pa.int64()))
+                        t = t.append_column(
+                            "__source_row__", pa.array([lo], type=pa.int64())
+                        )
                         all_slices.append(t)
                     bar.update(1)
                     bar.set_postfix_str(src_key, refresh=False)
@@ -191,7 +209,9 @@ def generate_queries(
                 src_key = bare_key_for_uri(src_uri)
                 for lo, t in fetch_file_rows_remote(src_uri, offsets, columns):
                     t = t.append_column("__source_file__", pa.array([src_key]))
-                    t = t.append_column("__source_row__", pa.array([lo], type=pa.int64()))
+                    t = t.append_column(
+                        "__source_row__", pa.array([lo], type=pa.int64())
+                    )
                     all_slices.append(t)
                 bar.update(1)
                 bar.set_postfix_str(src_key, refresh=False)

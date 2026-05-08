@@ -16,7 +16,7 @@ def _slice_batch(records: list[dict], batch_size: int) -> list[list[dict]]:
     """
     Slice a large prefetched chunk into upsert-sized batches.
     """
-    return [records[i:i + batch_size] for i in range(0, len(records), batch_size)]
+    return [records[i : i + batch_size] for i in range(0, len(records), batch_size)]
 
 
 async def run_loader(
@@ -42,7 +42,9 @@ async def run_loader(
     if prefetch_size is None:
         prefetch_size = batch_size * 10
 
-    logger.info(f"Loading into {store.name} (prefetch={prefetch_size:,}, batch={batch_size:,})")
+    logger.info(
+        f"Loading into {store.name} (prefetch={prefetch_size:,}, batch={batch_size:,})"
+    )
 
     dimensions = reader.get_dimensions()
     total = reader.get_total_count()

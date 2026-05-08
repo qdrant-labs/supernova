@@ -56,7 +56,7 @@ class DataReader(ABC):
         self.vectors = vectors or {
             "dense": {"type": "dense", "column": "dense_embedding"},
             "sparse": {"type": "sparse", "column": "sparse_embedding"},
-            "multivector": {"type": "multivector", "column": "multivector_embedding"}
+            "multivector": {"type": "multivector", "column": "multivector_embedding"},
         }
         self.payload_fields = payload_fields or {}
         self.duckdb_memory_limit = duckdb_memory_limit
@@ -195,16 +195,16 @@ class DataReader(ABC):
                 continue
             row = conn.execute(sql).fetchone()
             if row is None or row[0] is None:
-                raise RuntimeError(f"No data found for vector {name!r} at {self.source_sql}")
+                raise RuntimeError(
+                    f"No data found for vector {name!r} at {self.source_sql}"
+                )
             dims[name] = row[0]
         return dims
 
     def get_total_count(self) -> int:
         """Get the total number of records."""
         conn = self._get_connection()
-        result = conn.execute(
-            f"SELECT count(*) FROM {self.source_sql}"
-        ).fetchone()
+        result = conn.execute(f"SELECT count(*) FROM {self.source_sql}").fetchone()
         return result[0]
 
     def _build_select(self) -> tuple[str, list[tuple[str, str]], list[str]]:
@@ -247,8 +247,8 @@ class DataReader(ABC):
                     records = []
                     for row in rows:
                         row_id = row[0]
-                        vector_values = row[1:1 + n_vectors]
-                        payload_values = row[1 + n_vectors:]
+                        vector_values = row[1 : 1 + n_vectors]
+                        payload_values = row[1 + n_vectors :]
 
                         vectors: dict[str, object] = {}
                         for (name, vtype), val in zip(vector_order, vector_values):
@@ -274,11 +274,13 @@ class DataReader(ABC):
                                     pass
                             payload[key] = val
 
-                        records.append({
-                            "id": row_id,
-                            "vectors": vectors,
-                            "payload": payload,
-                        })
+                        records.append(
+                            {
+                                "id": row_id,
+                                "vectors": vectors,
+                                "payload": payload,
+                            }
+                        )
                     yield records
             finally:
                 self._after_source(source)

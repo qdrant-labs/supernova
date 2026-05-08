@@ -24,16 +24,41 @@ from tqdm import tqdm
 log = logging.getLogger(__name__)
 
 GPU_TABLE: dict[str, dict] = {
-    "b200":  {"name": "NVIDIA B200",         "effective_tflops_bf16": 880, "rate_per_hr": 6.2496},
-    "h200":  {"name": "NVIDIA H200",         "effective_tflops_bf16": 600, "rate_per_hr": 4.5396},
-    "h100":  {"name": "NVIDIA H100",         "effective_tflops_bf16": 395, "rate_per_hr": 3.9492},
-    "6000":  {"name": "NVIDIA RTX PRO 6000", "effective_tflops_bf16": 200, "rate_per_hr": 3.0312},
-    "l40s":  {"name": "NVIDIA L40S",         "effective_tflops_bf16": 145, "rate_per_hr": 1.9512},
-    "a100":  {"name": "NVIDIA A100",         "effective_tflops_bf16": 125, "rate_per_hr": 2.0988},
-    "a10g":  {"name": "NVIDIA A10G",         "effective_tflops_bf16": 50,  "rate_per_hr": 1.1016},
-    "l4":    {"name": "NVIDIA L4",           "effective_tflops_bf16": 48,  "rate_per_hr": 0.7992},
-    "t4":    {"name": "NVIDIA T4",           "effective_tflops_bf16": 26,  "rate_per_hr": 0.5904},
+    "b200": {
+        "name": "NVIDIA B200",
+        "effective_tflops_bf16": 880,
+        "rate_per_hr": 6.2496,
+    },
+    "h200": {
+        "name": "NVIDIA H200",
+        "effective_tflops_bf16": 600,
+        "rate_per_hr": 4.5396,
+    },
+    "h100": {
+        "name": "NVIDIA H100",
+        "effective_tflops_bf16": 395,
+        "rate_per_hr": 3.9492,
+    },
+    "6000": {
+        "name": "NVIDIA RTX PRO 6000",
+        "effective_tflops_bf16": 200,
+        "rate_per_hr": 3.0312,
+    },
+    "l40s": {
+        "name": "NVIDIA L40S",
+        "effective_tflops_bf16": 145,
+        "rate_per_hr": 1.9512,
+    },
+    "a100": {
+        "name": "NVIDIA A100",
+        "effective_tflops_bf16": 125,
+        "rate_per_hr": 2.0988,
+    },
+    "a10g": {"name": "NVIDIA A10G", "effective_tflops_bf16": 50, "rate_per_hr": 1.1016},
+    "l4": {"name": "NVIDIA L4", "effective_tflops_bf16": 48, "rate_per_hr": 0.7992},
+    "t4": {"name": "NVIDIA T4", "effective_tflops_bf16": 26, "rate_per_hr": 0.5904},
 }
+
 
 def detect_total_rows(dataset: str, hf_config: str | None, split: str) -> int | None:
     try:
@@ -45,6 +70,7 @@ def detect_total_rows(dataset: str, hf_config: str | None, split: str) -> int | 
         pass
     return None
 
+
 def _render_text(row: dict, column: str | None, template: str | None) -> str | None:
     if template:
         try:
@@ -55,8 +81,13 @@ def _render_text(row: dict, column: str | None, template: str | None) -> str | N
 
 
 def sample_token_lengths(
-    dataset: str, hf_config: str | None, split: str, column: str | None,
-    template: str | None, tokenizer_name: str, n: int,
+    dataset: str,
+    hf_config: str | None,
+    split: str,
+    column: str | None,
+    template: str | None,
+    tokenizer_name: str,
+    n: int,
 ) -> np.ndarray:
     ds = load_dataset(dataset, hf_config, split=split, streaming=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
@@ -69,6 +100,7 @@ def sample_token_lengths(
 
     return np.array(lengths, dtype=np.int64)
 
+
 def compute_token_stats(lengths: np.ndarray) -> dict:
     return {
         "count": len(lengths),
@@ -79,6 +111,7 @@ def compute_token_stats(lengths: np.ndarray) -> dict:
         "p99": float(np.percentile(lengths, 99)),
         "max": int(lengths.max()),
     }
+
 
 def fit_lognormal(lengths: np.ndarray) -> dict:
     shape, loc, scale = sp_stats.lognorm.fit(lengths, floc=0)
@@ -92,6 +125,7 @@ def fit_lognormal(lengths: np.ndarray) -> dict:
         "ks_stat": float(ks.statistic),
         "ks_pvalue": float(ks.pvalue),
     }
+
 
 def simulate_padding(
     lengths: np.ndarray, cutoff: int, batch_size: int = 64, num_batches: int = 10_000
@@ -119,6 +153,7 @@ def simulate_padding(
         "mean_truncated_tokens": float(truncated.mean()),
     }
 
+
 def count_model_params(model_name: str) -> tuple[int, str]:
     try:
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
@@ -132,16 +167,24 @@ def count_model_params(model_name: str) -> tuple[int, str]:
 
     try:
         from transformers import AutoModel
+
         model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
         n = sum(p.numel() for p in model.parameters())
         del model
         return n, "model.parameters()"
     except Exception as e:
-        raise RuntimeError(f"Could not determine parameter count for {model_name}. Error: {e}")
+        raise RuntimeError(
+            f"Could not determine parameter count for {model_name}. Error: {e}"
+        )
+
 
 def predict_throughput(
-    params: int, gpu_tflops: float, cutoff: int, gpu_scale: float = 1.0,
-    eta: float = 1.0, mean_tokens_per_text: float | None = None,
+    params: int,
+    gpu_tflops: float,
+    cutoff: int,
+    gpu_scale: float = 1.0,
+    eta: float = 1.0,
+    mean_tokens_per_text: float | None = None,
 ) -> dict:
     effective_tflops = gpu_tflops * gpu_scale
     t_max = effective_tflops * 1e12 / (2 * params)
@@ -156,7 +199,10 @@ def predict_throughput(
         "effective_tflops": effective_tflops,
     }
 
-def estimate_cost(total_rows: int, texts_per_s: float, rate_per_hr: float, overhead: float = 1.2) -> dict:
+
+def estimate_cost(
+    total_rows: int, texts_per_s: float, rate_per_hr: float, overhead: float = 1.2
+) -> dict:
     gpu_seconds = total_rows / texts_per_s
     gpu_hours = gpu_seconds / 3600
     raw_cost = gpu_hours * rate_per_hr
@@ -168,7 +214,10 @@ def estimate_cost(total_rows: int, texts_per_s: float, rate_per_hr: float, overh
         "wall_clock_hours": gpu_hours,
     }
 
-def plot_distribution(lengths: np.ndarray, fit: dict, cutoff: int, output_path: str = None) -> None:
+
+def plot_distribution(
+    lengths: np.ndarray, fit: dict, cutoff: int, output_path: str = None
+) -> None:
     """
     Generates and saves a token distribution plot.
     """
@@ -179,7 +228,14 @@ def plot_distribution(lengths: np.ndarray, fit: dict, cutoff: int, output_path: 
 
     # empirical histogram
     bins = np.logspace(np.log10(max(1, lengths.min())), np.log10(lengths.max()), 100)
-    ax.hist(lengths, bins=bins, density=True, alpha=0.5, color="steelblue", label="Empirical")
+    ax.hist(
+        lengths,
+        bins=bins,
+        density=True,
+        alpha=0.5,
+        color="steelblue",
+        label="Empirical",
+    )
 
     # fitted curve
     x = np.logspace(np.log10(max(1, lengths.min())), np.log10(lengths.max()), 500)
@@ -190,7 +246,7 @@ def plot_distribution(lengths: np.ndarray, fit: dict, cutoff: int, output_path: 
     for p, color in [(50, "green"), (95, "orange"), (99, "red")]:
         val = np.percentile(lengths, p)
         ax.axvline(val, color=color, ls="--", alpha=0.7, label=f"p{p}: {val:,.0f}")
-        
+
     # cutoff marker
     ax.axvline(cutoff, color="black", ls="-", lw=2, label=f"Cutoff: {cutoff}")
 
@@ -200,7 +256,7 @@ def plot_distribution(lengths: np.ndarray, fit: dict, cutoff: int, output_path: 
     ax.set_title("Token Length Distribution & Truncation Cutoff")
     ax.legend()
     fig.tight_layout()
-    
+
     if output_path:
         fig.savefig(output_path, dpi=150)
         plt.close(fig)
@@ -208,12 +264,27 @@ def plot_distribution(lengths: np.ndarray, fit: dict, cutoff: int, output_path: 
     else:
         plt.show()
 
+
 def print_report(
-    token_stats: dict, fit: dict, padding: dict, throughput: dict, cost: dict | None,
-    rate_per_hr: float, gpu: dict, gpu_scale: float, model_name: str, params: int,
-    params_method: str, dataset: str, config: str | None, column: str | None,
-    template: str | None, cutoff: int,
-    total_rows: int | None, total_rows_source: str | None, num_gpus: int | None
+    token_stats: dict,
+    fit: dict,
+    padding: dict,
+    throughput: dict,
+    cost: dict | None,
+    rate_per_hr: float,
+    gpu: dict,
+    gpu_scale: float,
+    model_name: str,
+    params: int,
+    params_method: str,
+    dataset: str,
+    config: str | None,
+    column: str | None,
+    template: str | None,
+    cutoff: int,
+    total_rows: int | None,
+    total_rows_source: str | None,
+    num_gpus: int | None,
 ) -> None:
     W = 64
     print(f"\n{'=' * W}")
@@ -235,7 +306,9 @@ def print_report(
     print(f"  p95:              {token_stats['p95']:,.0f} tokens")
     print(f"  p99:              {token_stats['p99']:,.0f} tokens")
     print(f"  Max:              {token_stats['max']:,} tokens")
-    print(f"  Fit:              lognormal (mu={fit['underlying_mu']:.2f}, sigma={fit['underlying_sigma']:.2f}, KS={fit['ks_stat']:.4f})")
+    print(
+        f"  Fit:              lognormal (mu={fit['underlying_mu']:.2f}, sigma={fit['underlying_sigma']:.2f}, KS={fit['ks_stat']:.4f})"
+    )
 
     print("\n--- Model ---")
     print(f"  Model:            {model_name}")
@@ -252,27 +325,38 @@ def print_report(
     print(f"\n--- Padding Simulation (cutoff={cutoff}) ---")
     print(f"  Efficiency (eta): {padding['eta']:.1%}")
     print(f"  Padding waste:    {padding['padding_waste_pct']:.1f}%")
-    print(f"  Tokens retained:  {padding['tokens_retained_pct']:.1f}%  (semantic coverage)")
+    print(
+        f"  Tokens retained:  {padding['tokens_retained_pct']:.1f}%  (semantic coverage)"
+    )
     print(f"  Texts truncated:  {padding['pct_texts_truncated']:.1f}%")
 
     print("\n--- Predicted Throughput ---")
     print(f"  T_max (tok/s):    {throughput['t_max_tok_s']:,.0f}")
-    print(f"  Useful tok/s:     {throughput['t_max_tok_s'] * padding['eta']:,.0f}  (T_max * eta)")
+    print(
+        f"  Useful tok/s:     {throughput['t_max_tok_s'] * padding['eta']:,.0f}  (T_max * eta)"
+    )
     print(f"  texts/s:          {throughput['texts_per_s']:,.0f}")
     print(f"  Cutoff:           {cutoff} tokens")
 
     if cost and total_rows:
         print("\n--- Cost Estimate ---")
-        rows_label = f"{total_rows:,}" + (f"  ({total_rows_source})" if total_rows_source else "")
+        rows_label = f"{total_rows:,}" + (
+            f"  ({total_rows_source})" if total_rows_source else ""
+        )
         print(f"  Total rows:       {rows_label}")
         print(f"  GPU hours:        {cost['gpu_hours']:,.1f}")
         print(f"  Raw cost:         ${cost['raw_cost']:,.2f}")
         print(f"  With {cost['overhead_factor']}x overhead: ${cost['total_cost']:,.2f}")
-        print(f"  Wall clock:       {cost['wall_clock_hours']:,.1f} hrs ({cost['wall_clock_hours'] / 24:.1f} days) [single GPU]")
+        print(
+            f"  Wall clock:       {cost['wall_clock_hours']:,.1f} hrs ({cost['wall_clock_hours'] / 24:.1f} days) [single GPU]"
+        )
         if num_gpus and num_gpus > 1:
             parallel_hrs = cost["wall_clock_hours"] / num_gpus
-            print(f"  With {num_gpus} GPUs:     {parallel_hrs:,.1f} hrs ({parallel_hrs / 24:.1f} days)")
+            print(
+                f"  With {num_gpus} GPUs:     {parallel_hrs:,.1f} hrs ({parallel_hrs / 24:.1f} days)"
+            )
     print(f"\n{'=' * W}")
+
 
 def normalize_gpu_key(gpu: str) -> str:
     """Normalize a user-supplied GPU label to a key in GPU_TABLE."""
@@ -316,7 +400,9 @@ def run_prediction(
 
     gpu_key = normalize_gpu_key(gpu)
     if gpu_key not in GPU_TABLE:
-        raise ValueError(f"Unknown GPU {gpu!r}. Choose from: {', '.join(GPU_TABLE.keys())}")
+        raise ValueError(
+            f"Unknown GPU {gpu!r}. Choose from: {', '.join(GPU_TABLE.keys())}"
+        )
     gpu_spec = GPU_TABLE[gpu_key]
     rate_per_hr = rate if rate is not None else gpu_spec["rate_per_hr"]
 
@@ -324,7 +410,9 @@ def run_prediction(
     t_start = time.perf_counter()
 
     log.info("[1/4] Sampling %s rows...", f"{sample:,}")
-    lengths = sample_token_lengths(dataset, hf_config, split, column, template, model, sample)
+    lengths = sample_token_lengths(
+        dataset, hf_config, split, column, template, model, sample
+    )
     token_stats = compute_token_stats(lengths)
 
     log.info("\n[2/4] Fitting lognormal distribution...")
@@ -342,46 +430,91 @@ def run_prediction(
         total_rows = detect_total_rows(dataset, hf_config, split)
         total_rows_source = "dataset metadata" if total_rows else None
 
-    log.info("\n[4/4] Simulating & predicting for %d cutoff(s): %s", len(cutoffs), cutoffs)
+    log.info(
+        "\n[4/4] Simulating & predicting for %d cutoff(s): %s", len(cutoffs), cutoffs
+    )
     results = []
     for cutoff in cutoffs:
         padding = simulate_padding(lengths, cutoff, batch_size, num_batches)
         throughput = predict_throughput(
-            params, gpu_spec["effective_tflops_bf16"], cutoff, gpu_scale,
-            eta=padding["eta"], mean_tokens_per_text=padding["mean_truncated_tokens"],
+            params,
+            gpu_spec["effective_tflops_bf16"],
+            cutoff,
+            gpu_scale,
+            eta=padding["eta"],
+            mean_tokens_per_text=padding["mean_truncated_tokens"],
         )
-        cost = estimate_cost(total_rows, throughput["texts_per_s"], rate_per_hr, overhead) if total_rows else None
+        cost = (
+            estimate_cost(total_rows, throughput["texts_per_s"], rate_per_hr, overhead)
+            if total_rows
+            else None
+        )
 
         plot_distribution(lengths, fit, cutoff, output)
         print_report(
-            token_stats, fit, padding, throughput, cost, rate_per_hr, gpu_spec, gpu_scale,
-            model, params, params_method, dataset, hf_config, column, template,
-            cutoff, total_rows, total_rows_source, num_gpus,
+            token_stats,
+            fit,
+            padding,
+            throughput,
+            cost,
+            rate_per_hr,
+            gpu_spec,
+            gpu_scale,
+            model,
+            params,
+            params_method,
+            dataset,
+            hf_config,
+            column,
+            template,
+            cutoff,
+            total_rows,
+            total_rows_source,
+            num_gpus,
         )
-        results.append({
-            "cutoff": cutoff, "prediction": throughput, "cost": cost, "padding": padding,
-        })
+        results.append(
+            {
+                "cutoff": cutoff,
+                "prediction": throughput,
+                "cost": cost,
+                "padding": padding,
+            }
+        )
 
     log.info(f"\nTotal prediction time: {time.perf_counter() - t_start:.1f} seconds")
 
     if output:
         with open(output, "w") as f:
-            json.dump({
-                "dataset": dataset, "hf_config": hf_config, "model": model,
-                "gpu": gpu_spec["name"], "results": results,
-            }, f, indent=2)
+            json.dump(
+                {
+                    "dataset": dataset,
+                    "hf_config": hf_config,
+                    "model": model,
+                    "gpu": gpu_spec["name"],
+                    "results": results,
+                },
+                f,
+                indent=2,
+            )
 
     return results
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Predict embedding throughput and cost.")
+    parser = argparse.ArgumentParser(
+        description="Predict embedding throughput and cost."
+    )
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--config", default=None)
-    parser.add_argument("--column", default=None, help="Field name in the dataset row to tokenize")
-    parser.add_argument("--template", default=None,
-                        help="Python str.format() template rendered against each row, e.g. "
-                             "'Title: {title}\\n\\nReview: {description}'. Use instead of --column.")
+    parser.add_argument(
+        "--column", default=None, help="Field name in the dataset row to tokenize"
+    )
+    parser.add_argument(
+        "--template",
+        default=None,
+        help="Python str.format() template rendered against each row, e.g. "
+        "'Title: {title}\\n\\nReview: {description}'. Use instead of --column.",
+    )
     parser.add_argument("--split", default="train")
     parser.add_argument("--sample", type=int, default=100_000)
     parser.add_argument("--model", required=True)
@@ -399,22 +532,36 @@ def main() -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO, format="%(message)s"
+    )
 
     hf_config = None if args.config in (None, "None") else args.config
 
     try:
         run_prediction(
-            dataset=args.dataset, model=args.model, cutoffs=args.cutoff,
-            hf_config=hf_config, split=args.split,
-            column=args.column, template=args.template,
-            sample=args.sample, gpu=args.gpu, gpu_scale=args.gpu_scale, rate=args.rate,
-            batch_size=args.batch_size, num_batches=args.num_batches,
-            total_rows=args.total_rows, num_gpus=args.num_gpus,
-            overhead=args.overhead, params=args.params, output=args.output,
+            dataset=args.dataset,
+            model=args.model,
+            cutoffs=args.cutoff,
+            hf_config=hf_config,
+            split=args.split,
+            column=args.column,
+            template=args.template,
+            sample=args.sample,
+            gpu=args.gpu,
+            gpu_scale=args.gpu_scale,
+            rate=args.rate,
+            batch_size=args.batch_size,
+            num_batches=args.num_batches,
+            total_rows=args.total_rows,
+            num_gpus=args.num_gpus,
+            overhead=args.overhead,
+            params=args.params,
+            output=args.output,
         )
     except ValueError as e:
         parser.error(str(e))
+
 
 if __name__ == "__main__":
     main()

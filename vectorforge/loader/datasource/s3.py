@@ -102,7 +102,9 @@ class S3DataReader(DataReader):
             for f in self.file_list:
                 if self.prefetch:
                     local_path = self._download_file(f)
-                    inner_args = ", file_row_number=true" if self._uses_file_row_number else ""
+                    inner_args = (
+                        ", file_row_number=true" if self._uses_file_row_number else ""
+                    )
                     inner = f"read_parquet('{local_path}'{inner_args})"
                     if self._uses_filename:
                         # Inject original S3 URI so vf_point_id sees the real path
@@ -130,7 +132,9 @@ class S3DataReader(DataReader):
 
         key = os.environ.get("AWS_ACCESS_KEY_ID", "")
         secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-        region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+        region = os.environ.get(
+            "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+        )
 
         conn.execute(f"SET s3_region = '{region}';")
         if key and secret:

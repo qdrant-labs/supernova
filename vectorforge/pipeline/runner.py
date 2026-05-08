@@ -36,7 +36,12 @@ async def run(
 ):
     logger.info(
         "Starting pipeline: source=%s engine=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
-        source.source_name, engine.model_name, storage.destination, chunk_size, num_workers, flush_threshold,
+        source.source_name,
+        engine.model_name,
+        storage.destination,
+        chunk_size,
+        num_workers,
+        flush_threshold,
     )
     start_time = time.time()
     total_records = 0
@@ -51,7 +56,9 @@ async def run(
     async def flush(records):
         nonlocal batch_counter, total_records
         local_path = write_batch(
-            records, output_dir, batch_counter,
+            records,
+            output_dir,
+            batch_counter,
             dense_column=dense_column,
             sparse_column=sparse_column,
             multivector_column=multivector_column,
@@ -59,7 +66,9 @@ async def run(
             filename_prefix=filename_prefix,
             row_group_size=row_group_size,
         )
-        logger.info("Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path)
+        logger.info(
+            "Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path
+        )
         batch_counter += 1
         total_records += len(records)
         # preserve any subdir structure from filename_prefix (e.g. "rank00/") so
@@ -73,13 +82,17 @@ async def run(
     # chunker: feeds work queue, then sends sentinels to shut down workers
     async def run_chunker():
         try:
-            for chunk_id, records in source.get_chunks(engine, chunk_size, max_text_length):
+            for chunk_id, records in source.get_chunks(
+                engine, chunk_size, max_text_length
+            ):
                 await work_queue.put((chunk_id, records))
         finally:
             # always send sentinels so workers exit even if the source raised;
             # otherwise drain_results hangs waiting on `finished_workers` and
             # the original exception gets masked.
-            logger.info("Chunker finished, sending stop signals to %d workers", num_workers)
+            logger.info(
+                "Chunker finished, sending stop signals to %d workers", num_workers
+            )
             for _ in range(num_workers):
                 await work_queue.put(None)
 
@@ -122,7 +135,10 @@ async def run(
     elapsed = time.time() - start_time
     logger.info(
         "Pipeline complete: %d records in %d batches, %.1fs elapsed (%.0f records/s)",
-        total_records, batch_counter, elapsed, total_records / elapsed if elapsed > 0 else 0,
+        total_records,
+        batch_counter,
+        elapsed,
+        total_records / elapsed if elapsed > 0 else 0,
     )
 
     manifest = {

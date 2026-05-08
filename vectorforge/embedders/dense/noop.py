@@ -55,7 +55,7 @@ class NoopDenseEmbedder(DenseEmbedder):
         if self._chunk_chars is None:
             return [text]
         n = self._chunk_chars
-        return [text[i:i + n] for i in range(0, len(text), n)] or [""]
+        return [text[i : i + n] for i in range(0, len(text), n)] or [""]
 
     async def embed(self, texts: list[str]):
         # Returning a list of None per input -- the worker sees a truthy list

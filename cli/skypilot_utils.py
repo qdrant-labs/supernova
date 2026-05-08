@@ -64,17 +64,32 @@ def launch_pool_and_jobs(
         check=True,
     )
     subprocess.run(
-        ["sky", "jobs", "launch", "-p", pool_name, "--num-jobs", str(num_jobs), "-y", str(job_path), *env_flags],
+        [
+            "sky",
+            "jobs",
+            "launch",
+            "-p",
+            pool_name,
+            "--num-jobs",
+            str(num_jobs),
+            "-y",
+            str(job_path),
+            *env_flags,
+        ],
         check=True,
     )
 
 
 def launch_single_job(job_path: Path, env_flags: list[str]) -> None:
     """Submit a single SkyPilot job (no pool)."""
-    subprocess.run(["sky", "jobs", "launch", "-y", str(job_path), *env_flags], check=True)
+    subprocess.run(
+        ["sky", "jobs", "launch", "-y", str(job_path), *env_flags], check=True
+    )
 
 
-def print_dry_run(pool_name: str, num_jobs: int, pool_path: Path, job_path: Path) -> None:
+def print_dry_run(
+    pool_name: str, num_jobs: int, pool_path: Path, job_path: Path
+) -> None:
     """Print the dry-run summary for a pool + jobs launch."""
     print(f"\n[dry run] Would create pool '{pool_name}' and submit {num_jobs} jobs")
     print(f"  Pool config: {pool_path}")

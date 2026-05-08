@@ -31,7 +31,6 @@ def _resolve_comparator(name: str | None) -> models.MultiVectorComparator:
 
 
 class QdrantVectorStore(VectorStore):
-
     def __init__(
         self,
         url: str,
@@ -80,7 +79,9 @@ class QdrantVectorStore(VectorStore):
         existing = [c.name for c in collections.collections]
 
         if self.collection_name in existing:
-            logger.info(f"Collection '{self.collection_name}' already exists, skipping creation")
+            logger.info(
+                f"Collection '{self.collection_name}' already exists, skipping creation"
+            )
             return
 
         vectors_config, sparse_vectors_config = self._build_vectors_config(dimensions)
@@ -174,16 +175,19 @@ class QdrantVectorStore(VectorStore):
                 await self._client.upsert(
                     collection_name=self.collection_name,
                     points=qdrant_points,
-                    wait=False
+                    wait=False,
                 )
                 return
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise
-                wait = 2 ** attempt
+                wait = 2**attempt
                 logger.warning(
                     "Upsert failed (attempt %d/%d), retrying in %ds: %s",
-                    attempt + 1, max_retries, wait, e,
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    e,
                 )
                 await asyncio.sleep(wait)
 

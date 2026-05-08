@@ -17,34 +17,53 @@ import click
 # inlined here so `vf --help` doesn't have to import every subcommand module
 # just to render the command list.
 _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
-    "embed":              ("cli.run_embedder:embed",
-                           "Embed a dataset locally."),
-    "embed-dist":         ("cli.run_embed_distributed:embed_dist",
-                           "Embed distributed via SkyPilot pool."),
-    "partition":          ("cli.run_partition:partition",
-                           "Run pipeline with no-op embedder (validate sharding without GPU)."),
-    "partition-dist":     ("cli.run_partition_distributed:partition_dist",
-                           "Distributed partition via SkyPilot pool."),
-    "load":               ("cli.run_loader:load",
-                           "Load pre-embedded data into a vector store."),
-    "load-dist":          ("cli.run_load_distributed:load_dist",
-                           "Distribute loading across SkyPilot instances."),
-    "push-hf":            ("cli.run_push_hf:push_hf",
-                           "Upload S3 parquets to a HuggingFace Hub dataset."),
-    "push-hf-dist":       ("cli.run_push_hf_distributed:push_hf_dist",
-                           "Distribute HF upload across SkyPilot instances."),
-    "generate-queries":   ("cli.run_generate_queries:generate_queries",
-                           "Sample N rows as eval queries (launches EC2; --local to run here)."),
-    "brute-force":        ("cli.run_brute_force:brute_force",
-                           "Exhaustive nearest-neighbor search for recall eval (single GPU)."),
-    "brute-force-dist":   ("cli.run_brute_force_distributed:brute_force_dist",
-                           "Distributed brute-force via SkyPilot GPU pool."),
-    "brute-force-merge":  ("cli.run_brute_force:brute_force_merge",
-                           "Merge partial results from a distributed brute-force run."),
-    "analysis":           ("cli.run_analysis:analysis",
-                           "Analyze a (distributed) embedding run."),
-    "throughput-predict": ("cli.run_throughput_predict:throughput_predict",
-                           "Predict embedding throughput + cost from a config."),
+    "embed": ("cli.run_embedder:embed", "Embed a dataset locally."),
+    "embed-dist": (
+        "cli.run_embed_distributed:embed_dist",
+        "Embed distributed via SkyPilot pool.",
+    ),
+    "partition": (
+        "cli.run_partition:partition",
+        "Run pipeline with no-op embedder (validate sharding without GPU).",
+    ),
+    "partition-dist": (
+        "cli.run_partition_distributed:partition_dist",
+        "Distributed partition via SkyPilot pool.",
+    ),
+    "load": ("cli.run_loader:load", "Load pre-embedded data into a vector store."),
+    "load-dist": (
+        "cli.run_load_distributed:load_dist",
+        "Distribute loading across SkyPilot instances.",
+    ),
+    "push-hf": (
+        "cli.run_push_hf:push_hf",
+        "Upload S3 parquets to a HuggingFace Hub dataset.",
+    ),
+    "push-hf-dist": (
+        "cli.run_push_hf_distributed:push_hf_dist",
+        "Distribute HF upload across SkyPilot instances.",
+    ),
+    "generate-queries": (
+        "cli.run_generate_queries:generate_queries",
+        "Sample N rows as eval queries (launches EC2; --local to run here).",
+    ),
+    "brute-force": (
+        "cli.run_brute_force:brute_force",
+        "Exhaustive nearest-neighbor search for recall eval (single GPU).",
+    ),
+    "brute-force-dist": (
+        "cli.run_brute_force_distributed:brute_force_dist",
+        "Distributed brute-force via SkyPilot GPU pool.",
+    ),
+    "brute-force-merge": (
+        "cli.run_brute_force:brute_force_merge",
+        "Merge partial results from a distributed brute-force run.",
+    ),
+    "analysis": ("cli.run_analysis:analysis", "Analyze a (distributed) embedding run."),
+    "throughput-predict": (
+        "cli.run_throughput_predict:throughput_predict",
+        "Predict embedding throughput + cost from a config.",
+    ),
 }
 
 
@@ -57,7 +76,9 @@ class LazyGroup(click.Group):
     a user invokes them.
     """
 
-    def __init__(self, *args, lazy_commands: dict[str, tuple[str, str]] | None = None, **kwargs):
+    def __init__(
+        self, *args, lazy_commands: dict[str, tuple[str, str]] | None = None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.lazy_commands = dict(lazy_commands or {})
 
@@ -75,7 +96,9 @@ class LazyGroup(click.Group):
             return cmd
         return None
 
-    def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+    def format_commands(
+        self, ctx: click.Context, formatter: click.HelpFormatter
+    ) -> None:
         # Render the command list using cached short_help strings so we
         # don't import every subcommand module just to describe them.
         rows: list[tuple[str, str]] = []

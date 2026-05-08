@@ -77,9 +77,13 @@ def launch_on_ec2(
     click.echo(f"  Corpus URI:  {corpus_uri}")
     click.echo(f"  Queries:     {n}  (seed={seed})")
     click.echo(f"  Region:      {region}")
-    click.echo(f"  Instance:    {instance_type}  ({'on-demand' if on_demand else 'spot'})")
+    click.echo(
+        f"  Instance:    {instance_type}  ({'on-demand' if on_demand else 'spot'})"
+    )
     click.echo(f"  Columns:     {columns or 'all'}")
-    click.echo(f"  Fetch mode:  {'prefetch (download-first)' if prefetch else 'range requests'}")
+    click.echo(
+        f"  Fetch mode:  {'prefetch (download-first)' if prefetch else 'range requests'}"
+    )
     click.echo(f"  Output:      {dest.eval_uri(output)}")
     click.echo(f"  Run dir:     {run_dir}")
     click.echo("=" * 60)
@@ -96,28 +100,61 @@ def launch_on_ec2(
     click.echo("Cancel:  sky jobs cancel -a")
 
 
-@click.command(name="generate-queries",
-               help="Sample N rows as eval queries (launches EC2; --local to run here).")
+@click.command(
+    name="generate-queries",
+    help="Sample N rows as eval queries (launches EC2; --local to run here).",
+)
 @click.argument("corpus_uri")
-@click.option("-n", "--num-queries", "num_queries", type=int, default=1000, show_default=True)
+@click.option(
+    "-n", "--num-queries", "num_queries", type=int, default=1000, show_default=True
+)
 @click.option("--seed", type=int, default=42, show_default=True)
-@click.option("--columns", multiple=True, default=(),
-              help="Columns to fetch (default: all). Repeat for each: "
-                   "--columns dense_embedding --columns sparse_embedding")
-@click.option("--output", default=None,
-              help="Output filename (default: queries_<n>.parquet).")
-@click.option("--local", is_flag=True,
-              help="Run the full pipeline in-process instead of launching EC2.")
-@click.option("--prefetch", is_flag=True,
-              help="Download each parquet fully before reading (better for large row groups).")
-@click.option("--instance-type", default=DEFAULT_INSTANCE_TYPE, show_default=True,
-              help="EC2 instance type.")
+@click.option(
+    "--columns",
+    multiple=True,
+    default=(),
+    help="Columns to fetch (default: all). Repeat for each: "
+    "--columns dense_embedding --columns sparse_embedding",
+)
+@click.option(
+    "--output", default=None, help="Output filename (default: queries_<n>.parquet)."
+)
+@click.option(
+    "--local",
+    is_flag=True,
+    help="Run the full pipeline in-process instead of launching EC2.",
+)
+@click.option(
+    "--prefetch",
+    is_flag=True,
+    help="Download each parquet fully before reading (better for large row groups).",
+)
+@click.option(
+    "--instance-type",
+    default=DEFAULT_INSTANCE_TYPE,
+    show_default=True,
+    help="EC2 instance type.",
+)
 @click.option("--on-demand", is_flag=True, help="Use on-demand instead of spot.")
-@click.option("--dry-run", is_flag=True, help="Print plan and write job config, don't launch.")
-def generate_queries(corpus_uri, num_queries, seed, columns, output, local, prefetch,
-                     instance_type, on_demand, dry_run):
+@click.option(
+    "--dry-run", is_flag=True, help="Print plan and write job config, don't launch."
+)
+def generate_queries(
+    corpus_uri,
+    num_queries,
+    seed,
+    columns,
+    output,
+    local,
+    prefetch,
+    instance_type,
+    on_demand,
+    dry_run,
+):
     """Sample N eval query rows from an embedded corpus."""
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s"
+    )
     logging.getLogger(__name__).setLevel(logging.INFO)
     logging.getLogger("vectorforge").setLevel(logging.INFO)
 

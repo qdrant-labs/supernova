@@ -40,4 +40,6 @@ class MultiVectorEmbedder(ABC):
         Split text into pieces that fit within this embedder's token limit.
         Must be overridden -- each embedder should use its own tokenizer.
         """
-        raise NotImplementedError("MultiVectorEmbedder subclass must implement split_text")
+        raise NotImplementedError(
+            "MultiVectorEmbedder subclass must implement split_text"
+        )

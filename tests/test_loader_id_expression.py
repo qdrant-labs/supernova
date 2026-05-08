@@ -22,11 +22,15 @@ from vectorforge.utils import make_point_id
 
 def _write_multi_rg_parquet(path: str, n: int, row_group_size: int) -> None:
     """Parquet with `id` matching the physical row index, in multiple row groups."""
-    table = pa.table({
-        "id": list(range(n)),
-        "tag": [f"tag_{i:05d}" for i in range(n)],
-        "dense_embedding": [[float(i), float(i + 1), float(i + 2)] for i in range(n)],
-    })
+    table = pa.table(
+        {
+            "id": list(range(n)),
+            "tag": [f"tag_{i:05d}" for i in range(n)],
+            "dense_embedding": [
+                [float(i), float(i + 1), float(i + 2)] for i in range(n)
+            ],
+        }
+    )
     pq.write_table(table, path, row_group_size=row_group_size)
 
 

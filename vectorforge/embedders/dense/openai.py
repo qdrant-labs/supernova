@@ -42,6 +42,7 @@ class OpenAIEmbedder(DenseEmbedder):
 
     def split_text(self, text: str) -> list[str]:
         import tiktoken
+
         encoder = tiktoken.encoding_for_model(self._model)
         tokens = encoder.encode(text, allowed_special="all")
 
@@ -70,16 +71,25 @@ class OpenAIEmbedder(DenseEmbedder):
             async with self._semaphore:
                 for attempt in range(self._max_retries):
                     try:
-                        response = await self.client.embeddings.create(input=batch, **kwargs_base)
+                        response = await self.client.embeddings.create(
+                            input=batch, **kwargs_base
+                        )
                         return [item.embedding for item in response.data]
                     except RateLimitError as e:
                         if attempt == self._max_retries - 1:
                             raise
-                        wait = 2 ** attempt
-                        retry_after = getattr(e.response, "headers", {}).get("retry-after")
+                        wait = 2**attempt
+                        retry_after = getattr(e.response, "headers", {}).get(
+                            "retry-after"
+                        )
                         if retry_after:
                             wait = float(retry_after)
-                        logger.warning("Rate limited, retrying in %.1fs (attempt %d/%d)", wait, attempt + 1, self._max_retries)
+                        logger.warning(
+                            "Rate limited, retrying in %.1fs (attempt %d/%d)",
+                            wait,
+                            attempt + 1,
+                            self._max_retries,
+                        )
                         await asyncio.sleep(wait)
 
         results = await asyncio.gather(*[_embed_batch(b) for b in batches])

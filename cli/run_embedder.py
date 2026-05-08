@@ -9,8 +9,12 @@ import yaml
 from vectorforge.sources.huggingface import HuggingFaceSource
 from vectorforge.sources.huggingface_parquet import HuggingFaceParquetSource
 from vectorforge.embedders.dense.openai import OpenAIEmbedder
-from vectorforge.embedders.dense.sentence_transformer import SentenceTransformerDenseEmbedder
-from vectorforge.embedders.sparse.sentence_transformer import SentenceTransformerSparseEmbedder
+from vectorforge.embedders.dense.sentence_transformer import (
+    SentenceTransformerDenseEmbedder,
+)
+from vectorforge.embedders.sparse.sentence_transformer import (
+    SentenceTransformerSparseEmbedder,
+)
 from vectorforge.embedders.sparse.fastembed import FastEmbedSparseEmbedder
 from vectorforge.embedders.multivector.bge_m3 import BGEM3MultiVectorEmbedder
 from vectorforge.embedders.hybrid import SentenceTransformerHybridEmbedder
@@ -52,7 +56,9 @@ def build_dense_embedder(cfg: dict):
     embedder_type = cfg.pop("type")
     cls = DENSE_EMBEDDER_REGISTRY.get(embedder_type)
     if cls is None:
-        raise ValueError(f"Unknown dense embedder type: {embedder_type}. Available: {list(DENSE_EMBEDDER_REGISTRY)}")
+        raise ValueError(
+            f"Unknown dense embedder type: {embedder_type}. Available: {list(DENSE_EMBEDDER_REGISTRY)}"
+        )
     return cls(**cfg)
 
 
@@ -60,7 +66,9 @@ def build_sparse_embedder(cfg: dict):
     embedder_type = cfg.pop("type")
     cls = SPARSE_EMBEDDER_REGISTRY.get(embedder_type)
     if cls is None:
-        raise ValueError(f"Unknown sparse embedder type: {embedder_type}. Available: {list(SPARSE_EMBEDDER_REGISTRY)}")
+        raise ValueError(
+            f"Unknown sparse embedder type: {embedder_type}. Available: {list(SPARSE_EMBEDDER_REGISTRY)}"
+        )
     return cls(**cfg)
 
 
@@ -68,7 +76,9 @@ def build_multivector_embedder(cfg: dict):
     embedder_type = cfg.pop("type")
     cls = MULTIVECTOR_EMBEDDER_REGISTRY.get(embedder_type)
     if cls is None:
-        raise ValueError(f"Unknown multivector embedder type: {embedder_type}. Available: {list(MULTIVECTOR_EMBEDDER_REGISTRY)}")
+        raise ValueError(
+            f"Unknown multivector embedder type: {embedder_type}. Available: {list(MULTIVECTOR_EMBEDDER_REGISTRY)}"
+        )
     return cls(**cfg)
 
 
@@ -76,10 +86,9 @@ def _can_hybrid(dense_cfg: dict, sparse_cfg: dict) -> bool:
     """
     Check if dense and sparse configs point to the same sentence_transformer model.
     """
-    return (
-        dense_cfg.get("type") == sparse_cfg.get("type") == "sentence_transformer"
-        and dense_cfg.get("model") == sparse_cfg.get("model")
-    )
+    return dense_cfg.get("type") == sparse_cfg.get(
+        "type"
+    ) == "sentence_transformer" and dense_cfg.get("model") == sparse_cfg.get("model")
 
 
 def build_engine(config: dict) -> EmbeddingEngine:
@@ -100,19 +109,24 @@ def build_engine(config: dict) -> EmbeddingEngine:
     multivector_cfg = dict(config.get("multivector_embedder") or {})
 
     if not dense_cfg and not sparse_cfg and not multivector_cfg:
-        raise ValueError("Config must specify at least one of: dense_embedder, sparse_embedder, multivector_embedder")
+        raise ValueError(
+            "Config must specify at least one of: dense_embedder, sparse_embedder, multivector_embedder"
+        )
 
     # pooling lives inside multivector_embedder (it only applies in that context).
     # pop it off so it isn't passed to the embedder constructor as an unknown kwarg.
     pooling_cfg = dict(multivector_cfg.pop("pooling", None) or {})
     if config.get("pooling"):
         import warnings
+
         warnings.warn(
             "Top-level 'pooling:' key is ignored. Nest it under 'multivector_embedder:' instead.",
             stacklevel=2,
         )
 
-    multivector = build_multivector_embedder(multivector_cfg) if multivector_cfg else None
+    multivector = (
+        build_multivector_embedder(multivector_cfg) if multivector_cfg else None
+    )
 
     pooling_type = pooling_cfg.get("type") if pooling_cfg else None
     pooling_normalize = pooling_cfg.get("normalize", True) if pooling_cfg else True
@@ -120,7 +134,7 @@ def build_engine(config: dict) -> EmbeddingEngine:
     # detect hybrid case: same model for both --> optimize for a single forward pass
     if dense_cfg and sparse_cfg and _can_hybrid(dense_cfg, sparse_cfg):
         hybrid_cfg = dict(dense_cfg)
-        hybrid_cfg.pop("type") # remove the type
+        hybrid_cfg.pop("type")  # remove the type
         hybrid = SentenceTransformerHybridEmbedder(**hybrid_cfg)
         return EmbeddingEngine(
             hybrid=hybrid,
@@ -164,14 +178,30 @@ def build_storage(cfg: dict):
 
 @click.command(name="embed", help="Embed a dataset locally.")
 @click.argument("config", required=False)
-@click.option("--offset", type=int, default=None,
-              help="Skip this many rows (for distributed slicing).")
-@click.option("--limit", type=int, default=None,
-              help="Process at most this many rows (for distributed slicing).")
-@click.option("--num-jobs", type=int, default=None,
-              help="Total number of parallel jobs (auto-computes offset/limit from dataset size).")
-@click.option("--job-rank", type=int, default=None,
-              help="This job's rank (0-indexed, used with --num-jobs).")
+@click.option(
+    "--offset",
+    type=int,
+    default=None,
+    help="Skip this many rows (for distributed slicing).",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    help="Process at most this many rows (for distributed slicing).",
+)
+@click.option(
+    "--num-jobs",
+    type=int,
+    default=None,
+    help="Total number of parallel jobs (auto-computes offset/limit from dataset size).",
+)
+@click.option(
+    "--job-rank",
+    type=int,
+    default=None,
+    help="This job's rank (0-indexed, used with --num-jobs).",
+)
 def embed(config, offset, limit, num_jobs, job_rank):
     """Run a vectorforge embedding pipeline."""
     logging.basicConfig(
@@ -183,7 +213,9 @@ def embed(config, offset, limit, num_jobs, job_rank):
 
     config_path = config or os.environ.get("VF_CONFIG_PATH")
     if not config_path:
-        raise click.UsageError("Provide a config path as argument or set VF_CONFIG_PATH env var")
+        raise click.UsageError(
+            "Provide a config path as argument or set VF_CONFIG_PATH env var"
+        )
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
@@ -206,7 +238,11 @@ def embed(config, offset, limit, num_jobs, job_rank):
         # slice space that --num-jobs divides. no window => slice the full dataset.
         window_offset = cfg["source"].get("offset") or 0
         window_limit = cfg["source"].get("limit")
-        window_size = min(window_limit, dataset_total - window_offset) if window_limit else dataset_total - window_offset
+        window_size = (
+            min(window_limit, dataset_total - window_offset)
+            if window_limit
+            else dataset_total - window_offset
+        )
 
         # using the window size and num_jobs, compute offset and limit for this job
         rows_per_job = math.ceil(window_size / num_jobs)
@@ -215,7 +251,13 @@ def embed(config, offset, limit, num_jobs, job_rank):
 
         logging.getLogger("vectorforge").info(
             "Job %d/%d: offset=%d limit=%d (window=[%d,%d), dataset_total=%d)",
-            job_rank, num_jobs, slice_offset, slice_limit, window_offset, window_offset + window_size, dataset_total,
+            job_rank,
+            num_jobs,
+            slice_offset,
+            slice_limit,
+            window_offset,
+            window_offset + window_size,
+            dataset_total,
         )
         cfg["source"]["offset"] = slice_offset
         cfg["source"]["limit"] = slice_limit
@@ -241,9 +283,21 @@ def embed(config, offset, limit, num_jobs, job_rank):
     pipeline_cfg = cfg.get("pipeline", {})
     storage_cfg = cfg.get("storage", {})
 
-    dense_column = pipeline_cfg.get("dense_embedding_column", "dense_embedding") if engine.has_dense else None
-    sparse_column = pipeline_cfg.get("sparse_embedding_column", "sparse_embedding") if engine.has_sparse else None
-    multivector_column = pipeline_cfg.get("multivector_embedding_column", "multivector_embedding") if engine.has_multivector else None
+    dense_column = (
+        pipeline_cfg.get("dense_embedding_column", "dense_embedding")
+        if engine.has_dense
+        else None
+    )
+    sparse_column = (
+        pipeline_cfg.get("sparse_embedding_column", "sparse_embedding")
+        if engine.has_sparse
+        else None
+    )
+    multivector_column = (
+        pipeline_cfg.get("multivector_embedding_column", "multivector_embedding")
+        if engine.has_multivector
+        else None
+    )
 
     # if pooling is configured (nested under multivector_embedder), its pooled_column_name
     # overrides the default dense column

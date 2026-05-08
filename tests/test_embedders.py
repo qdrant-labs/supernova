@@ -2,7 +2,7 @@ import pytest
 
 from vectorforge.embedders.dense.base import DenseEmbedder
 from vectorforge.embedders.sparse.base import SparseEmbedder
-from vectorforge.embedders.engine import EmbeddingEngine, EmbedResult
+from vectorforge.embedders.engine import EmbeddingEngine
 from vectorforge.models import SparseEmbedding
 
 

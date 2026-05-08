@@ -28,25 +28,51 @@ def list_s3_parquets(bucket: str, prefix: str) -> list[str]:
     """Return bare S3 keys (no scheme, no bucket) for every corpus parquet."""
     dest = S3Destination(bucket=bucket, prefix=prefix.rstrip("/"))
     scheme_prefix = f"s3://{bucket}/"
-    return [u[len(scheme_prefix):] for u in discover_corpus_parquets(dest)]
+    return [u[len(scheme_prefix) :] for u in discover_corpus_parquets(dest)]
 
 
 @click.command(name="push-hf", help="Upload S3 parquets to a HuggingFace Hub dataset.")
 @click.argument("s3_uri")
 @click.argument("repo_id")
-@click.option("--subfolder", default="data", show_default=True,
-              help="Folder inside the HF repo.")
+@click.option(
+    "--subfolder", default="data", show_default=True, help="Folder inside the HF repo."
+)
 @click.option("--private", is_flag=True, help="Create repo as private.")
-@click.option("--skip-existing/--no-skip-existing", default=True, show_default=True,
-              help="Skip files already present in the repo.")
-@click.option("--num-jobs", type=int, default=None,
-              help="Total parallel jobs — each takes a round-robin slice of files.")
-@click.option("--job-rank", type=int, default=None,
-              help="This job's rank (0-indexed). Defaults to $SKYPILOT_JOB_RANK.")
-@click.option("--commit-batch-size", type=int, default=10, show_default=True,
-              help="Files per HF commit. HF limits to 128 commits/hr.")
-def push_hf(s3_uri, repo_id, subfolder, private, skip_existing, num_jobs, job_rank,
-            commit_batch_size):
+@click.option(
+    "--skip-existing/--no-skip-existing",
+    default=True,
+    show_default=True,
+    help="Skip files already present in the repo.",
+)
+@click.option(
+    "--num-jobs",
+    type=int,
+    default=None,
+    help="Total parallel jobs — each takes a round-robin slice of files.",
+)
+@click.option(
+    "--job-rank",
+    type=int,
+    default=None,
+    help="This job's rank (0-indexed). Defaults to $SKYPILOT_JOB_RANK.",
+)
+@click.option(
+    "--commit-batch-size",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Files per HF commit. HF limits to 128 commits/hr.",
+)
+def push_hf(
+    s3_uri,
+    repo_id,
+    subfolder,
+    private,
+    skip_existing,
+    num_jobs,
+    job_rank,
+    commit_batch_size,
+):
     """Upload S3 parquets to a HuggingFace Hub dataset."""
     logging.basicConfig(
         level=logging.WARNING,
@@ -87,7 +113,10 @@ def push_hf(s3_uri, repo_id, subfolder, private, skip_existing, num_jobs, job_ra
         keys = [k for i, k in enumerate(all_keys) if i % num_jobs == job_rank]
         logger.info(
             "Rank %d/%d: %d files (of %d total)",
-            job_rank, num_jobs, len(keys), len(all_keys),
+            job_rank,
+            num_jobs,
+            len(keys),
+            len(all_keys),
         )
     else:
         keys = all_keys
@@ -114,7 +143,9 @@ def push_hf(s3_uri, repo_id, subfolder, private, skip_existing, num_jobs, job_ra
             if not pending:
                 return
             operations = [
-                CommitOperationAdd(path_in_repo=f"{subfolder}/{rel}", path_or_fileobj=lp)
+                CommitOperationAdd(
+                    path_in_repo=f"{subfolder}/{rel}", path_or_fileobj=lp
+                )
                 for _, rel, lp in pending
             ]
             batch_num += 1
@@ -129,21 +160,30 @@ def push_hf(s3_uri, repo_id, subfolder, private, skip_existing, num_jobs, job_ra
                 os.remove(lp)
             uploaded += len(pending)
             pending.clear()
-            logger.info("  Committed [%d uploaded, %d skipped so far]", uploaded, skipped)
+            logger.info(
+                "  Committed [%d uploaded, %d skipped so far]", uploaded, skipped
+            )
 
         for i, key in enumerate(keys):
-            relative = key[len(prefix):].lstrip("/")
+            relative = key[len(prefix) :].lstrip("/")
             path_in_repo = f"{subfolder}/{relative}"
 
             if skip_existing and api.file_exists(
                 repo_id=repo_id, filename=path_in_repo, repo_type="dataset"
             ):
-                logger.info("[%d/%d] Skipping (already uploaded): %s", i + 1, len(keys), relative)
+                logger.info(
+                    "[%d/%d] Skipping (already uploaded): %s",
+                    i + 1,
+                    len(keys),
+                    relative,
+                )
                 skipped += 1
                 continue
 
             local_path = os.path.join(tmpdir, Path(key).name)
-            logger.info("[%d/%d] Downloading s3://%s/%s...", i + 1, len(keys), bucket, key)
+            logger.info(
+                "[%d/%d] Downloading s3://%s/%s...", i + 1, len(keys), bucket, key
+            )
             s3.download_file(bucket, key, local_path)
             size_gb = os.path.getsize(local_path) / 1e9
             logger.info("  %.2f GB downloaded", size_gb)
@@ -154,7 +194,9 @@ def push_hf(s3_uri, repo_id, subfolder, private, skip_existing, num_jobs, job_ra
 
         flush_batch()  # commit any remaining files
 
-    click.echo(f"Finished: {uploaded} uploaded in {batch_num} commits, {skipped} skipped")
+    click.echo(
+        f"Finished: {uploaded} uploaded in {batch_num} commits, {skipped} skipped"
+    )
     if num_jobs is None or job_rank == 0:
         click.echo(f"Dataset: https://huggingface.co/datasets/{repo_id}")
 

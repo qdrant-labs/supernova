@@ -39,8 +39,9 @@ class SentenceTransformerSparseEmbedder(SparseEmbedder):
         trust_remote_code: bool = False,
     ):
         self._device = device or _detect_device()
-        torch_dtype = self.DTYPE_MAP.get(dtype, torch.float32)
-        logger.info("Loading sparse encoder %s on %s (dtype=%s)", model, self._device, dtype)
+        logger.info(
+            "Loading sparse encoder %s on %s (dtype=%s)", model, self._device, dtype
+        )
         self._model = SparseEncoder(
             model,
             device=self._device,
@@ -50,7 +51,10 @@ class SentenceTransformerSparseEmbedder(SparseEmbedder):
         self._batch_size = batch_size
         self._max_tokens = self._model.max_seq_length
         from transformers import AutoTokenizer
-        self._splitter_tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
+
+        self._splitter_tokenizer = AutoTokenizer.from_pretrained(
+            model, trust_remote_code=trust_remote_code
+        )
 
     @property
     def model_name(self) -> str:
@@ -69,7 +73,9 @@ class SentenceTransformerSparseEmbedder(SparseEmbedder):
         chunks = []
         for i in range(0, len(tokens), self._max_tokens):
             chunk_tokens = tokens[i : i + self._max_tokens]
-            chunks.append(self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True))
+            chunks.append(
+                self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            )
         return chunks
 
     def _encode(self, texts: list[str]) -> list[SparseEmbedding]:
@@ -86,15 +92,19 @@ class SentenceTransformerSparseEmbedder(SparseEmbedder):
                 # scipy sparse matrix — convert to indices/values
                 dense = row.toarray().squeeze()
                 nonzero = dense.nonzero()[0]
-                embeddings.append(SparseEmbedding(
-                    indices=nonzero.tolist(),
-                    values=dense[nonzero].tolist(),
-                ))
+                embeddings.append(
+                    SparseEmbedding(
+                        indices=nonzero.tolist(),
+                        values=dense[nonzero].tolist(),
+                    )
+                )
             elif isinstance(row, dict):
-                embeddings.append(SparseEmbedding(
-                    indices=list(row.keys()),
-                    values=list(row.values()),
-                ))
+                embeddings.append(
+                    SparseEmbedding(
+                        indices=list(row.keys()),
+                        values=list(row.values()),
+                    )
+                )
             else:
                 raise TypeError(f"Unexpected sparse output type: {type(row)}")
 

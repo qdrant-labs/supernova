@@ -17,12 +17,12 @@ def s3_rel_key(key: str, bucket: str, prefix: str) -> str:
     if key.startswith("s3://"):
         key = key[5:]
     if key.startswith(bucket + "/"):
-        key = key[len(bucket) + 1:]
+        key = key[len(bucket) + 1 :]
 
     # Strip the prefix (with trailing slash)
     stripped = prefix.rstrip("/") + "/"
     if key.startswith(stripped):
-        key = key[len(stripped):]
+        key = key[len(stripped) :]
 
     return key
 

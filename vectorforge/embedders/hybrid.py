@@ -49,7 +49,9 @@ class SentenceTransformerHybridEmbedder:
     ):
         self._device = device or _detect_device()
         torch_dtype = self.DTYPE_MAP.get(dtype, torch.float32)
-        logger.info("Loading hybrid encoder %s on %s (dtype=%s)", model, self._device, dtype)
+        logger.info(
+            "Loading hybrid encoder %s on %s (dtype=%s)", model, self._device, dtype
+        )
 
         self._dense_model = SentenceTransformer(
             model,
@@ -69,7 +71,10 @@ class SentenceTransformerHybridEmbedder:
         self._max_tokens = self._dense_model.max_seq_length
 
         from transformers import AutoTokenizer
-        self._splitter_tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
+
+        self._splitter_tokenizer = AutoTokenizer.from_pretrained(
+            model, trust_remote_code=trust_remote_code
+        )
 
     @property
     def model_name(self) -> str:
@@ -92,10 +97,14 @@ class SentenceTransformerHybridEmbedder:
         chunks = []
         for i in range(0, len(tokens), self._max_tokens):
             chunk_tokens = tokens[i : i + self._max_tokens]
-            chunks.append(self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True))
+            chunks.append(
+                self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            )
         return chunks
 
-    def _encode(self, texts: list[str]) -> tuple[list[list[float]], list[SparseEmbedding]]:
+    def _encode(
+        self, texts: list[str]
+    ) -> tuple[list[list[float]], list[SparseEmbedding]]:
         # Dense embeddings
         dense_np = self._dense_model.encode(
             texts,
@@ -117,19 +126,25 @@ class SentenceTransformerHybridEmbedder:
             if hasattr(row, "toarray"):
                 arr = row.toarray().squeeze()
                 nonzero = arr.nonzero()[0]
-                sparse.append(SparseEmbedding(
-                    indices=nonzero.tolist(),
-                    values=arr[nonzero].tolist(),
-                ))
+                sparse.append(
+                    SparseEmbedding(
+                        indices=nonzero.tolist(),
+                        values=arr[nonzero].tolist(),
+                    )
+                )
             elif isinstance(row, dict):
-                sparse.append(SparseEmbedding(
-                    indices=list(row.keys()),
-                    values=list(row.values()),
-                ))
+                sparse.append(
+                    SparseEmbedding(
+                        indices=list(row.keys()),
+                        values=list(row.values()),
+                    )
+                )
             else:
                 raise TypeError(f"Unexpected sparse output type: {type(row)}")
 
         return dense, sparse
 
-    async def embed(self, texts: list[str]) -> tuple[list[list[float]], list[SparseEmbedding]]:
+    async def embed(
+        self, texts: list[str]
+    ) -> tuple[list[list[float]], list[SparseEmbedding]]:
         return await asyncio.to_thread(self._encode, texts)

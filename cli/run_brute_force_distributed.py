@@ -42,29 +42,69 @@ DEFAULT_NUM_JOBS = 50
 _METRIC_CHOICES = [m.value for m in DistanceMetric]
 
 
-@click.command(name="brute-force-dist", help="Distributed brute-force via SkyPilot GPU pool.")
+@click.command(
+    name="brute-force-dist", help="Distributed brute-force via SkyPilot GPU pool."
+)
 @click.argument("corpus_uri")
-@click.option("--queries", default="queries_1000.parquet", show_default=True,
-              help="Queries parquet filename within {corpus}/eval/.")
-@click.option("-k", "k", type=int, default=DEFAULT_K, show_default=True,
-              help="Neighbors per query.")
-@click.option("--metric", type=click.Choice(_METRIC_CHOICES, case_sensitive=False),
-              default=DistanceMetric.COSINE.value, show_default=True)
+@click.option(
+    "--queries",
+    default="queries_1000.parquet",
+    show_default=True,
+    help="Queries parquet filename within {corpus}/eval/.",
+)
+@click.option(
+    "-k",
+    "k",
+    type=int,
+    default=DEFAULT_K,
+    show_default=True,
+    help="Neighbors per query.",
+)
+@click.option(
+    "--metric",
+    type=click.Choice(_METRIC_CHOICES, case_sensitive=False),
+    default=DistanceMetric.COSINE.value,
+    show_default=True,
+)
 @click.option("--dense-column", default="dense_embedding", show_default=True)
-@click.option("--num-jobs", type=int, default=DEFAULT_NUM_JOBS, show_default=True,
-              help="Number of GPU workers.")
+@click.option(
+    "--num-jobs",
+    type=int,
+    default=DEFAULT_NUM_JOBS,
+    show_default=True,
+    help="Number of GPU workers.",
+)
 @click.option("--output", default=None, help="Final merged output filename.")
-@click.option("--instance-type", default=DEFAULT_INSTANCE_TYPE, show_default=True,
-              help="EC2 instance type per worker.")
+@click.option(
+    "--instance-type",
+    default=DEFAULT_INSTANCE_TYPE,
+    show_default=True,
+    help="EC2 instance type per worker.",
+)
 @click.option("--on-demand", is_flag=True, help="Use on-demand instead of spot.")
-@click.option("--pool-name", default=None,
-              help="SkyPilot pool name (default: auto-generated).")
-@click.option("--dry-run", is_flag=True,
-              help="Print plan and write configs, don't launch.")
-def brute_force_dist(corpus_uri, queries, k, metric, dense_column, num_jobs, output,
-                     instance_type, on_demand, pool_name, dry_run):
+@click.option(
+    "--pool-name", default=None, help="SkyPilot pool name (default: auto-generated)."
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Print plan and write configs, don't launch."
+)
+def brute_force_dist(
+    corpus_uri,
+    queries,
+    k,
+    metric,
+    dense_column,
+    num_jobs,
+    output,
+    instance_type,
+    on_demand,
+    pool_name,
+    dry_run,
+):
     """Distributed brute-force nearest-neighbor search via SkyPilot GPU pool."""
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s"
+    )
     logging.getLogger(__name__).setLevel(logging.INFO)
 
     try:
@@ -84,7 +124,9 @@ def brute_force_dist(corpus_uri, queries, k, metric, dense_column, num_jobs, out
     region = get_bucket_region(dest.bucket)
     image_id = CUDA_IMAGE_IDS.get(region)
     if image_id is None:
-        click.echo(f"Warning: no CUDA AMI configured for {region!r}. Known: {list(CUDA_IMAGE_IDS)}")
+        click.echo(
+            f"Warning: no CUDA AMI configured for {region!r}. Known: {list(CUDA_IMAGE_IDS)}"
+        )
 
     corpus_uris = discover_corpus_parquets(dest)
     files_per_worker = math.ceil(len(corpus_uris) / num_jobs)
@@ -145,7 +187,9 @@ def brute_force_dist(corpus_uri, queries, k, metric, dense_column, num_jobs, out
     click.echo(f"  Metric:         {metric_enum.value}")
     click.echo(f"  Workers:        {num_jobs}")
     click.echo(f"  Files/worker:   ~{files_per_worker} (of {len(corpus_uris)} total)")
-    click.echo(f"  Instance:       {instance_type}  ({'on-demand' if on_demand else 'spot'})")
+    click.echo(
+        f"  Instance:       {instance_type}  ({'on-demand' if on_demand else 'spot'})"
+    )
     click.echo(f"  Region:         {region}")
     click.echo(f"  Pool:           {pool_name_eff}")
     click.echo(f"  Partial output: {partial_uri}/")
@@ -161,7 +205,9 @@ def brute_force_dist(corpus_uri, queries, k, metric, dense_column, num_jobs, out
         click.echo(f"[dry run] Job config:  {job_path}")
         return
 
-    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_jobs, build_env_flags())
+    launch_pool_and_jobs(
+        pool_name_eff, pool_path, job_path, num_jobs, build_env_flags()
+    )
 
     click.echo(f"Submitted {num_jobs} workers to pool '{pool_name_eff}'")
     print_monitor(pool_name_eff)

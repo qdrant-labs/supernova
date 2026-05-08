@@ -56,9 +56,10 @@ def _filter_paths(paths: list[str], pattern: str | list[str] | None) -> list[str
                     out.append(p)
         return out
     if pattern.startswith("regex:"):
-        rx = re.compile(pattern[len("regex:"):])
+        rx = re.compile(pattern[len("regex:") :])
         return [p for p in paths if rx.search(p)]
     return fnmatch.filter(paths, pattern)
+
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ class HuggingFaceParquetSource(DatasetSource):
         self._extract_text = _build_text_extractor(text_field, text_template)
 
         from huggingface_hub import HfApi, HfFileSystem
+
         self._fs = HfFileSystem()
         api = HfApi()
         all_files = api.list_repo_files(dataset_name, repo_type="dataset")
@@ -161,21 +163,27 @@ class HuggingFaceParquetSource(DatasetSource):
                     return path, pf.metadata.num_rows
                 except Exception as e:
                     if "429" in str(e) or "Too Many Requests" in str(e):
-                        wait = min(5 * 2 ** attempt, 120)
+                        wait = min(5 * 2**attempt, 120)
                         logger.warning(
                             "Rate limited reading footer for %s (attempt %d/%d), retrying in %ds",
-                            path, attempt + 1, 6, wait,
+                            path,
+                            attempt + 1,
+                            6,
+                            wait,
                         )
                         time.sleep(wait)
                     else:
                         logger.warning("Failed to read row count for %s: %s", path, e)
                         return path, None
-            logger.warning("Giving up on footer read for %s after 6 rate-limit retries", path)
+            logger.warning(
+                "Giving up on footer read for %s after 6 rate-limit retries", path
+            )
             return path, None
 
         logger.info(
             "Reading parquet footers for %d files (parallel=%d)...",
-            len(self._parquet_paths), self._metadata_workers,
+            len(self._parquet_paths),
+            self._metadata_workers,
         )
         with ThreadPoolExecutor(max_workers=self._metadata_workers) as ex:
             results = list(ex.map(fetch, self._parquet_paths))
@@ -196,7 +204,8 @@ class HuggingFaceParquetSource(DatasetSource):
         self._files_with_counts = [(p, n) for p, n in results if n > 0]
         logger.info(
             "Indexed %d parquet files, %d total rows",
-            len(self._files_with_counts), sum(n for _, n in self._files_with_counts),
+            len(self._files_with_counts),
+            sum(n for _, n in self._files_with_counts),
         )
 
     def list_files(self) -> list[tuple[str, int]]:
@@ -238,7 +247,9 @@ class HuggingFaceParquetSource(DatasetSource):
                 remote = f"datasets/{self.dataset_name}/{path}"
                 logger.info("Downloading %s -> %s", remote, local_path)
                 self._fs.get(remote, local_path)
-                logger.info("Downloaded %s (%.1f GB)", path, os.path.getsize(local_path) / 1e9)
+                logger.info(
+                    "Downloaded %s (%.1f GB)", path, os.path.getsize(local_path) / 1e9
+                )
             self._local_paths[path] = local_path
 
     def stream(self) -> Iterator[dict]:
@@ -268,7 +279,8 @@ class HuggingFaceParquetSource(DatasetSource):
             intra_offset = max(0, offset - file_start)
             available_in_file = num_rows - intra_offset
             want_from_file = (
-                min(available_in_file, limit - rows_yielded) if limit is not None
+                min(available_in_file, limit - rows_yielded)
+                if limit is not None
                 else available_in_file
             )
             if want_from_file <= 0:
@@ -277,7 +289,9 @@ class HuggingFaceParquetSource(DatasetSource):
             if path in self._local_paths:
                 pf = pq.ParquetFile(self._local_paths[path])
             else:
-                pf = pq.ParquetFile(f"datasets/{self.dataset_name}/{path}", filesystem=self._fs)
+                pf = pq.ParquetFile(
+                    f"datasets/{self.dataset_name}/{path}", filesystem=self._fs
+                )
             taken_from_file = 0
 
             for batch in pf.iter_batches(batch_size=10_000):
@@ -307,7 +321,11 @@ class HuggingFaceParquetSource(DatasetSource):
 
             logger.debug(
                 "%s: yielded %d rows (file rows %d..%d, intra-file want %d)",
-                path, taken_from_file, file_start, file_end, want_from_file,
+                path,
+                taken_from_file,
+                file_start,
+                file_end,
+                want_from_file,
             )
 
     def extract_text(self, row: dict) -> str:

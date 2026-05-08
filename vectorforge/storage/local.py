@@ -20,7 +20,9 @@ class LocalBackend(StorageBackend):
     async def ensure_ready(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
 
-    async def upload_file(self, local_path: str, remote_subpath: str | None = None) -> None:
+    async def upload_file(
+        self, local_path: str, remote_subpath: str | None = None
+    ) -> None:
         remote = remote_subpath or os.path.basename(local_path)
         dest = os.path.join(self.output_dir, remote)
         os.makedirs(os.path.dirname(dest), exist_ok=True)

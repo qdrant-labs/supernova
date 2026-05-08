@@ -24,7 +24,13 @@ from pathlib import Path
 import click
 import yaml
 
-from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_dry_run, print_monitor
+from cli.skypilot_utils import (
+    build_env_flags,
+    make_run_dir,
+    launch_pool_and_jobs,
+    print_dry_run,
+    print_monitor,
+)
 
 from vectorforge.loader.vectorstore.qdrant import QdrantVectorStore
 from vectorforge.destinations import datasource_to_destination
@@ -36,6 +42,7 @@ def resolve_env_vars(value: str) -> str:
     """
     Replace ${VAR_NAME} references with environment variable values.
     """
+
     def _replace(match):
         var_name = match.group(1)
         val = os.environ.get(var_name)
@@ -66,7 +73,10 @@ def discover_parquet_files(ds_cfg: dict) -> list[str]:
     List all corpus .parquet files for the loader's datasource block,
     excluding eval/ artifacts. Returns absolute URIs (s3:// or hf://...).
     """
-    from vectorforge.destinations import datasource_to_destination, discover_corpus_parquets
+    from vectorforge.destinations import (
+        datasource_to_destination,
+        discover_corpus_parquets,
+    )
 
     dest = datasource_to_destination(ds_cfg)
     return discover_corpus_parquets(dest)
@@ -86,19 +96,30 @@ async def _enable_and_wait(store: QdrantVectorStore):
 
 @click.command(name="load-dist", help="Distribute loading across SkyPilot instances.")
 @click.argument("config")
-@click.option("--dry-run", is_flag=True,
-              help="Generate configs and print plan, don't launch.")
+@click.option(
+    "--dry-run", is_flag=True, help="Generate configs and print plan, don't launch."
+)
 @click.option("--num-shards", type=int, default=None, help="Override number of shards.")
-@click.option("--pool-name", default=None,
-              help="SkyPilot pool name (default: auto-generated).")
-@click.option("--on-demand", is_flag=True,
-              help="Use on-demand instances instead of spot (higher cost, no preemption, "
-                   "separate AWS quota).")
-@click.option("--ramp", is_flag=True,
-              help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). "
-                   "Default is burst.")
-@click.option("--finalize", is_flag=True,
-              help="Enable Qdrant indexing (run after all jobs complete).")
+@click.option(
+    "--pool-name", default=None, help="SkyPilot pool name (default: auto-generated)."
+)
+@click.option(
+    "--on-demand",
+    is_flag=True,
+    help="Use on-demand instances instead of spot (higher cost, no preemption, "
+    "separate AWS quota).",
+)
+@click.option(
+    "--ramp",
+    is_flag=True,
+    help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). "
+    "Default is burst.",
+)
+@click.option(
+    "--finalize",
+    is_flag=True,
+    help="Enable Qdrant indexing (run after all jobs complete).",
+)
 def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize):
     """Dispatch distributed loading via SkyPilot pools."""
     logging.basicConfig(
@@ -165,7 +186,9 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     click.echo(f"  Num shards:   {num_shards_eff}")
     click.echo(f"  Files/shard:  ~{len(files) // num_shards_eff}")
     click.echo(f"  Pool name:    {pool_name_eff}")
-    click.echo(f"  Provision:    {'ramp (autoscaler)' if ramp else 'burst (all workers at startup)'}")
+    click.echo(
+        f"  Provision:    {'ramp (autoscaler)' if ramp else 'burst (all workers at startup)'}"
+    )
     click.echo(f"  Resources:    {resources}")
     click.echo(f"  Run dir:      {run_dir}")
     click.echo("=" * 60)
@@ -228,19 +251,26 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
 
     if isinstance(dest, S3Destination):
         from vectorforge.loader.datasource.s3 import S3DataReader
+
         reader = S3DataReader(
-            s3_bucket=dest.bucket, s3_prefix=dest.prefix,
-            vectors=vectors_spec, file_list=[files[0]],
+            s3_bucket=dest.bucket,
+            s3_prefix=dest.prefix,
+            vectors=vectors_spec,
+            file_list=[files[0]],
         )
     elif isinstance(dest, HfDestination):
         from vectorforge.loader.datasource.huggingface import HuggingFaceDataReader
 
         reader = HuggingFaceDataReader(
-            repo_id=dest.repo_id, subdir=dest.subdir or None,
-            vectors=vectors_spec, file_list=[files[0]],
+            repo_id=dest.repo_id,
+            subdir=dest.subdir or None,
+            vectors=vectors_spec,
+            file_list=[files[0]],
         )
     else:
-        raise ValueError(f"Unsupported destination for dim probe: {type(dest).__name__}")
+        raise ValueError(
+            f"Unsupported destination for dim probe: {type(dest).__name__}"
+        )
     dimensions = reader.get_dimensions()
     reader.close()
 

@@ -34,7 +34,10 @@ def test_write_batch_dense_only():
 
         # Dynamic columns from source data
         assert table.column("title").to_pylist() == ["greeting", "second"]
-        assert table.column("url").to_pylist() == ["http://example.com", "http://example.com/2"]
+        assert table.column("url").to_pylist() == [
+            "http://example.com",
+            "http://example.com/2",
+        ]
 
         embeddings = table.column("dense_embedding").to_pylist()
         assert len(embeddings[0]) == 3
@@ -44,12 +47,20 @@ def test_write_batch_sparse_only():
     records = [
         EmbeddedRecord(
             text="hello",
-            sparse_embedding=SparseEmbedding(indices=[0, 5, 10], values=[1.0, 0.5, 0.3]),
+            sparse_embedding=SparseEmbedding(
+                indices=[0, 5, 10], values=[1.0, 0.5, 0.3]
+            ),
         ),
     ]
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        path = write_batch(records, tmpdir, batch_id=0, dense_column=None, sparse_column="sparse_embedding")
+        path = write_batch(
+            records,
+            tmpdir,
+            batch_id=0,
+            dense_column=None,
+            sparse_column="sparse_embedding",
+        )
 
         table = pq.read_table(path)
         assert table.num_rows == 1
@@ -70,7 +81,9 @@ def test_write_batch_both():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         path = write_batch(
-            records, tmpdir, batch_id=0,
+            records,
+            tmpdir,
+            batch_id=0,
             dense_column="dense_embedding",
             sparse_column="sparse_embedding",
         )

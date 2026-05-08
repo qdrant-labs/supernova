@@ -73,19 +73,22 @@ def main():
             continue  # keep the user's original en.yaml untouched
 
         body = template
-        body = path_filter_re.sub(rf'\g<1>{code}wiki\g<2>', body)
-        body = s3_prefix_stem_re.sub(rf'\g<1>\g<2>/{code}\g<3>', body)
+        body = path_filter_re.sub(rf"\g<1>{code}wiki\g<2>", body)
+        body = s3_prefix_stem_re.sub(rf"\g<1>\g<2>/{code}\g<3>", body)
 
         out_path.write_text(body)
         written += 1
 
     # write a small manifest of (code, rows) so we can sort runs by size later
     import json
+
     manifest = {
         "dataset": "HuggingFaceFW/finewiki",
         "total_languages": len(langs),
         "total_rows": sum(r for _, r in langs),
-        "languages": [{"code": c, "rows": r} for c, r in sorted(langs, key=lambda x: -x[1])],
+        "languages": [
+            {"code": c, "rows": r} for c, r in sorted(langs, key=lambda x: -x[1])
+        ],
     }
     (CONFIG_DIR / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
 

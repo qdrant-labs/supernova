@@ -59,8 +59,12 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
 
     if source_type != "huggingface_parquet":
         # streaming HF source has no file-listing concept
-        click.echo(f"--list-files only supports source.type=huggingface_parquet (got {source_type!r}).")
-        click.echo("For streaming HF sources, partition assignment is offset-based -- run a partition")
+        click.echo(
+            f"--list-files only supports source.type=huggingface_parquet (got {source_type!r})."
+        )
+        click.echo(
+            "For streaming HF sources, partition assignment is offset-based -- run a partition"
+        )
         click.echo("with --num-jobs and inspect the S3 output instead.")
         return
 
@@ -69,7 +73,9 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
     total_rows = sum(n for _, n in files)
 
     click.echo(f"Dataset:    {source.dataset_name}")
-    click.echo(f"Filter:     path_filter={source_cfg.get('path_filter')!r}, split={source_cfg.get('split')!r}")
+    click.echo(
+        f"Filter:     path_filter={source_cfg.get('path_filter')!r}, split={source_cfg.get('split')!r}"
+    )
     click.echo(f"Files:      {len(files)} parquet files, {total_rows:,} total rows")
     click.echo("")
     sample = files[:10]
@@ -102,29 +108,46 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
         end = offset + limit
         # files this rank touches
         touched = [
-            os.path.basename(p)
-            for p, fs, fe in file_ranges
-            if fe > offset and fs < end
+            os.path.basename(p) for p, fs, fe in file_ranges if fe > offset and fs < end
         ]
         sample_touched = ", ".join(touched[:3])
         if len(touched) > 3:
             sample_touched += f" (+{len(touched) - 3} more)"
-        click.echo(f"  rank {rank:>3}: rows {offset:>10,}-{end - 1:>10,}  ({limit:>10,} rows)  files: {sample_touched}")
+        click.echo(
+            f"  rank {rank:>3}: rows {offset:>10,}-{end - 1:>10,}  ({limit:>10,} rows)  files: {sample_touched}"
+        )
 
 
-@click.command(name="partition",
-               help="Run pipeline with no-op embedder (validate sharding without GPU).")
+@click.command(
+    name="partition",
+    help="Run pipeline with no-op embedder (validate sharding without GPU).",
+)
 @click.argument("config", required=False)
-@click.option("--offset", type=int, default=None,
-              help="Skip this many rows (for explicit slicing).")
-@click.option("--limit", type=int, default=None,
-              help="Process at most this many rows.")
-@click.option("--num-jobs", type=int, default=None,
-              help="Total parallel jobs (auto-computes offset/limit per rank).")
-@click.option("--job-rank", type=int, default=None,
-              help="This job's rank (0-indexed; defaults to $SKYPILOT_JOB_RANK).")
-@click.option("--list-files", "list_files_flag", is_flag=True,
-              help="Dry-run: list matched files + per-rank plan and exit. No S3 writes.")
+@click.option(
+    "--offset",
+    type=int,
+    default=None,
+    help="Skip this many rows (for explicit slicing).",
+)
+@click.option("--limit", type=int, default=None, help="Process at most this many rows.")
+@click.option(
+    "--num-jobs",
+    type=int,
+    default=None,
+    help="Total parallel jobs (auto-computes offset/limit per rank).",
+)
+@click.option(
+    "--job-rank",
+    type=int,
+    default=None,
+    help="This job's rank (0-indexed; defaults to $SKYPILOT_JOB_RANK).",
+)
+@click.option(
+    "--list-files",
+    "list_files_flag",
+    is_flag=True,
+    help="Dry-run: list matched files + per-rank plan and exit. No S3 writes.",
+)
 def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
     """Run the embed pipeline with the no-op embedder for partition validation."""
     logging.basicConfig(
@@ -136,7 +159,9 @@ def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
 
     config_path = config or os.environ.get("VF_CONFIG_PATH")
     if not config_path:
-        raise click.UsageError("Provide a config path as argument or set VF_CONFIG_PATH env var")
+        raise click.UsageError(
+            "Provide a config path as argument or set VF_CONFIG_PATH env var"
+        )
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
@@ -160,7 +185,8 @@ def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
         window_offset = cfg["source"].get("offset") or 0
         window_limit = cfg["source"].get("limit")
         window_size = (
-            min(window_limit, dataset_total - window_offset) if window_limit
+            min(window_limit, dataset_total - window_offset)
+            if window_limit
             else dataset_total - window_offset
         )
 
@@ -170,7 +196,13 @@ def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
 
         logging.getLogger("vectorforge").info(
             "Job %d/%d: offset=%d limit=%d (window=[%d,%d), dataset_total=%d)",
-            job_rank, num_jobs, slice_offset, slice_limit, window_offset, window_offset + window_size, dataset_total,
+            job_rank,
+            num_jobs,
+            slice_offset,
+            slice_limit,
+            window_offset,
+            window_offset + window_size,
+            dataset_total,
         )
         cfg["source"]["offset"] = slice_offset
         cfg["source"]["limit"] = slice_limit

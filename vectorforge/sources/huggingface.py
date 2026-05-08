@@ -11,16 +11,20 @@ def _build_text_extractor(text_field: str | None, text_template: str | None):
     - text_field: single field name (fallback)
     """
     if text_template:
+
         def extract(row: dict) -> str:
             return text_template.format(**row)
+
         return extract
 
     if text_field:
+
         def extract(row: dict) -> str:
             val = row.get(text_field)
             if val is None:
                 raise ValueError(f"Row is missing text field '{text_field}'")
             return val
+
         return extract
 
     raise ValueError("Must specify either text_field or text_template")
@@ -49,9 +53,7 @@ class HuggingFaceSource(DatasetSource):
         self._limit = limit
         self._total_rows_override = total_rows_override
         self._extract_text = _build_text_extractor(text_field, text_template)
-        self._dataset = load_dataset(
-            dataset_name, config, streaming=True, split=split
-        )
+        self._dataset = load_dataset(dataset_name, config, streaming=True, split=split)
 
     @property
     def source_name(self) -> str:

@@ -17,6 +17,5 @@ snapshot_urls = []
 for node_url in QDRANT_NODES:
     node_client = QdrantClient(node_url, api_key=QDRANT_API_KEY)
     node_client.create_snapshot(
-        collection_name="finewiki-gte-multilingual-base-en",
-        wait=False
+        collection_name="finewiki-gte-multilingual-base-en", wait=False
     )

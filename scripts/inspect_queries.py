@@ -21,7 +21,9 @@ K = 1000
 ENRICH_COLUMNS = ["abstract", "title"]
 
 queries = pl.read_parquet("/Users/nathanleroy/Downloads/queries_1000.parquet")
-bf_ground_truth = pl.read_parquet("/Users/nathanleroy/Downloads/brute_force_queries_1000_k1000.parquet")
+bf_ground_truth = pl.read_parquet(
+    "/Users/nathanleroy/Downloads/brute_force_queries_1000_k1000.parquet"
+)
 
 queries = queries.with_columns(
     (pl.col("__source_file__") + ":" + pl.col("__source_row__").cast(pl.String))
@@ -41,6 +43,7 @@ bf_ground_truth = bf_ground_truth.join(
 fs = pafs.S3FileSystem()
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
 
+
 def enrich_one(row: dict) -> dict:
     key, lo = row["__source_file__"], row["__source_row__"]
     with fs.open_input_file(f"{BUCKET}/{key}") as f:
@@ -51,7 +54,10 @@ def enrich_one(row: dict) -> dict:
             cum += pf.metadata.row_group(rg_i).num_rows
         rg_idx = bisect.bisect_right(rg_starts, lo) - 1
         table = pf.read_row_group(rg_idx, columns=ENRICH_COLUMNS)
-        return {col: table.column(col)[lo - rg_starts[rg_idx]].as_py() for col in ENRICH_COLUMNS}
+        return {
+            col: table.column(col)[lo - rg_starts[rg_idx]].as_py()
+            for col in ENRICH_COLUMNS
+        }
 
 
 def query_qdrant(row: dict, ef_search: int = 128) -> list[str]:
@@ -62,14 +68,14 @@ def query_qdrant(row: dict, ef_search: int = 128) -> list[str]:
         with_payload=True,
         with_vectors=False,
         using=DENSE_VECTOR,
-        search_params=models.SearchParams(
-            hnsw_ef=ef_search
-        )
+        search_params=models.SearchParams(hnsw_ef=ef_search),
     )
     return [str(p.id) for p in result.points]
 
 
-def recall_one(row: dict, qdrant_hit_ids: list[str], negative_control: bool = False) -> float:
+def recall_one(
+    row: dict, qdrant_hit_ids: list[str], negative_control: bool = False
+) -> float:
     qid = row["point_id"]
     if negative_control:
         # select random bf_row as negative control to sanity check recall calculation (should be near 0)

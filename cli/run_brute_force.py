@@ -17,7 +17,12 @@ from pathlib import Path
 import click
 import yaml
 
-from cli.skypilot_utils import CUDA_IMAGE_IDS, build_env_flags, make_run_dir, launch_single_job
+from cli.skypilot_utils import (
+    CUDA_IMAGE_IDS,
+    build_env_flags,
+    make_run_dir,
+    launch_single_job,
+)
 from vectorforge.destinations import S3Destination, parse_destination
 from vectorforge.eval.brute_force import (
     DEFAULT_K,
@@ -62,7 +67,9 @@ def launch_on_ec2(
 
     image_id = CUDA_IMAGE_IDS.get(region)
     if image_id is None:
-        click.echo(f"Warning: no CUDA AMI configured for {region!r}. Known: {list(CUDA_IMAGE_IDS)}")
+        click.echo(
+            f"Warning: no CUDA AMI configured for {region!r}. Known: {list(CUDA_IMAGE_IDS)}"
+        )
 
     resources = {
         "cloud": "aws",
@@ -92,7 +99,9 @@ def launch_on_ec2(
     click.echo(f"  Queries:     {queries_filename}")
     click.echo(f"  K:           {k}")
     click.echo(f"  Metric:      {metric.value}")
-    click.echo(f"  Instance:    {instance_type}  ({'on-demand' if on_demand else 'spot'})")
+    click.echo(
+        f"  Instance:    {instance_type}  ({'on-demand' if on_demand else 'spot'})"
+    )
     click.echo(f"  Output:      {dest.eval_uri(output)}")
     click.echo(f"  Run dir:     {run_dir}")
     click.echo("=" * 60)
@@ -111,33 +120,84 @@ def launch_on_ec2(
 _METRIC_CHOICES = [m.value for m in DistanceMetric]
 
 
-@click.command(name="brute-force",
-               help="Exhaustive nearest-neighbor search for recall eval (single GPU).")
+@click.command(
+    name="brute-force",
+    help="Exhaustive nearest-neighbor search for recall eval (single GPU).",
+)
 @click.argument("corpus_uri")
-@click.option("--queries", default="queries_1000.parquet", show_default=True,
-              help="Queries parquet filename within {corpus}/eval/.")
-@click.option("-k", "k", type=int, default=DEFAULT_K, show_default=True,
-              help="Neighbors to retrieve per query.")
-@click.option("--metric", type=click.Choice(_METRIC_CHOICES, case_sensitive=False),
-              default=DistanceMetric.COSINE.value, show_default=True,
-              help="Distance metric.")
-@click.option("--dense-column", default="dense_embedding", show_default=True,
-              help="Dense embedding column name.")
-@click.option("--output", default=None,
-              help="Output filename (default: brute_force_<queries_stem>_k<K>.parquet).")
+@click.option(
+    "--queries",
+    default="queries_1000.parquet",
+    show_default=True,
+    help="Queries parquet filename within {corpus}/eval/.",
+)
+@click.option(
+    "-k",
+    "k",
+    type=int,
+    default=DEFAULT_K,
+    show_default=True,
+    help="Neighbors to retrieve per query.",
+)
+@click.option(
+    "--metric",
+    type=click.Choice(_METRIC_CHOICES, case_sensitive=False),
+    default=DistanceMetric.COSINE.value,
+    show_default=True,
+    help="Distance metric.",
+)
+@click.option(
+    "--dense-column",
+    default="dense_embedding",
+    show_default=True,
+    help="Dense embedding column name.",
+)
+@click.option(
+    "--output",
+    default=None,
+    help="Output filename (default: brute_force_<queries_stem>_k<K>.parquet).",
+)
 @click.option("--local", is_flag=True, help="Run in-process instead of launching EC2.")
-@click.option("--num-jobs", type=int, default=None,
-              help="Total parallel workers (used by brute-force-dist).")
-@click.option("--job-rank", type=int, default=None,
-              help="This worker's rank (0-indexed; defaults to $SKYPILOT_JOB_RANK).")
-@click.option("--instance-type", default=DEFAULT_INSTANCE_TYPE, show_default=True,
-              help="EC2 instance type.")
+@click.option(
+    "--num-jobs",
+    type=int,
+    default=None,
+    help="Total parallel workers (used by brute-force-dist).",
+)
+@click.option(
+    "--job-rank",
+    type=int,
+    default=None,
+    help="This worker's rank (0-indexed; defaults to $SKYPILOT_JOB_RANK).",
+)
+@click.option(
+    "--instance-type",
+    default=DEFAULT_INSTANCE_TYPE,
+    show_default=True,
+    help="EC2 instance type.",
+)
 @click.option("--on-demand", is_flag=True, help="Use on-demand instead of spot.")
-@click.option("--dry-run", is_flag=True, help="Print plan and write job config, don't launch.")
-def brute_force(corpus_uri, queries, k, metric, dense_column, output, local,
-                num_jobs, job_rank, instance_type, on_demand, dry_run):
+@click.option(
+    "--dry-run", is_flag=True, help="Print plan and write job config, don't launch."
+)
+def brute_force(
+    corpus_uri,
+    queries,
+    k,
+    metric,
+    dense_column,
+    output,
+    local,
+    num_jobs,
+    job_rank,
+    instance_type,
+    on_demand,
+    dry_run,
+):
     """Brute-force nearest-neighbor search for recall evaluation."""
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s"
+    )
     logging.getLogger(__name__).setLevel(logging.INFO)
     logging.getLogger("vectorforge").setLevel(logging.INFO)
 
@@ -176,18 +236,35 @@ def brute_force(corpus_uri, queries, k, metric, dense_column, output, local,
         )
 
 
-@click.command(name="brute-force-merge",
-               help="Merge partial results from a distributed brute-force run.")
+@click.command(
+    name="brute-force-merge",
+    help="Merge partial results from a distributed brute-force run.",
+)
 @click.argument("corpus_uri")
-@click.option("--queries", default="queries_1000.parquet", show_default=True,
-              help="Queries parquet filename within {corpus}/eval/.")
-@click.option("-k", "k", type=int, default=DEFAULT_K, show_default=True,
-              help="Neighbors retrieved per query.")
-@click.option("--output", default=None,
-              help="Output filename (default: brute_force_<queries_stem>_k<K>.parquet).")
+@click.option(
+    "--queries",
+    default="queries_1000.parquet",
+    show_default=True,
+    help="Queries parquet filename within {corpus}/eval/.",
+)
+@click.option(
+    "-k",
+    "k",
+    type=int,
+    default=DEFAULT_K,
+    show_default=True,
+    help="Neighbors retrieved per query.",
+)
+@click.option(
+    "--output",
+    default=None,
+    help="Output filename (default: brute_force_<queries_stem>_k<K>.parquet).",
+)
 def brute_force_merge(corpus_uri, queries, k, output):
     """Merge partial brute-force results from a distributed run."""
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s"
+    )
     logging.getLogger(__name__).setLevel(logging.INFO)
     logging.getLogger("vectorforge").setLevel(logging.INFO)
 

@@ -81,7 +81,7 @@ class HuggingFaceDataReader(DataReader):
             return self.repo_id
         # Derive from the first file_list entry: hf://datasets/ns/name/...
         first = self.file_list[0]
-        rest = first[len("hf://datasets/"):]
+        rest = first[len("hf://datasets/") :]
         ns, _, tail = rest.partition("/")
         name, _, _ = tail.partition("/")
         return f"{ns}/{name}"

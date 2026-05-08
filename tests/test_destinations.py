@@ -91,31 +91,47 @@ def test_parse_file_uri_rejects_non_absolute():
 
 def test_s3_eval_uri():
     dest = S3Destination(bucket="b", prefix="p/q")
-    assert dest.eval_uri("queries_1000.parquet") == "s3://b/p/q/eval/queries_1000.parquet"
+    assert (
+        dest.eval_uri("queries_1000.parquet") == "s3://b/p/q/eval/queries_1000.parquet"
+    )
 
 
 def test_hf_eval_uri_lives_at_repo_root_not_under_data():
     dest = HfDestination(repo_id="ns/name")
     # MUST NOT be under data/, otherwise load_dataset() would treat eval
     # artifacts as dataset rows.
-    assert dest.eval_uri("queries_1000.parquet") == "hf://datasets/ns/name/eval/queries_1000.parquet"
+    assert (
+        dest.eval_uri("queries_1000.parquet")
+        == "hf://datasets/ns/name/eval/queries_1000.parquet"
+    )
 
 
 def test_hf_eval_uri_ignores_subdir():
     # subdir applies to the corpus tree under data/; eval is a sibling.
     dest = HfDestination(repo_id="ns/name", subdir="cc-2025")
-    assert dest.eval_uri("queries.parquet") == "hf://datasets/ns/name/eval/queries.parquet"
+    assert (
+        dest.eval_uri("queries.parquet") == "hf://datasets/ns/name/eval/queries.parquet"
+    )
 
 
 def test_hf_child_uri_goes_under_data():
     dest = HfDestination(repo_id="ns/name")
-    assert dest.child_uri("rank00/batch_0.parquet") == "hf://datasets/ns/name/data/rank00/batch_0.parquet"
+    assert (
+        dest.child_uri("rank00/batch_0.parquet")
+        == "hf://datasets/ns/name/data/rank00/batch_0.parquet"
+    )
 
 
 def test_local_eval_and_child_uri():
     dest = LocalDestination(root="/data/corpus")
-    assert dest.child_uri("rank00/batch_0.parquet") == "file:///data/corpus/rank00/batch_0.parquet"
-    assert dest.eval_uri("queries_1000.parquet") == "file:///data/corpus/eval/queries_1000.parquet"
+    assert (
+        dest.child_uri("rank00/batch_0.parquet")
+        == "file:///data/corpus/rank00/batch_0.parquet"
+    )
+    assert (
+        dest.eval_uri("queries_1000.parquet")
+        == "file:///data/corpus/eval/queries_1000.parquet"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,19 +151,26 @@ def test_bare_key_hf():
     # The HF bare key includes the data/ component, mirroring how S3 keys
     # include their prefix. Both sides (loader macro + brute-force) must
     # produce this exact form for IDs to match.
-    assert bare_key_for_uri("hf://datasets/ns/name/data/file.parquet") == "data/file.parquet"
+    assert (
+        bare_key_for_uri("hf://datasets/ns/name/data/file.parquet")
+        == "data/file.parquet"
+    )
 
 
 def test_bare_key_hf_nested():
-    assert bare_key_for_uri(
-        "hf://datasets/ns/name/data/cc-2025/rank00/batch_0.parquet"
-    ) == "data/cc-2025/rank00/batch_0.parquet"
+    assert (
+        bare_key_for_uri("hf://datasets/ns/name/data/cc-2025/rank00/batch_0.parquet")
+        == "data/cc-2025/rank00/batch_0.parquet"
+    )
 
 
 def test_bare_key_file_is_absolute_path():
     # The container is the filesystem itself; the bare key is the absolute
     # path. Documents that local IDs are machine-specific by design.
-    assert bare_key_for_uri("file:///data/corpus/file.parquet") == "/data/corpus/file.parquet"
+    assert (
+        bare_key_for_uri("file:///data/corpus/file.parquet")
+        == "/data/corpus/file.parquet"
+    )
 
 
 def test_bare_key_unknown_scheme():
@@ -165,8 +188,14 @@ def test_fs_path_s3():
 
 
 def test_fs_path_hf():
-    assert fs_path_for_uri("hf://datasets/ns/name/data/file.parquet") == "datasets/ns/name/data/file.parquet"
+    assert (
+        fs_path_for_uri("hf://datasets/ns/name/data/file.parquet")
+        == "datasets/ns/name/data/file.parquet"
+    )
 
 
 def test_fs_path_file():
-    assert fs_path_for_uri("file:///data/corpus/file.parquet") == "/data/corpus/file.parquet"
+    assert (
+        fs_path_for_uri("file:///data/corpus/file.parquet")
+        == "/data/corpus/file.parquet"
+    )

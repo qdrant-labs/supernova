@@ -48,7 +48,17 @@ async def test_buffer_preserves_order():
 
     await buffer.drain()
     assert len(flushed_batches) == 1
-    assert flushed_batches[0] == ["c0r0", "c0r1", "c0r2", "c1r0", "c1r1", "c1r2", "c2r0", "c2r1", "c2r2"]
+    assert flushed_batches[0] == [
+        "c0r0",
+        "c0r1",
+        "c0r2",
+        "c1r0",
+        "c1r1",
+        "c1r2",
+        "c2r0",
+        "c2r1",
+        "c2r2",
+    ]
 
 
 @pytest.mark.asyncio
