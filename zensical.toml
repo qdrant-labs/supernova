@@ -26,6 +26,7 @@ nav = [
     "reference/skypilot.md",
     "reference/aws-sso.md",
     "reference/loader-architecture.md",
+    "reference/extending.md",
   ]},
 ]
 

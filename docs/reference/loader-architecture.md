@@ -98,7 +98,9 @@ payload_fields:
 
 Default: `{}` (no payload).
 
-**`source_sql`** — the DuckDB FROM clause. Defaults to `'<glob_path>'` but S3DataReader overrides it with `read_parquet([...])` when `file_list` is set. This is how distributed workers read only their assigned files.
+**`source_sql`** — the DuckDB FROM clause. Defaults to `'<glob_path>'` but subclasses override it with `read_parquet([...])` when `file_list` is set. This is how distributed workers read only their assigned files.
+
+**`_root_uri_prefix()`** — the URI prefix the base class strips from DuckDB's `filename` column to recover the bare key passed into `make_point_id`. Each subclass declares this once (`f"s3://{bucket}/"` for S3, `f"hf://datasets/{repo_id}/"` for HF) and the base class registers `vf_point_id` automatically. Both this loader and the brute-force / generate-queries pipelines must agree on the bare-key form, otherwise IDs won't match — see `vectorforge/destinations.py:bare_key_for_uri`.
 
 ### S3DataReader
 
@@ -218,18 +220,10 @@ resources:                    # SkyPilot VM spec
   use_spot: true
 ```
 
-## Adding a new vector store
+## Adding a new component
 
-1. Create `vectorforge/loader/vectorstore/my_store.py`
-2. Subclass `VectorStore` from `base.py`
-3. Implement `ensure_collection`, `upsert_batch`, `close`, `name`
-4. Optionally implement `defer_indexing`, `enable_indexing`, `wait_for_indexing`
-5. Register in `VECTORSTORE_REGISTRY` in `scripts/run_loader.py`
+See [Extending vectorforge](extending.md) for concrete walkthroughs of:
 
-## Adding a new datasource
-
-1. Create `vectorforge/loader/datasource/my_source.py`
-2. Subclass `DataReader` from `base.py`
-3. Implement `glob_path` property
-4. Optionally override `_configure_connection` for auth setup
-5. Register in `DATASOURCE_REGISTRY` in `scripts/run_loader.py`
+- Adding a raw input source (e.g. Common Crawl)
+- Adding a new corpus backend (e.g. GCS — covers `Destination`, `StorageBackend`, and `DataReader` together)
+- Adding a new vector store (e.g. Weaviate)

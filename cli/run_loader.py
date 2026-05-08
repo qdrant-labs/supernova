@@ -84,15 +84,13 @@ def build_vectorstore(cfg: dict, vectors: dict):
 
 def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]:
     """
-    Discover parquet files on S3 and return this job's shard.
+    Discover parquet files at the destination (S3 or HF) and return this
+    job's shard. Returns absolute URIs (s3:// or hf://datasets/...).
     """
-    import boto3
+    from vectorforge.destinations import datasource_to_destination, discover_corpus_parquets
 
-    bucket = ds_cfg["s3_bucket"]
-    prefix = ds_cfg["s3_prefix"].rstrip("/")
-
-    from vectorforge.utils import discover_corpus_parquets
-    files = [f"s3://{bucket}/{k}" for k in discover_corpus_parquets(bucket, prefix)]
+    dest = datasource_to_destination(ds_cfg)
+    files = discover_corpus_parquets(dest)
 
     # round-robin assignment
     shard = [f for i, f in enumerate(files) if i % num_jobs == job_rank]

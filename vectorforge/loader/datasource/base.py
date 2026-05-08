@@ -116,8 +116,25 @@ class DataReader(ABC):
             self._conn.execute(f"SET threads = {self.duckdb_threads};")
         return self._conn
 
+    @abstractmethod
+    def _root_uri_prefix(self) -> str:
+        """
+        URI prefix stripped from DuckDB's ``filename`` column to recover the
+        bare key fed into ``make_point_id``. Both sides that compute IDs
+        (this loader and the brute-force / generate-queries pipeline) must
+        agree on this form.
+
+          S3DataReader → "s3://{bucket}/"
+          HuggingFaceDataReader → "hf://datasets/{repo_id}/"
+        """
+
     def _register_macros(self) -> None:
-        """Register DuckDB macros available in all id_expression / payload SQL."""
+        """
+        Register DuckDB macros available in all id_expression / payload SQL.
+
+        Subclasses can override to add more macros, but should call
+        ``super()._register_macros()`` first so vf_point_id is registered.
+        """
         conn = self._conn
         # UUID formatting: 32-char hex → xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
         conn.execute("""
@@ -126,10 +143,18 @@ class DataReader(ABC):
                 substr(h, 13, 4) || '-' || substr(h, 17, 4) || '-' || substr(h, 21, 12)
             )
         """)
-        # Matches vectorforge.utils.make_point_id exactly: md5(file:row) as UUID
+        # Matches vectorforge.utils.make_point_id exactly: md5(file:row) as UUID.
         conn.execute("""
             CREATE OR REPLACE MACRO make_point_id(source_file, source_row) AS (
                 vf_uuid_from_hex(md5(source_file || ':' || CAST(source_row AS VARCHAR)))
+            )
+        """)
+        # Per-source vf_point_id: strips the backend-specific URI prefix from
+        # filename to get the bare key that brute-force / query gen also use.
+        prefix_len = len(self._root_uri_prefix())
+        conn.execute(f"""
+            CREATE OR REPLACE MACRO vf_point_id(fname, rnum) AS (
+                make_point_id(substr(fname, {prefix_len + 1}), rnum)
             )
         """)
 

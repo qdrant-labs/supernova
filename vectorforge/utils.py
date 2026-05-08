@@ -3,34 +3,26 @@ import uuid
 
 import boto3
 
-# Subdirectory under any corpus prefix that holds eval artifacts (queries,
-# brute-force results, partial results). Excluded from all corpus listings so
-# pipeline tools never accidentally process eval files as corpus data.
-EVAL_SUBDIR = "eval"
+# Re-export for callers that imported EVAL_SUBDIR from here historically.
+# All new code should import from vectorforge.destinations instead.
+from vectorforge.destinations import EVAL_SUBDIR  # noqa: F401
 
 
 def discover_corpus_parquets(bucket: str, prefix: str) -> list[str]:
     """
-    List all corpus parquet files under bucket/prefix, excluding eval/ artifacts.
+    Legacy S3-only shim. Returns bare S3 keys (no scheme, no bucket).
 
-    Excludes any key containing /{EVAL_SUBDIR}/ as a path component, regardless
-    of how deep eval/ sits relative to prefix. This means the exclusion works
-    whether eval/ is at the slice level (prefix/eval/) or at a parent level
-    (embedder/eval/) when globbing across multiple slices.
-
-    Returns bare S3 keys (no s3:// scheme, no bucket). Callers that need full
-    URIs should prepend f"s3://{bucket}/".
+    DEPRECATED: prefer ``vectorforge.destinations.discover_corpus_parquets``
+    which accepts a Destination and returns absolute URIs across schemes.
+    Kept here so the brute-force / generate-queries / push-hf paths that
+    haven't been migrated yet keep working.
     """
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    eval_segment = f"/{EVAL_SUBDIR}/"
-    keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".parquet") and eval_segment not in key:
-                keys.append(key)
-    return sorted(keys)
+    from vectorforge.destinations import S3Destination
+    from vectorforge.destinations import discover_corpus_parquets as _new
+
+    dest = S3Destination(bucket=bucket, prefix=prefix.rstrip("/"))
+    scheme_prefix = f"s3://{bucket}/"
+    return [u[len(scheme_prefix):] for u in _new(dest)]
 
 
 def s3_rel_key(key: str, bucket: str, prefix: str) -> str:

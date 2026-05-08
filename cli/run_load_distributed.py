@@ -66,10 +66,14 @@ def resolve_config(obj: str | dict | list):
     return obj
 
 
-def discover_parquet_files(bucket: str, prefix: str) -> list[str]:
-    """List all corpus .parquet files under an S3 prefix, excluding eval/ artifacts."""
-    from vectorforge.utils import discover_corpus_parquets
-    return [f"s3://{bucket}/{k}" for k in discover_corpus_parquets(bucket, prefix)]
+def discover_parquet_files(ds_cfg: dict) -> list[str]:
+    """
+    List all corpus .parquet files for the loader's datasource block,
+    excluding eval/ artifacts. Returns absolute URIs (s3:// or hf://...).
+    """
+    from vectorforge.destinations import datasource_to_destination, discover_corpus_parquets
+    dest = datasource_to_destination(ds_cfg)
+    return discover_corpus_parquets(dest)
 
 
 async def _setup_collection(store: QdrantVectorStore, dimensions: dict[str, int]):
@@ -140,11 +144,11 @@ def main(argv: list[str] | None = None):
     run_id = run_dir.name
 
     # discover parquet files
-    ds_cfg = config["datasource"]
-    bucket = ds_cfg["s3_bucket"]
-    prefix = ds_cfg["s3_prefix"]
-    logger.info(f"Discovering parquet files at s3://{bucket}/{prefix}/...")
-    files = discover_parquet_files(bucket, prefix)
+    ds_cfg = resolved_config["datasource"]
+    from vectorforge.destinations import datasource_to_destination
+    dest = datasource_to_destination(ds_cfg)
+    logger.info(f"Discovering parquet files at {dest.root_uri}/...")
+    files = discover_parquet_files(ds_cfg)
     logger.info(f"Found {len(files)} parquet files")
 
     if not files:
@@ -154,7 +158,7 @@ def main(argv: list[str] | None = None):
     print("=" * 60)
     print("vectorforge distributed loading plan")
     print("=" * 60)
-    print(f"  S3 prefix:    s3://{bucket}/{prefix}")
+    print(f"  Destination:  {dest.root_uri}")
     print(f"  Total files:  {len(files)}")
     print(f"  Num shards:   {num_shards}")
     print(f"  Files/shard:  ~{len(files) // num_shards}")
@@ -218,7 +222,20 @@ def main(argv: list[str] | None = None):
     # Use the first corpus file to probe vector dimensions. Assumes all files
     # share the same schema (guaranteed by the embedding pipeline) and avoids
     # the glob hitting eval/ parquets that have a different schema entirely.
-    reader = S3DataReader(s3_bucket=bucket, s3_prefix=prefix, vectors=vectors_spec, file_list=[files[0]])
+    from vectorforge.destinations import S3Destination, HfDestination
+    if isinstance(dest, S3Destination):
+        reader = S3DataReader(
+            s3_bucket=dest.bucket, s3_prefix=dest.prefix,
+            vectors=vectors_spec, file_list=[files[0]],
+        )
+    elif isinstance(dest, HfDestination):
+        from vectorforge.loader.datasource.huggingface import HuggingFaceDataReader
+        reader = HuggingFaceDataReader(
+            repo_id=dest.repo_id, subdir=dest.subdir or None,
+            vectors=vectors_spec, file_list=[files[0]],
+        )
+    else:
+        raise ValueError(f"Unsupported destination for dim probe: {type(dest).__name__}")
     dimensions = reader.get_dimensions()
     reader.close()
 

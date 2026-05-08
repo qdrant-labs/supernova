@@ -76,18 +76,11 @@ class S3DataReader(DataReader):
         logger.info("Downloaded %.2f GB: %s", size_gb, os.path.basename(local_path))
         return local_path
 
-    def _register_macros(self) -> None:
-        super()._register_macros()
-        # vf_point_id(filename, row_num) → UUID matching make_point_id(key, row_num)
-        # Strips s3://bucket/ from filename, keeping the full key path so IDs
-        # are stable regardless of what prefix is passed to the loader.
-        bucket_uri = f"s3://{self.s3_bucket}/"
-        uri_len = len(bucket_uri)
-        self._conn.execute(f"""
-            CREATE OR REPLACE MACRO vf_point_id(fname, rnum) AS (
-                make_point_id(substr(fname, {uri_len + 1}), rnum)
-            )
-        """)
+    def _root_uri_prefix(self) -> str:
+        # vf_point_id strips this from filename, so the bare key passed into
+        # make_point_id is the full S3 key (prefix + path), independent of
+        # what s3_prefix was used to scope this loader.
+        return f"s3://{self.s3_bucket}/"
 
     def _iter_sources(self) -> Iterable[str]:
         """Yield one FROM-clause expression per file.
