@@ -5,23 +5,14 @@ Dispatch distributed embedding jobs via SkyPilot pools.
 Creates a pool of GPU workers and submits parallel embedding jobs. Each job
 processes a slice of the dataset using --num-jobs/--job-rank for automatic
 partitioning.
-
-Then wrapper that joins sky pilot pool management with the existing embedding pipeline. The embedding
-pipeline is designed to be run in parallel across multiple workers.
-
-Usage:
-  vectorforge-embed-distributed configs/embedder/finewiki_gte_multi/en.yaml
-  vectorforge-embed-distributed configs/embedder/finewiki_gte_multi/en.yaml --dry-run
-  vectorforge-embed-distributed configs/embedder/finewiki_gte_multi/en.yaml --num-jobs 20
-  vectorforge-embed-distributed configs/embedder/finewiki_gte_multi/en.yaml --pool-name my-pool
 """
 
-import argparse
 import json
 import logging
 import math
 from pathlib import Path
 
+import click
 import yaml
 
 from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_dry_run, print_monitor
@@ -47,7 +38,25 @@ DEFAULT_RESOURCES = {
 }
 
 
-def main(argv: list[str] | None = None):
+@click.command(name="embed-dist", help="Embed distributed via SkyPilot pool.")
+@click.argument("config")
+@click.option("--dry-run", is_flag=True, help="Generate configs and print plan, don't launch.")
+@click.option("--num-jobs", type=int, default=None,
+              help="Number of parallel jobs (default: auto from dataset size).")
+@click.option("--chunk-size", type=int, default=None,
+              help="Rows per job (used to auto-compute num-jobs).")
+@click.option("--pool-name", default=None,
+              help="SkyPilot pool name (default: auto-generated).")
+@click.option("--max-workers", type=int, default=None,
+              help="Max pool workers for autoscaling (default: num-jobs).")
+@click.option("--on-demand", is_flag=True,
+              help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota).")
+@click.option("--ramp", is_flag=True,
+              help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). "
+                   "Default is burst (min_workers=max_workers) since EC2 provisioning is "
+                   "slow and we know the target count up front.")
+def embed_dist(config, dry_run, num_jobs, chunk_size, pool_name, max_workers, on_demand, ramp):
+    """Dispatch distributed embedding via SkyPilot pools."""
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -56,24 +65,13 @@ def main(argv: list[str] | None = None):
     logging.getLogger("vectorforge").setLevel(logging.INFO)
     logging.getLogger(__name__).setLevel(logging.INFO)
 
-    parser = argparse.ArgumentParser(description="Dispatch distributed embedding via SkyPilot pools")
-    parser.add_argument("config", help="Path to embedder YAML config")
-    parser.add_argument("--dry-run", action="store_true", help="Generate configs and print plan, don't launch")
-    parser.add_argument("--num-jobs", type=int, help="Number of parallel jobs (default: auto from dataset size)")
-    parser.add_argument("--chunk-size", type=int, help="Rows per job (used to auto-compute num-jobs)")
-    parser.add_argument("--pool-name", type=str, help="SkyPilot pool name (default: auto-generated)")
-    parser.add_argument("--max-workers", type=int, help="Max pool workers for autoscaling (default: num-jobs)")
-    parser.add_argument("--on-demand", action="store_true", help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota)")
-    parser.add_argument("--ramp", action="store_true", help="Let SkyPilot's autoscaler bring workers up gradually (min_workers=0). Default is burst (min_workers=max_workers) since EC2 provisioning is slow and we know the target count up front.")
-    args = parser.parse_args(argv)
+    with open(config) as f:
+        cfg = yaml.safe_load(f)
 
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
-
-    source_cfg = config["source"]
-    pipeline_cfg = config.get("pipeline", {})
-    resources = config.get("resources", dict(DEFAULT_RESOURCES))
-    if args.on_demand:
+    source_cfg = cfg["source"]
+    pipeline_cfg = cfg.get("pipeline", {})
+    resources = cfg.get("resources", dict(DEFAULT_RESOURCES))
+    if on_demand:
         resources["use_spot"] = False
 
     # get dataset size (source-agnostic)
@@ -81,37 +79,37 @@ def main(argv: list[str] | None = None):
     source = build_source(dict(source_cfg))
     total_rows = source.get_total_rows()
 
-    chunk_size = args.chunk_size or pipeline_cfg.get("chunk_size", 100_000)
-    num_jobs = args.num_jobs or math.ceil(total_rows / chunk_size)
-    max_workers = args.max_workers or num_jobs
+    chunk_size_eff = chunk_size or pipeline_cfg.get("chunk_size", 100_000)
+    num_jobs_eff = num_jobs or math.ceil(total_rows / chunk_size_eff)
+    max_workers_eff = max_workers or num_jobs_eff
 
-    config_name = Path(args.config).stem
-    pool_name = args.pool_name or f"vf-embed-{config_name}"
+    config_name = Path(config).stem
+    pool_name_eff = pool_name or f"vf-embed-{config_name}"
 
     # create run directory
-    run_dir = make_run_dir(pool_name)
+    run_dir = make_run_dir(pool_name_eff)
     run_id = run_dir.name
 
-    print("=" * 60)
-    print("vectorforge distributed embedding plan")
-    print("=" * 60)
-    print(f"  Source:       {source.source_name}")
-    print(f"  Total rows:   {total_rows:,}")
-    print(f"  Num jobs:     {num_jobs}")
-    print(f"  Rows/job:     ~{math.ceil(total_rows / num_jobs):,}")
-    print(f"  Max workers:  {max_workers}")
-    print(f"  Pool name:    {pool_name}")
-    print(f"  Provision:    {'ramp (autoscaler)' if args.ramp else 'burst (all workers at startup)'}")
-    print(f"  Resources:    {resources}")
-    print(f"  Run dir:      {run_dir}")
-    print("=" * 60)
+    click.echo("=" * 60)
+    click.echo("vectorforge distributed embedding plan")
+    click.echo("=" * 60)
+    click.echo(f"  Source:       {source.source_name}")
+    click.echo(f"  Total rows:   {total_rows:,}")
+    click.echo(f"  Num jobs:     {num_jobs_eff}")
+    click.echo(f"  Rows/job:     ~{math.ceil(total_rows / num_jobs_eff):,}")
+    click.echo(f"  Max workers:  {max_workers_eff}")
+    click.echo(f"  Pool name:    {pool_name_eff}")
+    click.echo(f"  Provision:    {'ramp (autoscaler)' if ramp else 'burst (all workers at startup)'}")
+    click.echo(f"  Resources:    {resources}")
+    click.echo(f"  Run dir:      {run_dir}")
+    click.echo("=" * 60)
 
     # generate pool YAML — burst by default (provision all workers at startup);
     # SkyPilot's autoscaler ramp is too slow when we know the target count up front.
     pool_yaml = {
         "pool": {
-            "min_workers": 0 if args.ramp else max_workers,
-            "max_workers": max_workers,
+            "min_workers": 0 if ramp else max_workers_eff,
+            "max_workers": max_workers_eff,
         },
         "resources": resources,
         "file_mounts": {
@@ -129,7 +127,7 @@ def main(argv: list[str] | None = None):
     job_yaml = {
         "name": f"embed-{config_name}",
         "resources": resources,
-        "run": f"cd /app && uv run vf embed {args.config} --num-jobs {num_jobs}",
+        "run": f"cd /app && uv run vf embed {config} --num-jobs {num_jobs_eff}",
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:
@@ -138,30 +136,30 @@ def main(argv: list[str] | None = None):
     # write manifest
     manifest = {
         "run_id": run_id,
-        "config": args.config,
+        "config": config,
         "source": source.source_name,
         "total_rows": total_rows,
-        "num_jobs": num_jobs,
-        "max_workers": max_workers,
-        "pool_name": pool_name,
+        "num_jobs": num_jobs_eff,
+        "max_workers": max_workers_eff,
+        "pool_name": pool_name_eff,
     }
     with open(run_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
 
     logger.info(f"Generated configs in {run_dir}/")
 
-    if args.dry_run:
-        print_dry_run(pool_name, num_jobs, pool_path, job_path)
+    if dry_run:
+        print_dry_run(pool_name_eff, num_jobs_eff, pool_path, job_path)
         return
 
     env_flags = build_env_flags(["HF_TOKEN", "OPENAI_API_KEY"])
-    logger.info(f"Creating pool '{pool_name}'...")
-    logger.info(f"Submitting {num_jobs} jobs to pool '{pool_name}'...")
-    launch_pool_and_jobs(pool_name, pool_path, job_path, num_jobs, env_flags)
+    logger.info(f"Creating pool '{pool_name_eff}'...")
+    logger.info(f"Submitting {num_jobs_eff} jobs to pool '{pool_name_eff}'...")
+    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_jobs_eff, env_flags)
 
-    print(f"\nSubmitted {num_jobs} jobs to pool '{pool_name}'")
-    print_monitor(pool_name)
+    click.echo(f"\nSubmitted {num_jobs_eff} jobs to pool '{pool_name_eff}'")
+    print_monitor(pool_name_eff)
 
 
 if __name__ == "__main__":
-    main()
+    embed_dist()

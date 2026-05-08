@@ -279,9 +279,6 @@ class HuggingFaceParquetSource(DatasetSource):
             else:
                 pf = pq.ParquetFile(f"datasets/{self.dataset_name}/{path}", filesystem=self._fs)
             taken_from_file = 0
-            # intra_offset is decremented as batches are skipped, so save the
-            # original value now to correctly anchor the global row index later.
-            original_intra_offset = intra_offset
 
             for batch in pf.iter_batches(batch_size=10_000):
                 batch_len = len(batch)
@@ -297,17 +294,11 @@ class HuggingFaceParquetSource(DatasetSource):
                 # 1. Zero-copy Arrow slicing before converting to Python list
                 rows = batch.slice(intra_offset, slice_len).to_pylist()
 
-                # Use the pre-skip intra_offset so the global index is anchored
-                # at file_start + original_intra_offset, not the depleted remainder.
-                current_global_index = file_start + original_intra_offset + taken_from_file
-
                 # Reset intra_offset since we've now entered the window
                 intra_offset = 0
 
-                for row in rows:
-                    current_global_index += 1
-                    yield row
-                    
+                yield from rows
+
                 taken_from_file += len(rows)
                 rows_yielded += len(rows)
 

@@ -10,114 +10,108 @@ all workers finish.
 Today this command provisions AWS GPU instances, so it requires an s3://
 corpus URI (we co-locate the workers in the bucket's region). For an hf://
 corpus, run `vf brute-force --local` from a high-bandwidth machine.
-
-Usage:
-  vf brute-force-dist s3://bucket/prefix --queries queries_1000.parquet
-  vf brute-force-dist s3://bucket/prefix --queries queries_1000.parquet --num-jobs 50
-  vf brute-force-dist s3://bucket/prefix --queries queries_1000.parquet --dry-run
 """
 
-import argparse
 import logging
 import math
 from pathlib import Path
 
+import click
 import yaml
 
-from cli.run_brute_force import (
+from cli.run_brute_force import DEFAULT_ACCELERATOR, DEFAULT_INSTANCE_TYPE
+from cli.skypilot_utils import (
     CUDA_IMAGE_IDS,
-    DEFAULT_ACCELERATOR,
-    DEFAULT_INSTANCE_TYPE,
-    DEFAULT_K,
-    DistanceMetric,
-    partial_subkey,
+    build_env_flags,
+    launch_pool_and_jobs,
+    make_run_dir,
+    print_monitor,
 )
-from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_monitor
 from vectorforge.destinations import (
     S3Destination,
     discover_corpus_parquets,
     parse_destination,
 )
+from vectorforge.eval.brute_force import DEFAULT_K, DistanceMetric, partial_subkey
 from vectorforge.utils import get_bucket_region
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_NUM_JOBS = 50
 
+_METRIC_CHOICES = [m.value for m in DistanceMetric]
 
-def main(argv: list[str] | None = None):
+
+@click.command(name="brute-force-dist", help="Distributed brute-force via SkyPilot GPU pool.")
+@click.argument("corpus_uri")
+@click.option("--queries", default="queries_1000.parquet", show_default=True,
+              help="Queries parquet filename within {corpus}/eval/.")
+@click.option("-k", "k", type=int, default=DEFAULT_K, show_default=True,
+              help="Neighbors per query.")
+@click.option("--metric", type=click.Choice(_METRIC_CHOICES, case_sensitive=False),
+              default=DistanceMetric.COSINE.value, show_default=True)
+@click.option("--dense-column", default="dense_embedding", show_default=True)
+@click.option("--num-jobs", type=int, default=DEFAULT_NUM_JOBS, show_default=True,
+              help="Number of GPU workers.")
+@click.option("--output", default=None, help="Final merged output filename.")
+@click.option("--instance-type", default=DEFAULT_INSTANCE_TYPE, show_default=True,
+              help="EC2 instance type per worker.")
+@click.option("--on-demand", is_flag=True, help="Use on-demand instead of spot.")
+@click.option("--pool-name", default=None,
+              help="SkyPilot pool name (default: auto-generated).")
+@click.option("--dry-run", is_flag=True,
+              help="Print plan and write configs, don't launch.")
+def brute_force_dist(corpus_uri, queries, k, metric, dense_column, num_jobs, output,
+                     instance_type, on_demand, pool_name, dry_run):
+    """Distributed brute-force nearest-neighbor search via SkyPilot GPU pool."""
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger(__name__).setLevel(logging.INFO)
 
-    parser = argparse.ArgumentParser(
-        description="Distributed brute-force nearest-neighbor search via SkyPilot GPU pool"
-    )
-    parser.add_argument("corpus_uri", help="s3://bucket/prefix (embedded corpus)")
-    parser.add_argument("--queries", default="queries_1000.parquet",
-                        help="Queries parquet filename within {corpus}/eval/ (default: queries_1000.parquet)")
-    parser.add_argument("-k", type=int, default=DEFAULT_K,
-                        help=f"Neighbors per query (default: {DEFAULT_K})")
-    parser.add_argument("--metric", type=DistanceMetric, default=DistanceMetric.COSINE,
-                        choices=list(DistanceMetric))
-    parser.add_argument("--dense-column", default="dense_embedding")
-    parser.add_argument("--num-jobs", type=int, default=DEFAULT_NUM_JOBS,
-                        help=f"Number of GPU workers (default: {DEFAULT_NUM_JOBS})")
-    parser.add_argument("--output", default=None,
-                        help="Final merged output filename")
-    parser.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE,
-                        help=f"EC2 instance type per worker (default: {DEFAULT_INSTANCE_TYPE})")
-    parser.add_argument("--on-demand", action="store_true",
-                        help="Use on-demand instead of spot")
-    parser.add_argument("--pool-name", default=None,
-                        help="SkyPilot pool name (default: auto-generated)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print plan and write configs, don't launch")
-    args = parser.parse_args(argv)
-
     try:
-        dest = parse_destination(args.corpus_uri)
+        dest = parse_destination(corpus_uri)
     except ValueError as e:
-        parser.error(str(e))
+        raise click.UsageError(str(e))
     if not isinstance(dest, S3Destination):
-        parser.error(
+        raise click.UsageError(
             f"brute-force-dist provisions AWS GPU workers, so it needs an s3:// corpus. "
-            f"For {args.corpus_uri}, run `vf brute-force --local` instead."
+            f"For {corpus_uri}, run `vf brute-force --local` instead."
         )
 
-    queries_stem = Path(args.queries).stem
-    output = args.output or f"brute_force_{queries_stem}_k{args.k}.parquet"
+    metric_enum = DistanceMetric(metric)
+    queries_stem = Path(queries).stem
+    output_eff = output or f"brute_force_{queries_stem}_k{k}.parquet"
 
     region = get_bucket_region(dest.bucket)
     image_id = CUDA_IMAGE_IDS.get(region)
     if image_id is None:
-        print(f"Warning: no CUDA AMI configured for {region!r}. Known: {list(CUDA_IMAGE_IDS)}")
+        click.echo(f"Warning: no CUDA AMI configured for {region!r}. Known: {list(CUDA_IMAGE_IDS)}")
 
     corpus_uris = discover_corpus_parquets(dest)
-    files_per_worker = math.ceil(len(corpus_uris) / args.num_jobs)
+    files_per_worker = math.ceil(len(corpus_uris) / num_jobs)
 
-    pool_name = args.pool_name or f"vf-bf-{queries_stem}"
+    pool_name_eff = pool_name or f"vf-bf-{queries_stem}"
     run_dir = make_run_dir("brute-force-dist")
 
     resources = {
         "cloud": "aws",
         "region": region,
-        "instance_type": args.instance_type,
+        "instance_type": instance_type,
         "accelerators": DEFAULT_ACCELERATOR,
-        "use_spot": not args.on_demand,
+        "use_spot": not on_demand,
     }
     if image_id:
         resources["image_id"] = image_id
 
     worker_flags = (
-        f"--queries {args.queries} -k {args.k} "
-        f"--metric {args.metric.value} --dense-column {args.dense_column} "
-        f"--num-jobs {args.num_jobs} --local"
+        f"--queries {queries} -k {k} "
+        f"--metric {metric_enum.value} --dense-column {dense_column} "
+        f"--num-jobs {num_jobs} --local"
     )
 
     pool_yaml = {
         "pool": {
-            "min_workers": args.num_jobs,
-            "max_workers": args.num_jobs,
+            "min_workers": num_jobs,
+            "max_workers": num_jobs,
         },
         "resources": resources,
         "file_mounts": {"/app": "."},
@@ -126,7 +120,7 @@ def main(argv: list[str] | None = None):
     job_yaml = {
         "name": f"vf-bf-{queries_stem}",
         "resources": resources,
-        "run": f"cd /app && uv run vf brute-force {args.corpus_uri} {worker_flags}",
+        "run": f"cd /app && uv run vf brute-force {corpus_uri} {worker_flags}",
     }
 
     pool_path = run_dir / "pool.yaml"
@@ -136,43 +130,43 @@ def main(argv: list[str] | None = None):
     with open(job_path, "w") as f:
         yaml.dump(job_yaml, f, default_flow_style=False, sort_keys=False)
 
-    partial_uri = dest.eval_uri(partial_subkey(queries_stem, args.k))
+    partial_uri = dest.eval_uri(partial_subkey(queries_stem, k))
     merge_cmd = (
-        f"vf brute-force-merge {args.corpus_uri} --queries {args.queries} "
-        f"-k {args.k} --output {output}"
+        f"vf brute-force-merge {corpus_uri} --queries {queries} "
+        f"-k {k} --output {output_eff}"
     )
 
-    print("=" * 60)
-    print("vectorforge brute-force-dist plan")
-    print("=" * 60)
-    print(f"  Corpus URI:     {args.corpus_uri}")
-    print(f"  Queries:        {args.queries}")
-    print(f"  K:              {args.k}")
-    print(f"  Metric:         {args.metric.value}")
-    print(f"  Workers:        {args.num_jobs}")
-    print(f"  Files/worker:   ~{files_per_worker} (of {len(corpus_uris)} total)")
-    print(f"  Instance:       {args.instance_type}  ({'on-demand' if args.on_demand else 'spot'})")
-    print(f"  Region:         {region}")
-    print(f"  Pool:           {pool_name}")
-    print(f"  Partial output: {partial_uri}/")
-    print(f"  Final output:   {dest.eval_uri(output)}")
-    print(f"  Run dir:        {run_dir}")
-    print("=" * 60)
-    print("\nWhen all workers finish, run:")
-    print(f"  {merge_cmd}")
-    print()
+    click.echo("=" * 60)
+    click.echo("vectorforge brute-force-dist plan")
+    click.echo("=" * 60)
+    click.echo(f"  Corpus URI:     {corpus_uri}")
+    click.echo(f"  Queries:        {queries}")
+    click.echo(f"  K:              {k}")
+    click.echo(f"  Metric:         {metric_enum.value}")
+    click.echo(f"  Workers:        {num_jobs}")
+    click.echo(f"  Files/worker:   ~{files_per_worker} (of {len(corpus_uris)} total)")
+    click.echo(f"  Instance:       {instance_type}  ({'on-demand' if on_demand else 'spot'})")
+    click.echo(f"  Region:         {region}")
+    click.echo(f"  Pool:           {pool_name_eff}")
+    click.echo(f"  Partial output: {partial_uri}/")
+    click.echo(f"  Final output:   {dest.eval_uri(output_eff)}")
+    click.echo(f"  Run dir:        {run_dir}")
+    click.echo("=" * 60)
+    click.echo("\nWhen all workers finish, run:")
+    click.echo(f"  {merge_cmd}")
+    click.echo("")
 
-    if args.dry_run:
-        print(f"[dry run] Pool config: {pool_path}")
-        print(f"[dry run] Job config:  {job_path}")
+    if dry_run:
+        click.echo(f"[dry run] Pool config: {pool_path}")
+        click.echo(f"[dry run] Job config:  {job_path}")
         return
 
-    launch_pool_and_jobs(pool_name, pool_path, job_path, args.num_jobs, build_env_flags())
+    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_jobs, build_env_flags())
 
-    print(f"Submitted {args.num_jobs} workers to pool '{pool_name}'")
-    print_monitor(pool_name)
-    print(f"\nWhen done: {merge_cmd}")
+    click.echo(f"Submitted {num_jobs} workers to pool '{pool_name_eff}'")
+    print_monitor(pool_name_eff)
+    click.echo(f"\nWhen done: {merge_cmd}")
 
 
 if __name__ == "__main__":
-    main()
+    brute_force_dist()

@@ -8,6 +8,7 @@ import pytest
 
 from vectorforge.destinations import (
     HfDestination,
+    LocalDestination,
     S3Destination,
     bare_key_for_uri,
     fs_path_for_uri,
@@ -67,6 +68,22 @@ def test_parse_unknown_scheme():
         parse_destination("bb://bucket/key")
 
 
+def test_parse_file_uri():
+    dest = parse_destination("file:///data/corpus")
+    assert isinstance(dest, LocalDestination)
+    assert dest.root == "/data/corpus"
+    assert dest.root_uri == "file:///data/corpus"
+
+
+def test_parse_file_uri_strips_trailing_slash():
+    assert parse_destination("file:///data/corpus/").root == "/data/corpus"
+
+
+def test_parse_file_uri_rejects_non_absolute():
+    with pytest.raises(ValueError, match="must be absolute"):
+        parse_destination("file://relative/path")
+
+
 # ---------------------------------------------------------------------------
 # eval_uri composition — eval/ at root for HF, under prefix for S3
 # ---------------------------------------------------------------------------
@@ -95,6 +112,12 @@ def test_hf_child_uri_goes_under_data():
     assert dest.child_uri("rank00/batch_0.parquet") == "hf://datasets/ns/name/data/rank00/batch_0.parquet"
 
 
+def test_local_eval_and_child_uri():
+    dest = LocalDestination(root="/data/corpus")
+    assert dest.child_uri("rank00/batch_0.parquet") == "file:///data/corpus/rank00/batch_0.parquet"
+    assert dest.eval_uri("queries_1000.parquet") == "file:///data/corpus/eval/queries_1000.parquet"
+
+
 # ---------------------------------------------------------------------------
 # bare_key_for_uri — consistency between sides that compute make_point_id
 # ---------------------------------------------------------------------------
@@ -121,9 +144,15 @@ def test_bare_key_hf_nested():
     ) == "data/cc-2025/rank00/batch_0.parquet"
 
 
+def test_bare_key_file_is_absolute_path():
+    # The container is the filesystem itself; the bare key is the absolute
+    # path. Documents that local IDs are machine-specific by design.
+    assert bare_key_for_uri("file:///data/corpus/file.parquet") == "/data/corpus/file.parquet"
+
+
 def test_bare_key_unknown_scheme():
     with pytest.raises(ValueError):
-        bare_key_for_uri("file:///local/path.parquet")
+        bare_key_for_uri("gs://bucket/file.parquet")
 
 
 # ---------------------------------------------------------------------------
@@ -137,3 +166,7 @@ def test_fs_path_s3():
 
 def test_fs_path_hf():
     assert fs_path_for_uri("hf://datasets/ns/name/data/file.parquet") == "datasets/ns/name/data/file.parquet"
+
+
+def test_fs_path_file():
+    assert fs_path_for_uri("file:///data/corpus/file.parquet") == "/data/corpus/file.parquet"

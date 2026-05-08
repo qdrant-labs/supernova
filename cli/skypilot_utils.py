@@ -56,7 +56,9 @@ def launch_pool_and_jobs(
     num_jobs: int,
     env_flags: list[str],
 ) -> None:
-    """Create a SkyPilot pool and submit num_jobs parallel jobs to it."""
+    """
+    Create a SkyPilot pool and submit num_jobs parallel jobs to it.
+    """
     subprocess.run(
         ["sky", "jobs", "pool", "apply", "-p", pool_name, str(pool_path), *env_flags],
         check=True,

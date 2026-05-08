@@ -80,12 +80,16 @@ async def run_loader(
     workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
 
     try:
-        for chunk in reader.read_batches(prefetch_size):
-            for batch in _slice_batch(chunk, batch_size):
-                await queue.put(batch)  # backpressure: blocks when queue is full
-        # tell workers to drain and exit
-        for _ in range(concurrency):
-            await queue.put(None)
+        try:
+            for chunk in reader.read_batches(prefetch_size):
+                for batch in _slice_batch(chunk, batch_size):
+                    await queue.put(batch)  # backpressure: blocks when queue is full
+        finally:
+            # always send sentinels so workers exit even if the producer raised;
+            # without this, asyncio.gather would block on hung workers and the
+            # exception would be masked by an unrelated cancellation later.
+            for _ in range(concurrency):
+                await queue.put(None)
         await asyncio.gather(*workers)
     finally:
         pbar.close()

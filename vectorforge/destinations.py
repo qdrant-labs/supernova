@@ -10,6 +10,7 @@ URI schemes
 Today:
   s3://bucket/prefix/...
   hf://datasets/namespace/repo[/subdir/...]
+  file:///abs/path/...
 
 To add another (gs://, az://, bb://) wire it through ``parse_destination``,
 ``discover_corpus_parquets``, ``filesystem_for_uri``, and ``fs_path_for_uri``.
@@ -66,6 +67,26 @@ class S3Destination:
 
 
 @dataclass(frozen=True)
+class LocalDestination:
+    root: str  # absolute filesystem path; trimmed of trailing slash
+
+    @property
+    def scheme(self) -> str:
+        return "file"
+
+    @property
+    def root_uri(self) -> str:
+        return f"file://{self.root}".rstrip("/")
+
+    def child_uri(self, sub: str) -> str:
+        sub = sub.lstrip("/")
+        return f"file://{self.root}/{sub}"
+
+    def eval_uri(self, filename: str) -> str:
+        return self.child_uri(f"{EVAL_SUBDIR}/{filename}")
+
+
+@dataclass(frozen=True)
 class HfDestination:
     repo_id: str  # "namespace/dataset-name"
     subdir: str = ""  # path within the data/ root (empty = the whole data/ tree)
@@ -93,17 +114,18 @@ class HfDestination:
         return f"hf://datasets/{self.repo_id}/{EVAL_SUBDIR}/{filename}"
 
 
-Destination = Union[S3Destination, HfDestination]
+Destination = Union[S3Destination, HfDestination, LocalDestination]
 
 def parse_destination(uri: str) -> Destination:
     """
-    Parse an s3:// or hf://datasets/ URI into a Destination.
+    Parse an s3://, hf://datasets/, or file:// URI into a Destination.
 
     Accepts:
       s3://bucket
       s3://bucket/prefix/...
       hf://datasets/namespace/name
       hf://datasets/namespace/name/subdir/...
+      file:///abs/path[/...]
 
     For hf:// any segments past ``namespace/name`` are treated as a *data/*
     sub-tree (i.e. they reference paths under data/, not the repo root).
@@ -127,8 +149,19 @@ def parse_destination(uri: str) -> Destination:
         subdir = parts[2].rstrip("/") if len(parts) == 3 else ""
         return HfDestination(repo_id=repo_id, subdir=subdir)
 
+    if uri.startswith("file://"):
+        # Standard form is file:///abs/path (3 slashes = scheme + empty host +
+        # absolute path). After stripping "file://" the remainder must start
+        # with "/", giving the absolute filesystem path.
+        rest = uri[len("file://"):]
+        if not rest.startswith("/"):
+            raise ValueError(
+                f"file:// URI must be absolute (file:///abs/path), got {uri!r}"
+            )
+        return LocalDestination(root=rest.rstrip("/"))
+
     raise ValueError(
-        f"Unknown URI scheme in {uri!r}. Supported: s3://, hf://datasets/"
+        f"Unknown URI scheme in {uri!r}. Supported: s3://, hf://datasets/, file://"
     )
 
 
@@ -141,6 +174,8 @@ def discover_corpus_parquets(dest: Destination) -> list[str]:
         return _discover_s3(dest)
     if isinstance(dest, HfDestination):
         return _discover_hf(dest)
+    if isinstance(dest, LocalDestination):
+        return _discover_local(dest)
     raise ValueError(f"Unknown destination type: {type(dest).__name__}")
 
 
@@ -156,6 +191,22 @@ def _discover_s3(dest: S3Destination) -> list[str]:
             key = obj["Key"]
             if key.endswith(".parquet") and eval_segment not in key:
                 uris.append(f"s3://{dest.bucket}/{key}")
+    return sorted(uris)
+
+
+def _discover_local(dest: LocalDestination) -> list[str]:
+    import os
+
+    eval_segment = f"{os.sep}{EVAL_SUBDIR}{os.sep}"
+    uris: list[str] = []
+    for dirpath, _dirs, files in os.walk(dest.root):
+        for name in files:
+            if not name.endswith(".parquet"):
+                continue
+            full = os.path.join(dirpath, name)
+            if eval_segment in full:
+                continue
+            uris.append(f"file://{full}")
     return sorted(uris)
 
 
@@ -188,6 +239,7 @@ def filesystem_for_uri(uri: str):
     For S3, this is ``pyarrow.fs.S3FileSystem``. For HF, this is
     ``huggingface_hub.HfFileSystem`` (fsspec-based; pyarrow accepts
     fsspec filesystems via duck-typing in ParquetFile / read_table).
+    For file://, this is ``pyarrow.fs.LocalFileSystem``.
     """
     if uri.startswith("s3://"):
         import pyarrow.fs as pafs
@@ -195,6 +247,9 @@ def filesystem_for_uri(uri: str):
     if uri.startswith("hf://"):
         from huggingface_hub import HfFileSystem
         return HfFileSystem()
+    if uri.startswith("file://"):
+        import pyarrow.fs as pafs
+        return pafs.LocalFileSystem()
     raise ValueError(f"Unknown URI scheme in {uri!r}")
 
 
@@ -204,11 +259,14 @@ def fs_path_for_uri(uri: str) -> str:
 
     pyarrow.fs.S3FileSystem expects:    bucket/key/...
     huggingface_hub.HfFileSystem expects: datasets/repo/path
+    pyarrow.fs.LocalFileSystem expects: /abs/path
     """
     if uri.startswith("s3://"):
         return uri[len("s3://"):]
     if uri.startswith("hf://"):
         return uri[len("hf://"):]
+    if uri.startswith("file://"):
+        return uri[len("file://"):]
     raise ValueError(f"Unknown URI scheme in {uri!r}")
 
 
@@ -223,6 +281,12 @@ def bare_key_for_uri(uri: str) -> str:
 
       s3://bucket/prefix/file.parquet      -> prefix/file.parquet
       hf://datasets/ns/name/data/file.pq   -> data/file.pq
+      file:///abs/path/file.parquet        -> /abs/path/file.parquet
+
+    For file:// the "container" is the filesystem itself, so the bare key is
+    the absolute path. IDs are therefore machine-specific — the same corpus
+    moved to a different mount point will hash to different IDs. This matches
+    the S3/HF behavior (changing bucket/repo also changes IDs).
 
     --- ID space anchoring (intentional design) ---
     The anchor is the top-level container: the S3 bucket, or the HF dataset
@@ -255,6 +319,8 @@ def bare_key_for_uri(uri: str) -> str:
         # Skip namespace/name; keep everything after.
         parts = rest.split("/", 2)
         return parts[2] if len(parts) == 3 else ""
+    if uri.startswith("file://"):
+        return uri[len("file://"):]
     raise ValueError(f"Unknown URI scheme in {uri!r}")
 
 
@@ -296,6 +362,16 @@ def list_parquets_under(prefix_uri: str) -> list[str]:
             uris.append(f"hf://datasets/{repo_id}/{path}")
         return sorted(uris)
 
+    if prefix_uri.startswith("file://"):
+        import os
+        root = prefix_uri[len("file://"):]
+        uris: list[str] = []
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if name.endswith(".parquet"):
+                    uris.append(f"file://{os.path.join(dirpath, name)}")
+        return sorted(uris)
+
     raise ValueError(f"Unknown URI scheme in {prefix_uri!r}")
 
 
@@ -327,6 +403,14 @@ def upload_file_to_uri(local_path: str, dest_uri: str) -> None:
         )
         return
 
+    if dest_uri.startswith("file://"):
+        import os
+        import shutil
+        target = dest_uri[len("file://"):]
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copyfile(local_path, target)
+        return
+
     raise ValueError(f"Unknown URI scheme in {dest_uri!r}")
 
 
@@ -355,6 +439,14 @@ def upload_bytes_to_uri(data: bytes, dest_uri: str) -> None:
         )
         return
 
+    if dest_uri.startswith("file://"):
+        import os
+        target = dest_uri[len("file://"):]
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(data)
+        return
+
     raise ValueError(f"Unknown URI scheme in {dest_uri!r}")
 
 
@@ -377,7 +469,12 @@ def datasource_to_destination(ds_cfg: dict) -> Destination:
             repo_id=ds_cfg["repo_id"],
             subdir=ds_cfg.get("subdir") or "",
         )
+    if ds_type == "local":
+        root = ds_cfg.get("root") or ds_cfg.get("path")
+        if not root:
+            raise ValueError("datasource type='local' requires 'root' (or 'path')")
+        return LocalDestination(root=root.rstrip("/"))
     raise ValueError(
         f"Unknown datasource.type for discovery: {ds_type!r}. "
-        f"Supported: 's3', 'huggingface'."
+        f"Supported: 's3', 'huggingface', 'local'."
     )

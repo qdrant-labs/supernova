@@ -8,19 +8,14 @@ GPU time on the actual embedding model. Output parquets have every column
 the real embed run produces, minus the float vectors -- so the same
 `scripts/verify_no_duplicates.py` runs against the partition output to
 confirm clean partitioning before committing to a real run.
-
-Usage:
-  vf partition configs/embedder/ccnews_2016.yaml
-  vf partition configs/embedder/ccnews_2016.yaml --num-jobs 10 --job-rank 3
-  vf partition configs/embedder/ccnews_2016.yaml --list-files       # dry-run
 """
 
-import argparse
 import asyncio
 import logging
 import math
 import os
 
+import click
 import yaml
 
 from cli.run_embedder import build_source, build_storage
@@ -64,32 +59,32 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
 
     if source_type != "huggingface_parquet":
         # streaming HF source has no file-listing concept
-        print(f"--list-files only supports source.type=huggingface_parquet (got {source_type!r}).")
-        print("For streaming HF sources, partition assignment is offset-based -- run a partition")
-        print("with --num-jobs and inspect the S3 output instead.")
+        click.echo(f"--list-files only supports source.type=huggingface_parquet (got {source_type!r}).")
+        click.echo("For streaming HF sources, partition assignment is offset-based -- run a partition")
+        click.echo("with --num-jobs and inspect the S3 output instead.")
         return
 
     source = build_source(source_cfg)
     files = source.list_files()
     total_rows = sum(n for _, n in files)
 
-    print(f"Dataset:    {source.dataset_name}")
-    print(f"Filter:     path_filter={source_cfg.get('path_filter')!r}, split={source_cfg.get('split')!r}")
-    print(f"Files:      {len(files)} parquet files, {total_rows:,} total rows")
-    print()
+    click.echo(f"Dataset:    {source.dataset_name}")
+    click.echo(f"Filter:     path_filter={source_cfg.get('path_filter')!r}, split={source_cfg.get('split')!r}")
+    click.echo(f"Files:      {len(files)} parquet files, {total_rows:,} total rows")
+    click.echo("")
     sample = files[:10]
     for path, n in sample:
-        print(f"  {n:>12,}  {path}")
+        click.echo(f"  {n:>12,}  {path}")
     if len(files) > len(sample):
-        print(f"  ... and {len(files) - len(sample)} more")
-    print()
+        click.echo(f"  ... and {len(files) - len(sample)} more")
+    click.echo("")
 
     if num_jobs is None:
-        print("Pass --num-jobs N to also see per-rank assignment.")
+        click.echo("Pass --num-jobs N to also see per-rank assignment.")
         return
 
     rows_per_job = math.ceil(total_rows / num_jobs)
-    print(f"With --num-jobs {num_jobs}: ~{rows_per_job:,} rows/rank")
+    click.echo(f"With --num-jobs {num_jobs}: ~{rows_per_job:,} rows/rank")
 
     # cumulative file boundaries: (path, file_start, file_end) over the global row index
     cumulative = 0
@@ -102,7 +97,7 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
         offset = rank * rows_per_job
         limit = min(rows_per_job, total_rows - offset)
         if limit <= 0:
-            print(f"  rank {rank:>3}: (empty)")
+            click.echo(f"  rank {rank:>3}: (empty)")
             continue
         end = offset + limit
         # files this rank touches
@@ -114,10 +109,24 @@ def _print_list_files_plan(config: dict, num_jobs: int | None) -> None:
         sample_touched = ", ".join(touched[:3])
         if len(touched) > 3:
             sample_touched += f" (+{len(touched) - 3} more)"
-        print(f"  rank {rank:>3}: rows {offset:>10,}-{end - 1:>10,}  ({limit:>10,} rows)  files: {sample_touched}")
+        click.echo(f"  rank {rank:>3}: rows {offset:>10,}-{end - 1:>10,}  ({limit:>10,} rows)  files: {sample_touched}")
 
 
-def main(argv: list[str] | None = None):
+@click.command(name="partition",
+               help="Run pipeline with no-op embedder (validate sharding without GPU).")
+@click.argument("config", required=False)
+@click.option("--offset", type=int, default=None,
+              help="Skip this many rows (for explicit slicing).")
+@click.option("--limit", type=int, default=None,
+              help="Process at most this many rows.")
+@click.option("--num-jobs", type=int, default=None,
+              help="Total parallel jobs (auto-computes offset/limit per rank).")
+@click.option("--job-rank", type=int, default=None,
+              help="This job's rank (0-indexed; defaults to $SKYPILOT_JOB_RANK).")
+@click.option("--list-files", "list_files_flag", is_flag=True,
+              help="Dry-run: list matched files + per-rank plan and exit. No S3 writes.")
+def partition(config, offset, limit, num_jobs, job_rank, list_files_flag):
+    """Run the embed pipeline with the no-op embedder for partition validation."""
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -125,78 +134,65 @@ def main(argv: list[str] | None = None):
     )
     logging.getLogger("vectorforge").setLevel(logging.INFO)
 
-    parser = argparse.ArgumentParser(
-        description="Run the embed pipeline with a no-op embedder for partition validation",
-    )
-    parser.add_argument("config", nargs="?", help="Path to YAML config file (same schema as `vf embed`)")
-    parser.add_argument("--offset", type=int, default=None, help="Skip this many rows (for explicit slicing)")
-    parser.add_argument("--limit", type=int, default=None, help="Process at most this many rows")
-    parser.add_argument("--num-jobs", type=int, default=None, help="Total parallel jobs (auto-computes offset/limit per rank)")
-    parser.add_argument("--job-rank", type=int, default=None, help="This job's rank (0-indexed; defaults to $SKYPILOT_JOB_RANK)")
-    parser.add_argument("--list-files", action="store_true",
-                        help="Dry-run: list matched files + per-rank plan and exit. No S3 writes.")
-    args = parser.parse_args(argv)
-
-    config_path = args.config or os.environ.get("VF_CONFIG_PATH")
+    config_path = config or os.environ.get("VF_CONFIG_PATH")
     if not config_path:
-        parser.error("Provide a config path as argument or set VF_CONFIG_PATH env var")
+        raise click.UsageError("Provide a config path as argument or set VF_CONFIG_PATH env var")
 
     with open(config_path) as f:
-        config = yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
 
-    if args.list_files:
-        _print_list_files_plan(config, args.num_jobs)
+    if list_files_flag:
+        _print_list_files_plan(cfg, num_jobs)
         return
 
-    # rank-based slicing (mirrors run_embedder.main)
+    # rank-based slicing (mirrors run_embedder.embed)
     filename_prefix = ""
-    if args.num_jobs is not None:
-        job_rank = args.job_rank
+    if num_jobs is not None:
         if job_rank is None:
             job_rank = int(os.environ.get("SKYPILOT_JOB_RANK", 0))
             logging.getLogger("vectorforge").info(
                 f"Auto-detected job rank {job_rank} from SKYPILOT_JOB_RANK env var"
             )
 
-        source_for_count = build_source(dict(config["source"]))
+        source_for_count = build_source(dict(cfg["source"]))
         dataset_total = source_for_count.get_total_rows()
 
-        window_offset = config["source"].get("offset") or 0
-        window_limit = config["source"].get("limit")
+        window_offset = cfg["source"].get("offset") or 0
+        window_limit = cfg["source"].get("limit")
         window_size = (
             min(window_limit, dataset_total - window_offset) if window_limit
             else dataset_total - window_offset
         )
 
-        rows_per_job = math.ceil(window_size / args.num_jobs)
-        offset = window_offset + job_rank * rows_per_job
-        limit = min(rows_per_job, window_size - job_rank * rows_per_job)
+        rows_per_job = math.ceil(window_size / num_jobs)
+        slice_offset = window_offset + job_rank * rows_per_job
+        slice_limit = min(rows_per_job, window_size - job_rank * rows_per_job)
 
         logging.getLogger("vectorforge").info(
             "Job %d/%d: offset=%d limit=%d (window=[%d,%d), dataset_total=%d)",
-            job_rank, args.num_jobs, offset, limit, window_offset, window_offset + window_size, dataset_total,
+            job_rank, num_jobs, slice_offset, slice_limit, window_offset, window_offset + window_size, dataset_total,
         )
-        config["source"]["offset"] = offset
-        config["source"]["limit"] = limit
+        cfg["source"]["offset"] = slice_offset
+        cfg["source"]["limit"] = slice_limit
 
-        rank_width = max(2, len(str(args.num_jobs - 1)))
-        shard_by_rank = bool(config.get("pipeline", {}).get("shard_by_rank"))
+        rank_width = max(2, len(str(num_jobs - 1)))
+        shard_by_rank = bool(cfg.get("pipeline", {}).get("shard_by_rank"))
         separator = "/" if shard_by_rank else "_"
         filename_prefix = f"rank{job_rank:0{rank_width}d}{separator}"
-    elif args.offset is not None or args.limit is not None:
-        if args.offset is not None:
-            config["source"]["offset"] = args.offset
-        if args.limit is not None:
-            config["source"]["limit"] = args.limit
+    elif offset is not None or limit is not None:
+        if offset is not None:
+            cfg["source"]["offset"] = offset
+        if limit is not None:
+            cfg["source"]["limit"] = limit
 
-    source = build_source(dict(config["source"]))
-    engine = build_noop_engine(config)
-    storage = build_storage(dict(config["storage"]))
+    source = build_source(dict(cfg["source"]))
+    engine = build_noop_engine(cfg)
+    storage = build_storage(dict(cfg["storage"]))
 
-    pipeline_cfg = config.get("pipeline", {})
-    storage_cfg = config.get("storage", {})
+    pipeline_cfg = cfg.get("pipeline", {})
+    storage_cfg = cfg.get("storage", {})
 
-    expected_total_rows = config["source"].get("limit")
+    expected_total_rows = cfg["source"].get("limit")
 
     asyncio.run(
         run(
@@ -221,4 +217,4 @@ def main(argv: list[str] | None = None):
 
 
 if __name__ == "__main__":
-    main()
+    partition()

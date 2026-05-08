@@ -1,9 +1,9 @@
-import argparse
 import asyncio
 import logging
 import os
 import re
 
+import click
 import yaml
 
 from vectorforge.loader.datasource.s3 import S3DataReader
@@ -100,7 +100,18 @@ def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]
     return shard
 
 
-def main(argv: list[str] | None = None):
+@click.command(name="load", help="Load pre-embedded data into a vector store.")
+@click.argument("config", required=False)
+@click.option("--dry-run", "-d", is_flag=True,
+              help="Parse config and print info without loading.")
+@click.option("--no-manage-indexing", "no_manage_indexing", is_flag=True,
+              help="Skip collection creation and indexing lifecycle (for distributed workers).")
+@click.option("--num-jobs", type=int, default=None,
+              help="Total number of parallel jobs (auto-shards files by rank).")
+@click.option("--job-rank", type=int, default=None,
+              help="This job's rank (0-indexed, used with --num-jobs).")
+def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
+    """Load pre-embedded data into a vector store."""
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -108,52 +119,40 @@ def main(argv: list[str] | None = None):
     )
     logging.getLogger("vectorforge").setLevel(logging.INFO)
 
-    parser = argparse.ArgumentParser(description="Load pre-embedded data into a vector store")
-    parser.add_argument("config", nargs="?", help="Path to YAML config file")
-    parser.add_argument("--dry-run", "-d", action="store_true", help="Parse config and print info without loading")
-    parser.add_argument("--no-manage-indexing", action="store_true", default=False,
-                        help="Skip collection creation and indexing lifecycle (for distributed workers)")
-    parser.add_argument("--num-jobs", type=int, default=None,
-                        help="Total number of parallel jobs (auto-shards files by rank)")
-    parser.add_argument("--job-rank", type=int, default=None,
-                        help="This job's rank (0-indexed, used with --num-jobs)")
-    args = parser.parse_args(argv)
-
-    config_path = args.config or os.environ.get("LOADER_CONFIG_PATH")
+    config_path = config or os.environ.get("LOADER_CONFIG_PATH")
     if not config_path:
-        parser.error("Provide a config path as argument or set LOADER_CONFIG_PATH env var")
+        raise click.UsageError("Provide a config path as argument or set LOADER_CONFIG_PATH env var")
 
     with open(config_path) as f:
-        config = yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
 
     # Resolve environment variables throughout the config
-    config = resolve_config(config)
+    cfg = resolve_config(cfg)
 
     # Rank-based file sharding for distributed loading
-    if args.num_jobs is not None:
-        job_rank = args.job_rank
+    if num_jobs is not None:
         if job_rank is None:
             job_rank = int(os.environ.get("SKYPILOT_JOB_RANK", 0))
 
-        shard_files = _discover_and_shard(config["datasource"], args.num_jobs, job_rank)
+        shard_files = _discover_and_shard(cfg["datasource"], num_jobs, job_rank)
         if not shard_files:
             logging.getLogger("vectorforge").info("No files assigned to this shard, exiting.")
             return
-        config["datasource"]["file_list"] = shard_files
+        cfg["datasource"]["file_list"] = shard_files
 
-    vectors = config.get("vectors")
+    vectors = cfg.get("vectors")
     if not vectors:
-        parser.error("config is missing required top-level 'vectors:' block")
+        raise click.UsageError("config is missing required top-level 'vectors:' block")
 
-    reader = build_reader(config["datasource"], vectors)
-    store = build_vectorstore(dict(config["vectorstore"]), vectors)
+    reader = build_reader(dict(cfg["datasource"]), vectors)
+    store = build_vectorstore(dict(cfg["vectorstore"]), vectors)
 
-    loader_cfg = config.get("loader", {})
+    loader_cfg = cfg.get("loader", {})
 
-    if args.dry_run:
-        print("Config parsed successfully. Reader and VectorStore instances created.")
-        print(f"Reader: {reader}")
-        print(f"VectorStore: {store}")
+    if dry_run:
+        click.echo("Config parsed successfully. Reader and VectorStore instances created.")
+        click.echo(f"Reader: {reader}")
+        click.echo(f"VectorStore: {store}")
         return
 
     asyncio.run(
@@ -163,10 +162,10 @@ def main(argv: list[str] | None = None):
             batch_size=loader_cfg.get("batch_size", 1000),
             prefetch_size=loader_cfg.get("prefetch_size"),
             concurrency=loader_cfg.get("concurrency", 8),
-            manage_indexing=not args.no_manage_indexing,
+            manage_indexing=not no_manage_indexing,
         )
     )
 
 
 if __name__ == "__main__":
-    main()
+    load()

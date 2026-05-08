@@ -55,6 +55,8 @@ class DataReader(ABC):
         self.id_expression = id_expression
         self.vectors = vectors or {
             "dense": {"type": "dense", "column": "dense_embedding"},
+            "sparse": {"type": "sparse", "column": "sparse_embedding"},
+            "multivector": {"type": "multivector", "column": "multivector_embedding"}
         }
         self.payload_fields = payload_fields or {}
         self.duckdb_memory_limit = duckdb_memory_limit
@@ -74,12 +76,20 @@ class DataReader(ABC):
     @property
     @abstractmethod
     def glob_path(self) -> str:
-        """DuckDB-readable glob path to the parquet files."""
+        """
+        DuckDB-readable glob path to the parquet files.
+        Examples:
+          - S3: "s3://bucket/prefix/**/*.parquet"
+          - HuggingFace: "hf://datasets/repo/data/subdir/**/*.parquet"
+          - Local: "/path/to/files/**/*.parquet"
+        """
 
     @property
     def _parquet_kwargs(self) -> str:
-        """Comma-prefixed kwargs to pass to ``read_parquet`` based on which
-        virtual columns the id_expression references. Returns "" when none."""
+        """
+        Comma-prefixed kwargs to pass to ``read_parquet`` based on which
+        virtual columns the id_expression references. Returns "" when none.
+        """
         parts = []
         if self._uses_filename:
             parts.append("filename=true")

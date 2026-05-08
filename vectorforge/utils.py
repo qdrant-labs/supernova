@@ -3,27 +3,6 @@ import uuid
 
 import boto3
 
-# Re-export for callers that imported EVAL_SUBDIR from here historically.
-# All new code should import from vectorforge.destinations instead.
-from vectorforge.destinations import EVAL_SUBDIR  # noqa: F401
-
-
-def discover_corpus_parquets(bucket: str, prefix: str) -> list[str]:
-    """
-    Legacy S3-only shim. Returns bare S3 keys (no scheme, no bucket).
-
-    DEPRECATED: prefer ``vectorforge.destinations.discover_corpus_parquets``
-    which accepts a Destination and returns absolute URIs across schemes.
-    Kept here so the brute-force / generate-queries / push-hf paths that
-    haven't been migrated yet keep working.
-    """
-    from vectorforge.destinations import S3Destination
-    from vectorforge.destinations import discover_corpus_parquets as _new
-
-    dest = S3Destination(bucket=bucket, prefix=prefix.rstrip("/"))
-    scheme_prefix = f"s3://{bucket}/"
-    return [u[len(scheme_prefix):] for u in _new(dest)]
-
 
 def s3_rel_key(key: str, bucket: str, prefix: str) -> str:
     """

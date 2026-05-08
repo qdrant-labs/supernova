@@ -72,11 +72,16 @@ async def run(
 
     # chunker: feeds work queue, then sends sentinels to shut down workers
     async def run_chunker():
-        for chunk_id, records in source.get_chunks(engine, chunk_size, max_text_length):
-            await work_queue.put((chunk_id, records))
-        logger.info("Chunker finished, sending stop signals to %d workers", num_workers)
-        for _ in range(num_workers):
-            await work_queue.put(None)
+        try:
+            for chunk_id, records in source.get_chunks(engine, chunk_size, max_text_length):
+                await work_queue.put((chunk_id, records))
+        finally:
+            # always send sentinels so workers exit even if the source raised;
+            # otherwise drain_results hangs waiting on `finished_workers` and
+            # the original exception gets masked.
+            logger.info("Chunker finished, sending stop signals to %d workers", num_workers)
+            for _ in range(num_workers):
+                await work_queue.put(None)
 
     # drain: pulls from result queue into buffer until all workers are done
     expected_chunks = None

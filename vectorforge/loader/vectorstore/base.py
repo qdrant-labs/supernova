@@ -14,15 +14,6 @@ class VectorStore(ABC):
         vectors. Sparse vectors are absent.
         """
 
-    async def configure_index(self, params: dict) -> None:
-        """Optionally configure the index after collection creation.
-
-        Override this to apply backend-specific index tuning (e.g. HNSW params,
-        quantization, on-disk settings) from the config's `params` block.
-        Called by the runner after ensure_collection().
-        """
-        pass # no op by default
-
     async def defer_indexing(self) -> None:
         """Disable indexing for fast bulk loading. Called before upserts begin."""
         pass  # no-op by default

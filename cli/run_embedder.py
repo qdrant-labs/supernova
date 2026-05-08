@@ -1,8 +1,9 @@
-import argparse
 import asyncio
 import logging
 import math
 import os
+
+import click
 import yaml
 
 from vectorforge.sources.huggingface import HuggingFaceSource
@@ -161,7 +162,18 @@ def build_storage(cfg: dict):
         raise ValueError(f"Unknown storage type: {storage_type}")
 
 
-def main(argv: list[str] | None = None):
+@click.command(name="embed", help="Embed a dataset locally.")
+@click.argument("config", required=False)
+@click.option("--offset", type=int, default=None,
+              help="Skip this many rows (for distributed slicing).")
+@click.option("--limit", type=int, default=None,
+              help="Process at most this many rows (for distributed slicing).")
+@click.option("--num-jobs", type=int, default=None,
+              help="Total number of parallel jobs (auto-computes offset/limit from dataset size).")
+@click.option("--job-rank", type=int, default=None,
+              help="This job's rank (0-indexed, used with --num-jobs).")
+def embed(config, offset, limit, num_jobs, job_rank):
+    """Run a vectorforge embedding pipeline."""
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -169,25 +181,16 @@ def main(argv: list[str] | None = None):
     )
     logging.getLogger("vectorforge").setLevel(logging.INFO)
 
-    parser = argparse.ArgumentParser(description="Run a vectorforge embedding pipeline")
-    parser.add_argument("config", nargs="?", help="Path to YAML config file")
-    parser.add_argument("--offset", type=int, default=None, help="Skip this many rows (for distributed slicing)")
-    parser.add_argument("--limit", type=int, default=None, help="Process at most this many rows (for distributed slicing)")
-    parser.add_argument("--num-jobs", type=int, default=None, help="Total number of parallel jobs (auto-computes offset/limit from dataset size)")
-    parser.add_argument("--job-rank", type=int, default=None, help="This job's rank (0-indexed, used with --num-jobs)")
-    args = parser.parse_args(argv)
-
-    config_path = args.config or os.environ.get("VF_CONFIG_PATH")
+    config_path = config or os.environ.get("VF_CONFIG_PATH")
     if not config_path:
-        parser.error("Provide a config path as argument or set VF_CONFIG_PATH env var")
+        raise click.UsageError("Provide a config path as argument or set VF_CONFIG_PATH env var")
 
     with open(config_path) as f:
-        config = yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
 
     # support both explicit offset/limit and rank-based slicing
     filename_prefix = ""
-    if args.num_jobs is not None:
-        job_rank = args.job_rank
+    if num_jobs is not None:
         if job_rank is None:
             # SkyPilot pools set these env vars automatically
             job_rank = int(os.environ.get("SKYPILOT_JOB_RANK", 0))
@@ -196,48 +199,47 @@ def main(argv: list[str] | None = None):
             )
 
         # build source to query total rows (source-agnostic)
-        source_for_count = build_source(dict(config["source"]))
+        source_for_count = build_source(dict(cfg["source"]))
         dataset_total = source_for_count.get_total_rows()
 
         # honor any YAML-level window: source.offset / source.limit bound the
         # slice space that --num-jobs divides. no window => slice the full dataset.
-        window_offset = config["source"].get("offset") or 0
-        window_limit = config["source"].get("limit")
+        window_offset = cfg["source"].get("offset") or 0
+        window_limit = cfg["source"].get("limit")
         window_size = min(window_limit, dataset_total - window_offset) if window_limit else dataset_total - window_offset
 
         # using the window size and num_jobs, compute offset and limit for this job
-        rows_per_job = math.ceil(window_size / args.num_jobs)
-        offset = window_offset + job_rank * rows_per_job
-        limit = min(rows_per_job, window_size - job_rank * rows_per_job)
+        rows_per_job = math.ceil(window_size / num_jobs)
+        slice_offset = window_offset + job_rank * rows_per_job
+        slice_limit = min(rows_per_job, window_size - job_rank * rows_per_job)
 
         logging.getLogger("vectorforge").info(
             "Job %d/%d: offset=%d limit=%d (window=[%d,%d), dataset_total=%d)",
-            job_rank, args.num_jobs, offset, limit, window_offset, window_offset + window_size, dataset_total,
+            job_rank, num_jobs, slice_offset, slice_limit, window_offset, window_offset + window_size, dataset_total,
         )
-        config["source"]["offset"] = offset
-        config["source"]["limit"] = limit
+        cfg["source"]["offset"] = slice_offset
+        cfg["source"]["limit"] = slice_limit
 
-        rank_width = max(2, len(str(args.num_jobs - 1)))
-        shard_by_rank = bool(config.get("pipeline", {}).get("shard_by_rank"))
+        rank_width = max(2, len(str(num_jobs - 1)))
+        shard_by_rank = bool(cfg.get("pipeline", {}).get("shard_by_rank"))
         # shard_by_rank=true  -> "rank00/batch_*.parquet" (50 subdirs, ~N files each)
         # shard_by_rank=false -> "rank00_batch_*.parquet" (flat, all in one dir)
         separator = "/" if shard_by_rank else "_"
         filename_prefix = f"rank{job_rank:0{rank_width}d}{separator}"
 
-    elif args.offset is not None or args.limit is not None:
+    elif offset is not None or limit is not None:
         # just use what was provided, no auto-computation
-        # in theory lets us do manual slicing
-        if args.offset is not None:
-            config["source"]["offset"] = args.offset
-        if args.limit is not None:
-            config["source"]["limit"] = args.limit
+        if offset is not None:
+            cfg["source"]["offset"] = offset
+        if limit is not None:
+            cfg["source"]["limit"] = limit
 
-    source = build_source(dict(config["source"]))
-    engine = build_engine(config)
-    storage = build_storage(dict(config["storage"]))
+    source = build_source(dict(cfg["source"]))
+    engine = build_engine(cfg)
+    storage = build_storage(dict(cfg["storage"]))
 
-    pipeline_cfg = config.get("pipeline", {})
-    storage_cfg = config.get("storage", {})
+    pipeline_cfg = cfg.get("pipeline", {})
+    storage_cfg = cfg.get("storage", {})
 
     dense_column = pipeline_cfg.get("dense_embedding_column", "dense_embedding") if engine.has_dense else None
     sparse_column = pipeline_cfg.get("sparse_embedding_column", "sparse_embedding") if engine.has_sparse else None
@@ -245,13 +247,13 @@ def main(argv: list[str] | None = None):
 
     # if pooling is configured (nested under multivector_embedder), its pooled_column_name
     # overrides the default dense column
-    pooling_cfg = (config.get("multivector_embedder") or {}).get("pooling") or {}
+    pooling_cfg = (cfg.get("multivector_embedder") or {}).get("pooling") or {}
     if pooling_cfg and pooling_cfg.get("pooled_column_name"):
         dense_column = pooling_cfg["pooled_column_name"]
 
     # expected_total_rows drives the progress bar's "X/Y chunks + pct" display.
     # prefer the per-job limit (set by --num-jobs slicing); fall back to source-level limit.
-    expected_total_rows = config["source"].get("limit")
+    expected_total_rows = cfg["source"].get("limit")
 
     asyncio.run(
         run(
@@ -275,4 +277,4 @@ def main(argv: list[str] | None = None):
 
 
 if __name__ == "__main__":
-    main()
+    embed()

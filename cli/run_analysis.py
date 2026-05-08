@@ -3,13 +3,8 @@ Analyze the output of a (distributed) embedding run.
 
 Reads per-rank manifests and scans parquet files at the storage destination,
 reporting schema, row count, per-rank throughput, and wall-clock stats.
-
-Usage:
-  vf analysis configs/embedder/google_extended_amazon.yaml
-  vf analysis --path s3://qdrant--vectorforge/google--extended-amazon/embed-gte-multilingual-base
 """
 
-import argparse
 import json
 import logging
 import statistics
@@ -19,17 +14,18 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 import boto3
+import click
 import duckdb
 import yaml
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_destination(args) -> str:
-    if args.path:
-        return args.path.rstrip("/")
+def _resolve_destination(config: str | None, path: str | None) -> str:
+    if path:
+        return path.rstrip("/")
 
-    with open(args.config) as f:
+    with open(config) as f:
         cfg = yaml.safe_load(f)
 
     storage = cfg.get("storage", {})
@@ -126,7 +122,16 @@ def _configure_duckdb_for_s3(con: duckdb.DuckDBPyConnection):
         logger.warning("Could not load AWS credentials via duckdb aws ext: %s", e)
 
 
-def main(argv: list[str] | None = None):
+@click.command(name="analysis", help="Analyze a (distributed) embedding run.")
+@click.argument("config", required=False)
+@click.option("--path", default=None,
+              help="Override: direct s3://bucket/prefix or local dir to analyze.")
+@click.option("--cost-per-hour", type=float, default=0.38, show_default=True,
+              help="Per-worker hourly cost in USD (default: g5.xlarge A10G spot).")
+@click.option("--check-duplicates", is_flag=True,
+              help="Check source_row_id uniqueness and report any duplicate or missing rows.")
+def analysis(config, path, cost_per_hour, check_duplicates):
+    """Analyze a vectorforge embedding run."""
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -134,32 +139,16 @@ def main(argv: list[str] | None = None):
     )
     logging.getLogger("vectorforge").setLevel(logging.INFO)
 
-    parser = argparse.ArgumentParser(description="Analyze a vectorforge embedding run")
-    parser.add_argument("config", nargs="?", help="Path to embedder YAML config (derives destination from storage section)")
-    parser.add_argument("--path", help="Override: direct s3://bucket/prefix or local dir to analyze")
-    parser.add_argument(
-        "--cost-per-hour",
-        type=float,
-        default=0.38,
-        help="Per-worker hourly cost in USD (default: 0.38 = g5.xlarge A10G spot)",
-    )
-    parser.add_argument(
-        "--check-duplicates",
-        action="store_true",
-        help="Check source_row_id uniqueness and report any duplicate or missing rows",
-    )
-    args = parser.parse_args(argv)
+    if not config and not path:
+        raise click.UsageError("Provide a config path or --path")
 
-    if not args.config and not args.path:
-        parser.error("Provide a config path or --path")
-
-    destination = _resolve_destination(args)
-    print(f"Analyzing: {destination}\n")
+    destination = _resolve_destination(config, path)
+    click.echo(f"Analyzing: {destination}\n")
 
     parquet_keys, manifest_keys = _list_keys(destination)
-    print(f"Found {len(parquet_keys)} parquet files, {len(manifest_keys)} manifests")
+    click.echo(f"Found {len(parquet_keys)} parquet files, {len(manifest_keys)} manifests")
     if not parquet_keys:
-        print("No parquet files found. Nothing to analyze.")
+        click.echo("No parquet files found. Nothing to analyze.")
         sys.exit(1)
 
     # schema + row count
@@ -170,24 +159,24 @@ def main(argv: list[str] | None = None):
     # top of the prefix) and sharded layouts (rank00/batch_*.parquet).
     globs = f"'{destination}/**/*.parquet'"
 
-    print("\n=== Schema ===")
+    click.echo("\n=== Schema ===")
     schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet({globs})").fetchall()
     for col in schema:
         name, dtype = col[0], col[1]
-        print(f"  {name:30s} {dtype}")
+        click.echo(f"  {name:30s} {dtype}")
 
     row_count = con.execute(f"SELECT COUNT(*) FROM read_parquet({globs})").fetchone()[0]
-    print(f"\nTotal rows: {row_count:,}")
-    print(f"Parquet files: {len(parquet_keys)}")
+    click.echo(f"\nTotal rows: {row_count:,}")
+    click.echo(f"Parquet files: {len(parquet_keys)}")
 
     manifests = _read_manifests(destination, manifest_keys) if manifest_keys else []
     manifests.sort(key=lambda m: m.get("_key", ""))
 
     if not manifests:
-        print("\nNo manifests found, skipping throughput analysis.")
+        click.echo("\nNo manifests found, skipping throughput analysis.")
         return
 
-    print("\n=== Per-rank manifests ===")
+    click.echo("\n=== Per-rank manifests ===")
 
     rps_values = []
     elapsed_values = []
@@ -195,13 +184,13 @@ def main(argv: list[str] | None = None):
     starts = []
     ends = []
 
-    print(f"  {'rank':>6}  {'records':>12}  {'elapsed_s':>10}  {'rec/s':>10}")
+    click.echo(f"  {'rank':>6}  {'records':>12}  {'elapsed_s':>10}  {'rec/s':>10}")
     for m in manifests:
         key = m["_key"].rsplit("/", 1)[-1]
         records = m.get("total_records", 0)
         elapsed = m.get("elapsed_seconds", 0.0)
         rps = m.get("records_per_second", 0.0)
-        print(f"  {key[:6]:>6}  {records:>12,}  {elapsed:>10.1f}  {rps:>10.1f}")
+        click.echo(f"  {key[:6]:>6}  {records:>12,}  {elapsed:>10.1f}  {rps:>10.1f}")
 
         rps_values.append(rps)
         elapsed_values.append(elapsed)
@@ -217,37 +206,38 @@ def main(argv: list[str] | None = None):
                 pass
 
     # aggregate stats
-    print("\n=== Aggregate ===")
-    print(f"  jobs:            {len(manifests)}")
-    print(f"  total records:   {sum(records_values):,}")
+    click.echo("\n=== Aggregate ===")
+    click.echo(f"  jobs:            {len(manifests)}")
+    click.echo(f"  total records:   {sum(records_values):,}")
     if rps_values:
-        print(f"  rows/s  min:    {min(rps_values):.1f}")
-        print(f"  rows/s  max:    {max(rps_values):.1f}")
-        print(f"  rows/s  mean:   {statistics.mean(rps_values):.1f}")
-        print(f"  rows/s  median: {statistics.median(rps_values):.1f}")
+        click.echo(f"  rows/s  min:    {min(rps_values):.1f}")
+        click.echo(f"  rows/s  max:    {max(rps_values):.1f}")
+        click.echo(f"  rows/s  mean:   {statistics.mean(rps_values):.1f}")
+        click.echo(f"  rows/s  median: {statistics.median(rps_values):.1f}")
     if elapsed_values:
-        print(f"  elapsed min:    {min(elapsed_values):.1f}s")
-        print(f"  elapsed max:    {max(elapsed_values):.1f}s")
-        print(f"  elapsed mean:   {statistics.mean(elapsed_values):.1f}s")
+        click.echo(f"  elapsed min:    {min(elapsed_values):.1f}s")
+        click.echo(f"  elapsed max:    {max(elapsed_values):.1f}s")
+        click.echo(f"  elapsed mean:   {statistics.mean(elapsed_values):.1f}s")
     if starts and ends:
         wall = max(e.timestamp() for e in ends) - min(starts)
-        print(f"  wall clock:     {wall:.1f}s ({wall/60:.1f} min)")
-        print(f"  sum cpu time:   {sum(elapsed_values):.1f}s (parallel speedup: {sum(elapsed_values)/wall:.1f}x)")
+        click.echo(f"  wall clock:     {wall:.1f}s ({wall/60:.1f} min)")
+        click.echo(f"  sum cpu time:   {sum(elapsed_values):.1f}s (parallel speedup: {sum(elapsed_values)/wall:.1f}x)")
 
     if elapsed_values:
         total_worker_hours = sum(elapsed_values) / 3600.0
-        est_cost = total_worker_hours * args.cost_per_hour
-        print(f"\n=== Cost estimate (at ${args.cost_per_hour:.2f}/hr per worker) ===")
-        print(f"  worker-hours:   {total_worker_hours:.2f}")
-        print(f"  estimated cost: ${est_cost:.2f}")
-        print(f"  cost per 1M rec: ${(est_cost / sum(records_values) * 1_000_000):.2f}" if sum(records_values) else "")
-        print("  note: sums per-job elapsed time; doesn't include idle worker time between jobs")
+        est_cost = total_worker_hours * cost_per_hour
+        click.echo(f"\n=== Cost estimate (at ${cost_per_hour:.2f}/hr per worker) ===")
+        click.echo(f"  worker-hours:   {total_worker_hours:.2f}")
+        click.echo(f"  estimated cost: ${est_cost:.2f}")
+        if sum(records_values):
+            click.echo(f"  cost per 1M rec: ${(est_cost / sum(records_values) * 1_000_000):.2f}")
+        click.echo("  note: sums per-job elapsed time; doesn't include idle worker time between jobs")
 
-    print("\n=== rows/s distribution ===")
-    print(_ascii_histogram(rps_values, bins=10))
+    click.echo("\n=== rows/s distribution ===")
+    click.echo(_ascii_histogram(rps_values, bins=10))
 
-    if args.check_duplicates:
-        print("\n=== Duplicate / coverage check (source_row_id) ===")
+    if check_duplicates:
+        click.echo("\n=== Duplicate / coverage check (source_row_id) ===")
         stats = con.execute(f"""
             SELECT
                 COUNT(*)                          AS total_rows,
@@ -258,15 +248,15 @@ def main(argv: list[str] | None = None):
             FROM read_parquet({globs})
         """).fetchone()
         total, unique, dupes, min_id, max_id = stats
-        print(f"  total rows:         {total:,}")
-        print(f"  unique source_row_id: {unique:,}")
-        print(f"  duplicates:         {dupes:,}  {'✓ none' if dupes == 0 else '✗ FOUND'}")
-        print(f"  source_row_id range: [{min_id:,}, {max_id:,}]  (span: {max_id - min_id + 1:,})")
+        click.echo(f"  total rows:         {total:,}")
+        click.echo(f"  unique source_row_id: {unique:,}")
+        click.echo(f"  duplicates:         {dupes:,}  {'✓ none' if dupes == 0 else '✗ FOUND'}")
+        click.echo(f"  source_row_id range: [{min_id:,}, {max_id:,}]  (span: {max_id - min_id + 1:,})")
         coverage_gap = (max_id - min_id + 1) - unique
-        print(f"  gaps in range:      {coverage_gap:,}  {'✓ none' if coverage_gap == 0 else '(missing rows)'}")
+        click.echo(f"  gaps in range:      {coverage_gap:,}  {'✓ none' if coverage_gap == 0 else '(missing rows)'}")
 
         if dupes > 0:
-            print("\n  First 10 duplicated source_row_ids:")
+            click.echo("\n  First 10 duplicated source_row_ids:")
             rows = con.execute(f"""
                 SELECT source_row_id, COUNT(*) AS cnt
                 FROM read_parquet({globs})
@@ -276,8 +266,8 @@ def main(argv: list[str] | None = None):
                 LIMIT 10
             """).fetchall()
             for src_id, cnt in rows:
-                print(f"    source_row_id={src_id:,}  appears {cnt}x")
+                click.echo(f"    source_row_id={src_id:,}  appears {cnt}x")
 
 
 if __name__ == "__main__":
-    main()
+    analysis()

@@ -55,7 +55,9 @@ class S3DataReader(DataReader):
         return f"'{self.glob_path}'"
 
     def _download_file(self, s3_uri: str) -> str:
-        """Download an S3 file to local disk and return the local path."""
+        """
+        Download an S3 file to local disk and return the local path.
+        """
         import boto3
 
         os.makedirs(self.prefetch_dir, exist_ok=True)
@@ -83,7 +85,8 @@ class S3DataReader(DataReader):
         return f"s3://{self.s3_bucket}/"
 
     def _iter_sources(self) -> Iterable[str]:
-        """Yield one FROM-clause expression per file.
+        """
+        Yield one FROM-clause expression per file.
 
         With prefetch=True: downloads each S3 file to local disk before
         yielding the local path expression. _after_source() deletes it once
