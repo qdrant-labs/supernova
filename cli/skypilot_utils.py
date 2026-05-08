@@ -87,6 +87,16 @@ def launch_single_job(job_path: Path, env_flags: list[str]) -> None:
     )
 
 
+def launch_single_job_to_pool(
+    pool_name: str, job_path: Path, env_flags: list[str]
+) -> None:
+    """Submit a single SkyPilot job to an existing pool (does not create a pool)."""
+    subprocess.run(
+        ["sky", "jobs", "launch", "-p", pool_name, "-y", str(job_path), *env_flags],
+        check=True,
+    )
+
+
 def print_dry_run(
     pool_name: str, num_jobs: int, pool_path: Path, job_path: Path
 ) -> None:

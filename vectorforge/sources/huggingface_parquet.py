@@ -157,26 +157,34 @@ class HuggingFaceParquetSource(DatasetSource):
 
         def fetch(path: str) -> tuple[str, int | None]:
             url = f"datasets/{self.dataset_name}/{path}"
+            last_err: Exception | None = None
             for attempt in range(6):
                 try:
                     pf = pq.ParquetFile(url, filesystem=self._fs)
                     return path, pf.metadata.num_rows
                 except Exception as e:
-                    if "429" in str(e) or "Too Many Requests" in str(e):
+                    last_err = e
+                    is_rate_limit = "429" in str(e) or "Too Many Requests" in str(e)
+                    if is_rate_limit:
+                        # HF rate-limit windows are minutes-long, so back off harder.
                         wait = min(5 * 2**attempt, 120)
-                        logger.warning(
-                            "Rate limited reading footer for %s (attempt %d/%d), retrying in %ds",
-                            path,
-                            attempt + 1,
-                            6,
-                            wait,
-                        )
-                        time.sleep(wait)
+                        reason = "rate limited"
                     else:
-                        logger.warning("Failed to read row count for %s: %s", path, e)
-                        return path, None
+                        # Generic flake (5xx, connection reset, DNS hiccup, etc.).
+                        # These are usually one-shot — a couple of seconds is enough.
+                        wait = min(2 * 2**attempt, 30)
+                        reason = f"transient error ({type(e).__name__})"
+                    logger.warning(
+                        "%s reading footer for %s (attempt %d/6), retrying in %ds: %s",
+                        reason,
+                        path,
+                        attempt + 1,
+                        wait,
+                        e,
+                    )
+                    time.sleep(wait)
             logger.warning(
-                "Giving up on footer read for %s after 6 rate-limit retries", path
+                "Giving up on footer read for %s after 6 retries: %s", path, last_err
             )
             return path, None
 
@@ -220,9 +228,18 @@ class HuggingFaceParquetSource(DatasetSource):
         return sum(n for _, n in self._files_with_counts)
 
     def _prefetch_files(self) -> None:
-        """Download only the parquet files overlapping this rank's window to local disk."""
+        """Download only the parquet files overlapping this rank's window to local disk.
+
+        Uses ``huggingface_hub.hf_hub_download`` rather than ``HfFileSystem.get``
+        because the former honours ``HF_HUB_ENABLE_HF_TRANSFER=1`` and falls
+        through to the Rust hf_transfer client for multi-part parallel
+        downloads — typically 5-10x faster on EC2 than fsspec's single-stream
+        HTTP. With the env unset it uses standard requests at the same speed
+        as before.
+        """
         import os
         from pathlib import Path
+        from huggingface_hub import hf_hub_download
 
         self._ensure_counts()
         offset = self._offset
@@ -239,16 +256,28 @@ class HuggingFaceParquetSource(DatasetSource):
         Path(self._prefetch_dir).mkdir(parents=True, exist_ok=True)
 
         for path in to_download:
-            safe_name = path.replace("/", "__")
-            local_path = os.path.join(self._prefetch_dir, safe_name)
-            if os.path.exists(local_path):
+            # hf_hub_download with local_dir writes to `{local_dir}/{path}` —
+            # preserves the repo path structure, so e.g.
+            # "data/train-00046.parquet" lands at
+            # "{prefetch_dir}/data/train-00046.parquet".
+            expected_local = os.path.join(self._prefetch_dir, path)
+            if os.path.exists(expected_local):
                 logger.info("Already cached: %s", path)
+                local_path = expected_local
             else:
-                remote = f"datasets/{self.dataset_name}/{path}"
-                logger.info("Downloading %s -> %s", remote, local_path)
-                self._fs.get(remote, local_path)
                 logger.info(
-                    "Downloaded %s (%.1f GB)", path, os.path.getsize(local_path) / 1e9
+                    "Downloading datasets/%s/%s -> %s",
+                    self.dataset_name, path, expected_local,
+                )
+                local_path = hf_hub_download(
+                    repo_id=self.dataset_name,
+                    filename=path,
+                    repo_type="dataset",
+                    local_dir=self._prefetch_dir,
+                )
+                logger.info(
+                    "Downloaded %s (%.1f GB)",
+                    path, os.path.getsize(local_path) / 1e9,
                 )
             self._local_paths[path] = local_path
 

@@ -151,9 +151,13 @@ def partition_dist(
     with open(pool_path, "w") as f:
         yaml.dump(pool_yaml, f, default_flow_style=False, sort_keys=False)
 
+    # HF_HUB_ENABLE_HF_TRANSFER activates the Rust hf_transfer client for
+    # multi-part parallel downloads when prefetch=true on a huggingface_parquet
+    # source. The hf_transfer wheel is pulled in via the `partition` extra.
     job_yaml = {
         "name": f"partition-{config_name}",
         "resources": resources,
+        "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
         "run": f"cd /app && uv run vf partition {config} --num-jobs {num_jobs_eff}",
     }
     job_path = run_dir / "job.yaml"
