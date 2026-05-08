@@ -22,6 +22,7 @@ sparse_embedder:
 storage:
   type: hf
   repo_id: nleroy917/finewiki-all-mini-en
+  private: false
   output_dir: /tmp/vectorforge
 
 resources:
@@ -37,8 +38,6 @@ resources:
   any_of:
     - region: us-east-1
     - region: us-west-2
-
-
 
 pipeline:
   chunk_size: 1000
