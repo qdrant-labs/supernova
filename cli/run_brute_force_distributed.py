@@ -4,7 +4,12 @@ Distributed brute-force nearest-neighbor search via a SkyPilot GPU pool.
 
 Splits the corpus across N GPU workers. Each worker prefetches its assigned
 files to local NVMe, runs GPU similarity search, and saves a partial top-K
-result to S3. Run `vf brute-force-merge` when all workers finish.
+result under {corpus_uri}/eval/_bf_partial_*. Run `vf brute-force-merge` when
+all workers finish.
+
+Today this command provisions AWS GPU instances, so it requires an s3://
+corpus URI (we co-locate the workers in the bucket's region). For an hf://
+corpus, run `vf brute-force --local` from a high-bandwidth machine.
 
 Usage:
   vf brute-force-dist s3://bucket/prefix --queries queries_1000.parquet
@@ -25,10 +30,14 @@ from cli.run_brute_force import (
     DEFAULT_INSTANCE_TYPE,
     DEFAULT_K,
     DistanceMetric,
-    list_corpus_parquets,
-    partial_prefix,
+    partial_subkey,
 )
 from cli.skypilot_utils import build_env_flags, make_run_dir, launch_pool_and_jobs, print_monitor
+from vectorforge.destinations import (
+    S3Destination,
+    discover_corpus_parquets,
+    parse_destination,
+)
 from vectorforge.utils import get_bucket_region
 
 logger = logging.getLogger(__name__)
@@ -43,9 +52,9 @@ def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Distributed brute-force nearest-neighbor search via SkyPilot GPU pool"
     )
-    parser.add_argument("s3_uri", help="s3://bucket/prefix (embedded corpus)")
+    parser.add_argument("corpus_uri", help="s3://bucket/prefix (embedded corpus)")
     parser.add_argument("--queries", default="queries_1000.parquet",
-                        help="Queries parquet filename within the prefix (default: queries_1000.parquet)")
+                        help="Queries parquet filename within {corpus}/eval/ (default: queries_1000.parquet)")
     parser.add_argument("-k", type=int, default=DEFAULT_K,
                         help=f"Neighbors per query (default: {DEFAULT_K})")
     parser.add_argument("--metric", type=DistanceMetric, default=DistanceMetric.COSINE,
@@ -65,22 +74,26 @@ def main(argv: list[str] | None = None):
                         help="Print plan and write configs, don't launch")
     args = parser.parse_args(argv)
 
-    if not args.s3_uri.startswith("s3://"):
-        parser.error("s3_uri must start with s3://")
-    without_scheme = args.s3_uri[5:]
-    bucket, _, prefix = without_scheme.partition("/")
-    prefix = prefix.rstrip("/")
+    try:
+        dest = parse_destination(args.corpus_uri)
+    except ValueError as e:
+        parser.error(str(e))
+    if not isinstance(dest, S3Destination):
+        parser.error(
+            f"brute-force-dist provisions AWS GPU workers, so it needs an s3:// corpus. "
+            f"For {args.corpus_uri}, run `vf brute-force --local` instead."
+        )
 
     queries_stem = Path(args.queries).stem
     output = args.output or f"brute_force_{queries_stem}_k{args.k}.parquet"
 
-    region = get_bucket_region(bucket)
+    region = get_bucket_region(dest.bucket)
     image_id = CUDA_IMAGE_IDS.get(region)
     if image_id is None:
         print(f"Warning: no CUDA AMI configured for {region!r}. Known: {list(CUDA_IMAGE_IDS)}")
 
-    corpus_keys = list_corpus_parquets(bucket, prefix)
-    files_per_worker = math.ceil(len(corpus_keys) / args.num_jobs)
+    corpus_uris = discover_corpus_parquets(dest)
+    files_per_worker = math.ceil(len(corpus_uris) / args.num_jobs)
 
     pool_name = args.pool_name or f"vf-bf-{queries_stem}"
     run_dir = make_run_dir("brute-force-dist")
@@ -113,7 +126,7 @@ def main(argv: list[str] | None = None):
     job_yaml = {
         "name": f"vf-bf-{queries_stem}",
         "resources": resources,
-        "run": f"cd /app && uv run vf brute-force {args.s3_uri} {worker_flags}",
+        "run": f"cd /app && uv run vf brute-force {args.corpus_uri} {worker_flags}",
     }
 
     pool_path = run_dir / "pool.yaml"
@@ -123,26 +136,26 @@ def main(argv: list[str] | None = None):
     with open(job_path, "w") as f:
         yaml.dump(job_yaml, f, default_flow_style=False, sort_keys=False)
 
-    pprefix = partial_prefix(prefix, queries_stem, args.k)
+    partial_uri = dest.eval_uri(partial_subkey(queries_stem, args.k))
     merge_cmd = (
-        f"vf brute-force {args.s3_uri} --queries {args.queries} "
-        f"-k {args.k} --output {output} --merge"
+        f"vf brute-force-merge {args.corpus_uri} --queries {args.queries} "
+        f"-k {args.k} --output {output}"
     )
 
     print("=" * 60)
     print("vectorforge brute-force-dist plan")
     print("=" * 60)
-    print(f"  S3 prefix:      {args.s3_uri}")
+    print(f"  Corpus URI:     {args.corpus_uri}")
     print(f"  Queries:        {args.queries}")
     print(f"  K:              {args.k}")
     print(f"  Metric:         {args.metric.value}")
     print(f"  Workers:        {args.num_jobs}")
-    print(f"  Files/worker:   ~{files_per_worker} (of {len(corpus_keys)} total)")
+    print(f"  Files/worker:   ~{files_per_worker} (of {len(corpus_uris)} total)")
     print(f"  Instance:       {args.instance_type}  ({'on-demand' if args.on_demand else 'spot'})")
     print(f"  Region:         {region}")
     print(f"  Pool:           {pool_name}")
-    print(f"  Partial output: s3://{bucket}/{pprefix}/")
-    print(f"  Final output:   s3://{bucket}/{prefix}/{output}")
+    print(f"  Partial output: {partial_uri}/")
+    print(f"  Final output:   {dest.eval_uri(output)}")
     print(f"  Run dir:        {run_dir}")
     print("=" * 60)
     print("\nWhen all workers finish, run:")

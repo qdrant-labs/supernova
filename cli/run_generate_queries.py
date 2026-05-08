@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Sample N rows from embedded S3 parquets as eval query vectors.
+Sample N rows from an embedded corpus as eval query vectors.
 
-Default mode launches a single high-bandwidth EC2 instance in the bucket's
-region via SkyPilot. The job runs the full pipeline in-region: build index
-from parquet footers, fetch the actual row data, push queries.parquet to S3.
+Default mode launches a single high-bandwidth EC2 instance in the corpus's
+region via SkyPilot (S3 only — HF doesn't have an obvious in-region story).
+The job runs the full pipeline: build index from parquet footers, fetch the
+actual row data, push queries.parquet to the corpus's eval/ subfolder.
 
 Use --local to run the full pipeline in-process (also what the EC2 job calls).
 
-Output: s3://bucket/prefix/eval/queries_<n>.parquet
+Output: {corpus_uri}/eval/queries_<n>.parquet
   All original parquet columns (dense_embedding, sparse_embedding, text, …)
-  plus __source_file__ and __source_row__ for provenance.
+  plus __source_file__ (bare key) and __source_row__ for provenance.
 
 Usage:
   vf generate-queries s3://bucket/prefix -n 1000
+  vf generate-queries hf://datasets/ns/repo -n 1000 --local
   vf generate-queries s3://bucket/prefix -n 1000 --on-demand
   vf generate-queries s3://bucket/prefix -n 1000 --dry-run
-  vf generate-queries s3://bucket/prefix -n 1000 --local             # run here
 """
 
 import argparse
@@ -30,13 +31,20 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pyarrow.fs as pafs
 import yaml
 
 from cli.skypilot_utils import build_env_flags, make_run_dir, launch_single_job
+from vectorforge.destinations import (
+    S3Destination,
+    bare_key_for_uri,
+    discover_corpus_parquets,
+    filesystem_for_uri,
+    fs_path_for_uri,
+    parse_destination,
+    upload_bytes_to_uri,
+)
 from vectorforge.utils import get_bucket_region
 
 logger = logging.getLogger(__name__)
@@ -45,22 +53,18 @@ logger = logging.getLogger(__name__)
 # minutes locally finish in seconds in-region.
 DEFAULT_INSTANCE_TYPE = "r5n.2xlarge"  # 8 vCPU, 64GB RAM, 25Gbps
 
-def list_s3_parquets(bucket: str, prefix: str) -> list[str]:
-    from vectorforge.utils import discover_corpus_parquets
-    return discover_corpus_parquets(bucket, prefix)
 
-
-def build_manifest(bucket: str, keys: list[str]) -> tuple[list[dict], int]:
+def build_manifest(uris: list[str]) -> tuple[list[dict], int]:
     """Read parquet footers only — range requests, no data download."""
-    fs = pafs.S3FileSystem()
     manifest = []
     global_offset = 0
-    for i, key in enumerate(keys):
-        logger.info("[%d/%d] metadata: %s", i + 1, len(keys), key)
-        with fs.open_input_file(f"{bucket}/{key}") as f:
-            meta = pq.read_metadata(f)
+    for i, uri in enumerate(uris):
+        logger.info("[%d/%d] metadata: %s", i + 1, len(uris), uri)
+        fs = filesystem_for_uri(uri)
+        fs_path = fs_path_for_uri(uri)
+        meta = pq.read_metadata(fs_path, filesystem=fs)
         manifest.append({
-            "key": key,
+            "uri": uri,
             "global_start": global_offset,
             "row_count": meta.num_rows,
         })
@@ -71,12 +75,7 @@ def build_manifest(bucket: str, keys: list[str]) -> tuple[list[dict], int]:
 def sample_offsets(
     manifest: list[dict], total_rows: int, n: int, seed: int,
 ) -> dict[str, list[int]]:
-    """Sample n global indices, return as {full_s3_key: [local_offsets]}.
-
-    Stores the full S3 key (no scheme, no bucket) so __source_file__ is
-    absolute and make_point_id produces stable IDs regardless of what prefix
-    is passed to downstream tools.
-    """
+    """Sample n global indices, return as {file_uri: [local_offsets]}."""
     rng = random.Random(seed)
     global_indices = sorted(rng.sample(range(total_rows), n))
     cum_ends = [e["global_start"] + e["row_count"] for e in manifest]
@@ -84,7 +83,7 @@ def sample_offsets(
     for gi in global_indices:
         fi = bisect.bisect_right(cum_ends, gi)
         entry = manifest[fi]
-        file_map[entry["key"]].append(gi - entry["global_start"])
+        file_map[entry["uri"]].append(gi - entry["global_start"])
     return dict(file_map)
 
 
@@ -119,29 +118,38 @@ def _extract_rows(
     return results
 
 
-def fetch_file_rows_s3(
-    fs: pafs.S3FileSystem,
-    bucket: str,
-    key: str,
+def fetch_file_rows_remote(
+    uri: str,
     row_offsets: list[int],
     columns: list[str] | None,
 ) -> list[tuple[int, pa.Table]]:
-    """Range-request mode: fetch only needed row groups via S3FileSystem."""
-    with fs.open_input_file(f"{bucket}/{key}") as f:
-        return _extract_rows(pq.ParquetFile(f), row_offsets, columns)
+    """Range-request mode: fetch only needed row groups via the URI's filesystem."""
+    fs = filesystem_for_uri(uri)
+    fs_path = fs_path_for_uri(uri)
+    pf = pq.ParquetFile(fs_path, filesystem=fs)
+    return _extract_rows(pf, row_offsets, columns)
 
 
 def fetch_file_rows_prefetch(
-    s3_client,
-    bucket: str,
-    key: str,
+    uri: str,
     row_offsets: list[int],
     columns: list[str] | None,
     tmpdir: str,
 ) -> list[tuple[int, pa.Table]]:
     """Prefetch mode: download full file first, read locally, then delete."""
-    local_path = os.path.join(tmpdir, key.replace("/", "_"))
-    s3_client.download_file(bucket, key, local_path)
+    safe_name = uri.replace("/", "_").replace(":", "_")
+    local_path = os.path.join(tmpdir, safe_name)
+    fs = filesystem_for_uri(uri)
+    fs_path = fs_path_for_uri(uri)
+    # fsspec / pyarrow filesystem both support open_input_file → read; for
+    # download we use fsspec's get_file when available, else read+write.
+    with fs.open_input_file(fs_path) if hasattr(fs, "open_input_file") else fs.open(fs_path, "rb") as src:
+        with open(local_path, "wb") as dst:
+            while True:
+                chunk = src.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
     try:
         return _extract_rows(pq.ParquetFile(local_path), row_offsets, columns)
     finally:
@@ -149,23 +157,23 @@ def fetch_file_rows_prefetch(
 
 
 def run_pipeline(
-    bucket: str,
-    prefix: str,
+    corpus_uri: str,
     n: int,
     seed: int,
     columns: list[str] | None,
     output: str,
     prefetch: bool = False,
 ):
-    print(f"Listing parquets at s3://{bucket}/{prefix}/...")
-    keys = list_s3_parquets(bucket, prefix)
-    if not keys:
+    dest = parse_destination(corpus_uri)
+    print(f"Listing parquets at {dest.root_uri}/...")
+    uris = discover_corpus_parquets(dest)
+    if not uris:
         print("No parquet files found.")
         return
-    print(f"Found {len(keys)} parquet files")
+    print(f"Found {len(uris)} parquet files")
 
     print("Reading metadata (parquet footers)...")
-    manifest, total_rows = build_manifest(bucket, keys)
+    manifest, total_rows = build_manifest(uris)
     print(f"Total rows: {total_rows:,}")
 
     actual_n = min(n, total_rows)
@@ -182,24 +190,24 @@ def run_pipeline(
 
     with tqdm(total=total_files, unit="file", dynamic_ncols=True) as bar:
         if prefetch:
-            s3_client = boto3.client("s3")
             with tempfile.TemporaryDirectory() as tmpdir:
-                for src, offsets in file_map.items():
-                    for lo, t in fetch_file_rows_prefetch(s3_client, bucket, src, offsets, columns, tmpdir):
-                        t = t.append_column("__source_file__", pa.array([src]))
+                for src_uri, offsets in file_map.items():
+                    src_key = bare_key_for_uri(src_uri)
+                    for lo, t in fetch_file_rows_prefetch(src_uri, offsets, columns, tmpdir):
+                        t = t.append_column("__source_file__", pa.array([src_key]))
                         t = t.append_column("__source_row__", pa.array([lo], type=pa.int64()))
                         all_slices.append(t)
                     bar.update(1)
-                    bar.set_postfix_str(src, refresh=False)
+                    bar.set_postfix_str(src_key, refresh=False)
         else:
-            fs = pafs.S3FileSystem()
-            for src, offsets in file_map.items():
-                for lo, t in fetch_file_rows_s3(fs, bucket, src, offsets, columns):
-                    t = t.append_column("__source_file__", pa.array([src]))
+            for src_uri, offsets in file_map.items():
+                src_key = bare_key_for_uri(src_uri)
+                for lo, t in fetch_file_rows_remote(src_uri, offsets, columns):
+                    t = t.append_column("__source_file__", pa.array([src_key]))
                     t = t.append_column("__source_row__", pa.array([lo], type=pa.int64()))
                     all_slices.append(t)
                 bar.update(1)
-                bar.set_postfix_str(src, refresh=False)
+                bar.set_postfix_str(src_key, refresh=False)
 
     result = pa.concat_tables(all_slices)
     print(f"Collected {len(result)} rows")
@@ -209,17 +217,13 @@ def run_pipeline(
 
     buf = pa.BufferOutputStream()
     pq.write_table(result, buf, compression="snappy")
-    s3_key = f"{prefix}/eval/{output}"
-    boto3.client("s3").put_object(
-        Bucket=bucket, Key=s3_key, Body=bytes(buf.getvalue())
-    )
-    print(f"Pushed to s3://{bucket}/{s3_key}")
+    eval_uri = dest.eval_uri(output)
+    upload_bytes_to_uri(bytes(buf.getvalue()), eval_uri)
+    print(f"Pushed to {eval_uri}")
 
 
 def launch_on_ec2(
-    s3_uri: str,
-    bucket: str,
-    prefix: str,
+    corpus_uri: str,
     n: int,
     seed: int,
     columns: list[str] | None,
@@ -229,7 +233,16 @@ def launch_on_ec2(
     dry_run: bool,
     prefetch: bool = False,
 ):
-    region = get_bucket_region(bucket)
+    dest = parse_destination(corpus_uri)
+    if not isinstance(dest, S3Destination):
+        # In-region EC2 launch only makes sense for S3 (we co-locate the
+        # instance with the bucket). For HF corpora, run --local from a
+        # high-bandwidth machine instead.
+        raise SystemExit(
+            f"EC2 launch is supported for s3:// corpora only. For {corpus_uri}, "
+            "use --local to run in-process."
+        )
+    region = get_bucket_region(dest.bucket)
     print(f"Bucket region: {region}")
 
     worker_flags = f"-n {n} --seed {seed} --output {output} --local"
@@ -250,7 +263,7 @@ def launch_on_ec2(
         },
         "file_mounts": {"/app": "."},
         "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync",
-        "run": f"cd /app && uv run vf generate-queries {s3_uri} {worker_flags}",
+        "run": f"cd /app && uv run vf generate-queries {corpus_uri} {worker_flags}",
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:
@@ -259,13 +272,13 @@ def launch_on_ec2(
     print("=" * 60)
     print("vectorforge generate-queries plan")
     print("=" * 60)
-    print(f"  S3 prefix:   {s3_uri}")
+    print(f"  Corpus URI:  {corpus_uri}")
     print(f"  Queries:     {n}  (seed={seed})")
     print(f"  Region:      {region}")
     print(f"  Instance:    {instance_type}  ({'on-demand' if on_demand else 'spot'})")
     print(f"  Columns:     {columns or 'all'}")
     print(f"  Fetch mode:  {'prefetch (download-first)' if prefetch else 'range requests'}")
-    print(f"  Output:      s3://{bucket}/{prefix}/eval/{output}")
+    print(f"  Output:      {dest.eval_uri(output)}")
     print(f"  Run dir:     {run_dir}")
     print("=" * 60)
 
@@ -276,18 +289,19 @@ def launch_on_ec2(
 
     launch_single_job(job_path, build_env_flags())
 
-    print(f"\nOutput will be at s3://{bucket}/{prefix}/{output}")
+    print(f"\nOutput will be at {dest.eval_uri(output)}")
     print("Monitor: sky jobs logs")
     print("Cancel:  sky jobs cancel -a")
+
 
 def main(argv: list[str] | None = None):
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger(__name__).setLevel(logging.INFO)
 
     parser = argparse.ArgumentParser(
-        description="Sample N eval query rows from embedded S3 parquets"
+        description="Sample N eval query rows from an embedded corpus (S3 or HF)"
     )
-    parser.add_argument("s3_uri", help="s3://bucket/prefix")
+    parser.add_argument("corpus_uri", help="s3://bucket/prefix or hf://datasets/ns/repo")
     parser.add_argument("-n", "--num-queries", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--columns", nargs="+", default=None,
@@ -300,7 +314,7 @@ def main(argv: list[str] | None = None):
                         help="Run the full pipeline in-process instead of launching EC2")
     parser.add_argument("--prefetch", action="store_true",
                         help="Download each parquet fully before reading (better for large row groups)")
-    # EC2 / SkyPilot options
+    # EC2 / SkyPilot options (S3 only)
     parser.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE,
                         help=f"EC2 instance type (default: {DEFAULT_INSTANCE_TYPE})")
     parser.add_argument("--on-demand", action="store_true",
@@ -309,18 +323,16 @@ def main(argv: list[str] | None = None):
                         help="Print plan and write job config, don't launch")
     args = parser.parse_args(argv)
 
-    if not args.s3_uri.startswith("s3://"):
-        parser.error("s3_uri must start with s3://")
-    without_scheme = args.s3_uri[5:]
-    bucket, _, prefix = without_scheme.partition("/")
-    prefix = prefix.rstrip("/")
+    try:
+        parse_destination(args.corpus_uri)
+    except ValueError as e:
+        parser.error(str(e))
 
     output = args.output or f"queries_{args.num_queries}.parquet"
 
     if args.local:
         run_pipeline(
-            bucket=bucket,
-            prefix=prefix,
+            corpus_uri=args.corpus_uri,
             n=args.num_queries,
             seed=args.seed,
             columns=args.columns,
@@ -329,9 +341,7 @@ def main(argv: list[str] | None = None):
         )
     else:
         launch_on_ec2(
-            s3_uri=args.s3_uri,
-            bucket=bucket,
-            prefix=prefix,
+            corpus_uri=args.corpus_uri,
             n=args.num_queries,
             seed=args.seed,
             columns=args.columns,

@@ -9,11 +9,12 @@ Distributed mode: use `vf brute-force-dist` to split the corpus across N
 GPU workers. Each worker runs with --num-jobs N and outputs a partial result
 file. Merge with `vf brute-force-merge` when all workers finish.
 
-IDs are md5(source_file:source_row) as UUIDs — the Qdrant loader must use
-the same scheme so brute-force hit IDs and Qdrant point IDs can be compared.
+IDs are md5(bare_key:source_row) as UUIDs — both the loader's vf_point_id
+macro and this script use bare_key_for_uri to derive the same key from the
+backend-specific URI form, so brute-force hit IDs and Qdrant point IDs match.
 
-Output: s3://bucket/prefix/eval/brute_force_<queries_stem>_k<K>.parquet
-  query_id   (str)         UUID derived from md5(source_file:source_row)
+Output: {corpus_uri}/eval/brute_force_<queries_stem>_k<K>.parquet
+  query_id   (str)         UUID derived from md5(bare_key:source_row)
   hit_ids    (list[str])   top-K hit IDs ranked best → worst
   hit_scores (list[float]) corresponding similarity scores
 
@@ -21,7 +22,7 @@ Sanity check: top hit for each query should be itself (score = 1.0).
 
 Usage:
   vf brute-force s3://bucket/prefix --queries queries_1000.parquet
-  vf brute-force s3://bucket/prefix --queries queries_1000.parquet -k 10000 --local
+  vf brute-force hf://datasets/ns/repo --queries queries_1000.parquet --local
   vf brute-force s3://bucket/prefix --queries queries_1000.parquet --metric euclidean
   vf brute-force s3://bucket/prefix --queries queries_1000.parquet --dry-run
 """
@@ -38,17 +39,25 @@ from pathlib import Path
 from queue import Queue
 from threading import Thread
 
-import boto3
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pyarrow.fs as pafs
 import yaml
 
 from tqdm import tqdm
 
 from cli.skypilot_utils import CUDA_IMAGE_IDS, build_env_flags, make_run_dir, launch_single_job
-from vectorforge.utils import get_bucket_region, make_point_id, s3_rel_key
+from vectorforge.destinations import (
+    S3Destination,
+    bare_key_for_uri,
+    discover_corpus_parquets,
+    filesystem_for_uri,
+    fs_path_for_uri,
+    list_parquets_under,
+    parse_destination,
+    upload_file_to_uri,
+)
+from vectorforge.utils import get_bucket_region, make_point_id
 
 logger = logging.getLogger(__name__)
 
@@ -65,24 +74,21 @@ class DistanceMetric(str, Enum):
     EUCLIDEAN = "euclidean"
 
 
-def partial_prefix(prefix: str, queries_stem: str, k: int) -> str:
-    return f"{prefix}/eval/_bf_partial_{queries_stem}_k{k}"
-
-
-def list_corpus_parquets(bucket: str, prefix: str) -> list[str]:
-    from vectorforge.utils import discover_corpus_parquets
-    return discover_corpus_parquets(bucket, prefix)
+def partial_subkey(queries_stem: str, k: int) -> str:
+    """Sub-path under {corpus_uri}/eval/ for per-rank partial result files."""
+    return f"_bf_partial_{queries_stem}_k{k}"
 
 
 def load_queries(
-    bucket: str,
-    prefix: str,
+    dest,
     queries_filename: str,
     dense_column: str,
 ) -> tuple[np.ndarray, list[str]]:
-    fs = pafs.S3FileSystem()
+    queries_uri = dest.eval_uri(queries_filename)
+    fs = filesystem_for_uri(queries_uri)
+    fs_path = fs_path_for_uri(queries_uri)
     table = pq.read_table(
-        f"{bucket}/{prefix}/eval/{queries_filename}",
+        fs_path,
         filesystem=fs,
         columns=[dense_column, "__source_file__", "__source_row__"],
     )
@@ -106,40 +112,36 @@ def _compute_scores(Q, C, metric: DistanceMetric):
 
 
 def _prefetch_files(
-    bucket: str,
-    keys: list[str],
+    uris: list[str],
     tmpdir: str,
     dense_column: str,
 ) -> dict[str, str]:
     """
-    Download only the dense embedding column for each key to local disk.
+    Download only the dense embedding column for each file to local disk.
+    Keyed by the source URI.
     """
     local_paths = {}
-    print(f"Prefetching {len(keys)} files (dense column only)...")
-    fs = pafs.S3FileSystem()
-    for key in tqdm(keys, unit="file", desc="download", dynamic_ncols=True):
-        local_path = os.path.join(tmpdir, key.replace("/", "__") + ".parquet")
-        table = pq.read_table(f"{bucket}/{key}", filesystem=fs, columns=[dense_column])
+    print(f"Prefetching {len(uris)} files (dense column only)...")
+    for uri in tqdm(uris, unit="file", desc="download", dynamic_ncols=True):
+        safe_name = uri.replace("/", "__").replace(":", "_")
+        local_path = os.path.join(tmpdir, safe_name + ".parquet")
+        fs = filesystem_for_uri(uri)
+        fs_path = fs_path_for_uri(uri)
+        table = pq.read_table(fs_path, filesystem=fs, columns=[dense_column])
         pq.write_table(table, local_path, compression="snappy")
-        local_paths[key] = local_path
+        local_paths[uri] = local_path
     return local_paths
 
 
-def _save_and_push(
-    result: pa.Table,
-    local_output: str,
-    bucket: str,
-    s3_key: str,
-):
+def _save_and_push(result: pa.Table, local_output: str, dest_uri: str):
     pq.write_table(result, local_output, compression="snappy")
     print(f"Wrote {local_output}")
-    boto3.client("s3").upload_file(local_output, bucket, s3_key)
-    print(f"Pushed to s3://{bucket}/{s3_key}")
+    upload_file_to_uri(local_output, dest_uri)
+    print(f"Pushed to {dest_uri}")
 
 
 def run_pipeline(
-    bucket: str,
-    prefix: str,
+    corpus_uri: str,
     queries_filename: str,
     k: int,
     metric: DistanceMetric,
@@ -153,6 +155,7 @@ def run_pipeline(
     except ImportError:
         raise RuntimeError("torch is required. Install with: uv sync --extra eval")
 
+    dest = parse_destination(corpus_uri)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         logger.warning("No GPU detected — falling back to CPU. This will be slow.")
@@ -171,59 +174,60 @@ def run_pipeline(
           (f"  Rank: {job_rank}/{num_jobs}" if num_jobs else ""))
 
     print(f"Loading queries from {queries_filename}...")
-    query_embeddings, query_ids = load_queries(bucket, prefix, queries_filename, dense_column)
+    query_embeddings, query_ids = load_queries(dest, queries_filename, dense_column)
     n_queries = len(query_embeddings)
     print(f"{n_queries} queries, dim={query_embeddings.shape[1]}")
 
-    all_corpus_keys = list_corpus_parquets(bucket, prefix)
+    all_corpus_uris = discover_corpus_parquets(dest)
 
     if num_jobs is not None:
-        chunk = math.ceil(len(all_corpus_keys) / num_jobs)
+        chunk = math.ceil(len(all_corpus_uris) / num_jobs)
         start = job_rank * chunk
-        corpus_keys = all_corpus_keys[start : start + chunk]
-        print(f"Rank {job_rank}/{num_jobs}: {len(corpus_keys)} files (index {start}–{start + len(corpus_keys) - 1} of {len(all_corpus_keys)})")
+        corpus_uris = all_corpus_uris[start : start + chunk]
+        print(f"Rank {job_rank}/{num_jobs}: {len(corpus_uris)} files (index {start}–{start + len(corpus_uris) - 1} of {len(all_corpus_uris)})")
     else:
-        corpus_keys = all_corpus_keys
-        print(f"{len(corpus_keys)} corpus files")
+        corpus_uris = all_corpus_uris
+        print(f"{len(corpus_uris)} corpus files")
 
     Q = torch.tensor(query_embeddings, dtype=torch.float32, device=device)
     top_scores = torch.full((n_queries, k), float("-inf"), device=device)
     top_encoded_ids = torch.zeros((n_queries, k), dtype=torch.int64, device=device)
 
     # In distributed mode, prefetch files to local NVMe first so the GPU is
-    # never blocked on S3 during the compute loop.
+    # never blocked on remote I/O during the compute loop.
     local_paths: dict[str, str] = {}
     tmpdir_ctx = None
     if num_jobs is not None:
         tmpdir_ctx = tempfile.TemporaryDirectory(prefix="vf_bf_")
-        local_paths = _prefetch_files(bucket, corpus_keys, tmpdir_ctx.name, dense_column)
+        local_paths = _prefetch_files(corpus_uris, tmpdir_ctx.name, dense_column)
 
-    # Key → stable integer index (relative to this worker's slice, offset by start)
-    offset = (job_rank * math.ceil(len(all_corpus_keys) / num_jobs)) if num_jobs else 0
-    key_to_file_idx = {key: offset + i for i, key in enumerate(corpus_keys)}
+    # URI → stable integer index (relative to this worker's slice, offset by start).
+    offset = (job_rank * math.ceil(len(all_corpus_uris) / num_jobs)) if num_jobs else 0
+    uri_to_file_idx = {uri: offset + i for i, uri in enumerate(corpus_uris)}
 
     file_queue: Queue = Queue(maxsize=PREFETCH_QUEUE_SIZE)
 
     def reader():
-        for key in corpus_keys:
-            if key in local_paths:
-                table = pq.read_table(local_paths[key], columns=[dense_column])
+        for uri in corpus_uris:
+            if uri in local_paths:
+                table = pq.read_table(local_paths[uri], columns=[dense_column])
             else:
-                fs = pafs.S3FileSystem()
-                table = pq.read_table(f"{bucket}/{key}", filesystem=fs, columns=[dense_column])
+                fs = filesystem_for_uri(uri)
+                fs_path = fs_path_for_uri(uri)
+                table = pq.read_table(fs_path, filesystem=fs, columns=[dense_column])
             arr = np.array(table[dense_column].to_pylist(), dtype=np.float32)
-            file_queue.put((key, arr))
+            file_queue.put((uri, arr))
         file_queue.put(None)
 
     Thread(target=reader, daemon=True).start()
 
-    with tqdm(total=len(corpus_keys), unit="file", dynamic_ncols=True) as bar:
+    with tqdm(total=len(corpus_uris), unit="file", dynamic_ncols=True) as bar:
         while True:
             item = file_queue.get()
             if item is None:
                 break
-            key, arr = item
-            file_idx = key_to_file_idx[key]
+            uri, arr = item
+            file_idx = uri_to_file_idx[uri]
             n_rows = len(arr)
 
             C = torch.tensor(arr, dtype=torch.float32, device=device)
@@ -242,7 +246,7 @@ def run_pipeline(
             top_encoded_ids = merged_encoded.gather(1, top_idx)
 
             bar.update(1)
-            bar.set_postfix_str(s3_rel_key(key, bucket, prefix), refresh=False)
+            bar.set_postfix_str(bare_key_for_uri(uri), refresh=False)
 
     if tmpdir_ctx:
         tmpdir_ctx.cleanup()
@@ -260,7 +264,9 @@ def run_pipeline(
         for enc in q_enc:
             f_idx = int(enc) // MAX_ROWS_PER_FILE
             r_idx = int(enc) % MAX_ROWS_PER_FILE
-            ids.append(make_point_id(all_corpus_keys[f_idx], r_idx))
+            # bare_key_for_uri so the ID matches what the loader's vf_point_id
+            # macro produces and what the queries file's __source_file__ holds.
+            ids.append(make_point_id(bare_key_for_uri(all_corpus_uris[f_idx]), r_idx))
         hit_ids_out.append(ids)
         hit_scores_out.append(q_scores.tolist())
 
@@ -272,51 +278,45 @@ def run_pipeline(
 
     if num_jobs is not None:
         rank_width = max(3, len(str(num_jobs - 1)))
-        s3_key = f"{partial_prefix(prefix, queries_stem, k)}/rank{job_rank:0{rank_width}d}.parquet"
+        partial_path = f"{partial_subkey(queries_stem, k)}/rank{job_rank:0{rank_width}d}.parquet"
+        dest_uri = dest.eval_uri(partial_path)
         local_out = f"/tmp/rank{job_rank:0{rank_width}d}.parquet"
     else:
-        s3_key = f"{prefix}/eval/{output}"
+        dest_uri = dest.eval_uri(output)
         local_out = f"/tmp/{output}"
 
-    _save_and_push(result, local_out, bucket, s3_key)
+    _save_and_push(result, local_out, dest_uri)
 
 
 def merge_results(
-    bucket: str,
-    prefix: str,
+    corpus_uri: str,
     queries_filename: str,
     k: int,
     output: str,
 ):
+    dest = parse_destination(corpus_uri)
     queries_stem = Path(queries_filename).stem
-    pprefix = partial_prefix(prefix, queries_stem, k)
+    pprefix_uri = dest.eval_uri(partial_subkey(queries_stem, k))
 
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    partial_keys = sorted(
-        obj["Key"]
-        for page in paginator.paginate(Bucket=bucket, Prefix=pprefix)
-        for obj in page.get("Contents", [])
-        if obj["Key"].endswith(".parquet")
-    )
+    partial_uris = list_parquets_under(pprefix_uri)
+    if not partial_uris:
+        raise RuntimeError(f"No partial results found at {pprefix_uri}/")
 
-    if not partial_keys:
-        raise RuntimeError(f"No partial results found at s3://{bucket}/{pprefix}/")
+    print(f"Merging {len(partial_uris)} partial results (k={k})...")
 
-    print(f"Merging {len(partial_keys)} partial results (k={k})...")
-    fs = pafs.S3FileSystem()
-
-    # {query_id: [(score, hit_id), ...]} accumulated across all workers
+    # {query_id: [(score, hit_id), ...]} accumulated across all workers.
     candidates: dict[str, list[tuple[float, str]]] = defaultdict(list)
 
-    for key in tqdm(partial_keys, unit="file", desc="load", dynamic_ncols=True):
-        table = pq.read_table(f"{bucket}/{key}", filesystem=fs)
+    for uri in tqdm(partial_uris, unit="file", desc="load", dynamic_ncols=True):
+        fs = filesystem_for_uri(uri)
+        fs_path = fs_path_for_uri(uri)
+        table = pq.read_table(fs_path, filesystem=fs)
         for row in table.to_pylist():
             q_id = row["query_id"]
             for hit_id, score in zip(row["hit_ids"], row["hit_scores"]):
                 candidates[q_id].append((score, hit_id))
 
-    print(f"Sorting {len(candidates)} queries × up to {len(partial_keys) * k:,} candidates...")
+    print(f"Sorting {len(candidates)} queries × up to {len(partial_uris) * k:,} candidates...")
     query_ids = sorted(candidates)
     hit_ids_out, hit_scores_out = [], []
     for q_id in query_ids:
@@ -331,13 +331,11 @@ def merge_results(
     })
 
     local_out = f"/tmp/{output}"
-    _save_and_push(result, local_out, bucket, f"{prefix}/eval/{output}")
+    _save_and_push(result, local_out, dest.eval_uri(output))
 
 
 def launch_on_ec2(
-    s3_uri: str,
-    bucket: str,
-    prefix: str,
+    corpus_uri: str,
     queries_filename: str,
     k: int,
     metric: DistanceMetric,
@@ -347,7 +345,13 @@ def launch_on_ec2(
     on_demand: bool,
     dry_run: bool,
 ):
-    region = get_bucket_region(bucket)
+    dest = parse_destination(corpus_uri)
+    if not isinstance(dest, S3Destination):
+        raise SystemExit(
+            f"EC2 launch is supported for s3:// corpora only. For {corpus_uri}, "
+            "use --local."
+        )
+    region = get_bucket_region(dest.bucket)
     print(f"Bucket region: {region}")
 
     worker_flags = (
@@ -377,7 +381,7 @@ def launch_on_ec2(
         "resources": resources,
         "file_mounts": {"/app": "."},
         "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync --extra eval",
-        "run": f"cd /app && uv run vf brute-force {s3_uri} {worker_flags}",
+        "run": f"cd /app && uv run vf brute-force {corpus_uri} {worker_flags}",
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:
@@ -386,12 +390,12 @@ def launch_on_ec2(
     print("=" * 60)
     print("vectorforge brute-force plan")
     print("=" * 60)
-    print(f"  S3 prefix:   {s3_uri}")
+    print(f"  Corpus URI:  {corpus_uri}")
     print(f"  Queries:     {queries_filename}")
     print(f"  K:           {k}")
     print(f"  Metric:      {metric.value}")
     print(f"  Instance:    {instance_type}  ({'on-demand' if on_demand else 'spot'})")
-    print(f"  Output:      s3://{bucket}/{prefix}/eval/{output}")
+    print(f"  Output:      {dest.eval_uri(output)}")
     print(f"  Run dir:     {run_dir}")
     print("=" * 60)
 
@@ -401,7 +405,7 @@ def launch_on_ec2(
         return
 
     launch_single_job(job_path, build_env_flags())
-    print(f"\nOutput will be at s3://{bucket}/{prefix}/{output}")
+    print(f"\nOutput will be at {dest.eval_uri(output)}")
     print("Monitor: sky jobs logs")
     print("Cancel:  sky jobs cancel -a")
 
@@ -413,9 +417,9 @@ def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Brute-force nearest-neighbor search for recall evaluation"
     )
-    parser.add_argument("s3_uri", help="s3://bucket/prefix (embedded corpus)")
+    parser.add_argument("corpus_uri", help="s3://bucket/prefix or hf://datasets/ns/repo")
     parser.add_argument("--queries", default="queries_1000.parquet",
-                        help="Queries parquet filename within the prefix (default: queries_1000.parquet)")
+                        help="Queries parquet filename within {corpus}/eval/ (default: queries_1000.parquet)")
     parser.add_argument("-k", type=int, default=DEFAULT_K,
                         help=f"Neighbors to retrieve per query (default: {DEFAULT_K})")
     parser.add_argument("--metric", type=DistanceMetric, default=DistanceMetric.COSINE,
@@ -439,19 +443,17 @@ def main(argv: list[str] | None = None):
                         help="Print plan and write job config, don't launch")
     args = parser.parse_args(argv)
 
-    if not args.s3_uri.startswith("s3://"):
-        parser.error("s3_uri must start with s3://")
-    without_scheme = args.s3_uri[5:]
-    bucket, _, prefix = without_scheme.partition("/")
-    prefix = prefix.rstrip("/")
+    try:
+        parse_destination(args.corpus_uri)
+    except ValueError as e:
+        parser.error(str(e))
 
     queries_stem = Path(args.queries).stem
     output = args.output or f"brute_force_{queries_stem}_k{args.k}.parquet"
 
     if args.local or args.num_jobs:
         run_pipeline(
-            bucket=bucket,
-            prefix=prefix,
+            corpus_uri=args.corpus_uri,
             queries_filename=args.queries,
             k=args.k,
             metric=args.metric,
@@ -462,9 +464,7 @@ def main(argv: list[str] | None = None):
         )
     else:
         launch_on_ec2(
-            s3_uri=args.s3_uri,
-            bucket=bucket,
-            prefix=prefix,
+            corpus_uri=args.corpus_uri,
             queries_filename=args.queries,
             k=args.k,
             metric=args.metric,
@@ -477,33 +477,32 @@ def main(argv: list[str] | None = None):
 
 
 def merge_main(argv: list[str] | None = None):
-    """Entry point for `vf brute-force-merge`. Standalone parser; no --merge flag injection."""
+    """Entry point for `vf brute-force-merge`. Standalone parser; no argv injection."""
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger(__name__).setLevel(logging.INFO)
 
     parser = argparse.ArgumentParser(
         description="Merge partial brute-force results from a distributed run"
     )
-    parser.add_argument("s3_uri", help="s3://bucket/prefix (embedded corpus)")
+    parser.add_argument("corpus_uri", help="s3://bucket/prefix or hf://datasets/ns/repo")
     parser.add_argument("--queries", default="queries_1000.parquet",
-                        help="Queries parquet filename within the prefix (default: queries_1000.parquet)")
+                        help="Queries parquet filename within {corpus}/eval/ (default: queries_1000.parquet)")
     parser.add_argument("-k", type=int, default=DEFAULT_K,
                         help=f"Neighbors retrieved per query (default: {DEFAULT_K})")
     parser.add_argument("--output", default=None,
                         help="Output filename (default: brute_force_<queries_stem>_k<K>.parquet)")
     args = parser.parse_args(argv)
 
-    if not args.s3_uri.startswith("s3://"):
-        parser.error("s3_uri must start with s3://")
-    bucket, _, prefix = args.s3_uri[5:].partition("/")
-    prefix = prefix.rstrip("/")
+    try:
+        parse_destination(args.corpus_uri)
+    except ValueError as e:
+        parser.error(str(e))
 
     queries_stem = Path(args.queries).stem
     output = args.output or f"brute_force_{queries_stem}_k{args.k}.parquet"
 
     merge_results(
-        bucket=bucket,
-        prefix=prefix,
+        corpus_uri=args.corpus_uri,
         queries_filename=args.queries,
         k=args.k,
         output=output,

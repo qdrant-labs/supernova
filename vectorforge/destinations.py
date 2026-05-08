@@ -264,6 +264,116 @@ def bare_key_for_uri(uri: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Write + list helpers for eval / partial-result artifacts
+#
+# These complement ``discover_corpus_parquets`` (which lists corpus parquets
+# under a Destination, excluding eval/). Brute-force partial results and
+# generated queries live UNDER the destination's eval_uri — these helpers
+# cover writing them and listing them back during merge.
+# ---------------------------------------------------------------------------
+
+
+def list_parquets_under(prefix_uri: str) -> list[str]:
+    """
+    List all .parquet files under a URI prefix. Does NOT filter eval/, since
+    this is used to enumerate eval artifacts (queries, brute-force partials)
+    that live under {root}/eval/.
+    """
+    if prefix_uri.startswith("s3://"):
+        import boto3
+        rest = prefix_uri[len("s3://"):]
+        bucket, _, prefix = rest.partition("/")
+        s3 = boto3.client("s3")
+        paginator = s3.get_paginator("list_objects_v2")
+        uris: list[str] = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                if obj["Key"].endswith(".parquet"):
+                    uris.append(f"s3://{bucket}/{obj['Key']}")
+        return sorted(uris)
+
+    if prefix_uri.startswith("hf://datasets/"):
+        from huggingface_hub import HfApi
+        rest = prefix_uri[len("hf://datasets/"):]
+        parts = rest.split("/", 2)
+        if len(parts) < 2:
+            raise ValueError(f"Bad hf:// prefix: {prefix_uri!r}")
+        repo_id = f"{parts[0]}/{parts[1]}"
+        in_repo_prefix = parts[2] if len(parts) == 3 else ""
+        api = HfApi()
+        paths = api.list_repo_files(repo_id, repo_type="dataset")
+        uris: list[str] = []
+        for path in paths:
+            if not path.endswith(".parquet"):
+                continue
+            if in_repo_prefix and not path.startswith(in_repo_prefix):
+                continue
+            uris.append(f"hf://datasets/{repo_id}/{path}")
+        return sorted(uris)
+
+    raise ValueError(f"Unknown URI scheme in {prefix_uri!r}")
+
+
+def upload_file_to_uri(local_path: str, dest_uri: str) -> None:
+    """
+    Upload ``local_path`` to the given destination URI. Synchronous, intended
+    for one-shot eval artifact writes (queries, brute-force partials/final).
+    """
+    if dest_uri.startswith("s3://"):
+        import boto3
+        rest = dest_uri[len("s3://"):]
+        bucket, _, key = rest.partition("/")
+        boto3.client("s3").upload_file(local_path, bucket, key)
+        return
+
+    if dest_uri.startswith("hf://datasets/"):
+        from huggingface_hub import HfApi
+        rest = dest_uri[len("hf://datasets/"):]
+        parts = rest.split("/", 2)
+        if len(parts) < 3:
+            raise ValueError(f"hf:// upload URI needs in-repo path: {dest_uri!r}")
+        repo_id = f"{parts[0]}/{parts[1]}"
+        path_in_repo = parts[2]
+        HfApi().upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+        return
+
+    raise ValueError(f"Unknown URI scheme in {dest_uri!r}")
+
+
+def upload_bytes_to_uri(data: bytes, dest_uri: str) -> None:
+    """Same as upload_file_to_uri but for in-memory bytes."""
+    if dest_uri.startswith("s3://"):
+        import boto3
+        rest = dest_uri[len("s3://"):]
+        bucket, _, key = rest.partition("/")
+        boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=data)
+        return
+
+    if dest_uri.startswith("hf://datasets/"):
+        from huggingface_hub import HfApi
+        rest = dest_uri[len("hf://datasets/"):]
+        parts = rest.split("/", 2)
+        if len(parts) < 3:
+            raise ValueError(f"hf:// upload URI needs in-repo path: {dest_uri!r}")
+        repo_id = f"{parts[0]}/{parts[1]}"
+        path_in_repo = parts[2]
+        HfApi().upload_file(
+            path_or_fileobj=data,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+        return
+
+    raise ValueError(f"Unknown URI scheme in {dest_uri!r}")
+
+
 def datasource_to_destination(ds_cfg: dict) -> Destination:
     """
     Build a Destination from the loader's ``datasource:`` config block.
