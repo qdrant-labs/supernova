@@ -431,8 +431,6 @@ def main(argv: list[str] | None = None):
                         help="Total parallel workers (used by brute-force-dist)")
     parser.add_argument("--job-rank", type=int, default=None,
                         help="This worker's rank (0-indexed; defaults to $SKYPILOT_JOB_RANK)")
-    parser.add_argument("--merge", action="store_true",
-                        help="Merge partial results from a previous distributed run")
     parser.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE,
                         help=f"EC2 instance type (default: {DEFAULT_INSTANCE_TYPE})")
     parser.add_argument("--on-demand", action="store_true",
@@ -450,15 +448,7 @@ def main(argv: list[str] | None = None):
     queries_stem = Path(args.queries).stem
     output = args.output or f"brute_force_{queries_stem}_k{args.k}.parquet"
 
-    if args.merge:
-        merge_results(
-            bucket=bucket,
-            prefix=prefix,
-            queries_filename=args.queries,
-            k=args.k,
-            output=output,
-        )
-    elif args.local or args.num_jobs:
+    if args.local or args.num_jobs:
         run_pipeline(
             bucket=bucket,
             prefix=prefix,
@@ -484,6 +474,40 @@ def main(argv: list[str] | None = None):
             on_demand=args.on_demand,
             dry_run=args.dry_run,
         )
+
+
+def merge_main(argv: list[str] | None = None):
+    """Entry point for `vf brute-force-merge`. Standalone parser; no --merge flag injection."""
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger(__name__).setLevel(logging.INFO)
+
+    parser = argparse.ArgumentParser(
+        description="Merge partial brute-force results from a distributed run"
+    )
+    parser.add_argument("s3_uri", help="s3://bucket/prefix (embedded corpus)")
+    parser.add_argument("--queries", default="queries_1000.parquet",
+                        help="Queries parquet filename within the prefix (default: queries_1000.parquet)")
+    parser.add_argument("-k", type=int, default=DEFAULT_K,
+                        help=f"Neighbors retrieved per query (default: {DEFAULT_K})")
+    parser.add_argument("--output", default=None,
+                        help="Output filename (default: brute_force_<queries_stem>_k<K>.parquet)")
+    args = parser.parse_args(argv)
+
+    if not args.s3_uri.startswith("s3://"):
+        parser.error("s3_uri must start with s3://")
+    bucket, _, prefix = args.s3_uri[5:].partition("/")
+    prefix = prefix.rstrip("/")
+
+    queries_stem = Path(args.queries).stem
+    output = args.output or f"brute_force_{queries_stem}_k{args.k}.parquet"
+
+    merge_results(
+        bucket=bucket,
+        prefix=prefix,
+        queries_filename=args.queries,
+        k=args.k,
+        output=output,
+    )
 
 
 if __name__ == "__main__":

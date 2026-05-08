@@ -4654,6 +4654,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
+    { name = "click" },
     { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "pyarrow" },
@@ -4702,6 +4703,7 @@ requires-dist = [
     { name = "aiobotocore", marker = "extra == 'embed'" },
     { name = "aiobotocore", marker = "extra == 'partition'" },
     { name = "boto3" },
+    { name = "click", specifier = ">=8.1" },
     { name = "datasets", marker = "extra == 'embed'" },
     { name = "datasets", marker = "extra == 'partition'" },
     { name = "duckdb", marker = "extra == 'load'", specifier = ">=1.5.1" },

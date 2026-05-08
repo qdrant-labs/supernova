@@ -12,6 +12,7 @@ dependencies = [
     "tqdm",
     "boto3",
     "huggingface_hub",
+    "click>=8.1",
 ]
 
 [project.optional-dependencies]

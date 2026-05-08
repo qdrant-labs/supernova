@@ -14,7 +14,6 @@ import json
 import logging
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from scipy import stats as sp_stats
@@ -173,6 +172,8 @@ def plot_distribution(lengths: np.ndarray, fit: dict, cutoff: int, output_path: 
     """
     Generates and saves a token distribution plot.
     """
+    import matplotlib.pyplot as plt
+
     log.info("\nGenerating distribution plot...")
     fig, ax = plt.subplots(figsize=(10, 5))
 
