@@ -65,7 +65,20 @@ Base class for all parquet data sources. Handles DuckDB connection, SQL generati
 
 ### Key concepts
 
-**`id_column`** — parquet column for the point id. Defaults to `row_id`.
+**`id_expression`** — DuckDB SQL expression that yields the point id per row. Defaults to the bare column name `row_id` (works if your parquets carry a `row_id` column). Any DuckDB expression that returns `UBIGINT` or a UUID string is valid:
+
+- `row_id` — use a pre-baked id column
+- `hash(text)` — content-deduplicated ids
+- `uuid()` — random per-row UUIDs
+- `vf_point_id(filename, file_row_number)` — **recommended** for vectorforge-produced corpora; matches `vf brute-force` and `vf generate-queries` so recall ground truth aligns
+
+The base reader (`vectorforge/loader/datasource/base.py`) registers three macros at connection time:
+
+- `vf_uuid_from_hex(h)` — formats a 32-char hex string as a canonical UUID.
+- `make_point_id(source_file, source_row)` — `vf_uuid_from_hex(md5(source_file || ':' || source_row))`. Mirrors `vectorforge.utils.make_point_id` exactly.
+- `vf_point_id(fname, rnum)` — `make_point_id(substr(fname, prefix_len + 1), rnum)`, where `prefix_len` is the URI-prefix length each subclass declares via `_root_uri_prefix()`.
+
+If the `id_expression` references `filename` or `file_row_number`, the base reader auto-injects `read_parquet(..., filename=true, file_row_number=true)` so those virtual columns are available. **Use `file_row_number`, not `ROW_NUMBER() OVER (PARTITION BY filename)`** — `file_row_number` is the physical row index and is stable under DuckDB's parallel parquet scan; window-function row numbers reflect scan order and can produce different IDs from the brute-force side. There's an explicit regression test in `tests/test_loader_id_expression.py` that documents both behaviours.
 
 **`vectors`** (top-level config) — declares one or more named vectors. Passed to both the reader (which knows the parquet column to read) and the vector store (which knows how to configure the collection):
 
@@ -207,7 +220,7 @@ datasource:
   repo_id: org/dataset
   subdir: en                  # optional subfolder
   # Common options
-  id_column: row_id           # default
+  id_expression: "vf_point_id(filename, file_row_number)"   # DuckDB SQL; default: "row_id"
   payload_fields:             # optional payload composition
     text: text
   file_list:                  # optional explicit file list (used by dispatch workers)

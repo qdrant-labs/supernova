@@ -9,11 +9,21 @@ Both tasks are designed for massive parallelization. Embedding generation fans o
 
 ## Mental model
 
-The two pipelines are independent. You can run them separately, on different machines, at different times. The parquet files on S3 are the bridge between them -- each embedding run produces many parquet files (one per chunk/slice), stored under a common S3 prefix.
+The two pipelines are independent. You can run them separately, on different machines, at different times. The parquet files at the destination are the bridge between them -- each embedding run produces many parquet files (one per chunk/slice), stored under a common URI prefix.
 
 ```
-Source (HuggingFace) --> [Embedding Pipeline] --> S3 (many parquets) --> [Loading Pipeline] --> Qdrant
+Source (HuggingFace) --> [Embedding Pipeline] --> Destination --> [Loading Pipeline] --> Qdrant
 ```
+
+Destinations and corpora are addressed by URI. Three schemes are supported today:
+
+| Scheme | Used for |
+|--------|----------|
+| `s3://bucket/prefix` | S3 buckets (the typical production destination) |
+| `hf://datasets/ns/name[/subdir]` | HuggingFace Hub datasets (good for community sharing) |
+| `file:///abs/path` | Local filesystem (handy for tests and single-machine flows) |
+
+The same URI is recognised by every command that operates on a corpus -- `vf load`, `vf brute-force`, `vf generate-queries`, `vf push-hf`, etc.
 
 ### Embedding pipeline
 
@@ -36,12 +46,40 @@ The many parquet files on S3 are divided into N groups. Each group is assigned t
 
 ## CLI
 
+All subcommands are dispatched through a single `vf` entrypoint (a click group). `vf --help` lists everything and stays fast — heavy ML imports only load when the relevant subcommand actually runs.
+
+### Embed
+
 | Command | Purpose |
 |---------|---------|
 | `vf embed` | Embed a dataset locally |
-| `vf embed-dist` | Distribute embedding across SkyPilot GPU pool |
-| `vf load` | Load pre-embedded data into a vector store |
-| `vf load-dist` | Distribute loading across SkyPilot spot instances |
-| `vf analysis` | Analyze a completed embedding run (schema, throughput, cost) |
+| `vf embed-dist` | Distribute embedding across a SkyPilot GPU pool |
+| `vf partition` | Run the embed pipeline with a no-op embedder (validates sharding without GPU spend) |
+| `vf partition-dist` | Distribute the no-op pipeline across a CPU pool |
 
-See [config reference](reference/config.md) for every YAML knob and tuning advice, and [CLI reference](reference/cli.md) for all flags. For very large datasets (≥100M rows), see [incremental / windowed runs](reference/config.md#incremental--windowed-runs).
+### Load
+
+| Command | Purpose |
+|---------|---------|
+| `vf load` | Load pre-embedded data into a vector store |
+| `vf load-dist` | Distribute loading across a SkyPilot pool. `--finalize` enables Qdrant indexing afterwards |
+
+### Eval (queries + ground truth)
+
+| Command | Purpose |
+|---------|---------|
+| `vf generate-queries` | Sample N rows from a corpus as eval queries (writes `{corpus}/eval/queries_<N>.parquet`) |
+| `vf brute-force` | Single-GPU exact-NN search for recall ground truth |
+| `vf brute-force-dist` | Distribute brute-force across a SkyPilot GPU pool, writing partial results |
+| `vf brute-force-merge` | Merge per-rank partial results into the final top-K parquet |
+
+### Publish + introspect
+
+| Command | Purpose |
+|---------|---------|
+| `vf push-hf` | Upload S3 parquets to a HuggingFace Hub dataset (batch-committed) |
+| `vf push-hf-dist` | Distribute the HF upload across a CPU pool (S3→EC2 in-region, then EC2→HF) |
+| `vf analysis` | Analyze a completed embedding run (schema, throughput, cost) |
+| `vf throughput-predict` | Predict embedding throughput + cost from a config |
+
+See [CLI reference](reference/cli.md) for all flags, [config reference](reference/config.md) for every YAML knob and tuning advice, and [S3 layout](reference/s3-layout.md) for how corpora and eval artifacts are organised. For very large datasets (≥100M rows), see [incremental / windowed runs](reference/config.md#incremental--windowed-runs).

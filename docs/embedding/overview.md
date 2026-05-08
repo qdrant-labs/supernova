@@ -39,13 +39,17 @@ You must specify at least one of `dense_embedder` or `sparse_embedder`. See [Den
 
 ### Column naming
 
-The embedding columns default to `dense_embedding` and `sparse_embedding`. Override with:
+The embedding columns default to `dense_embedding`, `sparse_embedding`, and `multivector_embedding`. Override with:
 
 ```yaml
 pipeline:
-  dense_embedding_column: my_dense   # default: dense_embedding
-  sparse_embedding_column: my_sparse # default: sparse_embedding
+  dense_embedding_column: my_dense              # default: dense_embedding
+  sparse_embedding_column: my_sparse            # default: sparse_embedding
+  multivector_embedding_column: my_multivector  # default: multivector_embedding
+  rendered_text_column: text                    # default: text
 ```
+
+The `rendered_text_column` setting controls where the **template-rendered** text lands. If your source already has a `text` field it gets shadowed — set `rendered_text_column: rendered_text` to keep both.
 
 ## Sources
 
@@ -100,25 +104,33 @@ storage:
 
 ## Output format
 
-Every parquet file has the same flat schema:
+Every parquet file has a flat schema. Three groups of columns:
+
+**Always present:**
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `row_id` | int64 | Auto-incrementing record ID |
-| `source_row_id` | int64 | Original row in the source dataset |
-| `chunk_id` | int32 | Pipeline batch / slice ID |
-| `chunk_index` | int32 | Position within a text split (0 if not split) |
-| `text` | string | The embedded text |
-| `dense_embedding` | list\<float32\> | Dense embedding (when configured) |
-| `sparse_embedding` | struct{indices, values} | Sparse embedding (when configured) |
+| `text` | string | The text that was sent to the embedder (template-rendered). Configurable via `pipeline.rendered_text_column`. |
 
-Query with DuckDB:
+**Embedding columns** — written only when the corresponding embedder is configured. Names default as below; override via `pipeline.dense_embedding_column` / `pipeline.sparse_embedding_column` / `pipeline.multivector_embedding_column`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `dense_embedding` | `list<float32>` | Dense embedding |
+| `sparse_embedding` | `struct{indices: list<uint32>, values: list<float32>}` | Sparse embedding |
+| `multivector_embedding` | `list<list<float32>>` | Multi-vector embedding (N vectors per row) |
+
+**Pass-through source columns** — every column from the source row (after `source.exclude_columns` filtering) is appended verbatim under its original name. The writer skips any source column whose name collides with the embedding columns or with `rendered_text_column`. Types are inferred from the data by pyarrow.
+
+So if your HuggingFace source has columns `title`, `abstract`, `author`, those land alongside the embedding columns:
 
 ```sql
-SELECT row_id, text[:80] AS preview, length(dense_embedding) AS dim
-FROM 's3://my-bucket/dataset/model/**/*.parquet'
+SELECT title, length(dense_embedding) AS dim
+FROM read_parquet('s3://my-bucket/dataset/model/**/*.parquet')
 LIMIT 10;
 ```
+
+Unique row IDs are derived deterministically at **load time** from `(parquet_file_path, file_row_number)` using `vf_point_id` — see [Loader Architecture](../reference/loader-architecture.md#id-space-anchoring). The embed-side parquets do not carry an explicit `row_id` column; identity is anchored to physical row position so a re-read of the same parquet always produces the same IDs.
 
 ## Running locally
 

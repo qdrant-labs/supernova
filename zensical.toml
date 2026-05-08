@@ -23,6 +23,8 @@ nav = [
   ]},
   {"Reference" = [
     "reference/cli.md",
+    "reference/config.md",
+    "reference/s3-layout.md",
     "reference/skypilot.md",
     "reference/aws-sso.md",
     "reference/loader-architecture.md",

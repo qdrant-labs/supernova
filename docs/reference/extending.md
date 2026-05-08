@@ -115,7 +115,21 @@ class GsDestination:
         return self.child_uri(f"{EVAL_SUBDIR}/{filename}")
 ```
 
-Add a branch in each of the four scheme-keyed functions — `parse_destination`, `discover_corpus_parquets`, `filesystem_for_uri`, `bare_key_for_uri`:
+Add a branch in each of the scheme-keyed helpers in `vectorforge/destinations.py`. As of today there are nine, and a complete backend touches them all (the eval-side commands won't work otherwise):
+
+| Helper | What you add |
+|--------|---------------|
+| `parse_destination(uri)` | recognise the new scheme and return your dataclass |
+| `discover_corpus_parquets(dest)` | list every `.parquet` under the destination, excluding `eval/` |
+| `filesystem_for_uri(uri)` | return a pyarrow- (or fsspec-) compatible filesystem object for `pq.read_table(..., filesystem=fs)` |
+| `fs_path_for_uri(uri)` | strip the scheme to whatever path your filesystem expects |
+| `bare_key_for_uri(uri)` | the per-file identifier used by `make_point_id`; must agree on both sides of the loader/eval split |
+| `list_parquets_under(prefix_uri)` | recursive `.parquet` list for arbitrary prefixes (eval artifacts) — does not exclude `eval/` |
+| `upload_file_to_uri(local, dest_uri)` | one-shot eval-artifact uploads (queries, brute-force outputs) |
+| `upload_bytes_to_uri(data, dest_uri)` | same, for in-memory bytes |
+| `datasource_to_destination(ds_cfg)` | build a `Destination` from a loader-config `datasource:` block |
+
+Sketch:
 
 ```python
 def parse_destination(uri: str) -> Destination:

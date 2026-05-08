@@ -62,10 +62,17 @@ print(con.sql(\"SELECT count(*) FROM 's3://my-bucket/tweet-sentiment/openai-3-sm
 Create `configs/loader/my_dataset.yaml`:
 
 ```yaml
+vectors:                              # required: declare each named vector
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+
 datasource:
   type: s3
   s3_bucket: my-bucket
   s3_prefix: tweet-sentiment/openai-3-small
+  id_expression: "vf_point_id(filename, file_row_number)"
   payload_fields:
     text: text
 
@@ -80,6 +87,10 @@ loader:
   prefetch_size: 100000
   concurrency: 8
 ```
+
+The top-level `vectors:` block is required — it tells the loader which parquet column carries each vector and the vector store how to configure the collection.
+
+`id_expression` is a DuckDB SQL expression that yields the point id per row. The `vf_point_id(filename, file_row_number)` macro is the recommended choice: it produces stable UUIDs that match what `vf brute-force` and `vf generate-queries` emit, so recall ground truth lines up across the eval pipeline. See [Loader Architecture](../reference/loader-architecture.md) for the details.
 
 Run:
 

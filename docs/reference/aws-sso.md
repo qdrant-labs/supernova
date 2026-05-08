@@ -64,23 +64,28 @@ vf embed-dist configs/embedder/my_dataset.yaml
 
 **Important:** SSO temporary credentials last 8-12 hours. Refresh before long-running jobs.
 
-## 4. Code Changes Required
+## 4. How credentials reach each component
 
-### DuckDB S3 reader needs AWS_SESSION_TOKEN
+### DuckDB S3 reader
 
-SSO temporary credentials include a session token. DuckDB needs it set explicitly.
-
-In `vectorforge/loader/datasource/s3.py`, the `_configure_connection` method needs:
+DuckDB's httpfs reads `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` directly from environment variables. SSO temporary credentials add `AWS_SESSION_TOKEN`, which DuckDB needs set explicitly — `S3DataReader._configure_connection` handles this:
 
 ```python
+# vectorforge/loader/datasource/s3.py
 session_token = os.environ.get("AWS_SESSION_TOKEN", "")
 if session_token:
     conn.execute(f"SET s3_session_token = '{session_token}';")
 ```
 
-### aiobotocore (S3Backend) -- no changes needed
+So as long as you `eval "$(aws configure export-credentials --profile sandbox --format env)"` before running `vf load`, DuckDB picks everything up.
 
-aiobotocore automatically reads `AWS_SESSION_TOKEN` from the environment, so `vectorforge/storage/s3.py` works as-is.
+### aiobotocore (S3 storage backend)
+
+aiobotocore — used by the embed pipeline's `S3Backend` and by `cli/run_push_hf.py` — automatically reads `AWS_SESSION_TOKEN` from the environment via boto3's standard credential chain. No special handling needed.
+
+### SkyPilot dispatch
+
+`cli/skypilot_utils.build_env_flags()` forwards `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION` from your shell to every job/pool launched. Credentials are passed via `--env` flags at launch time and never written to disk.
 
 ## 5. Quick Reference
 

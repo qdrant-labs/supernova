@@ -92,8 +92,10 @@ Extra keys available for `huggingface_parquet` only:
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `path_filter` | auto-match by `split` | Substring filter on parquet paths. Useful for repos that mix splits or configs at different paths. |
-| `metadata_workers` | `32` | Parallelism for the per-file footer fetches at init. |
+| `path_filter` | auto-match by `split` | Glob (or `regex:<expr>`, or list of either) over parquet paths. Useful for repos that mix splits or configs at different paths. |
+| `metadata_workers` | `4` | Parallelism for the per-file footer fetches at init. Kept low by default to avoid bursting HF resolver rate limits when many ranks start simultaneously. |
+| `prefetch` | `false` | Download each parquet to local disk before streaming. Eliminates per-batch HTTP range requests at the cost of a one-time sequential download — strongly recommended for multi-rank runs. |
+| `prefetch_dir` | `/tmp/vectorforge_parquet` | Local directory for prefetched files. |
 
 If unsure: start with `huggingface`. If you see distributed ranks producing identical output (a quick `LIMIT 1` query against rank0 vs another rank's parquet shows this), switch to `huggingface_parquet`.
 

@@ -13,11 +13,39 @@ cd vectorforge
 uv sync
 ```
 
-This installs everything needed for both embedding generation and data loading.
+`uv sync` alone installs the **base** deps (pyarrow, numpy, click, boto3, huggingface_hub, etc.) — enough to run `vf --help`, parse configs, and use the `vectorforge.destinations` / URI helpers.
+
+The actual pipelines live under optional extras so embed workers don't pull in qdrant-client and load workers don't pull in torch:
+
+| Extra | Installs | Use when |
+|-------|----------|----------|
+| `embed` | datasets, sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `vf embed` / `vf partition` workers locally |
+| `partition` | datasets, aiobotocore, tiktoken | CPU partition workers (no ML models, no fastembed) |
+| `load` | duckdb, qdrant-client | Running `vf load` (loader workers) |
+| `eval` | torch | `vf brute-force --local` |
+| `dist` | skypilot[aws] | Dispatching distributed jobs from your laptop / Hetzner box |
+
+Pick the extras that match your role. Common combinations:
+
+```bash
+# Local laptop dispatching distributed embed + load + eval
+uv sync --extra dist --extra load --extra eval
+
+# A single embed worker
+uv sync --extra embed
+
+# A single load worker
+uv sync --extra load
+
+# Everything (heavy)
+uv sync --all-extras
+```
+
+The dispatch CLIs (`vf embed-dist`, `vf load-dist`, `vf brute-force-dist`, `vf push-hf-dist`) bake the right `uv sync --extra ...` into the pool's `setup:` script, so workers install the right slice automatically.
 
 ## Environment variables
 
-Set the variables relevant to your workflow:
+Set the variables relevant to your workflow.
 
 ### Embedding pipeline
 
@@ -26,7 +54,7 @@ Set the variables relevant to your workflow:
 | `OPENAI_API_KEY` | OpenAI embedder |
 | `AWS_ACCESS_KEY_ID` | S3 storage backend |
 | `AWS_SECRET_ACCESS_KEY` | S3 storage backend |
-| `HF_TOKEN` | HuggingFace Hub storage backend |
+| `HF_TOKEN` | HuggingFace Hub storage backend / private dataset reads |
 
 ### Loading pipeline
 
@@ -38,13 +66,14 @@ Set the variables relevant to your workflow:
 | `AWS_REGION` | S3 region (defaults to `us-east-1`) |
 | `QDRANT_URL` | Qdrant cluster URL |
 | `QDRANT_API_KEY` | Qdrant API key |
+| `HF_TOKEN` | Reading private corpora from `hf://datasets/...` |
 
 ## SkyPilot setup
 
-SkyPilot is used to parallelize both embedding generation (GPU instances) and vector store loading (CPU spot instances).
+SkyPilot is used to parallelize embedding generation (GPU instances), loading (CPU spot instances), and brute-force eval (GPU instances). It's only needed if you'll be **dispatching** distributed jobs — workers themselves don't need it.
 
 ```bash
-# SkyPilot is included in vectorforge dependencies
+uv sync --extra dist
 sky check aws
 ```
 
@@ -53,10 +82,12 @@ SkyPilot requires IAM permissions to launch EC2 instances. See the [SkyPilot AWS
 ## Verify installation
 
 ```bash
+vf --help                # lists all 14 subcommands; should run in well under a second
 vf embed --help
-vf embed-dist --help
 vf load --help
-vf load-dist --help
+vf brute-force --help
 
 uv run pytest tests/ -v
 ```
+
+The CLI is a click group with **lazy subcommand loading** (`cli/cli.py:LazyGroup`) — `vf --help` doesn't import torch or qdrant-client, only the relevant module is loaded when you actually run a subcommand.

@@ -27,7 +27,7 @@ datasource:
   type: s3                          # s3 or huggingface
   s3_bucket: my-bucket
   s3_prefix: dataset/model
-  id_column: row_id                 # default
+  id_expression: "vf_point_id(filename, file_row_number)"   # see below
   payload_fields:                   # what ends up in the vector store payload
     text: text                      # payload key: parquet column name
     source: source
@@ -75,6 +75,21 @@ datasource:
   repo_id: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
   subdir: en
 ```
+
+## Point IDs (`id_expression`)
+
+`id_expression` is a **DuckDB SQL expression** the loader evaluates per row to produce the Qdrant point ID. The default (`row_id`) is just a bare column name and works if your parquets carry a pre-baked `row_id` column. The recommended form for vectorforge-produced corpora is the built-in macro:
+
+```yaml
+datasource:
+  id_expression: "vf_point_id(filename, file_row_number)"
+```
+
+The macro hashes `(parquet path, physical row index)` into a deterministic UUID — the same form used by `vf brute-force` and `vf generate-queries`, so recall ground truth lines up across the eval pipeline.
+
+`file_row_number` is critical here: it's a DuckDB virtual column that always reflects the physical row index, regardless of parallel scan order. Do **not** use `ROW_NUMBER() OVER (PARTITION BY filename)` — that reflects DuckDB's scan ordering and produces different IDs from the brute-force side under concurrency. There's a regression test for this in `tests/test_loader_id_expression.py`.
+
+The base reader auto-enables `read_parquet(..., filename=true, file_row_number=true)` whenever your `id_expression` mentions either column, so you don't have to wire that yourself. See [Loader Architecture](../reference/loader-architecture.md#id-space-anchoring) for the full ID-space discussion.
 
 ## Vectors
 
