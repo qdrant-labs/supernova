@@ -42,13 +42,6 @@ if TYPE_CHECKING:
 
 EVAL_SUBDIR = "eval"
 HF_DATA_SUBDIR = "data"
-
-
-# ---------------------------------------------------------------------------
-# Destination dataclasses
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class S3Destination:
     bucket: str
@@ -102,12 +95,6 @@ class HfDestination:
 
 Destination = Union[S3Destination, HfDestination]
 
-
-# ---------------------------------------------------------------------------
-# URI parsing
-# ---------------------------------------------------------------------------
-
-
 def parse_destination(uri: str) -> Destination:
     """
     Parse an s3:// or hf://datasets/ URI into a Destination.
@@ -143,11 +130,6 @@ def parse_destination(uri: str) -> Destination:
     raise ValueError(
         f"Unknown URI scheme in {uri!r}. Supported: s3://, hf://datasets/"
     )
-
-
-# ---------------------------------------------------------------------------
-# Discovery — list corpus parquets, excluding eval artifacts
-# ---------------------------------------------------------------------------
 
 
 def discover_corpus_parquets(dest: Destination) -> list[str]:
@@ -196,11 +178,6 @@ def _discover_hf(dest: HfDestination) -> list[str]:
             continue
         uris.append(f"hf://datasets/{dest.repo_id}/{path}")
     return sorted(uris)
-
-
-# ---------------------------------------------------------------------------
-# Filesystem dispatch — for direct pyarrow reads (brute-force, query gen)
-# ---------------------------------------------------------------------------
 
 
 def filesystem_for_uri(uri: str):
@@ -279,21 +256,6 @@ def bare_key_for_uri(uri: str) -> str:
         parts = rest.split("/", 2)
         return parts[2] if len(parts) == 3 else ""
     raise ValueError(f"Unknown URI scheme in {uri!r}")
-
-
-# ---------------------------------------------------------------------------
-# Helpers for loader configs (datasource block → Destination)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Write + list helpers for eval / partial-result artifacts
-#
-# These complement ``discover_corpus_parquets`` (which lists corpus parquets
-# under a Destination, excluding eval/). Brute-force partial results and
-# generated queries live UNDER the destination's eval_uri — these helpers
-# cover writing them and listing them back during merge.
-# ---------------------------------------------------------------------------
 
 
 def list_parquets_under(prefix_uri: str) -> list[str]:
