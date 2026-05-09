@@ -238,7 +238,7 @@ def embed(config, num_jobs, job_rank):
 
         logging.getLogger("vectorforge").info(
             "Job %d/%d: offset=%d limit=%d (dataset_total=%d)",
-            job_rank,
+            job_rank + 1,
             num_jobs,
             slice_offset,
             slice_limit,

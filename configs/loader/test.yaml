@@ -19,20 +19,18 @@ vectors:
 datasource:
   type: s3
   bucket: qdrant--vectorforge
-  prefix: fineweb/embedder-bge-large-en-v1.5/cc-main-2025-26
+  prefix: mteb_tweets/all-MiniLM-L6-v2
   id_expression: "vf_point_id(filename, file_row_number)"
   prefetch: true
   payload_fields:
-    text: rendered_text
-    title: id
-    url: url
-    date: date
-    language: language
-    language_score: language_score
+    text: text
+    label: label
+    label_text: label_text
+    tweet_id: id
 
 vectorstore:
   type: qdrant
-  collection_name: fineweb-bge-large-bm25
+  collection_name: mteb_tweets_all-MiniLM-L6-v2
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
 

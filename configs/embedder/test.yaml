@@ -18,7 +18,7 @@ sparse_embedder:
 storage:
   type: s3
   bucket: qdrant--vectorforge
-  prefix: sqale2/embed-all-MiniLM-L6-v2
+  prefix: mteb_tweets/all-MiniLM-L6-v2
   output_dir: /tmp/vectorforge
 
 pipeline:
@@ -27,3 +27,13 @@ pipeline:
   max_text_length: 8192
   shard_by_rank: true
   flush_threshold: 1000
+
+resources:
+  cpus: 4
+  memory: 32
+  cloud: aws
+  image_id:
+    us-east-1: ami-0038d79e7270bb987
+    us-west-2: ami-08a03808395c1b31f
+    us-east-2: ami-0a28b3d7e7c9192a7
+  

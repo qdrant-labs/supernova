@@ -37,53 +37,81 @@ def _resolve_destination(config: str | None, path: str | None) -> str:
     raise ValueError(f"Unsupported storage type for analysis: {stype}")
 
 
-def _list_keys(destination: str) -> tuple[list[str], list[str]]:
+def _list_corpus_and_manifests(destination: str) -> tuple[list[str], list[str]]:
     """
-    Return (parquet_keys, manifest_keys) under the destination.
+    Return (corpus_parquet_uris, manifest_uris) under the destination.
+
+    Corpus parquets come from ``discover_corpus_parquets`` so ``eval/``
+    artifacts are filtered out. Manifests are listed separately and the
+    same eval filter is applied.
     """
+    from vectorforge.destinations import (
+        discover_corpus_parquets,
+        parse_destination,
+    )
+
+    # Accept bare local paths too (legacy --path callers).
+    if not destination.startswith(("s3://", "hf://", "file://")):
+        destination = f"file://{destination}"
+
+    dest = parse_destination(destination)
+    corpus_uris = discover_corpus_parquets(dest)
+    manifest_uris = _list_manifests(destination)
+    return corpus_uris, manifest_uris
+
+
+def _list_manifests(destination: str) -> list[str]:
+    """List `*_manifest.json` URIs under the destination, excluding ``eval/``."""
+    eval_segment = "/eval/"
+
     if destination.startswith("s3://"):
         parsed = urlparse(destination)
         bucket = parsed.netloc
         prefix = parsed.path.lstrip("/")
         s3 = boto3.client("s3")
-
-        parquets, manifests = [], []
+        uris: list[str] = []
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key.endswith(".parquet"):
-                    parquets.append(key)
-                elif key.endswith("_manifest.json"):
-                    manifests.append(key)
-        return parquets, manifests
+                if not key.endswith("_manifest.json"):
+                    continue
+                if eval_segment in f"/{key}":
+                    continue
+                uris.append(f"s3://{bucket}/{key}")
+        return sorted(uris)
 
-    # local
+    # file:// or bare path
+    import os
     from pathlib import Path
 
-    root = Path(destination)
-    parquets = [str(p) for p in root.rglob("*.parquet")]
-    manifests = [str(p) for p in root.rglob("*_manifest.json")]
-    return parquets, manifests
+    root = destination[len("file://") :] if destination.startswith("file://") else destination
+    eval_path_segment = f"{os.sep}eval{os.sep}"
+    return sorted(
+        f"file://{p}"
+        for p in Path(root).rglob("*_manifest.json")
+        if eval_path_segment not in str(p)
+    )
 
 
-def _read_manifests(destination: str, manifest_keys: list[str]) -> list[dict]:
+def _read_manifests(manifest_uris: list[str]) -> list[dict]:
     manifests = []
-    if destination.startswith("s3://"):
-        parsed = urlparse(destination)
-        bucket = parsed.netloc
-        s3 = boto3.client("s3")
-        for key in manifest_keys:
+    s3 = None
+    for uri in manifest_uris:
+        if uri.startswith("s3://"):
+            if s3 is None:
+                s3 = boto3.client("s3")
+            parsed = urlparse(uri)
+            bucket = parsed.netloc
+            key = parsed.path.lstrip("/")
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             m = json.loads(body)
-            m["_key"] = key
-            manifests.append(m)
-    else:
-        for path in manifest_keys:
+        else:
+            path = uri[len("file://") :] if uri.startswith("file://") else uri
             with open(path) as f:
                 m = json.load(f)
-                m["_key"] = path
-                manifests.append(m)
+        m["_key"] = uri
+        manifests.append(m)
     return manifests
 
 
@@ -157,11 +185,11 @@ def analysis(config, path, cost_per_hour, check_duplicates):
     destination = _resolve_destination(config, path)
     click.echo(f"Analyzing: {destination}\n")
 
-    parquet_keys, manifest_keys = _list_keys(destination)
+    parquet_uris, manifest_uris = _list_corpus_and_manifests(destination)
     click.echo(
-        f"Found {len(parquet_keys)} parquet files, {len(manifest_keys)} manifests"
+        f"Found {len(parquet_uris)} parquet files, {len(manifest_uris)} manifests"
     )
-    if not parquet_keys:
+    if not parquet_uris:
         click.echo("No parquet files found. Nothing to analyze.")
         sys.exit(1)
 
@@ -169,21 +197,26 @@ def analysis(config, path, cost_per_hour, check_duplicates):
     con = duckdb.connect()
     if destination.startswith("s3://"):
         _configure_duckdb_for_s3(con)
-    # pass both globs so the same script works for flat layouts (all parquets at the
-    # top of the prefix) and sharded layouts (rank00/batch_*.parquet).
-    globs = f"'{destination}/**/*.parquet'"
+
+    # Pass an explicit list to read_parquet rather than a glob, so eval/ files
+    # filtered out by discover_corpus_parquets stay filtered.
+    files_literal = "[" + ", ".join(f"'{u}'" for u in parquet_uris) + "]"
 
     click.echo("\n=== Schema ===")
-    schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet({globs})").fetchall()
+    schema = con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet({files_literal})"
+    ).fetchall()
     for col in schema:
         name, dtype = col[0], col[1]
         click.echo(f"  {name:30s} {dtype}")
 
-    row_count = con.execute(f"SELECT COUNT(*) FROM read_parquet({globs})").fetchone()[0]
+    row_count = con.execute(
+        f"SELECT COUNT(*) FROM read_parquet({files_literal})"
+    ).fetchone()[0]
     click.echo(f"\nTotal rows: {row_count:,}")
-    click.echo(f"Parquet files: {len(parquet_keys)}")
+    click.echo(f"Parquet files: {len(parquet_uris)}")
 
-    manifests = _read_manifests(destination, manifest_keys) if manifest_keys else []
+    manifests = _read_manifests(manifest_uris) if manifest_uris else []
     manifests.sort(key=lambda m: m.get("_key", ""))
 
     if not manifests:
@@ -265,7 +298,7 @@ def analysis(config, path, cost_per_hour, check_duplicates):
                 COUNT(*) - COUNT(DISTINCT source_row_id) AS duplicate_count,
                 MIN(source_row_id)                AS min_source_row_id,
                 MAX(source_row_id)                AS max_source_row_id
-            FROM read_parquet({globs})
+            FROM read_parquet({files_literal})
         """).fetchone()
         total, unique, dupes, min_id, max_id = stats
         click.echo(f"  total rows:         {total:,}")
@@ -285,7 +318,7 @@ def analysis(config, path, cost_per_hour, check_duplicates):
             click.echo("\n  First 10 duplicated source_row_ids:")
             rows = con.execute(f"""
                 SELECT source_row_id, COUNT(*) AS cnt
-                FROM read_parquet({globs})
+                FROM read_parquet({files_literal})
                 GROUP BY source_row_id
                 HAVING cnt > 1
                 ORDER BY cnt DESC

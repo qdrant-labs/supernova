@@ -14,11 +14,11 @@ from qdrant_client import models
 BUCKET = "qdrant--vectorforge"
 QDRANT_URL = os.environ["QDRANT_URL"]
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
-COLLECTION = "arxiv-bge-large"
+COLLECTION = "mteb_tweets_all-MiniLM-L6-v2"
 DENSE_VECTOR = "dense"
 DENSE_COLUMN = "dense_embedding"
 K = 1000
-ENRICH_COLUMNS = ["abstract", "title"]
+ENRICH_COLUMNS = ["text"]
 
 queries = pl.read_parquet("/Users/nathanleroy/Downloads/queries_1000.parquet")
 bf_ground_truth = pl.read_parquet(
@@ -91,13 +91,12 @@ def recall_one(
 row = queries.row(random.randrange(len(queries)), named=True)
 
 text = enrich_one(row)
-hits = query_qdrant(row, ef_search=2)
-recall = recall_one(row, hits, negative_control=True)
+hits = query_qdrant(row, ef_search=256)
+recall = recall_one(row, hits)
 
 print(f"point_id:  {row['point_id']}")
 print(f"source:    {row['__source_file__']}  row={row['__source_row__']}")
-print(f"abstract:  {text['abstract'][:300]}")
-print(f"title:     {text['title'][:300]}")
+print(f"text:      {text['text'][:300]}")
 print(f"recall@{K}: {recall:.4f}")
 
 result = client.query_points(

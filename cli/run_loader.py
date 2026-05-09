@@ -156,18 +156,31 @@ def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
     # Resolve environment variables throughout the config
     cfg = resolve_config(cfg)
 
-    # Rank-based file sharding for distributed loading
+    # Always populate file_list from discover_corpus_parquets so eval/
+    # artifacts are filtered out (the readers' fallback glob is unfiltered).
+    # Rank-based sharding splits the same list when --num-jobs is set.
     if num_jobs is not None:
         if job_rank is None:
             job_rank = int(os.environ.get("SKYPILOT_JOB_RANK", 0))
-
-        shard_files = _discover_and_shard(cfg["datasource"], num_jobs, job_rank)
-        if not shard_files:
+        files = _discover_and_shard(cfg["datasource"], num_jobs, job_rank)
+        if not files:
             logging.getLogger("vectorforge").info(
                 "No files assigned to this shard, exiting."
             )
             return
-        cfg["datasource"]["file_list"] = shard_files
+    else:
+        from vectorforge.destinations import (
+            datasource_to_destination,
+            discover_corpus_parquets,
+        )
+
+        files = discover_corpus_parquets(datasource_to_destination(cfg["datasource"]))
+        if not files:
+            logging.getLogger("vectorforge").info(
+                "No corpus parquet files discovered at the datasource. Nothing to load."
+            )
+            return
+    cfg["datasource"]["file_list"] = files
 
     vectors = cfg.get("vectors")
     if not vectors:

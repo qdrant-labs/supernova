@@ -46,7 +46,7 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         )
         self._model_name = model
         self._batch_size = batch_size
-        self._dimensions_val = self._model.get_sentence_embedding_dimension()
+        self._dimensions_val = self._model.get_embedding_dimension()
         # override the model's seq-length cap if user set one
         if max_tokens is not None:
             # clamp to the model's native max — exceeding it breaks the forward pass
