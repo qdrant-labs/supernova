@@ -12,7 +12,7 @@ dense_embedder:
 
 sparse_embedder:                                                                                        
   type: fastembed                                                                                     
-  model: Qdrant/bm25                                                                                  
+  model: Qdrant/bm25                                                                            
   batch_size: 256
 
 storage:
@@ -23,10 +23,10 @@ storage:
 
 pipeline:
   chunk_size: 1000
-  num_workers: 2
-  max_text_length: 8192
-  shard_by_rank: true
-  flush_threshold: 1000
+  flush_threshold: 10000
+  # max_text_length: 8192
+  # num_workers: 2
+  # shard_by_rank: true
 
 resources:
   cpus: 4
