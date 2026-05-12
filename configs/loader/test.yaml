@@ -1,12 +1,3 @@
-dispatch:
-  num_shards: 25
-  run_name: fineweb-bge-large-bm25
-
-resources:
-  cpus: 2
-  memory: 16
-  cloud: aws
-
 datasource:
   type: s3
   bucket: qdrant--vectorforge
@@ -36,3 +27,12 @@ vectorstore:
 loader:
   batch_size: 256
   concurrency: 4
+
+resources:
+  cpus: 2
+  memory: 16
+  cloud: aws
+
+dispatch:
+  num_shards: 25
+  run_name: fineweb-bge-large-bm25

@@ -10,9 +10,9 @@ dense_embedder:
   batch_size: 128
   dtype: bfloat16
 
-sparse_embedder:                                                                                        
-  type: fastembed                                                                                     
-  model: Qdrant/bm25                                                                            
+sparse_embedder:
+  type: fastembed
+  model: Qdrant/bm25
   batch_size: 256
 
 storage:
