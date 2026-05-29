@@ -39,6 +39,10 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
         "cli.run_generate_queries:generate_queries",
         "Sample N rows as eval queries (launches EC2; --local to run here).",
     ),
+    "subsample": (
+        "cli.run_subsample:subsample",
+        "Sample N random rows from a corpus to a local parquet file.",
+    ),
     "brute-force": (
         "cli.run_brute_force:brute_force",
         "Exhaustive nearest-neighbor search for recall eval (single GPU).",

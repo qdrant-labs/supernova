@@ -1,0 +1,48 @@
+datasource:
+  type: s3
+  bucket: qdrant--vectorforge
+  prefix: finewiki/embed-gte-multilingual-base/es
+  id_expression: "vf_point_id(filename, file_row_number)"
+  payload_fields:
+    text: text
+    id: id
+    wikiname: wikiname
+    page_id: page_id
+    title: title
+    url: url
+    date_modified: date_modified
+    in_language: in_language
+    wikidata_id: wikidata_id
+    bytes_html: bytes_html
+    wikitext: wikitext
+    version: version
+    infoboxes: infoboxes
+    has_math: has_math
+  
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+  sparse:
+    type: sparse
+    column: sparse_embedding
+
+vectorstore:
+  type: qdrant
+  collection_name: arxiv_papers_embedder_bge_large_en_v1_5
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+
+loader:
+  batch_size: 256
+  concurrency: 4
+
+resources:
+  cpus: 2
+  memory: 16
+  cloud: aws
+
+dispatch:
+  num_shards: 25
+  run_name: fineweb-bge-large-bm25

@@ -1,12 +1,13 @@
 source:
   type: huggingface_parquet
-  dataset_name: mteb/tweet_sentiment_extraction
+  dataset_name: HuggingFaceFW/fineweb
   split: train
   text_field: text
+  path_filter: data/CC-MAIN-2025-26/*
 
 dense_embedder:
   type: sentence_transformer
-  model: sentence-transformers/all-MiniLM-L6-v2
+  model: Alibaba-NLP/gte-multilingual-base
   batch_size: 128
   dtype: bfloat16
 
@@ -18,7 +19,7 @@ sparse_embedder:
 storage:
   type: s3
   bucket: qdrant--vectorforge
-  prefix: mteb_tweets/all-MiniLM-L6-v2
+  prefix: fineweb/embed-gte-multilingual-base
   output_dir: /tmp/vectorforge
 
 pipeline:
@@ -29,6 +30,7 @@ pipeline:
   # shard_by_rank: true
 
 resources:
+  gpus: 1
   cpus: 4
   memory: 32
   cloud: aws
