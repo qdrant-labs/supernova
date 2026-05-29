@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 
 from qdrant_client import AsyncQdrantClient, models
 
@@ -44,7 +45,16 @@ class QdrantVectorStore(VectorStore):
         self.collection_name = collection_name
         self.vectors = vectors
         self.params = params or {}
+        self.upsert_wait = self._resolve_upsert_wait()
         self._client = AsyncQdrantClient(url=url, api_key=api_key, timeout=60)
+
+    def _resolve_upsert_wait(self) -> bool:
+        # VF_UPSERT_WAIT env var overrides YAML; default false matches the
+        # historic hardcoded behavior (fire-and-forget upserts).
+        env = os.environ.get("VF_UPSERT_WAIT")
+        if env is not None:
+            return env.strip().lower() in ("1", "true", "yes", "on")
+        return bool(self.params.get("upsert_wait", False))
 
     def _build_vectors_config(
         self, dimensions: dict[str, int]
@@ -175,7 +185,7 @@ class QdrantVectorStore(VectorStore):
                 await self._client.upsert(
                     collection_name=self.collection_name,
                     points=qdrant_points,
-                    wait=False,
+                    wait=self.upsert_wait,
                 )
                 return
             except Exception as e:
