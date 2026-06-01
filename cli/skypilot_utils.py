@@ -1,9 +1,14 @@
 """
 Shared SkyPilot helpers used across all vf *-dist and EC2-launch commands.
+
+All launches go through the SkyPilot Python SDK (sky.jobs.launch /
+sky.jobs.pool_apply) and stream their progress to stdout via
+sky.stream_and_get. ``sky`` is imported lazily inside each helper because
+the package pulls in a lot at import time.
 """
 
 import os
-import subprocess
+import sys
 
 from datetime import datetime
 from pathlib import Path
@@ -27,19 +32,20 @@ CUDA_IMAGE_IDS = {
 }
 
 
-def build_env_flags(extra_vars: list[str] | None = None) -> list[str]:
+def build_env_dict(extra_vars: list[str] | None = None) -> dict[str, str]:
     """
-    Build --env KEY=VAL flags for sky jobs commands from the current environment.
+    Collect env vars to forward to a SkyPilot job, as a dict suitable for
+    ``sky.Task.update_envs(...)``.
 
     Always forwards AWS credential vars. Pass extra_vars for tool-specific
     secrets (HF_TOKEN, QDRANT_URL, OPENAI_API_KEY, etc.).
     """
-    flags = []
+    envs: dict[str, str] = {}
     for var in AWS_ENV_VARS + (extra_vars or []):
         val = os.environ.get(var)
         if val:
-            flags.extend(["--env", f"{var}={val}"])
-    return flags
+            envs[var] = val
+    return envs
 
 
 def make_run_dir(name: str) -> Path:
@@ -49,52 +55,62 @@ def make_run_dir(name: str) -> Path:
     return run_dir
 
 
+def launch_single_job(job_path: Path, envs: dict[str, str]) -> None:
+    """Submit a single SkyPilot job (no pool) and stream its progress."""
+    import sky
+
+    task = sky.Task.from_yaml(str(job_path))
+    if envs:
+        task.update_envs(envs)
+
+    request_id = sky.jobs.launch(task)
+    sky.stream_and_get(request_id, output_stream=sys.stdout)
+
+
 def launch_pool_and_jobs(
     pool_name: str,
     pool_path: Path,
     job_path: Path,
     num_jobs: int,
-    env_flags: list[str],
+    envs: dict[str, str],
 ) -> None:
     """
-    Create a SkyPilot pool and submit num_jobs parallel jobs to it.
+    Apply a pool config and submit ``num_jobs`` parallel jobs to that pool.
+
+    Env vars are attached to both the pool task (visible during setup) and
+    the job task (visible at run time) to match the prior ``--env`` flag
+    behavior, which forwarded them to both phases.
     """
-    subprocess.run(
-        ["sky", "jobs", "pool", "apply", "-p", pool_name, str(pool_path), *env_flags],
-        check=True,
-    )
-    subprocess.run(
-        [
-            "sky",
-            "jobs",
-            "launch",
-            "-p",
-            pool_name,
-            "--num-jobs",
-            str(num_jobs),
-            "-y",
-            str(job_path),
-            *env_flags,
-        ],
-        check=True,
-    )
+    import sky
 
-
-def launch_single_job(job_path: Path, env_flags: list[str]) -> None:
-    """Submit a single SkyPilot job (no pool)."""
-    subprocess.run(
-        ["sky", "jobs", "launch", "-y", str(job_path), *env_flags], check=True
+    pool_task = sky.Task.from_yaml(str(pool_path))
+    if envs:
+        pool_task.update_envs(envs)
+    pool_req = sky.jobs.pool_apply(
+        pool_task, pool_name, mode=sky.serve.UpdateMode.ROLLING
     )
+    sky.stream_and_get(pool_req, output_stream=sys.stdout)
+
+    job_task = sky.Task.from_yaml(str(job_path))
+    if envs:
+        job_task.update_envs(envs)
+    job_req = sky.jobs.launch(job_task, pool=pool_name, num_jobs=num_jobs)
+    sky.stream_and_get(job_req, output_stream=sys.stdout)
 
 
 def launch_single_job_to_pool(
-    pool_name: str, job_path: Path, env_flags: list[str]
+    pool_name: str,
+    job_path: Path,
+    envs: dict[str, str],
 ) -> None:
     """Submit a single SkyPilot job to an existing pool (does not create a pool)."""
-    subprocess.run(
-        ["sky", "jobs", "launch", "-p", pool_name, "-y", str(job_path), *env_flags],
-        check=True,
-    )
+    import sky
+
+    task = sky.Task.from_yaml(str(job_path))
+    if envs:
+        task.update_envs(envs)
+    request_id = sky.jobs.launch(task, pool=pool_name)
+    sky.stream_and_get(request_id, output_stream=sys.stdout)
 
 
 def print_dry_run(

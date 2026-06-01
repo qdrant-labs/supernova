@@ -17,9 +17,9 @@ import click
 import yaml
 
 from cli.skypilot_utils import (
-    build_env_flags,
-    make_run_dir,
+    build_env_dict,
     launch_pool_and_jobs,
+    make_run_dir,
     print_dry_run,
     print_monitor,
 )
@@ -183,10 +183,10 @@ def partition_dist(
         print_dry_run(pool_name_eff, num_jobs_eff, pool_path, job_path)
         return
 
-    env_flags = build_env_flags(["HF_TOKEN"])
+    envs = build_env_dict(["HF_TOKEN"])
     logger.info(f"Creating pool '{pool_name_eff}'...")
     logger.info(f"Submitting {num_jobs_eff} jobs to pool '{pool_name_eff}'...")
-    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_jobs_eff, env_flags)
+    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_jobs_eff, envs)
 
     click.echo(f"\nSubmitted {num_jobs_eff} partition jobs to pool '{pool_name_eff}'")
     print_monitor(pool_name_eff)

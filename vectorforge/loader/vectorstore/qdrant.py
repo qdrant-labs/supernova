@@ -188,7 +188,7 @@ class QdrantVectorStore(VectorStore):
                 await self._client.upsert(
                     collection_name=self.collection_name,
                     points=qdrant_points,
-                    # wait=self.upsert_wait,
+                    # wait=upsert_wait,
                     wait=False # hardcoded for debugging right now
                 )
                 return

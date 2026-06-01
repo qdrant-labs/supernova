@@ -16,7 +16,7 @@ import click
 import yaml
 
 from cli.skypilot_utils import (
-    build_env_flags,
+    build_env_dict,
     launch_pool_and_jobs,
     launch_single_job_to_pool,
     make_run_dir,
@@ -150,9 +150,9 @@ def _retry_one_rank(
         click.echo(f"To run manually: sky jobs launch -p {pool_name} -y {retry_path}")
         return
 
-    env_flags = build_env_flags(["HF_TOKEN", "OPENAI_API_KEY"])
+    envs = build_env_dict(["HF_TOKEN", "OPENAI_API_KEY"])
     logger.info("Submitting retry for rank %d to pool '%s'...", retry_rank, pool_name)
-    launch_single_job_to_pool(pool_name, retry_path, env_flags)
+    launch_single_job_to_pool(pool_name, retry_path, envs)
     click.echo(f"\nSubmitted retry for rank {retry_rank} to pool '{pool_name}'")
     click.echo("Monitor: sky jobs queue   |   Logs: sky jobs logs <job-id>")
 
@@ -331,10 +331,10 @@ def embed_dist(
         print_dry_run(pool_name_eff, num_jobs_eff, pool_path, job_path)
         return
 
-    env_flags = build_env_flags(["HF_TOKEN", "OPENAI_API_KEY"])
+    envs = build_env_dict(["HF_TOKEN", "OPENAI_API_KEY"])
     logger.info(f"Creating pool '{pool_name_eff}'...")
     logger.info(f"Submitting {num_jobs_eff} jobs to pool '{pool_name_eff}'...")
-    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_jobs_eff, env_flags)
+    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_jobs_eff, envs)
 
     click.echo(f"\nSubmitted {num_jobs_eff} jobs to pool '{pool_name_eff}'")
     print_monitor(pool_name_eff)

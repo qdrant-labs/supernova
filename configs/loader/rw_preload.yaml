@@ -3,6 +3,8 @@ datasource:
   bucket: qdrant--vectorforge
   prefix: finewiki/embed-gte-multilingual-base/en
   id_expression: vf_point_id(filename, file_row_number)
+  prefetch: true
+  prefetch_dir: /tmp/vectorforge_loader
   payload_fields:
     text: text
     id: id
@@ -13,13 +15,9 @@ datasource:
     date_modified: date_modified
     in_language: in_language
     wikidata_id: wikidata_id
-    bytes_html: bytes_html
-    wikitext: wikitext
     version: version
-    infoboxes: infoboxes
     has_math: has_math
-  prefetch: true
-  prefetch_dir: /tmp/vectorforge_loader
+
 vectors:
   dense:
     type: dense

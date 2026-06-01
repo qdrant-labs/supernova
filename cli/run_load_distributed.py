@@ -25,9 +25,9 @@ import click
 import yaml
 
 from cli.skypilot_utils import (
-    build_env_flags,
-    make_run_dir,
+    build_env_dict,
     launch_pool_and_jobs,
+    make_run_dir,
     print_dry_run,
     print_monitor,
 )
@@ -277,10 +277,10 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     asyncio.run(_setup_collection(store, dimensions))
     logger.info("Qdrant collection ready (indexing deferred)")
 
-    env_flags = build_env_flags(["QDRANT_URL", "QDRANT_API_KEY", "HF_TOKEN"])
+    envs = build_env_dict(["QDRANT_URL", "QDRANT_API_KEY", "HF_TOKEN"])
     logger.info(f"Creating pool '{pool_name_eff}'...")
     logger.info(f"Submitting {num_shards_eff} jobs to pool '{pool_name_eff}'...")
-    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_shards_eff, env_flags)
+    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_shards_eff, envs)
 
     click.echo(f"\nSubmitted {num_shards_eff} loading jobs to pool '{pool_name_eff}'")
     print_monitor(pool_name_eff)

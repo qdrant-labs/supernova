@@ -22,7 +22,7 @@ import yaml
 from cli.run_brute_force import DEFAULT_ACCELERATOR, DEFAULT_INSTANCE_TYPE
 from cli.skypilot_utils import (
     CUDA_IMAGE_IDS,
-    build_env_flags,
+    build_env_dict,
     launch_pool_and_jobs,
     make_run_dir,
     print_monitor,
@@ -206,7 +206,7 @@ def brute_force_dist(
         return
 
     launch_pool_and_jobs(
-        pool_name_eff, pool_path, job_path, num_jobs, build_env_flags()
+        pool_name_eff, pool_path, job_path, num_jobs, build_env_dict()
     )
 
     click.echo(f"Submitted {num_jobs} workers to pool '{pool_name_eff}'")

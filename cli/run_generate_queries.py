@@ -12,7 +12,7 @@ import logging
 import click
 import yaml
 
-from cli.skypilot_utils import build_env_flags, make_run_dir, launch_single_job
+from cli.skypilot_utils import build_env_dict, launch_single_job, make_run_dir
 from vectorforge.destinations import S3Destination, parse_destination
 from vectorforge.eval.generate_queries import generate_queries as _generate_queries
 from vectorforge.utils import get_bucket_region
@@ -93,7 +93,7 @@ def launch_on_ec2(
         click.echo(f"To run manually: sky jobs launch -y {job_path}")
         return
 
-    launch_single_job(job_path, build_env_flags())
+    launch_single_job(job_path, build_env_dict())
 
     click.echo(f"\nOutput will be at {dest.eval_uri(output)}")
     click.echo("Monitor: sky jobs logs")
