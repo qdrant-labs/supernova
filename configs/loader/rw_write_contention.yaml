@@ -1,0 +1,50 @@
+datasource:
+  type: s3
+  bucket: qdrant--vectorforge
+  prefix: finewiki/embed-gte-multilingual-base/es
+  id_expression: vf_point_id(filename, file_row_number)
+
+  payload_fields:
+    text: text
+    id: id
+    wikiname: wikiname
+    page_id: page_id
+    title: title
+    url: url
+    date_modified: date_modified
+    in_language: in_language
+    wikidata_id: wikidata_id
+    bytes_html: bytes_html
+    wikitext: wikitext
+    version: version
+    infoboxes: infoboxes
+    has_math: has_math
+  prefetch: true
+  prefetch_dir: /tmp/vectorforge_loader
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+
+vectorstore:
+  type: qdrant
+  collection_name: rw_contention
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  params:
+    upsert_wait: true
+
+loader:
+  batch_size: 512
+  concurrency: 4
+  
+dispatch:
+  num_shards: 10
+  run_name: finewiki_preload
+
+resources:
+  cpus: 2
+  memory: 16
+  cloud: aws

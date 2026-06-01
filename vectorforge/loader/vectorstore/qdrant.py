@@ -180,12 +180,16 @@ class QdrantVectorStore(VectorStore):
             )
             for p in points
         ]
+        upsert_wait = self.upsert_wait
+        # log out the upsert_wait value for debugging
+        logger.debug(f"Upsert wait is set to {upsert_wait}")
         for attempt in range(max_retries):
             try:
                 await self._client.upsert(
                     collection_name=self.collection_name,
                     points=qdrant_points,
-                    wait=self.upsert_wait,
+                    # wait=self.upsert_wait,
+                    wait=False # hardcoded for debugging right now
                 )
                 return
             except Exception as e:
