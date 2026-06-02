@@ -23,6 +23,7 @@ vectors:
     type: dense
     column: dense_embedding
     distance: cosine
+
 vectorstore:
   type: qdrant
   collection_name: rw_contention
@@ -30,6 +31,8 @@ vectorstore:
   api_key: ${QDRANT_API_KEY}
   params:
     upsert_wait: false
+    shard_number: 24
+
 loader:
   batch_size: 512
   concurrency: 4

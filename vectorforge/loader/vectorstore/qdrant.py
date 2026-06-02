@@ -32,6 +32,29 @@ def _resolve_comparator(name: str | None) -> models.MultiVectorComparator:
 
 
 class QdrantVectorStore(VectorStore):
+    # Top-level vectorstore.params keys this backend understands. Anything
+    # outside this set at construction time is a typo and raises loudly —
+    # silent param drop (e.g. shard_numbr instead of shard_number) is the
+    # worst UX. Nested config dicts (hnsw_config, etc.) are validated by
+    # qdrant_client's pydantic models, which already forbid extra keys.
+    _VALID_PARAM_KEYS = frozenset(
+        {
+            # non-collection-creation params
+            "upsert_wait",
+            # create_collection scalar params
+            "shard_number",
+            "sharding_method",
+            "replication_factor",
+            "write_consistency_factor",
+            "on_disk_payload",
+            # create_collection nested-dict params
+            "hnsw_config",
+            "optimizers_config",
+            "wal_config",
+            "quantization",
+        }
+    )
+
     def __init__(
         self,
         url: str,
@@ -45,8 +68,14 @@ class QdrantVectorStore(VectorStore):
         self.collection_name = collection_name
         self.vectors = vectors
         self.params = params or {}
+        unknown = set(self.params) - self._VALID_PARAM_KEYS
+        if unknown:
+            raise ValueError(
+                f"QdrantVectorStore: unknown params keys {sorted(unknown)}. "
+                f"Valid keys: {sorted(self._VALID_PARAM_KEYS)}"
+            )
         self.upsert_wait = self._resolve_upsert_wait()
-        self._client = AsyncQdrantClient(url=url, api_key=api_key, timeout=60)
+        self._client = AsyncQdrantClient(url=url, api_key=api_key, timeout=180, prefer_grpc=True)
 
     def _resolve_upsert_wait(self) -> bool:
         # VF_UPSERT_WAIT env var overrides YAML; default false matches the
@@ -84,6 +113,51 @@ class QdrantVectorStore(VectorStore):
 
         return vectors_config, sparse_vectors_config
 
+    def _build_create_collection_kwargs(self, dimensions: dict[str, int]) -> dict:
+        """
+        Translate ``self.params`` + ``dimensions`` into kwargs for
+        ``AsyncQdrantClient.create_collection``.
+
+        Scalar params pass through unchanged. Nested config dicts
+        (hnsw_config / optimizers_config / wal_config) are spread into the
+        matching ``qdrant_client.models.*ConfigDiff`` — pydantic raises on
+        unknown nested keys, so typos at that level surface as
+        ``ValidationError`` from qdrant_client without us needing to mirror
+        its full schema.
+        """
+        vectors_config, sparse_vectors_config = self._build_vectors_config(dimensions)
+        kwargs: dict = {
+            "collection_name": self.collection_name,
+            "vectors_config": vectors_config,
+            "sparse_vectors_config": sparse_vectors_config or None,
+        }
+
+        p = self.params
+        for key in (
+            "shard_number",
+            "sharding_method",
+            "replication_factor",
+            "write_consistency_factor",
+            "on_disk_payload",
+        ):
+            if key in p:
+                kwargs[key] = p[key]
+
+        if "hnsw_config" in p:
+            kwargs["hnsw_config"] = models.HnswConfigDiff(**p["hnsw_config"])
+        if "optimizers_config" in p:
+            kwargs["optimizers_config"] = models.OptimizersConfigDiff(
+                **p["optimizers_config"]
+            )
+        if "wal_config" in p:
+            kwargs["wal_config"] = models.WalConfigDiff(**p["wal_config"])
+
+        quant = self._build_quantization(p)
+        if quant is not None:
+            kwargs["quantization_config"] = quant
+
+        return kwargs
+
     async def ensure_collection(self, dimensions: dict[str, int]) -> None:
         collections = await self._client.get_collections()
         existing = [c.name for c in collections.collections]
@@ -94,15 +168,12 @@ class QdrantVectorStore(VectorStore):
             )
             return
 
-        vectors_config, sparse_vectors_config = self._build_vectors_config(dimensions)
-        await self._client.create_collection(
-            collection_name=self.collection_name,
-            vectors_config=vectors_config,
-            sparse_vectors_config=sparse_vectors_config or None,
-        )
+        kwargs = self._build_create_collection_kwargs(dimensions)
+        await self._client.create_collection(**kwargs)
         logger.info(
-            f"Created collection '{self.collection_name}' with vectors={list(vectors_config)}, "
-            f"sparse={list(sparse_vectors_config)}"
+            f"Created collection '{self.collection_name}' with vectors={list(kwargs['vectors_config'])}, "
+            f"sparse={list(kwargs.get('sparse_vectors_config') or [])}, "
+            f"extra_params={sorted(set(self.params) - {'upsert_wait'})}"
         )
 
     async def defer_indexing(self) -> None:
