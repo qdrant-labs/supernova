@@ -1,29 +1,29 @@
 # Cost and Time Estimation
 
-Before embedding a dataset, estimate how long it will take and what it will cost. The fastest path is `vf throughput-predict`; the back-of-envelope arithmetic below is useful when you want a rough sense without running the predictor.
+Before embedding a dataset, estimate how long it will take and what it will cost. The fastest path is `nova throughput-predict`; the back-of-envelope arithmetic below is useful when you want a rough sense without running the predictor.
 
-## `vf throughput-predict`
+## `nova throughput-predict`
 
 The predictor reads dataset, model, text rendering, and per-text cutoff straight from your embedder YAML. It tokenizes a sample of the source to build an empirical length distribution, simulates batched padding, and prints throughput + wall-clock + cost estimates.
 
 ```bash
 # Single-cutoff estimate
-vf throughput-predict configs/embedder/finewiki_en_all_mini.yaml --gpu a10g
+nova throughput-predict configs/embedder/finewiki_en_all_mini.yaml --gpu a10g
 
 # Sweep across cutoffs to find the padding sweet spot
-vf throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
+nova throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
   --gpu a10g --cutoff 256 --cutoff 512 --cutoff 1024
 
 # Distributed wall-clock estimate (10× A10G in parallel)
-vf throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
+nova throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
   --gpu a10g --num-gpus 10
 
 # Save JSON + plot
-vf throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
+nova throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
   --gpu a10g --output predictions.json
 ```
 
-`vf throughput-predict --help` lists every override (model, total rows, batch size, sample size, GPU rate, …). The GPU catalogue lives in `vectorforge/throughput.py:GPU_TABLE`.
+`nova throughput-predict --help` lists every override (model, total rows, batch size, sample size, GPU rate, …). The GPU catalogue lives in `supernova/throughput.py:GPU_TABLE`.
 
 ## Manual back-of-envelope
 
@@ -34,11 +34,11 @@ cost         = gpu_hours * price_per_gpu_hour
 wall_time    = gpu_hours / num_gpus
 ```
 
-For a confidence interval on `mean_tokens_per_row`, profile a sample of the source with your model's tokenizer using vectorforge's parquet-level source:
+For a confidence interval on `mean_tokens_per_row`, profile a sample of the source with your model's tokenizer using supernova's parquet-level source:
 
 ```python
 from transformers import AutoTokenizer
-from vectorforge.sources.huggingface import HuggingFaceSource
+from supernova.sources.huggingface import HuggingFaceSource
 
 tok = AutoTokenizer.from_pretrained("Alibaba-NLP/gte-multilingual-base", trust_remote_code=True)
 src = HuggingFaceSource(
@@ -87,7 +87,7 @@ Self-hosted GPU embedding is ~10× cheaper than OpenAI at this scale.
 
 ## Padding waste
 
-Transformer models pad every batch to the length of the longest sequence in that batch. `vf throughput-predict --cutoff <N1> --cutoff <N2> --cutoff <N3>` sweeps cutoffs and reports padding efficiency for each.
+Transformer models pad every batch to the length of the longest sequence in that batch. `nova throughput-predict --cutoff <N1> --cutoff <N2> --cutoff <N3>` sweeps cutoffs and reports padding efficiency for each.
 
 Typical findings:
 

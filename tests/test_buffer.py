@@ -1,7 +1,7 @@
 import pytest
 
-from vectorforge.pipeline.buffer import ResultBuffer
-from vectorforge.models import ChunkResult, EmbeddedRecord
+from supernova.pipeline.buffer import ResultBuffer
+from supernova.models import ChunkResult, EmbeddedRecord
 
 
 def _make_chunk(chunk_id: int, num_records: int = 3) -> ChunkResult:

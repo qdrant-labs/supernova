@@ -1,12 +1,12 @@
 # Loading Overview
 
-vectorforge's loading pipeline streams pre-embedded parquet files from S3 or HuggingFace into vector stores like Qdrant. An embedding run typically produces many parquet files (one per chunk/slice) under a shared S3 prefix -- the loader reads all of them. It uses DuckDB for efficient remote parquet reads and async concurrency for parallel upserts.
+supernova's loading pipeline streams pre-embedded parquet files from S3 or HuggingFace into vector stores like Qdrant. An embedding run typically produces many parquet files (one per chunk/slice) under a shared S3 prefix -- the loader reads all of them. It uses DuckDB for efficient remote parquet reads and async concurrency for parallel upserts.
 
 ![Loading Pipeline](../fig/ingestion_pipelione.svg)
 
 ## Configuration
 
-Loader configs live in `configs/loader/`. The same file is consumed by both `vf load` (single machine) and `vf load-dist` (distributed via SkyPilot); the distributed dispatcher reads the optional `dispatch:` and `resources:` blocks and the single-machine loader ignores them.
+Loader configs live in `configs/loader/`. The same file is consumed by both `nova load` (single machine) and `nova load-dist` (distributed via SkyPilot); the distributed dispatcher reads the optional `dispatch:` and `resources:` blocks and the single-machine loader ignores them.
 
 ```yaml
 vectors:
@@ -47,7 +47,7 @@ loader:
 ## Running
 
 ```bash
-vf load configs/loader/my_dataset.yaml
+nova load configs/loader/my_dataset.yaml
 ```
 
 ## Datasources
@@ -78,14 +78,14 @@ datasource:
 
 ## Point IDs (`id_expression`)
 
-`id_expression` is a **DuckDB SQL expression** the loader evaluates per row to produce the Qdrant point ID. The default (`row_id`) is just a bare column name and works if your parquets carry a pre-baked `row_id` column. The recommended form for vectorforge-produced corpora is the built-in macro:
+`id_expression` is a **DuckDB SQL expression** the loader evaluates per row to produce the Qdrant point ID. The default (`row_id`) is just a bare column name and works if your parquets carry a pre-baked `row_id` column. The recommended form for supernova-produced corpora is the built-in macro:
 
 ```yaml
 datasource:
   id_expression: "vf_point_id(filename, file_row_number)"
 ```
 
-The macro hashes `(parquet path, physical row index)` into a deterministic UUID — the same form used by `vf brute-force` and `vf generate-queries`, so recall ground truth lines up across the eval pipeline.
+The macro hashes `(parquet path, physical row index)` into a deterministic UUID — the same form used by `nova brute-force` and `nova generate-queries`, so recall ground truth lines up across the eval pipeline.
 
 `file_row_number` is critical here: it's a DuckDB virtual column that always reflects the physical row index, regardless of parallel scan order. Do **not** use `ROW_NUMBER() OVER (PARTITION BY filename)` — that reflects DuckDB's scan ordering and produces different IDs from the brute-force side under concurrency. There's a regression test for this in `tests/test_loader_id_expression.py`.
 

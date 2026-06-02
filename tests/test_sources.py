@@ -1,7 +1,7 @@
-from vectorforge.sources.base import DatasetSource
-from vectorforge.embedders.dense.base import DenseEmbedder
-from vectorforge.embedders.engine import EmbeddingEngine
-from vectorforge.models import Record
+from supernova.sources.base import DatasetSource
+from supernova.embedders.dense.base import DenseEmbedder
+from supernova.embedders.engine import EmbeddingEngine
+from supernova.models import Record
 
 
 class FakeDenseEmbedder(DenseEmbedder):

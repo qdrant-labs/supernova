@@ -1,6 +1,6 @@
 # Embedding Overview
 
-vectorforge's embedding pipeline streams data from a source, embeds text with configurable dense and/or sparse models, and writes the results as parquet files to S3 or HuggingFace Hub.
+supernova's embedding pipeline streams data from a source, embeds text with configurable dense and/or sparse models, and writes the results as parquet files to S3 or HuggingFace Hub.
 
 ![Embedding Pipeline](../fig/embedding_pipeline.svg)
 
@@ -32,7 +32,7 @@ storage:
   type: s3                         # s3, hf, or local
   bucket: my-bucket
   prefix: arxiv-papers/gte-multilingual-base
-  output_dir: /tmp/vectorforge
+  output_dir: /tmp/supernova
 ```
 
 You must specify at least one of `dense_embedder` or `sparse_embedder`. See [Dense Embedders](dense-embedders.md) and [Sparse Embedders](sparse-embedders.md) for details.
@@ -99,7 +99,7 @@ storage:
 ```yaml
 storage:
   type: local
-  output_dir: /tmp/vectorforge
+  output_dir: /tmp/supernova
 ```
 
 ## Output format
@@ -135,7 +135,7 @@ Unique row IDs are derived deterministically at **load time** from `(parquet_fil
 ## Running locally
 
 ```bash
-vf embed configs/embedder/my_dataset.yaml
+nova embed configs/embedder/my_dataset.yaml
 ```
 
 The local runner uses async workers with a priority queue buffer to ensure ordered output. Good for development and small datasets.

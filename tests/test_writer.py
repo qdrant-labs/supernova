@@ -4,8 +4,8 @@ import tempfile
 import pytest
 import pyarrow.parquet as pq
 
-from vectorforge.models import EmbeddedRecord, SparseEmbedding
-from vectorforge.storage.writer import write_batch
+from supernova.models import EmbeddedRecord, SparseEmbedding
+from supernova.storage.writer import write_batch
 
 
 def test_write_batch_dense_only():

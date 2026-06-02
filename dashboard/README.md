@@ -1,1 +1,1 @@
-# vectorforge dashboard
+# supernova dashboard

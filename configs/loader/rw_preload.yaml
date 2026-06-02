@@ -4,7 +4,7 @@ datasource:
   prefix: finewiki/embed-gte-multilingual-base/en
   id_expression: vf_point_id(filename, file_row_number)
   prefetch: true
-  prefetch_dir: /tmp/vectorforge_loader
+  prefetch_dir: /tmp/supernova_loader
   payload_fields:
     text: text
     id: id

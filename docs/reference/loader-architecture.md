@@ -12,13 +12,13 @@ Three CLI tools operate at different scales:
 
 | Command | What it does | When to use |
 |---------|-------------|-------------|
-| `vf load` | Single-machine loader | Dev, small datasets, single VM |
-| `vf load-dist` | Fan out across SkyPilot spot instances | Large datasets (100GB+) |
+| `nova load` | Single-machine loader | Dev, small datasets, single VM |
+| `nova load-dist` | Fan out across SkyPilot spot instances | Large datasets (100GB+) |
 
 ## Module Structure
 
 ```
-vectorforge/loader/
+supernova/loader/
 ├── datasource/
 │   ├── base.py            # DataReader ABC — DuckDB streaming, batch iteration
 │   ├── s3.py              # S3DataReader — httpfs, AWS creds, file_list support
@@ -31,7 +31,7 @@ vectorforge/loader/
 
 ## Data Flow
 
-### Single machine (`vf load`)
+### Single machine (`nova load`)
 
 ```
 1. DuckDB fetchmany(prefetch_size)     # large read from S3/HF, one I/O op
@@ -40,7 +40,7 @@ vectorforge/loader/
 4. Repeat until exhausted
 ```
 
-### Distributed (`vf load-dist`)
+### Distributed (`nova load-dist`)
 
 ```
 Master (your laptop):
@@ -53,7 +53,7 @@ Master (your laptop):
   7. Enable indexing → wait for HNSW build → report
 
 Workers (SkyPilot spot instances):
-  - Run vf load --no-manage-indexing
+  - Run nova load --no-manage-indexing
   - Read only their assigned parquet files (file_list)
   - Upsert to shared Qdrant collection
   - No indexing lifecycle — master handles that
@@ -70,12 +70,12 @@ Base class for all parquet data sources. Handles DuckDB connection, SQL generati
 - `row_id` — use a pre-baked id column
 - `hash(text)` — content-deduplicated ids
 - `uuid()` — random per-row UUIDs
-- `vf_point_id(filename, file_row_number)` — **recommended** for vectorforge-produced corpora; matches `vf brute-force` and `vf generate-queries` so recall ground truth aligns
+- `vf_point_id(filename, file_row_number)` — **recommended** for supernova-produced corpora; matches `nova brute-force` and `nova generate-queries` so recall ground truth aligns
 
-The base reader (`vectorforge/loader/datasource/base.py`) registers three macros at connection time:
+The base reader (`supernova/loader/datasource/base.py`) registers three macros at connection time:
 
 - `vf_uuid_from_hex(h)` — formats a 32-char hex string as a canonical UUID.
-- `make_point_id(source_file, source_row)` — `vf_uuid_from_hex(md5(source_file || ':' || source_row))`. Mirrors `vectorforge.utils.make_point_id` exactly.
+- `make_point_id(source_file, source_row)` — `vf_uuid_from_hex(md5(source_file || ':' || source_row))`. Mirrors `supernova.utils.make_point_id` exactly.
 - `vf_point_id(fname, rnum)` — `make_point_id(substr(fname, prefix_len + 1), rnum)`, where `prefix_len` is the URI-prefix length each subclass declares via `_root_uri_prefix()`.
 
 If the `id_expression` references `filename` or `file_row_number`, the base reader auto-injects `read_parquet(..., filename=true, file_row_number=true)` so those virtual columns are available. **Use `file_row_number`, not `ROW_NUMBER() OVER (PARTITION BY filename)`** — `file_row_number` is the physical row index and is stable under DuckDB's parallel parquet scan; window-function row numbers reflect scan order and can produce different IDs from the brute-force side. There's an explicit regression test in `tests/test_loader_id_expression.py` that documents both behaviours.
@@ -113,7 +113,7 @@ Default: `{}` (no payload).
 
 **`source_sql`** — the DuckDB FROM clause. Defaults to `'<glob_path>'` but subclasses override it with `read_parquet([...])` when `file_list` is set. This is how distributed workers read only their assigned files.
 
-**`_root_uri_prefix()`** — the URI prefix the base class strips from DuckDB's `filename` column to recover the bare key passed into `make_point_id`. Each subclass declares this once (`f"s3://{bucket}/"` for S3, `f"hf://datasets/{repo_id}/"` for HF) and the base class registers `vf_point_id` automatically. Both this loader and the brute-force / generate-queries pipelines must agree on the bare-key form, otherwise IDs won't match — see `vectorforge/destinations.py:bare_key_for_uri`.
+**`_root_uri_prefix()`** — the URI prefix the base class strips from DuckDB's `filename` column to recover the bare key passed into `make_point_id`. Each subclass declares this once (`f"s3://{bucket}/"` for S3, `f"hf://datasets/{repo_id}/"` for HF) and the base class registers `vf_point_id` automatically. Both this loader and the brute-force / generate-queries pipelines must agree on the bare-key form, otherwise IDs won't match — see `supernova/destinations.py:bare_key_for_uri`.
 
 ### S3DataReader
 
@@ -128,7 +128,7 @@ Default: `{}` (no payload).
 - Optional `subdir` to scope to a subfolder
 - Requires `HF_TOKEN` env var for authenticated access
 
-Note: the embed-side storage backend now writes to `hf://buckets/...` (HF Storage Buckets), but the loader still reads from `hf://datasets/...` because DuckDB's `httpfs` extension only supports the dataset/space form of `hf://` ("DuckDB only supports querying datasets or spaces"). Legacy corpora already in dataset repos load fine; new corpora written to buckets cannot be loaded into Qdrant via `vf load` until DuckDB adds bucket support upstream.
+Note: the embed-side storage backend now writes to `hf://buckets/...` (HF Storage Buckets), but the loader still reads from `hf://datasets/...` because DuckDB's `httpfs` extension only supports the dataset/space form of `hf://` ("DuckDB only supports querying datasets or spaces"). Legacy corpora already in dataset repos load fine; new corpora written to buckets cannot be loaded into Qdrant via `nova load` until DuckDB adds bucket support upstream.
 
 ## ID space anchoring
 
@@ -145,7 +145,7 @@ Two consequences fall out of this anchor choice:
 
 **Reset across containers.** Migrating S3 bucket A → S3 bucket B, or S3 → HF, changes the anchor and therefore the IDs. The recall ground-truth (`queries_*.parquet`, `brute_force_*.parquet`) must be regenerated on the new side; you cannot reuse a Qdrant collection across container migrations.
 
-This is a deliberate trade-off, not an oversight. There is no unforced way to make a hash function span containers — they're literally different ID universes — without introducing an external "logical dataset name" registry that someone has to set correctly per run. The current scheme prioritises the workflow that's actually common (scoped loads within one bucket/repo) over the one that's rare (cross-backend migrations). The seam where this is implemented is `DataReader._root_uri_prefix()` and `vectorforge.destinations.bare_key_for_uri()` — both must strip the same prefix.
+This is a deliberate trade-off, not an oversight. There is no unforced way to make a hash function span containers — they're literally different ID universes — without introducing an external "logical dataset name" registry that someone has to set correctly per run. The current scheme prioritises the workflow that's actually common (scoped loads within one bucket/repo) over the one that's rare (cross-backend migrations). The seam where this is implemented is `DataReader._root_uri_prefix()` and `supernova.destinations.bare_key_for_uri()` — both must strip the same prefix.
 
 ## VectorStore
 
@@ -202,7 +202,7 @@ concurrency=8          →  8 upserts running in parallel
 
 ## Configuration Reference
 
-`vf load` and `vf load-dist` consume the **same** config file from `configs/loader/`. The `dispatch:` and `resources:` blocks are read by `vf load-dist` only and ignored by the single-machine loader.
+`nova load` and `nova load-dist` consume the **same** config file from `configs/loader/`. The `dispatch:` and `resources:` blocks are read by `nova load-dist` only and ignored by the single-machine loader.
 
 ```yaml
 vectors:                      # required, at least one entry
@@ -240,7 +240,7 @@ loader:
   prefetch_size: 10000        # default: batch_size * 10
   concurrency: 8              # default
 
-# Optional, only consumed by `vf load-dist`:
+# Optional, only consumed by `nova load-dist`:
 dispatch:
   num_shards: 10              # number of parallel SkyPilot workers
   run_name: my-run            # optional, defaults to config filename
@@ -254,7 +254,7 @@ resources:                    # SkyPilot VM spec
 
 ## Adding a new component
 
-See [Extending vectorforge](extending.md) for concrete walkthroughs of:
+See [Extending supernova](extending.md) for concrete walkthroughs of:
 
 - Adding a raw input source (e.g. Common Crawl)
 - Adding a new corpus backend (e.g. GCS — covers `Destination`, `StorageBackend`, and `DataReader` together)

@@ -1,6 +1,6 @@
 # SkyPilot
 
-vectorforge uses SkyPilot for all distributed compute -- both embedding generation (GPU) and data loading (CPU). SkyPilot gives us job management on ephemeral cloud VMs, using spot instances that are 60-90% cheaper than on-demand.
+supernova uses SkyPilot for all distributed compute -- both embedding generation (GPU) and data loading (CPU). SkyPilot gives us job management on ephemeral cloud VMs, using spot instances that are 60-90% cheaper than on-demand.
 
 ## Setup
 
@@ -15,7 +15,7 @@ Check AWS service quotas for your account. Request vCPU limit increases if neede
 
 ## Pools
 
-Both `vf embed-dist` and `vf load-dist` use [SkyPilot pools](https://docs.skypilot.co/en/stable/examples/pools.html). A pool is a set of workers that auto-scale and reuse setup across jobs. Workers are provisioned once (uv sync, model downloads), then jobs are submitted to the pool.
+Both `nova embed-dist` and `nova load-dist` use [SkyPilot pools](https://docs.skypilot.co/en/stable/examples/pools.html). A pool is a set of workers that auto-scale and reuse setup across jobs. Workers are provisioned once (uv sync, model downloads), then jobs are submitted to the pool.
 
 ```bash
 # Create a pool

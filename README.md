@@ -1,10 +1,10 @@
-# vectorforge
+# supernova
 
 Generate massive pre-embedded datasets, then load them into vector databases.
 
 ## Overview
 
-vectorforge has two pipelines:
+supernova has two pipelines:
 
 1. **Embedding** -- stream data from HuggingFace, embed with dense and/or sparse models, write parquet to S3
 2. **Loading** -- stream pre-embedded parquet from S3/HuggingFace into vector stores (Qdrant)
@@ -17,22 +17,22 @@ Both pipelines are streaming (never loads the full dataset into memory), pluggab
 uv sync
 
 # 1. Embed a dataset locally
-vf embed configs/embedder/nick007x_arxiv_papers.yaml
+nova embed configs/embedder/nick007x_arxiv_papers.yaml
 
 # 2. Embed distributed across SkyPilot GPU pool
-vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml
+nova embed-dist configs/embedder/nick007x_arxiv_papers.yaml
 
 # 3. Load into Qdrant
-vf load configs/loader/ccnews_bge_large.yaml
+nova load configs/loader/ccnews_bge_large.yaml
 
 # 4. Distributed loading (SkyPilot)
-vf load-dist configs/loader/ccnews_bge_large.yaml
+nova load-dist configs/loader/ccnews_bge_large.yaml
 ```
 
 ## Project structure
 
 ```
-vectorforge/
+supernova/
   sources/            # Data sources (HuggingFace)
   embedders/
     dense/            # Dense embedding backends (OpenAI, sentence-transformers)
@@ -51,10 +51,10 @@ configs/
   loader/             # Loading pipeline configs (single + distributed)
 
 scripts/
-  run_embedder.py           # vectorforge CLI
-  run_embed_distributed.py  # vf embed-dist CLI
-  run_loader.py             # vf load CLI
-  run_load_distributed.py   # vf load-dist CLI
+  run_embedder.py           # supernova CLI
+  run_embed_distributed.py  # nova embed-dist CLI
+  run_loader.py             # nova load CLI
+  run_load_distributed.py   # nova load-dist CLI
 ```
 
 ---
@@ -85,7 +85,7 @@ storage:
   type: s3                      # or hf, local
   bucket: qdrant--vectorforge
   prefix: arxiv-papers/gte-multilingual-base
-  output_dir: /tmp/vectorforge
+  output_dir: /tmp/supernova
 ```
 
 ### Sparse embeddings
@@ -107,7 +107,7 @@ sparse_embedder:
   dtype: bfloat16
 ```
 
-When both point to the same model, vectorforge automatically uses a hybrid encoder to minimize forward passes. You must specify at least one of `dense_embedder` or `sparse_embedder`.
+When both point to the same model, supernova automatically uses a hybrid encoder to minimize forward passes. You must specify at least one of `dense_embedder` or `sparse_embedder`.
 
 ### Dense embedders
 
@@ -129,7 +129,7 @@ The OpenAI embedder supports any OpenAI-compatible API via `base_url` (llama.cpp
 ### Running locally
 
 ```bash
-vf embed configs/embedder/nick007x_arxiv_papers.yaml
+nova embed configs/embedder/nick007x_arxiv_papers.yaml
 ```
 
 ### Running at scale with SkyPilot
@@ -138,13 +138,13 @@ SkyPilot pools create GPU workers and distribute embedding jobs across them. Wor
 
 ```bash
 # Preview the plan
-vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml --dry-run
+nova embed-dist configs/embedder/nick007x_arxiv_papers.yaml --dry-run
 
 # Run (default: A10G spot, autoscaling)
-vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml
+nova embed-dist configs/embedder/nick007x_arxiv_papers.yaml
 
 # Custom parallelism
-vf embed-dist configs/embedder/nick007x_arxiv_papers.yaml --num-jobs 20
+nova embed-dist configs/embedder/nick007x_arxiv_papers.yaml --num-jobs 20
 ```
 
 Override resources in your config:
@@ -215,7 +215,7 @@ loader:
 ### Running
 
 ```bash
-vf load configs/loader/ccnews_bge_large.yaml
+nova load configs/loader/ccnews_bge_large.yaml
 ```
 
 ### Datasources
@@ -243,9 +243,9 @@ vf load configs/loader/ccnews_bge_large.yaml
 For terabyte-scale datasets, fan out across SkyPilot spot instances:
 
 ```bash
-vf load-dist configs/loader/ccnews_bge_large.yaml
-vf load-dist configs/loader/ccnews_bge_large.yaml --dry-run
-vf load-dist configs/loader/ccnews_bge_large.yaml --num-shards 20
+nova load-dist configs/loader/ccnews_bge_large.yaml
+nova load-dist configs/loader/ccnews_bge_large.yaml --dry-run
+nova load-dist configs/loader/ccnews_bge_large.yaml --num-shards 20
 ```
 
 ---

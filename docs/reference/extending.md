@@ -1,12 +1,12 @@
-# Extending vectorforge
+# Extending supernova
 
 Three things you can plug in. Each lives in a different layer with a different ABC and registry.
 
 | What you want | Where it lives | ABC | Used by |
 |---|---|---|---|
-| Read raw text/data into the embed pipeline (e.g. Common Crawl, a custom JSONL feed) | `vectorforge/sources/` | `DatasetSource` | `vf embed` |
-| Add a new corpus backend (write embedded parquets, then read them back later — e.g. GCS, Backblaze) | `vectorforge/destinations.py` + `vectorforge/storage/` + `vectorforge/loader/datasource/` | `Destination` (dataclass) + `StorageBackend` + `DataReader` | `vf embed`, `vf load` |
-| Add a new vector DB to load *into* (e.g. Weaviate, Pinecone) | `vectorforge/loader/vectorstore/` | `VectorStore` | `vf load` |
+| Read raw text/data into the embed pipeline (e.g. Common Crawl, a custom JSONL feed) | `supernova/sources/` | `DatasetSource` | `nova embed` |
+| Add a new corpus backend (write embedded parquets, then read them back later — e.g. GCS, Backblaze) | `supernova/destinations.py` + `supernova/storage/` + `supernova/loader/datasource/` | `Destination` (dataclass) + `StorageBackend` + `DataReader` | `nova embed`, `nova load` |
+| Add a new vector DB to load *into* (e.g. Weaviate, Pinecone) | `supernova/loader/vectorstore/` | `VectorStore` | `nova load` |
 
 The three are deliberately separate. A "source" is read-only raw input — Common Crawl is a source you'd never write back to. A "destination" is the corpus-shaped storage on both sides of the bridge — embedder writes parquets to it, loader reads them back. A "vector store" is the loading sink — Qdrant today, possibly more later.
 
@@ -19,10 +19,10 @@ A source produces dicts, one per row, plus a way to derive the text to embed.
 ### What to implement
 
 ```python
-# vectorforge/sources/common_crawl.py
+# supernova/sources/common_crawl.py
 from typing import Iterator
-from vectorforge.models import Record
-from vectorforge.sources.base import DatasetSource
+from supernova.models import Record
+from supernova.sources.base import DatasetSource
 
 
 class CommonCrawlSource(DatasetSource):
@@ -87,10 +87,10 @@ This is the meatier one because a corpus backend is *three coordinated pieces*: 
 
 ### Step 1: register the URI scheme
 
-`vectorforge/destinations.py` is the single source of truth for "where does this corpus live?" Add a dataclass and wire it through four functions.
+`supernova/destinations.py` is the single source of truth for "where does this corpus live?" Add a dataclass and wire it through four functions.
 
 ```python
-# vectorforge/destinations.py
+# supernova/destinations.py
 
 @dataclass(frozen=True)
 class GsDestination:
@@ -115,7 +115,7 @@ class GsDestination:
         return self.child_uri(f"{EVAL_SUBDIR}/{filename}")
 ```
 
-Add a branch in each of the scheme-keyed helpers in `vectorforge/destinations.py`. As of today there are nine, and a complete backend touches them all (the eval-side commands won't work otherwise):
+Add a branch in each of the scheme-keyed helpers in `supernova/destinations.py`. As of today there are nine, and a complete backend touches them all (the eval-side commands won't work otherwise):
 
 | Helper | What you add |
 |--------|---------------|
@@ -178,10 +178,10 @@ Add tests in `tests/test_destinations.py` mirroring the S3 ones — eval URI pla
 
 ### Step 2: write path — `StorageBackend`
 
-`vectorforge/storage/gcs.py`:
+`supernova/storage/gcs.py`:
 
 ```python
-from vectorforge.storage.base import StorageBackend
+from supernova.storage.base import StorageBackend
 
 
 class GcsBackend(StorageBackend):
@@ -228,7 +228,7 @@ def build_storage(cfg: dict):
 
 ### Step 3: read path — `DataReader`
 
-`vectorforge/loader/datasource/gcs.py`:
+`supernova/loader/datasource/gcs.py`:
 
 ```python
 from typing import Iterable
@@ -318,11 +318,11 @@ datasource:
 
 ## 3. Adding a new vector store
 
-Lives in `vectorforge/loader/vectorstore/`. The contract is async because Qdrant's client is async; if your store has only a sync client, wrap calls in `asyncio.to_thread`.
+Lives in `supernova/loader/vectorstore/`. The contract is async because Qdrant's client is async; if your store has only a sync client, wrap calls in `asyncio.to_thread`.
 
 ```python
-# vectorforge/loader/vectorstore/weaviate.py
-from vectorforge.loader.vectorstore.base import VectorStore
+# supernova/loader/vectorstore/weaviate.py
+from supernova.loader.vectorstore.base import VectorStore
 
 
 class WeaviateVectorStore(VectorStore):
@@ -367,7 +367,7 @@ VECTORSTORE_REGISTRY = {
 
 ### Deferred indexing
 
-`vf load` calls `defer_indexing()` before bulk writes and `enable_indexing()` + `wait_for_indexing()` after. If your store doesn't support disabling indexing during loads, leave the methods as no-ops — the runner just skips them and writes will be slower but correct. See [loader-architecture.md](loader-architecture.md#deferred-indexing) for the full lifecycle.
+`nova load` calls `defer_indexing()` before bulk writes and `enable_indexing()` + `wait_for_indexing()` after. If your store doesn't support disabling indexing during loads, leave the methods as no-ops — the runner just skips them and writes will be slower but correct. See [loader-architecture.md](loader-architecture.md#deferred-indexing) for the full lifecycle.
 
 ### Configs
 

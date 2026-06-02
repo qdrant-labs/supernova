@@ -1,5 +1,5 @@
 [project]
-name = "vectorforge"
+name = "supernova"
 version = "0.1.0"
 description = "Stream massive datasets, embed at scale, store as parquet in S3."
 readme = "README.md"
@@ -70,10 +70,10 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["vectorforge*", "cli*"]
+include = ["supernova*"]
 
 [project.scripts]
-vf = "cli.cli:main"
+nova = "supernova.cli.cli:main"
 
 [dependency-groups]
 dev = [
