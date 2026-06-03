@@ -82,6 +82,11 @@ load = [
 eval = [
     "torch",
 ]
+# Load testing -- `nova storm` query workers
+storm = [
+    "qdrant-client>=1.9.0",
+    "duckdb>=1.5.1",
+]
 # Distributed job dispatch -- local / Hetzner only, never on workers
 dist = [
     "skypilot[aws]",

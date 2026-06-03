@@ -35,6 +35,14 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
         "supernova.cli.run_load_distributed:load_dist",
         "Distribute loading across SkyPilot instances.",
     ),
+    "storm": (
+        "supernova.cli.run_storm:storm",
+        "Load-test a vector store (single machine).",
+    ),
+    "storm-dist": (
+        "supernova.cli.run_storm_distributed:storm_dist",
+        "Distributed load test via SkyPilot pool (replicated).",
+    ),
     "generate-queries": (
         "supernova.cli.run_generate_queries:generate_queries",
         "Sample N rows as eval queries (launches EC2; --local to run here).",
