@@ -12,7 +12,13 @@ import logging
 import click
 import yaml
 
-from supernova.cli.skypilot_utils import build_env_dict, launch_single_job, make_run_dir
+from supernova.cli.skypilot_utils import (
+    build_env_dict,
+    build_worker_setup,
+    launch_single_job,
+    make_run_dir,
+    worker_run,
+)
 from supernova.destinations import S3Destination, parse_destination
 from supernova.eval.generate_queries import generate_queries as _generate_queries
 from supernova.utils import get_bucket_region
@@ -63,9 +69,8 @@ def launch_on_ec2(
             "instance_type": instance_type,
             "use_spot": not on_demand,
         },
-        "file_mounts": {"/app": "."},
-        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync",
-        "run": f"cd /app && uv run nova generate-queries {corpus_uri} {worker_flags}",
+        "setup": build_worker_setup(),
+        "run": worker_run(f"generate-queries {corpus_uri} {worker_flags}"),
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:

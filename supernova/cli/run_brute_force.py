@@ -20,8 +20,10 @@ import yaml
 from supernova.cli.skypilot_utils import (
     CUDA_IMAGE_IDS,
     build_env_dict,
+    build_worker_setup,
     launch_single_job,
     make_run_dir,
+    worker_run,
 )
 from supernova.destinations import S3Destination, parse_destination
 from supernova.eval.brute_force import (
@@ -84,9 +86,8 @@ def launch_on_ec2(
     job_yaml = {
         "name": "nova-brute-force",
         "resources": resources,
-        "file_mounts": {"/app": "."},
-        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync --extra eval",
-        "run": f"cd /app && uv run nova brute-force {corpus_uri} {worker_flags}",
+        "setup": build_worker_setup("eval"),
+        "run": worker_run(f"brute-force {corpus_uri} {worker_flags}"),
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:

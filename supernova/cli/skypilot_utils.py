@@ -165,8 +165,11 @@ def worker_version() -> str:
         ) from exc
 
 
-def worker_install_spec(extra: str) -> str:
+def worker_install_spec(extra: str | None = None) -> str:
     """pip/uv install target for workers.
+
+    ``extra`` is the optional-dependency group (e.g. "load", "embed"); pass
+    None for commands that only need base deps (e.g. generate-queries).
 
     Default: the pinned PyPI release matching the controller's own version.
     Override with ``NOVA_WORKER_INSTALL_SPEC`` to test code that isn't on PyPI
@@ -175,15 +178,17 @@ def worker_install_spec(extra: str) -> str:
 
         NOVA_WORKER_INSTALL_SPEC='supernova[{extra}] @ git+https://github.com/qdrant-labs/supernova@<sha>'
     """
+    bracket = f"[{extra}]" if extra else ""
     override = os.environ.get("NOVA_WORKER_INSTALL_SPEC")
     if override:
-        return override.replace("{extra}", extra)
-    return f"supernova[{extra}]=={worker_version()}"
+        return override.replace("{extra}", extra or "")
+    return f"supernova{bracket}=={worker_version()}"
 
 
-def build_worker_setup(extra: str) -> str:
+def build_worker_setup(extra: str | None = None) -> str:
     """SkyPilot ``setup`` script: install uv, then install supernova[extra]
-    into a fixed venv. Replaces the old mount-CWD + ``uv sync`` bootstrap."""
+    into a fixed venv. ``extra`` may be None for base-only commands.
+    Replaces the old mount-CWD + ``uv sync`` bootstrap."""
     spec = worker_install_spec(extra)
     return (
         "curl -LsSf https://astral.sh/uv/install.sh | sh && "

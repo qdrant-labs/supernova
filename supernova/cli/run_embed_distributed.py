@@ -17,11 +17,14 @@ import yaml
 
 from supernova.cli.skypilot_utils import (
     build_env_dict,
+    build_worker_setup,
+    config_mount,
     launch_pool_and_jobs,
     launch_single_job_to_pool,
     make_run_dir,
     print_dry_run,
     print_monitor,
+    worker_run,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,8 +128,8 @@ def _retry_one_rank(
         "name": f"{original_job.get('name', 'embed')}-retry-rank{rank_str}",
         "resources": original_job["resources"],
         "envs": original_job.get("envs", {"HF_HUB_ENABLE_HF_TRANSFER": "1"}),
-        "run": (
-            f"cd /app && uv run nova embed {config} "
+        "run": worker_run(
+            f"embed /cfg/{Path(config).name} "
             f"--num-jobs {num_jobs_orig} --job-rank {retry_rank}"
         ),
     }
@@ -278,6 +281,9 @@ def embed_dist(
     click.echo(f"  Run dir:      {run_dir}")
     click.echo("=" * 60)
 
+    # Stage the (raw) config so workers get it without mounting the repo.
+    cfg_mounts, remote_cfg = config_mount(run_dir, config)
+
     # generate pool YAML — burst by default (provision all workers at startup);
     # SkyPilot's autoscaler ramp is too slow when we know the target count up front.
     pool_yaml = {
@@ -286,10 +292,8 @@ def embed_dist(
             "max_workers": max_workers_eff,
         },
         "resources": resources,
-        "file_mounts": {
-            "/app": ".",
-        },
-        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync --extra embed",
+        "file_mounts": cfg_mounts,
+        "setup": build_worker_setup("embed"),
     }
     pool_path = run_dir / "pool.yaml"
     with open(pool_path, "w") as f:
@@ -306,7 +310,7 @@ def embed_dist(
         "name": f"embed-{config_name}",
         "resources": resources,
         "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
-        "run": f"cd /app && uv run nova embed {config} --num-jobs {num_jobs_eff}",
+        "run": worker_run(f"embed {remote_cfg} --num-jobs {num_jobs_eff}"),
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:

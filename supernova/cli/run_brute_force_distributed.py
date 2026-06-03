@@ -23,9 +23,11 @@ from supernova.cli.run_brute_force import DEFAULT_ACCELERATOR, DEFAULT_INSTANCE_
 from supernova.cli.skypilot_utils import (
     CUDA_IMAGE_IDS,
     build_env_dict,
+    build_worker_setup,
     launch_pool_and_jobs,
     make_run_dir,
     print_monitor,
+    worker_run,
 )
 from supernova.destinations import (
     S3Destination,
@@ -156,13 +158,12 @@ def brute_force_dist(
             "max_workers": num_jobs,
         },
         "resources": resources,
-        "file_mounts": {"/app": "."},
-        "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && cd /app && uv sync --extra eval",
+        "setup": build_worker_setup("eval"),
     }
     job_yaml = {
         "name": f"nova-bf-{queries_stem}",
         "resources": resources,
-        "run": f"cd /app && uv run nova brute-force {corpus_uri} {worker_flags}",
+        "run": worker_run(f"brute-force {corpus_uri} {worker_flags}"),
     }
 
     pool_path = run_dir / "pool.yaml"
