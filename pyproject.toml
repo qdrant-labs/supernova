@@ -1,9 +1,31 @@
 [project]
-name = "vectorforge"
-version = "0.1.0"
+name = "supernova"
+version = "0.1.2"
 description = "Stream massive datasets, embed at scale, store as parquet in S3."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+keywords = [
+    "vector-database",
+    "embeddings",
+    "distributed",
+    "skypilot",
+    "qdrant",
+    "knn",
+    "parquet",
+    "benchmark",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     # true core -- needed by all workers and local dev
     "pyarrow",
@@ -60,20 +82,30 @@ load = [
 eval = [
     "torch",
 ]
+# Load testing -- `nova storm` query workers
+storm = [
+    "qdrant-client>=1.9.0",
+    "duckdb>=1.5.1",
+]
 # Distributed job dispatch -- local / Hetzner only, never on workers
 dist = [
     "skypilot[aws]",
 ]
 
+[project.urls]
+Homepage = "https://github.com/qdrant-labs/supernova"
+Repository = "https://github.com/qdrant-labs/supernova"
+Issues = "https://github.com/qdrant-labs/supernova/issues"
+
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["vectorforge*", "cli*"]
+include = ["supernova*"]
 
 [project.scripts]
-vf = "cli.cli:main"
+nova = "supernova.cli.cli:main"
 
 [dependency-groups]
 dev = [

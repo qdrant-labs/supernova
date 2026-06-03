@@ -19,7 +19,7 @@ storage:
   type: s3
   bucket: qdrant--vectorforge
   prefix: mteb_tweets/all-MiniLM-L6-v2
-  output_dir: /tmp/vectorforge
+  output_dir: /tmp/supernova
 
 pipeline:
   chunk_size: 1000

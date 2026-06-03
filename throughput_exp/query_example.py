@@ -1,8 +1,6 @@
 import duckdb
 
-S3_PATH = "s3://qdrant--vectorforge/finewiki/embed-gte-multilingual-base/**/*.parquet"
-S3_PATH = "s3://qdrant--vectorforge/fineweb/embedder-bge-large-en-v1.5/cc-main-2025-26/**/*.parquet"
-S3_PATH = "s3://poshmark-benchmark/listings_90_days_may_4_with_lattice_embeddings_spark_method/*.parquet"
+S3_PATH = "s3://ziprecruiter-benchmark/jobs_index_data_monetized_formatted/*.parquet"
 
 con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")

@@ -1,0 +1,39 @@
+name: Release to PyPI
+
+# Publishes supernova to PyPI when a version tag is pushed (e.g. `v0.1.0`),
+# using PyPI Trusted Publishing (OIDC) — no API tokens stored in the repo.
+#
+# One-time setup on PyPI before the first tagged release:
+#   pypi.org -> your account -> Publishing -> "Add a pending publisher"
+#     PyPI project name:  supernova
+#     Owner:              qdrant-labs
+#     Repository name:    supernova
+#     Workflow filename:  release.yml
+#     Environment name:   pypi
+# After that, `git tag v0.1.0 && git push origin v0.1.0` ships it.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+jobs:
+  pypi-publish:
+    name: Build & publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/supernova
+    permissions:
+      id-token: write # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

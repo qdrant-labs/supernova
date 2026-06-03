@@ -1,8 +1,8 @@
-# AWS SSO Setup for vectorforge
+# AWS SSO Setup for supernova
 
 ## Overview
 
-vectorforge uses AWS credentials for S3 storage and SkyPilot instance provisioning. AWS SSO gives you temporary credentials tied to your company identity.
+supernova uses AWS credentials for S3 storage and SkyPilot instance provisioning. AWS SSO gives you temporary credentials tied to your company identity.
 
 ## 1. Configure AWS SSO Profile
 
@@ -38,7 +38,7 @@ eval "$(aws configure export-credentials --profile sandbox --format env)"
 
 **Option B** exports `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` as env vars. Useful when a tool doesn't support profiles (e.g. DuckDB httpfs).
 
-### DuckDB / vf load
+### DuckDB / nova load
 
 DuckDB's httpfs reads `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from env vars. It also needs `AWS_SESSION_TOKEN` for SSO temporary credentials. Update the S3 reader to pass the session token if present.
 
@@ -47,19 +47,19 @@ After that, the workflow is:
 ```bash
 aws sso login --profile sandbox
 eval "$(aws configure export-credentials --profile sandbox --format env)"
-vf load configs/loader/ccnews_bge_large.yaml
+nova load configs/loader/ccnews_bge_large.yaml
 ```
 
 ## 3. SkyPilot Usage
 
-SkyPilot jobs receive credentials via `--env` flags at launch time (never written to disk). The `vf embed-dist` and `vf load-dist` commands handle this automatically by forwarding relevant env vars from your shell.
+SkyPilot jobs receive credentials via `--env` flags at launch time (never written to disk). The `nova embed-dist` and `nova load-dist` commands handle this automatically by forwarding relevant env vars from your shell.
 
 Before launching distributed jobs:
 
 ```bash
 aws sso login --profile sandbox
 eval "$(aws configure export-credentials --profile sandbox --format env)"
-vf embed-dist configs/embedder/my_dataset.yaml
+nova embed-dist configs/embedder/my_dataset.yaml
 ```
 
 **Important:** SSO temporary credentials last 8-12 hours. Refresh before long-running jobs.
@@ -71,13 +71,13 @@ vf embed-dist configs/embedder/my_dataset.yaml
 DuckDB's httpfs reads `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` directly from environment variables. SSO temporary credentials add `AWS_SESSION_TOKEN`, which DuckDB needs set explicitly — `S3DataReader._configure_connection` handles this:
 
 ```python
-# vectorforge/loader/datasource/s3.py
+# supernova/loader/datasource/s3.py
 session_token = os.environ.get("AWS_SESSION_TOKEN", "")
 if session_token:
     conn.execute(f"SET s3_session_token = '{session_token}';")
 ```
 
-So as long as you `eval "$(aws configure export-credentials --profile sandbox --format env)"` before running `vf load`, DuckDB picks everything up.
+So as long as you `eval "$(aws configure export-credentials --profile sandbox --format env)"` before running `nova load`, DuckDB picks everything up.
 
 ### aiobotocore (S3 storage backend)
 

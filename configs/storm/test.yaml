@@ -1,0 +1,46 @@
+# Example `nova storm` config — load-test a Qdrant collection.
+#
+#   nova storm        configs/storm/test.yaml          # local smoke test
+#   nova storm-dist   configs/storm/test.yaml           # replicated fleet (in-region)
+
+# The cluster under test.
+target:
+  type: qdrant
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  collection_name: rw_contention
+
+# What to query with.
+query:
+  vector_name: dense          # which named vector to search
+  top_k: 10
+  source:
+    # Query vectors — ideally the parquet produced by `nova generate-queries`.
+    uri: s3://qdrant--vectorforge/finewiki/embed-gte-multilingual-base/en/eval/queries.parquet
+    column: dense_embedding
+    limit: 5000               # how many query vectors to cycle through
+
+# Load profile — applied PER WORKER and replicated across the fleet, so total
+# offered load is roughly num_workers × concurrency (NOT sharded).
+load:
+  concurrency: 32             # in-flight requests held per worker (closed-loop)
+  duration_s: 60
+  ramp_s: 10                  # TODO: ease concurrency up over the first N seconds
+
+# Where latency samples go. (local for now; TSDB/Grafana sink is a TODO.)
+sink:
+  type: local
+  path: ./storm-results.parquet
+
+# Consumed by `storm-dist`.
+dispatch:
+  num_workers: 4
+  run_name: storm_test
+
+# Handed straight to SkyPilot. Keep `region` matching the cluster + bucket.
+# storm-dist defaults to on-demand regardless (spot preemption skews results).
+resources:
+  cpus: 4
+  memory: 8
+  cloud: aws
+  region: us-east-1

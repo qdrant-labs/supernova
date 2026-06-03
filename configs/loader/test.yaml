@@ -3,6 +3,7 @@ datasource:
   bucket: qdrant--vectorforge
   prefix: mteb_tweets/all-MiniLM-L6-v2
   id_expression: "vf_point_id(filename, file_row_number)"
+  prefetch: true
   payload_fields:
     text: text
     label: label

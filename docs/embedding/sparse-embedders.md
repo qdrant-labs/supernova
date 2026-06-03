@@ -63,7 +63,7 @@ BM25 has no transformer token limit — text length is governed by the pipeline'
 
 ## Hybrid mode
 
-When `dense_embedder` and `sparse_embedder` both use the same `sentence_transformer` model, vectorforge runs a single forward pass and produces both vectors at once:
+When `dense_embedder` and `sparse_embedder` both use the same `sentence_transformer` model, supernova runs a single forward pass and produces both vectors at once:
 
 ```yaml
 dense_embedder:

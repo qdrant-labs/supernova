@@ -9,20 +9,20 @@
 
 ```bash
 git clone <repo-url>
-cd vectorforge
+cd supernova
 uv sync
 ```
 
-`uv sync` alone installs the **base** deps (pyarrow, numpy, click, boto3, huggingface_hub, etc.) — enough to run `vf --help`, parse configs, and use the `vectorforge.destinations` / URI helpers.
+`uv sync` alone installs the **base** deps (pyarrow, numpy, click, boto3, huggingface_hub, etc.) — enough to run `nova --help`, parse configs, and use the `supernova.destinations` / URI helpers.
 
 The actual pipelines live under optional extras so embed workers don't pull in qdrant-client and load workers don't pull in torch:
 
 | Extra | Installs | Use when |
 |-------|----------|----------|
-| `embed` | sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `vf embed` / `vf partition` workers locally |
+| `embed` | sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `nova embed` / `nova partition` workers locally |
 | `partition` | aiobotocore, tiktoken | CPU partition workers (no ML models, no fastembed) |
-| `load` | duckdb, qdrant-client | Running `vf load` (loader workers) |
-| `eval` | torch | `vf brute-force --local` |
+| `load` | duckdb, qdrant-client | Running `nova load` (loader workers) |
+| `eval` | torch | `nova brute-force --local` |
 | `dist` | skypilot[aws] | Dispatching distributed jobs from your laptop / Hetzner box |
 
 Pick the extras that match your role. Common combinations:
@@ -41,7 +41,7 @@ uv sync --extra load
 uv sync --all-extras
 ```
 
-The dispatch CLIs (`vf embed-dist`, `vf load-dist`, `vf brute-force-dist`) bake the right `uv sync --extra ...` into the pool's `setup:` script, so workers install the right slice automatically.
+The dispatch CLIs (`nova embed-dist`, `nova load-dist`, `nova brute-force-dist`) bake the right `uv sync --extra ...` into the pool's `setup:` script, so workers install the right slice automatically.
 
 ## Environment variables
 
@@ -82,12 +82,12 @@ SkyPilot requires IAM permissions to launch EC2 instances. See the [SkyPilot AWS
 ## Verify installation
 
 ```bash
-vf --help                # lists every subcommand; should run in well under a second
-vf embed --help
-vf load --help
-vf brute-force --help
+nova --help                # lists every subcommand; should run in well under a second
+nova embed --help
+nova load --help
+nova brute-force --help
 
 uv run pytest tests/ -v
 ```
 
-The CLI is a click group with **lazy subcommand loading** (`cli/cli.py:LazyGroup`) — `vf --help` doesn't import torch or qdrant-client, only the relevant module is loaded when you actually run a subcommand.
+The CLI is a click group with **lazy subcommand loading** (`cli/cli.py:LazyGroup`) — `nova --help` doesn't import torch or qdrant-client, only the relevant module is loaded when you actually run a subcommand.

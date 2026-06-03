@@ -3,14 +3,14 @@
 For terabyte-scale datasets, distribute loading across SkyPilot spot instances using pools.
 
 ```bash
-vf load-dist configs/loader/ccnews_bge_large.yaml
-vf load-dist configs/loader/ccnews_bge_large.yaml --dry-run
-vf load-dist configs/loader/ccnews_bge_large.yaml --num-shards 20
+nova load-dist configs/loader/ccnews_bge_large.yaml
+nova load-dist configs/loader/ccnews_bge_large.yaml --dry-run
+nova load-dist configs/loader/ccnews_bge_large.yaml --num-shards 20
 ```
 
 ## Configuration
 
-Distributed runs use the same loader config as `vf load`, plus optional `dispatch` and `resources` blocks that the single-machine loader ignores:
+Distributed runs use the same loader config as `nova load`, plus optional `dispatch` and `resources` blocks that the single-machine loader ignores:
 
 ```yaml
 dispatch:
@@ -60,7 +60,7 @@ loader:
 
 ```bash
 # After monitoring shows all jobs succeeded:
-vf load-dist configs/loader/ccnews_bge_large.yaml --finalize
+nova load-dist configs/loader/ccnews_bge_large.yaml --finalize
 ```
 
 ## Monitoring
@@ -77,7 +77,7 @@ sky jobs pool down <pool-name>
 Each run creates a directory:
 
 ```
-runs/2026-04-13T14-30_ccnews-bge-large/
+~/.nova/runs/2026-04-13T14-30_ccnews-bge-large/
   pool.yaml                  # pool config (resources, setup)
   job.yaml                   # job config (run command)
   manifest.json              # file counts, shard plan
@@ -85,11 +85,11 @@ runs/2026-04-13T14-30_ccnews-bge-large/
 
 ## Running shards manually
 
-Each worker runs a standard `vf load` command with `--num-jobs` and `--no-manage-indexing`. You can run shards locally without SkyPilot:
+Each worker runs a standard `nova load` command with `--num-jobs` and `--no-manage-indexing`. You can run shards locally without SkyPilot:
 
 ```bash
 # Run shard 0 of 10
-vf load configs/loader/ccnews_bge_large.yaml --num-jobs 10 --job-rank 0 --no-manage-indexing
+nova load configs/loader/ccnews_bge_large.yaml --num-jobs 10 --job-rank 0 --no-manage-indexing
 ```
 
 ## Prerequisites

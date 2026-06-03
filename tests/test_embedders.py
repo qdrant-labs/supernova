@@ -1,9 +1,9 @@
 import pytest
 
-from vectorforge.embedders.dense.base import DenseEmbedder
-from vectorforge.embedders.sparse.base import SparseEmbedder
-from vectorforge.embedders.engine import EmbeddingEngine
-from vectorforge.models import SparseEmbedding
+from supernova.embedders.dense.base import DenseEmbedder
+from supernova.embedders.sparse.base import SparseEmbedder
+from supernova.embedders.engine import EmbeddingEngine
+from supernova.models import SparseEmbedding
 
 
 class FakeDenseEmbedder(DenseEmbedder):

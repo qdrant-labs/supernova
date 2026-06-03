@@ -1,6 +1,6 @@
 # CLI Reference
 
-Every subcommand is dispatched through the `vf` entrypoint, a click group defined in `cli/cli.py`. `vf --help` lists every command; `vf <command> --help` prints flags for one. Subcommand modules are imported lazily so `vf --help` returns in tens of milliseconds even though heavy ML libraries are involved.
+Every subcommand is dispatched through the `nova` entrypoint, a click group defined in `cli/cli.py`. `nova --help` lists every command; `nova <command> --help` prints flags for one. Subcommand modules are imported lazily so `nova --help` returns in tens of milliseconds even though heavy ML libraries are involved.
 
 Corpora and destinations are addressed by URI. The schemes supported today:
 
@@ -11,12 +11,12 @@ Corpora and destinations are addressed by URI. The schemes supported today:
 
 ---
 
-## vf embed
+## nova embed
 
 Run the embedding pipeline locally.
 
 ```bash
-vf embed <config> [options]
+nova embed <config> [options]
 ```
 
 | Option | Description |
@@ -24,14 +24,14 @@ vf embed <config> [options]
 | `--num-jobs N` | Total parallel jobs (auto-computes per-rank slice from dataset size). |
 | `--job-rank N` | This job's rank (reads `$SKYPILOT_JOB_RANK` if omitted). |
 
-The config path can also be supplied via `VF_CONFIG_PATH`.
+The config path can also be supplied via `NOVA_CONFIG_PATH`.
 
-## vf embed-dist
+## nova embed-dist
 
 Distribute embedding across a SkyPilot GPU pool.
 
 ```bash
-vf embed-dist <config> [options]
+nova embed-dist <config> [options]
 ```
 
 | Option | Description |
@@ -44,12 +44,12 @@ vf embed-dist <config> [options]
 | `--on-demand` | Use on-demand instead of spot — separate AWS quota, no preemption. |
 | `--ramp` | Opt into SkyPilot's gradual autoscaler (`min_workers=0`). Default is burst (`min_workers=max_workers`) since EC2 provisioning is slow and the autoscaler ramps ~1 replica per 3 minutes. |
 
-## vf partition
+## nova partition
 
-Run the embed pipeline with the **no-op embedder**: same I/O and sharding as `vf embed` but no GPU forward pass. Output parquets carry every column except the float vectors, so you can validate clean partitioning (`scripts/verify_no_duplicates.py`) before committing GPU time.
+Run the embed pipeline with the **no-op embedder**: same I/O and sharding as `nova embed` but no GPU forward pass. Output parquets carry every column except the float vectors, so you can validate clean partitioning (`scripts/verify_no_duplicates.py`) before committing GPU time.
 
 ```bash
-vf partition <config> [options]
+nova partition <config> [options]
 ```
 
 | Option | Description |
@@ -58,24 +58,24 @@ vf partition <config> [options]
 | `--job-rank N` | This job's rank (defaults to `$SKYPILOT_JOB_RANK`). |
 | `--list-files` | Dry-run: list matched parquet files + per-rank plan and exit. Meaningful for `source.type=huggingface` or its alias `huggingface_parquet`. |
 
-## vf partition-dist
+## nova partition-dist
 
-Distribute `vf partition` across a SkyPilot CPU pool. Same flag shape as `vf embed-dist` but cheaper resources.
+Distribute `nova partition` across a SkyPilot CPU pool. Same flag shape as `nova embed-dist` but cheaper resources.
 
 ```bash
-vf partition-dist <config> [options]
+nova partition-dist <config> [options]
 ```
 
-Flags: `--dry-run`, `--num-jobs N`, `--chunk-size N`, `--pool-name NAME`, `--max-workers N`, `--on-demand`, `--ramp` — same semantics as `vf embed-dist`.
+Flags: `--dry-run`, `--num-jobs N`, `--chunk-size N`, `--pool-name NAME`, `--max-workers N`, `--on-demand`, `--ramp` — same semantics as `nova embed-dist`.
 
 ---
 
-## vf load
+## nova load
 
 Load pre-embedded data into a vector store.
 
 ```bash
-vf load <config> [options]
+nova load <config> [options]
 ```
 
 | Option | Description |
@@ -87,12 +87,12 @@ vf load <config> [options]
 
 The config path can also be supplied via `LOADER_CONFIG_PATH`. The config must include a top-level `vectors:` block.
 
-## vf load-dist
+## nova load-dist
 
 Distribute loading across a SkyPilot CPU pool. Reads the same loader config and additionally consumes the `dispatch:` and `resources:` blocks the single-machine loader ignores.
 
 ```bash
-vf load-dist <config> [options]
+nova load-dist <config> [options]
 ```
 
 | Option | Description |
@@ -101,17 +101,17 @@ vf load-dist <config> [options]
 | `--num-shards N` | Override `dispatch.num_shards`. |
 | `--pool-name NAME` | SkyPilot pool name (default: auto-generated). |
 | `--on-demand` | Use on-demand instead of spot. |
-| `--ramp` | Gradual autoscaling instead of burst (see `vf embed-dist`). |
+| `--ramp` | Gradual autoscaling instead of burst (see `nova embed-dist`). |
 | `--finalize` | Skip dispatch — only enable Qdrant indexing and wait for HNSW build. Run this once all worker jobs have completed. |
 
 ---
 
-## vf generate-queries
+## nova generate-queries
 
 Sample N rows from an embedded corpus as eval query vectors. Default mode launches an in-region EC2 instance (S3 only); pass `--local` to run in-process. Output lands at `{corpus}/eval/queries_<N>.parquet` with `__source_file__` and `__source_row__` provenance columns.
 
 ```bash
-vf generate-queries <corpus_uri> [options]
+nova generate-queries <corpus_uri> [options]
 ```
 
 | Option | Description |
@@ -127,12 +127,12 @@ vf generate-queries <corpus_uri> [options]
 
 EC2 launch only works for `s3://` corpora. For `hf://` and `file://`, use `--local`.
 
-## vf brute-force
+## nova brute-force
 
 Exhaustive nearest-neighbour search for recall evaluation. Requires `torch` (`uv sync --extra eval`).
 
 ```bash
-vf brute-force <corpus_uri> [options]
+nova brute-force <corpus_uri> [options]
 ```
 
 | Option | Description |
@@ -147,47 +147,47 @@ vf brute-force <corpus_uri> [options]
 | `--instance-type TYPE` | EC2 instance type (default `g4dn.2xlarge` — 1× T4 GPU). |
 | `--on-demand`, `--dry-run` | As above. |
 
-EC2 launch only works for `s3://` corpora. Hits land at `{corpus}/eval/brute_force_<stem>_k<K>.parquet`. In distributed mode each worker writes `{corpus}/eval/_bf_partial_<stem>_k<K>/rankNNN.parquet`; merge with `vf brute-force-merge`.
+EC2 launch only works for `s3://` corpora. Hits land at `{corpus}/eval/brute_force_<stem>_k<K>.parquet`. In distributed mode each worker writes `{corpus}/eval/_bf_partial_<stem>_k<K>/rankNNN.parquet`; merge with `nova brute-force-merge`.
 
-## vf brute-force-dist
+## nova brute-force-dist
 
 Distribute brute-force across a SkyPilot GPU pool. Each worker prefetches its assigned files to local NVMe, runs GPU similarity search, and saves a partial top-K result.
 
 ```bash
-vf brute-force-dist <s3_corpus_uri> [options]
+nova brute-force-dist <s3_corpus_uri> [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--queries`, `-k`, `--metric`, `--dense-column` | Same as `vf brute-force`. |
+| `--queries`, `-k`, `--metric`, `--dense-column` | Same as `nova brute-force`. |
 | `--num-jobs N` | Number of GPU workers (default 50). |
 | `--output FILE` | Final merged output filename. |
 | `--instance-type TYPE` | Per-worker EC2 instance (default `g4dn.2xlarge`). |
 | `--pool-name NAME`, `--on-demand`, `--dry-run` | As above. |
 
-Today this command provisions AWS GPU instances, so it only accepts S3 corpora. For HF / local, run `vf brute-force --local`.
+Today this command provisions AWS GPU instances, so it only accepts S3 corpora. For HF / local, run `nova brute-force --local`.
 
-## vf brute-force-merge
+## nova brute-force-merge
 
 Merge partial brute-force results from a distributed run into a single top-K parquet.
 
 ```bash
-vf brute-force-merge <corpus_uri> [options]
+nova brute-force-merge <corpus_uri> [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--queries FILE`, `-k N`, `--output FILE` | Same as `vf brute-force`. |
+| `--queries FILE`, `-k N`, `--output FILE` | Same as `nova brute-force`. |
 
 ---
 
-## vf analysis
+## nova analysis
 
 Analyze a completed embedding run: schema, row count, per-rank throughput, wall clock, cost estimate.
 
 ```bash
-vf analysis <config>           # derives destination from storage section
-vf analysis --path s3://...    # ad-hoc, no config needed
+nova analysis <config>           # derives destination from storage section
+nova analysis --path s3://...    # ad-hoc, no config needed
 ```
 
 | Option | Description |
@@ -196,17 +196,17 @@ vf analysis --path s3://...    # ad-hoc, no config needed
 | `--cost-per-hour USD` | Per-worker hourly rate (default 0.38 = g5.xlarge A10G spot). Use ~1.01 for g5.xlarge on-demand. |
 | `--check-duplicates` | Run a `source_row_id` uniqueness + coverage check across all parquets. |
 
-## vf throughput-predict
+## nova throughput-predict
 
 Predict embedding throughput and cost from an embedder YAML — without running anything. Pulls dataset, model, and rendering details from the config; only GPU + simulation knobs come from the CLI.
 
 ```bash
-vf throughput-predict <config> [options]
+nova throughput-predict <config> [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--gpu KEY` | GPU key (default `a10g`). See `vectorforge/throughput.py:GPU_TABLE` for the catalogue. |
+| `--gpu KEY` | GPU key (default `a10g`). See `supernova/throughput.py:GPU_TABLE` for the catalogue. |
 | `--gpu-scale F` | Multiplier on effective TFLOPS (e.g. `0.85` for thermal headroom). |
 | `--rate USD` | $/hr override. |
 | `--num-gpus N` | Parallel GPUs for wall-clock estimate. |
@@ -223,9 +223,9 @@ vf throughput-predict <config> [options]
 
 ## SkyPilot environment
 
-Every dispatch command (`*-dist`, `vf brute-force`, `vf generate-queries`) calls `cli.skypilot_utils.build_env_flags()` which forwards the relevant env vars to the pool/job:
+Every dispatch command (`*-dist`, `nova brute-force`, `nova generate-queries`) calls `cli.skypilot_utils.build_env_flags()` which forwards the relevant env vars to the pool/job:
 
 - AWS: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`
 - Per-command extras: `HF_TOKEN`, `OPENAI_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`
 
-Plus SkyPilot's own `SKYPILOT_JOB_RANK` / `SKYPILOT_NUM_JOBS` which `vf embed` / `vf load` / `vf brute-force` read for slicing.
+Plus SkyPilot's own `SKYPILOT_JOB_RANK` / `SKYPILOT_NUM_JOBS` which `nova embed` / `nova load` / `nova brute-force` read for slicing.

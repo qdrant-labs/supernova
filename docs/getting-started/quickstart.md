@@ -28,20 +28,20 @@ storage:
   type: s3
   bucket: my-bucket
   prefix: tweet-sentiment/openai-3-small
-  output_dir: /tmp/vectorforge
+  output_dir: /tmp/supernova
 ```
 
 Run locally:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-vf embed configs/embedder/my_dataset.yaml
+nova embed configs/embedder/my_dataset.yaml
 ```
 
 For larger datasets, use SkyPilot to parallelize:
 
 ```bash
-vf embed-dist configs/embedder/my_dataset.yaml
+nova embed-dist configs/embedder/my_dataset.yaml
 ```
 
 ## 2. Verify the output
@@ -90,14 +90,14 @@ loader:
 
 The top-level `vectors:` block is required — it tells the loader which parquet column carries each vector and the vector store how to configure the collection.
 
-`id_expression` is a DuckDB SQL expression that yields the point id per row. The `vf_point_id(filename, file_row_number)` macro is the recommended choice: it produces stable UUIDs that match what `vf brute-force` and `vf generate-queries` emit, so recall ground truth lines up across the eval pipeline. See [Loader Architecture](../reference/loader-architecture.md) for the details.
+`id_expression` is a DuckDB SQL expression that yields the point id per row. The `vf_point_id(filename, file_row_number)` macro is the recommended choice: it produces stable UUIDs that match what `nova brute-force` and `nova generate-queries` emit, so recall ground truth lines up across the eval pipeline. See [Loader Architecture](../reference/loader-architecture.md) for the details.
 
 Run:
 
 ```bash
 export QDRANT_URL=https://your-cluster.qdrant.io
 export QDRANT_API_KEY=your-key
-vf load configs/loader/my_dataset.yaml
+nova load configs/loader/my_dataset.yaml
 ```
 
 The loader automatically creates the Qdrant collection, defers HNSW indexing during load, and builds the index after all data is loaded.

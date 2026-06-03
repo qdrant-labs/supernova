@@ -1,12 +1,12 @@
 """
-Tests for vectorforge.destinations — URI parsing, scheme dispatch, and the
+Tests for supernova.destinations — URI parsing, scheme dispatch, and the
 bare-key derivation that brute-force / generate-queries / loader macros
 must agree on.
 """
 
 import pytest
 
-from vectorforge.destinations import (
+from supernova.destinations import (
     HfDestination,
     LocalDestination,
     S3Destination,

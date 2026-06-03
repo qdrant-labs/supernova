@@ -16,8 +16,8 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from vectorforge.loader.datasource.s3 import S3DataReader
-from vectorforge.utils import make_point_id
+from supernova.loader.datasource.s3 import S3DataReader
+from supernova.utils import make_point_id
 
 
 def _write_multi_rg_parquet(path: str, n: int, row_group_size: int) -> None:
