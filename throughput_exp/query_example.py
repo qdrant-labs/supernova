@@ -1,6 +1,6 @@
 import duckdb
 
-S3_PATH = "s3://ziprecruiter-benchmark/jobs_index_data_formatted/*.parquet"
+S3_PATH = "s3://ziprecruiter-benchmark/jobs_index_data_monetized_formatted/*.parquet"
 
 con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")

@@ -52,6 +52,7 @@ class QdrantVectorStore(VectorStore):
             "optimizers_config",
             "wal_config",
             "quantization",
+            "strict_mode_config",
         }
     )
 
@@ -97,11 +98,15 @@ class QdrantVectorStore(VectorStore):
                 vectors_config[name] = models.VectorParams(
                     size=dimensions[name],
                     distance=_resolve_distance(spec.get("distance")),
+                    datatype=spec.get("datatype"),
+                    on_disk=spec.get("on_disk"),
                 )
             elif vtype == "multivector":
                 vectors_config[name] = models.VectorParams(
                     size=dimensions[name],
                     distance=_resolve_distance(spec.get("distance")),
+                    datatype=spec.get("datatype"),
+                    on_disk=spec.get("on_disk"),
                     multivector_config=models.MultiVectorConfig(
                         comparator=_resolve_comparator(spec.get("comparator")),
                     ),
@@ -151,6 +156,10 @@ class QdrantVectorStore(VectorStore):
             )
         if "wal_config" in p:
             kwargs["wal_config"] = models.WalConfigDiff(**p["wal_config"])
+        if "strict_mode_config" in p:
+            kwargs["strict_mode_config"] = models.StrictModeConfig(
+                **p["strict_mode_config"]
+            )
 
         quant = self._build_quantization(p)
         if quant is not None:
