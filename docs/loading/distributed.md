@@ -77,7 +77,7 @@ sky jobs pool down <pool-name>
 Each run creates a directory:
 
 ```
-runs/2026-04-13T14-30_ccnews-bge-large/
+~/.nova/runs/2026-04-13T14-30_ccnews-bge-large/
   pool.yaml                  # pool config (resources, setup)
   job.yaml                   # job config (run command)
   manifest.json              # file counts, shard plan

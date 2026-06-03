@@ -22,6 +22,7 @@ from supernova.cli.skypilot_utils import (
     launch_pool_and_jobs,
     launch_single_job_to_pool,
     make_run_dir,
+    nova_home,
     print_dry_run,
     print_monitor,
     worker_run,
@@ -54,7 +55,7 @@ def _find_latest_run_dir(config_path: str) -> Path | None:
     written for this config. Matches against the manifest's ``config`` field
     rather than the dir name so custom ``--pool-name`` runs are found too.
     """
-    runs_root = Path("runs")
+    runs_root = nova_home() / "runs"
     if not runs_root.exists():
         return None
     candidates: list[Path] = []

@@ -52,10 +52,10 @@ You can also manage pools directly:
 
 ```bash
 # Create a pool
-sky jobs pool apply -p my-pool runs/<run-dir>/pool.yaml
+sky jobs pool apply -p my-pool ~/.nova/runs/<run-dir>/pool.yaml
 
 # Submit jobs
-sky jobs launch -p my-pool --num-jobs 20 runs/<run-dir>/job.yaml
+sky jobs launch -p my-pool --num-jobs 20 ~/.nova/runs/<run-dir>/job.yaml
 
 # Monitor
 sky jobs pool status my-pool
@@ -75,7 +75,7 @@ sky jobs pool down my-pool
 Each run creates a directory:
 
 ```
-runs/2026-04-13T14-30_vf-embed-en/
+~/.nova/runs/2026-04-13T14-30_vf-embed-en/
   pool.yaml                  # pool config (resources, setup)
   job.yaml                   # job config (run command)
   manifest.json              # plan metadata

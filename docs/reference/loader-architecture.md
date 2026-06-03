@@ -46,7 +46,7 @@ supernova/loader/
 Master (your laptop):
   1. boto3 list_objects → discover parquet files
   2. Round-robin assign files to N shards
-  3. Generate per-shard YAML configs (paper trail in runs/<run_id>/)
+  3. Generate per-shard YAML configs (paper trail in ~/.nova/runs/<run_id>/)
   4. Create Qdrant collection + defer indexing
   5. sky jobs launch --async × N (env vars injected, not written to disk)
   6. Poll sky jobs queue until all complete

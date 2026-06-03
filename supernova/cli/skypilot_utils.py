@@ -50,9 +50,22 @@ def build_env_dict(extra_vars: list[str] | None = None) -> dict[str, str]:
     return envs
 
 
+def nova_home() -> Path:
+    """Root for nova's local state — run metadata, and a home for future caches.
+
+    Defaults to ``~/.nova``; override with ``$NOVA_HOME``. Deliberately outside
+    any project directory so an installed ``nova`` writes to a stable location
+    no matter where it's invoked, and so SkyPilot's file-mount staging never
+    runs ``git ls-files`` inside a repo subtree (which trips a git bug).
+    """
+    return Path(os.environ.get("NOVA_HOME", Path.home() / ".nova"))
+
+
 def make_run_dir(name: str) -> Path:
-    """Create runs/{timestamp}_{name}/ and return the path."""
-    run_dir = Path("runs") / f"{datetime.now().strftime('%Y-%m-%dT%H-%M')}_{name}"
+    """Create ``~/.nova/runs/{timestamp}_{name}/`` and return the path."""
+    run_dir = (
+        nova_home() / "runs" / f"{datetime.now().strftime('%Y-%m-%dT%H-%M')}_{name}"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
