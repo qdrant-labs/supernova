@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/fig/supernova_logo.svg" alt="supernova" width="400">
+</p>
+
 # supernova
 
 Generate massive pre-embedded datasets, then load them into vector databases.
