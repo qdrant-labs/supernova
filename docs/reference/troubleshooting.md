@@ -18,7 +18,10 @@ Sometimes I'll see a jobs stuck bouncing between the `PENDING` and `STARTING` st
 ```bash
 sky jobs logs --controller # TODO: check if this is the right command
 ```
-This will show you the logs from the controller, which is responsible for launching and managing jobs. You can also inspect the logs of the individual nodes, which might show you more details about why the job is failing to start
+This will show you the logs from the controller, which is responsible for launching and managing jobs. Another useful command is looking at the pool controller logs:
+```bash
+sky jobs pool logs nova-embed-test --controller
+```
 
 ## Lingering nodes/workers
 Sometimes, after all jobs are marked `SUCCEEDED` or `FAILED`, I'll see that there are still active EC2 instances running in the AWS console. I'm not sure why this is, but it seems like sometimes the cleanup process fails and leaves behind some nodes. To fix this, I usually just tell `skypilot` to stop all nodes:

@@ -160,6 +160,11 @@ def print_monitor(pool_name: str) -> None:
 # installs supernova) and the job's `run` phase (which invokes it) agree on
 # where the `nova` entrypoint is — the two run in separate shells on the same node.
 WORKER_VENV = "$HOME/.nova-venv"
+# Pin the worker's Python: AMIs often ship an older system Python (e.g. 3.10),
+# but supernova needs >=3.11. `uv venv --python` downloads a managed CPython if
+# the requested version isn't already present. 3.12 has mature wheels across the
+# full ML stack (torch, FlagEmbedding, fastembed, ...).
+WORKER_PYTHON = "3.12"
 
 
 def worker_version() -> str:
@@ -205,7 +210,7 @@ def build_worker_setup(extra: str | None = None) -> str:
     spec = worker_install_spec(extra)
     return (
         "curl -LsSf https://astral.sh/uv/install.sh | sh && "
-        f"uv venv {WORKER_VENV} && "
+        f"uv venv --python {WORKER_PYTHON} {WORKER_VENV} && "
         f'uv pip install --python {WORKER_VENV}/bin/python "{spec}"'
     )
 
