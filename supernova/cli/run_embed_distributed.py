@@ -309,6 +309,7 @@ def embed_dist(
     job_yaml = {
         "name": f"embed-{config_name}",
         "resources": resources,
+        # this was causing me weird errors when getting model files, so setting it to "1" fixed things
         "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
         "run": worker_run(f"embed {remote_cfg} --num-jobs {num_jobs_eff}"),
     }
