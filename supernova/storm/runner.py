@@ -10,6 +10,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 
+from supernova import metrics
 from supernova.storm.base import BaseLoadTester, LoadProfile, QueryResult
 
 
@@ -54,6 +55,7 @@ async def run_storm(
     def record(r: QueryResult) -> None:
         nonlocal n_ok, n_err
         latencies.append(r.latency_s)
+        metrics.observe("latency_ms", r.latency_s * 1000.0, ok=r.ok)
         if r.ok:
             n_ok += 1
         else:

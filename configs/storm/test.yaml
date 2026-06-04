@@ -8,34 +8,35 @@ target:
   type: qdrant
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
-  collection_name: rw_contention
+  collection_name: products
 
 # What to query with.
 query:
   vector_name: dense          # which named vector to search
-  top_k: 10
+  top_k: 250
   source:
     # Query vectors — ideally the parquet produced by `nova generate-queries`.
-    uri: s3://qdrant--vectorforge/finewiki/embed-gte-multilingual-base/en/eval/queries.parquet
-    column: dense_embedding
-    limit: 5000               # how many query vectors to cycle through
+    uri: s3://qdrant--vectorforge/queries/poshmark_1000.parquet
+    column: embedding
+    limit: 1000               # how many query vectors to cycle through
 
 # Load profile — applied PER WORKER and replicated across the fleet, so total
 # offered load is roughly num_workers × concurrency (NOT sharded).
 load:
-  concurrency: 32             # in-flight requests held per worker (closed-loop)
-  duration_s: 60
-  ramp_s: 10                  # TODO: ease concurrency up over the first N seconds
+  concurrency: 128              # in-flight requests held per worker (closed-loop)
+  duration_s: 300               # how long to keep the load going
 
-# Where latency samples go. (local for now; TSDB/Grafana sink is a TODO.)
-sink:
-  type: local
-  path: ./storm-results.parquet
+# Where measurements go. Omit / leave commented for stdout — the local-first
+# default, no DB needed. Uncomment to stream to Postgres (local Timescale or
+# Neon) for live Grafana; storm-dist forwards ${SN_METRICS_DB_URL} to workers
+# automatically because it's referenced here.
+metrics:
+  type: postgres
+  dsn: ${SN_METRICS_DB_URL}
 
 # Consumed by `storm-dist`.
 dispatch:
   num_workers: 4
-  run_name: storm_test
 
 # Handed straight to SkyPilot. Keep `region` matching the cluster + bucket.
 # storm-dist defaults to on-demand regardless (spot preemption skews results).

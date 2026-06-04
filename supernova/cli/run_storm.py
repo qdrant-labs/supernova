@@ -8,10 +8,12 @@ laptop->cluster latency across the public internet, not the cluster's own.
 
 import asyncio
 import logging
+import os
 
 import click
 import yaml
 
+from supernova.metrics import build_metrics, generate_run_name, make_run_id, set_current
 from supernova.storm.base import BaseLoadTester, LoadProfile
 from supernova.storm.qdrant import QdrantLoadTester
 from supernova.storm.runner import run_storm
@@ -100,14 +102,32 @@ def storm(config, duration, concurrency):
         profile.concurrency,
         profile.duration_s,
     )
-    results = asyncio.run(run_storm(tester, vectors, profile))
 
-    # TODO: write raw (timestamp, latency, status) to the configured sink
-    # (local parquet, or a TSDB/Grafana store) so storm-dist can merge fleet-wide.
-    click.echo("=" * 50)
-    for k, v in results.summary().items():
-        click.echo(f"  {k:>16}: {v}")
-    click.echo("=" * 50)
+    node_id = os.environ.get("SKYPILOT_JOB_RANK", "local")
+    base_name = cfg.get("dispatch", {}).get("run_name") or generate_run_name()
+    # Unique per execution so reruns don't collide on the runs PK. Distributed
+    # workers share one id via NOVA_RUN_ID (the controller mints + forwards it).
+    run_id = os.environ.get("NOVA_RUN_ID") or make_run_id(base_name)
+    metrics_backend = build_metrics(cfg.get("metrics"))
+    set_current(metrics_backend)
+    metrics_backend.init()
+    metrics_backend.start(run_id, {"command": "storm", "node_id": node_id, "config": cfg})
+    logger.info("storm run: %s (node %s)", run_id, node_id)
+
+    status = "ok"
+    try:
+        results = asyncio.run(run_storm(tester, vectors, profile))
+        summary = results.summary()
+        metrics_backend.summary(summary)
+        click.echo("=" * 50)
+        for k, v in summary.items():
+            click.echo(f"  {k:>16}: {v}")
+        click.echo("=" * 50)
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        metrics_backend.finish(status)
 
 
 if __name__ == "__main__":

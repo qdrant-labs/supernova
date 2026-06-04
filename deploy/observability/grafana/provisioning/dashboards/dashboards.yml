@@ -1,0 +1,10 @@
+apiVersion: 1
+
+# Auto-load dashboard JSON from the json/ subdir on boot.
+providers:
+  - name: supernova
+    type: file
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+      foldersFromFilesStructure: false

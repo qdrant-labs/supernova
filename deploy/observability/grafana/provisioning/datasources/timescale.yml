@@ -1,0 +1,19 @@
+apiVersion: 1
+
+# Grafana auto-loads this on boot, so the datasource is ready with no clicking.
+# `url` is the compose service name; Grafana reaches the db over the bridge net.
+datasources:
+  - name: supernova-timescale
+    uid: supernova-timescale
+    type: postgres
+    access: proxy
+    url: timescaledb:5432
+    user: postgres
+    isDefault: true
+    jsonData:
+      database: supernova
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: true
+    secureJsonData:
+      password: supernova

@@ -1,0 +1,36 @@
+# Local observability stack for supernova metrics: TimescaleDB (the sink) +
+# Grafana (pre-wired to it). `docker compose up -d`, point SN_METRICS_DB_URL at
+# the db, and run demo_emit.py to watch samples stream in.
+#
+# Local story only. On an EC2 fleet, workers can't reach this container — they
+# write to Neon instead (same backend, different DSN) and Grafana points at Neon.
+# SkyPilot's own Prometheus is a separate, optional fleet-health datasource and
+# is not part of this stack.
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_PASSWORD: supernova
+      POSTGRES_DB: supernova
+    ports:
+      - "5432:5432"
+    volumes:
+      - tsdb-data:/var/lib/postgresql/data
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: supernova
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - timescaledb
+
+volumes:
+  tsdb-data:
+  grafana-data:

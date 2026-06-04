@@ -91,6 +91,12 @@ storm = [
 dist = [
     "skypilot[aws]",
 ]
+# Metrics sink driver -- the postgres/timescale backend. The dispatcher composes
+# this onto a command's extras only when the config's metrics.type needs it, so
+# embed/load/storm workers pull a DB driver only when they actually log to one.
+pg = [
+    "psycopg[binary]>=3.3.4",
+]
 
 [project.urls]
 Homepage = "https://github.com/qdrant-labs/supernova"
@@ -113,4 +119,6 @@ dev = [
     "pytest-asyncio",
     "ruff>=0.15.12",
     "zensical",
+    # local dev runs the postgres backend (+ its tests); workers get it via [pg].
+    "psycopg[binary]>=3.3.4",
 ]

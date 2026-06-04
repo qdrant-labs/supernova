@@ -25,6 +25,7 @@ from supernova.cli.skypilot_utils import (
     print_monitor,
     worker_run,
 )
+from supernova.metrics import make_run_id, required_extra
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,10 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
     num_workers_eff = num_workers or dispatch.get("num_workers", 4)
     run_name = dispatch.get("run_name", Path(config).stem)
     pool_name_eff = pool_name or f"nova-storm-{run_name}"
+    # Mint ONE run id on the controller and forward it to every worker, so the
+    # replicated fleet writes into a single run (each worker distinguished by
+    # node_id = SKYPILOT_JOB_RANK) instead of each minting its own.
+    metrics_run_id = make_run_id(run_name)
 
     resources = dict(cfg.get("resources") or DEFAULT_RESOURCES)
     resources["use_spot"] = bool(spot)
@@ -83,14 +88,22 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
     click.echo(f"  Workers:      {num_workers_eff}  (each runs the full load profile)")
     click.echo(f"  Per-worker:   concurrency={cfg.get('load', {}).get('concurrency', 32)}")
     click.echo(f"  Instances:    {'spot' if spot else 'on-demand'}")
+    click.echo(f"  Metrics run:  {metrics_run_id}")
     click.echo(f"  Run dir:      {run_dir}")
     click.echo("=" * 60)
+
+    # storm extra + (only if the config logs to a backend needing a driver) that
+    # backend's extra, e.g. postgres -> pg (psycopg). stdout/null add nothing.
+    worker_extras = "storm"
+    pg_extra = required_extra(cfg.get("metrics"))
+    if pg_extra:
+        worker_extras = f"{worker_extras},{pg_extra}"
 
     pool_yaml = {
         "pool": {"min_workers": num_workers_eff, "max_workers": num_workers_eff},
         "resources": resources,
         "file_mounts": cfg_mounts,
-        "setup": build_worker_setup("storm"),
+        "setup": build_worker_setup(worker_extras),
     }
     pool_path = run_dir / "pool.yaml"
     with open(pool_path, "w") as f:
@@ -124,15 +137,17 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
     # so a non-Qdrant target's creds get forwarded without a hardcoded list.
     referenced = sorted(set(re.findall(r"\$\{(\w+)\}", Path(config).read_text())))
     envs = build_env_dict(referenced)
+    envs["NOVA_RUN_ID"] = metrics_run_id  # every worker writes into this one run
     logger.info("Creating pool '%s' with %d workers...", pool_name_eff, num_workers_eff)
     launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_workers_eff, envs)
 
     click.echo(f"\nLaunched {num_workers_eff} storm workers on pool '{pool_name_eff}'")
     print_monitor(pool_name_eff)
     click.echo(
-        "\nTODO: each worker prints its own p50/p95/p99. For fleet-wide numbers, "
-        "have workers write raw latency samples to S3 / a TSDB and add a "
-        "`storm-merge` step that combines the distributions (never average p99s)."
+        f"\nMetrics: all workers stream to run '{metrics_run_id}' (one node each, "
+        "via SKYPILOT_JOB_RANK). Fleet p50/p95/p99 = percentile_cont over that "
+        "run's samples across nodes — pick it in the Grafana Run dropdown. (Needs "
+        "a postgres metrics backend reachable from the workers, e.g. Neon.)"
     )
 
 
