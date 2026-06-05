@@ -31,6 +31,34 @@ services:
     depends_on:
       - timescaledb
 
+  # Scrapes Qdrant Cloud's /metrics + /sys_metrics so the server's own view can
+  # overlay the client load-test metrics. Opt-in: `docker compose --profile qdrant up`.
+  # Reuses QDRANT_URL + QDRANT_API_KEY from your env; the key is written to a file
+  # at start (Bearer auth) so it never lands in the repo. Prometheus can't expand
+  # env vars in its config, hence the small render-at-start shell step.
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["qdrant"]
+    environment:
+      QDRANT_URL: ${QDRANT_URL:-}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prom-data:/prometheus
+    ports:
+      - "9090:9090"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        printf '%s' "$$QDRANT_API_KEY" > /tmp/qdrant_key
+        HOST=$$(printf '%s' "$$QDRANT_URL" | sed -e 's#^[a-z]*://##' -e 's#/.*##')
+        case "$$HOST" in *:*) ;; *) HOST="$$HOST:443" ;; esac
+        sed "s#__QDRANT_HOST__#$$HOST#g" /etc/prometheus/prometheus.tmpl.yml > /tmp/prometheus.yml
+        exec /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus
+
 volumes:
   tsdb-data:
   grafana-data:
+  prom-data:

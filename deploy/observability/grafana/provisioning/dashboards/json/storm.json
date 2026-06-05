@@ -3,17 +3,25 @@
   "title": "Supernova — Storm",
   "editable": true,
   "schemaVersion": 39,
-  "version": 1,
+  "version": 4,
   "refresh": "5s",
   "timezone": "browser",
   "time": { "from": "now-3h", "to": "now" },
   "templating": {
     "list": [
       {
+        "name": "ds",
+        "label": "Source",
+        "type": "datasource",
+        "query": "postgres",
+        "current": {},
+        "hide": 0
+      },
+      {
         "name": "run",
         "label": "Run",
         "type": "query",
-        "datasource": { "type": "postgres", "uid": "supernova-timescale" },
+        "datasource": { "type": "postgres", "uid": "${ds}" },
         "definition": "SELECT run_id FROM runs ORDER BY started_at DESC",
         "query": "SELECT run_id FROM runs ORDER BY started_at DESC",
         "refresh": 2,
@@ -29,7 +37,7 @@
       "id": 1,
       "title": "Fleet QPS — $run",
       "type": "timeseries",
-      "datasource": { "type": "postgres", "uid": "supernova-timescale" },
+      "datasource": { "type": "postgres", "uid": "${ds}" },
       "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
       "fieldConfig": {
         "defaults": {
@@ -45,7 +53,7 @@
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "postgres", "uid": "supernova-timescale" },
+          "datasource": { "type": "postgres", "uid": "${ds}" },
           "rawQuery": true,
           "format": "time_series",
           "rawSql": "SELECT time_bucket('1 second', ts) AS time, count(*) AS qps FROM samples WHERE metric = 'latency_ms' AND run_id = '$run' AND $__timeFilter(ts) GROUP BY 1 ORDER BY 1"
@@ -54,9 +62,9 @@
     },
     {
       "id": 2,
-      "title": "Latency p50 / p95 / p99 — $run",
+      "title": "Fleet latency p50 / p95 / p99 — $run",
       "type": "timeseries",
-      "datasource": { "type": "postgres", "uid": "supernova-timescale" },
+      "datasource": { "type": "postgres", "uid": "${ds}" },
       "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
       "fieldConfig": {
         "defaults": {
@@ -72,10 +80,97 @@
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "postgres", "uid": "supernova-timescale" },
+          "datasource": { "type": "postgres", "uid": "${ds}" },
           "rawQuery": true,
           "format": "time_series",
           "rawSql": "SELECT time_bucket('5 seconds', ts) AS time, percentile_cont(0.50) WITHIN GROUP (ORDER BY value) AS p50, percentile_cont(0.95) WITHIN GROUP (ORDER BY value) AS p95, percentile_cont(0.99) WITHIN GROUP (ORDER BY value) AS p99 FROM samples WHERE metric = 'latency_ms' AND run_id = '$run' AND $__timeFilter(ts) GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "QPS by node — $run",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "${ds}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "${ds}" },
+          "rawQuery": true,
+          "format": "time_series",
+          "rawSql": "SELECT time_bucket('1 second', ts) AS time, node_id, count(*) AS qps FROM samples WHERE metric = 'latency_ms' AND run_id = '$run' AND $__timeFilter(ts) GROUP BY 1, node_id ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "p99 by node — $run",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "${ds}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 27 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "${ds}" },
+          "rawQuery": true,
+          "format": "time_series",
+          "rawSql": "SELECT time_bucket('5 seconds', ts) AS time, node_id, percentile_cont(0.99) WITHIN GROUP (ORDER BY value) AS p99 FROM samples WHERE metric = 'latency_ms' AND run_id = '$run' AND $__timeFilter(ts) GROUP BY 1, node_id ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Client p99 (Neon) vs server gRPC p99 (Qdrant) — $run",
+      "type": "timeseries",
+      "datasource": { "type": "datasource", "uid": "-- Mixed --" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 36 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "client",
+          "datasource": { "type": "postgres", "uid": "${ds}" },
+          "rawQuery": true,
+          "format": "time_series",
+          "rawSql": "SELECT time_bucket('5 seconds', ts) AS time, percentile_cont(0.99) WITHIN GROUP (ORDER BY value) AS \"client p99\" FROM samples WHERE metric = 'latency_ms' AND run_id = '$run' AND $__timeFilter(ts) GROUP BY 1 ORDER BY 1"
+        },
+        {
+          "refId": "server",
+          "datasource": { "type": "prometheus", "uid": "qdrant-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(grpc_responses_duration_seconds_bucket[$__rate_interval]))) * 1000",
+          "legendFormat": "server gRPC p99"
         }
       ]
     }

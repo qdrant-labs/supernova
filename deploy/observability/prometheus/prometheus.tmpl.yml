@@ -1,0 +1,29 @@
+# Rendered at container start: __QDRANT_HOST__ is replaced with the host derived
+# from $QDRANT_URL, and the API key is read from a file (Bearer auth). See the
+# prometheus service's entrypoint in docker-compose.yml.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # App metrics: request rates, gRPC/REST latency histograms, collection stats,
+  # memory. This is the one that overlays the load test.
+  - job_name: qdrant
+    scheme: https
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/qdrant_key
+    static_configs:
+      - targets: ["__QDRANT_HOST__"]
+
+  # Cluster/k8s metrics (Cloud-only). Already carries its own job/instance labels,
+  # so honor_labels keeps them instead of renaming to exported_*.
+  - job_name: qdrant-sys
+    scheme: https
+    metrics_path: /sys_metrics
+    honor_labels: true
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/qdrant_key
+    static_configs:
+      - targets: ["__QDRANT_HOST__"]

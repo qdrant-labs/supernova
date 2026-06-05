@@ -1,0 +1,14 @@
+apiVersion: 1
+
+# Reads the Prometheus that scrapes Qdrant (the `qdrant` compose profile). If you
+# bring up the stack without that profile, this datasource just shows as down —
+# harmless; the Postgres panels still work.
+datasources:
+  - name: qdrant-prometheus
+    uid: qdrant-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    jsonData:
+      httpMethod: POST
+      timeInterval: 5s
