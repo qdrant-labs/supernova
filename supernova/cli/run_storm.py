@@ -69,7 +69,13 @@ def _load_query_vectors(source: dict, limit: int) -> list[list[float]]:
 @click.argument("config")
 @click.option("--duration", type=float, default=None, help="Override load.duration_s.")
 @click.option("--concurrency", type=int, default=None, help="Override load.concurrency.")
-def storm(config, duration, concurrency):
+@click.option(
+    "--qps",
+    type=float,
+    default=None,
+    help="Override load.qps (target queries/sec per worker; 0 = max throughput).",
+)
+def storm(config, duration, concurrency, qps):
     """Run a load test against the configured vector store."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
@@ -90,17 +96,25 @@ def storm(config, duration, concurrency):
     if not vectors:
         raise click.UsageError(f"No query vectors loaded from {src.get('uri')!r}")
 
+    target_qps = qps if qps is not None else (load.get("qps") or 0)
     profile = LoadProfile(
         concurrency=concurrency or load.get("concurrency", 32),
         duration_s=duration or load.get("duration_s", 60),
         ramp_s=load.get("ramp_s", 0),
+        target_qps=target_qps,
     )
+    filter_spec = query.get("filter")
 
+    if profile.target_qps > 0:
+        mode = f"paced {profile.target_qps:.0f} qps/worker (cap {profile.concurrency} in-flight)"
+    else:
+        mode = f"closed-loop concurrency={profile.concurrency}"
     logger.info(
-        "storm: %d query vectors, concurrency=%d, duration=%.0fs",
+        "storm: %d query vectors, %s, duration=%.0fs%s",
         len(vectors),
-        profile.concurrency,
+        mode,
         profile.duration_s,
+        ", filtered" if filter_spec else "",
     )
 
     node_id = os.environ.get("SKYPILOT_JOB_RANK", "local")
@@ -116,7 +130,7 @@ def storm(config, duration, concurrency):
 
     status = "ok"
     try:
-        results = asyncio.run(run_storm(tester, vectors, profile))
+        results = asyncio.run(run_storm(tester, vectors, profile, filter_spec=filter_spec))
         summary = results.summary()
         metrics_backend.summary(summary)
         click.echo("=" * 50)

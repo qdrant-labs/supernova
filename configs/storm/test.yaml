@@ -19,12 +19,24 @@ query:
     uri: s3://qdrant--vectorforge/queries/poshmark_1000.parquet
     column: embedding
     limit: 1000               # how many query vectors to cycle through
+  # Optional payload filter applied to every query. The shape is vendor-native —
+  # this is a Qdrant filter, parsed 1:1 into models.Filter. Omit for no filter.
+  # filter:
+  #   must:
+  #     - key: category
+  #       match:
+  #         value: electronics
 
 # Load profile — applied PER WORKER and replicated across the fleet, so total
-# offered load is roughly num_workers × concurrency (NOT sharded).
+# offered load is roughly num_workers × {concurrency or qps} (NOT sharded).
 load:
-  concurrency: 128              # in-flight requests held per worker (closed-loop)
+  concurrency: 128              # closed-loop: in-flight held per worker.
+                                # paced (qps set): in-flight ceiling / safety cap.
   duration_s: 300               # how long to keep the load going
+  # qps: 1200                   # optional target queries/sec PER WORKER. Set it to
+                                # pace at a fixed offered rate (open-loop); omit / 0
+                                # to measure max throughput at the concurrency above.
+                                # Fleet target = num_workers × qps.
 
 # Where measurements go. Omit / leave commented for stdout — the local-first
 # default, no DB needed. Uncomment to stream to Postgres (local Timescale or

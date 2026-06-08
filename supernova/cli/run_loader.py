@@ -137,7 +137,13 @@ def _discover_and_shard(ds_cfg: dict, num_jobs: int, job_rank: int) -> list[str]
     default=None,
     help="This job's rank (0-indexed, used with --num-jobs).",
 )
-def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
+@click.option(
+    "--wps",
+    type=float,
+    default=None,
+    help="Override loader.wps (target writes/points per second per worker; 0 = max).",
+)
+def load(config, dry_run, no_manage_indexing, num_jobs, job_rank, wps):
     """Load pre-embedded data into a vector store."""
     logging.basicConfig(
         level=logging.WARNING,
@@ -201,6 +207,8 @@ def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
         click.echo(f"VectorStore: {store}")
         return
 
+    target_wps = wps if wps is not None else (loader_cfg.get("wps") or 0)
+
     asyncio.run(
         run_loader(
             reader=reader,
@@ -209,6 +217,7 @@ def load(config, dry_run, no_manage_indexing, num_jobs, job_rank):
             prefetch_size=loader_cfg.get("prefetch_size"),
             concurrency=loader_cfg.get("concurrency", 8),
             manage_indexing=not no_manage_indexing,
+            target_wps=target_wps,
         )
     )
 

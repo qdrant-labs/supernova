@@ -26,6 +26,7 @@ async def run_loader(
     prefetch_size: int | None = None,
     concurrency: int = 8,
     manage_indexing: bool = True,
+    target_wps: float = 0.0,
 ) -> None:
     """
     Stream pre-embedded parquet data into a vector store.
@@ -36,14 +37,23 @@ async def run_loader(
     blocks once the queue is full -- so memory is capped to roughly one
     in-flight chunk plus (queue capacity + concurrency) batches.
 
+    ``target_wps`` (writes/sec, i.e. points/sec; 0 = unbounded) paces the
+    producer: it sleeps to admit batches at the target point rate, mirroring
+    ``storm``'s paced query mode. The bounded queue is the safety valve -- if the
+    workers can't sustain the target the queue fills, the producer blocks on
+    ``put``, and the achieved rate sags below target, which is the finding ("this
+    cluster tops out below N wps"), not an error. Per worker, like storm's qps:
+    fleet target = num_jobs × target_wps.
+
     When manage_indexing=False, skips collection creation and indexing
     lifecycle (for distributed workers where the master handles this).
     """
     if prefetch_size is None:
         prefetch_size = batch_size * 10
 
+    pacing = f", target={target_wps:,.0f} pts/s" if target_wps > 0 else ""
     logger.info(
-        f"Loading into {store.name} (prefetch={prefetch_size:,}, batch={batch_size:,})"
+        f"Loading into {store.name} (prefetch={prefetch_size:,}, batch={batch_size:,}{pacing})"
     )
 
     dimensions = reader.get_dimensions()
@@ -81,10 +91,21 @@ async def run_loader(
 
     workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
 
+    # Points-based pacing clock: advance the virtual schedule by one batch's
+    # worth of points each dispatch and sleep to it. Falling behind (delay <= 0)
+    # admits the next batch immediately to catch up, so the average tracks target.
+    per_point_s = 1.0 / target_wps if target_wps > 0 else 0.0
+    next_dispatch = time.perf_counter()
+
     try:
         try:
             for chunk in reader.read_batches(prefetch_size):
                 for batch in _slice_batch(chunk, batch_size):
+                    if per_point_s:
+                        next_dispatch += len(batch) * per_point_s
+                        delay = next_dispatch - time.perf_counter()
+                        if delay > 0:
+                            await asyncio.sleep(delay)
                     await queue.put(batch)  # backpressure: blocks when queue is full
         finally:
             # always send sentinels so workers exit even if the producer raised;

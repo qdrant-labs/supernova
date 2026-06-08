@@ -1,19 +1,9 @@
-# datasource:
-#   type: s3
-#   bucket: qdrant--vectorforge
-#   prefix: mteb_tweets/all-MiniLM-L6-v2
-#   id_expression: "vf_point_id(filename, file_row_number)"
-#   prefetch: true
-#   payload_fields:
-#     text: text
-#     label: label
-#     label_text: label_text
-#     tweet_id: id
-
 datasource:
-  type: local
-  path: /tmp/mteb_tweets_all-MiniLM-L6-v2
+  type: s3
+  bucket: qdrant--vectorforge
+  prefix: mteb_tweets/all-MiniLM-L6-v2
   id_expression: "vf_point_id(filename, file_row_number)"
+  prefetch: true
   payload_fields:
     text: text
     label: label
@@ -21,13 +11,13 @@ datasource:
     tweet_id: id
 
 vectors:
-  my_dense_embedding_again:
+  dense:
     type: dense
     column: dense_embedding
     distance: cosine
-  # my_sparse_embedding:
-  #   type: sparse
-  #   column: sparse_embedding
+  sparse:
+    type: sparse
+    column: sparse_embedding
 
 vectorstore:
   type: qdrant
@@ -38,6 +28,9 @@ vectorstore:
 loader:
   batch_size: 256
   concurrency: 4
+  # wps: 2000     # optional target writes (points) per second PER WORKER. Set it
+                  # to pace upserts at a fixed rate; omit / 0 for max throughput.
+                  # Fleet target = num_jobs × wps.
 
 resources:
   cpus: 2

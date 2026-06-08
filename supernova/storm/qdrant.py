@@ -30,7 +30,18 @@ class QdrantLoadTester(BaseLoadTester):
             url=self.url, api_key=self.api_key, prefer_grpc=True, timeout=60
         )
 
-    async def query(self, vector: list[float]) -> QueryResult:
+    def compile_filter(self, spec: dict | None):
+        """The ``query.filter`` block is a Qdrant-native filter (``must`` /
+        ``should`` / ``must_not`` with field conditions), parsed straight into a
+        ``models.Filter`` so what you write in YAML maps 1:1 to the API.
+        """
+        if not spec:
+            return None
+        from qdrant_client import models
+
+        return models.Filter(**spec)
+
+    async def query(self, vector: list[float], query_filter=None) -> QueryResult:
         t0 = time.perf_counter()
         try:
             resp = await self._client.query_points(
@@ -38,6 +49,7 @@ class QdrantLoadTester(BaseLoadTester):
                 query=vector,
                 using=self.vector_name,
                 limit=self.top_k,
+                query_filter=query_filter,
                 with_payload=False,
             )
             ids = [p.id for p in resp.points]
