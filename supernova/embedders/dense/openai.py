@@ -40,21 +40,6 @@ class OpenAIEmbedder(DenseEmbedder):
     def max_tokens(self) -> int:
         return 8192
 
-    def split_text(self, text: str) -> list[str]:
-        import tiktoken
-
-        encoder = tiktoken.encoding_for_model(self._model)
-        tokens = encoder.encode(text, allowed_special="all")
-
-        if len(tokens) <= self.max_tokens:
-            return [text]
-
-        chunks = []
-        for i in range(0, len(tokens), self.max_tokens):
-            chunk_tokens = tokens[i : i + self.max_tokens]
-            chunks.append(encoder.decode(chunk_tokens))
-        return chunks
-
     async def embed(self, texts: list[str]) -> list[list[float]]:
         from openai import RateLimitError
 

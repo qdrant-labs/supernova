@@ -19,8 +19,7 @@ The actual pipelines live under optional extras so embed workers don't pull in q
 
 | Extra | Installs | Use when |
 |-------|----------|----------|
-| `embed` | sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `nova embed` / `nova partition` workers locally |
-| `partition` | aiobotocore, tiktoken | CPU partition workers (no ML models, no fastembed) |
+| `embed` | sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `nova embed` workers locally |
 | `load` | duckdb, qdrant-client | Running `nova load` (loader workers) |
 | `eval` | torch | `nova brute-force --local` |
 | `dist` | skypilot[aws] | Dispatching distributed jobs from your laptop / Hetzner box |

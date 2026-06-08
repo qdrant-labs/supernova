@@ -54,8 +54,6 @@ All subcommands are dispatched through a single `nova` entrypoint (a click group
 |---------|---------|
 | `nova embed` | Embed a dataset locally |
 | `nova embed-dist` | Distribute embedding across a SkyPilot GPU pool |
-| `nova partition` | Run the embed pipeline with a no-op embedder (validates sharding without GPU spend) |
-| `nova partition-dist` | Distribute the no-op pipeline across a CPU pool |
 
 ### Load
 

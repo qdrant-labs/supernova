@@ -44,10 +44,6 @@ class FastEmbedSparseEmbedder(SparseEmbedder):
         # Return a large sentinel so the pipeline's max_text_length governs instead.
         return 100_000
 
-    def split_text(self, text: str) -> list[str]:
-        # BM25 has no subword token limit — always treat the full text as one chunk.
-        return [text]
-
     def _encode(self, texts: list[str]) -> list[SparseEmbedding]:
         results = list(self._model.embed(texts, batch_size=self._batch_size))
         return [

@@ -172,16 +172,6 @@ class EmbeddingEngine:
             return self.sparse.max_tokens
         return self.multivector.max_tokens
 
-    def split_text(self, text: str) -> list[str]:
-        """Use whichever embedder's tokenizer is available."""
-        if self._hybrid:
-            return self._hybrid.split_text(text)
-        if self.dense:
-            return self.dense.split_text(text)
-        if self.sparse:
-            return self.sparse.split_text(text)
-        return self.multivector.split_text(text)
-
     async def embed(self, texts: list[str]) -> EmbedResult:
         dense_out = None
         sparse_out = None

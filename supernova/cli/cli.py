@@ -22,14 +22,6 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
         "supernova.cli.run_embed_distributed:embed_dist",
         "Embed distributed via SkyPilot pool.",
     ),
-    "partition": (
-        "supernova.cli.run_partition:partition",
-        "Run pipeline with no-op embedder (validate sharding without GPU).",
-    ),
-    "partition-dist": (
-        "supernova.cli.run_partition_distributed:partition_dist",
-        "Distributed partition via SkyPilot pool.",
-    ),
     "load": ("supernova.cli.run_loader:load", "Load pre-embedded data into a vector store."),
     "load-dist": (
         "supernova.cli.run_load_distributed:load_dist",

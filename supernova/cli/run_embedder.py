@@ -18,6 +18,7 @@ from supernova.embedders.sparse.fastembed import FastEmbedSparseEmbedder
 from supernova.embedders.multivector.bge_m3 import BGEM3MultiVectorEmbedder
 from supernova.embedders.hybrid import SentenceTransformerHybridEmbedder
 from supernova.embedders.engine import EmbeddingEngine
+from supernova.chunkers import build_chunker
 from supernova.storage.s3 import S3Backend
 from supernova.storage.huggingface import HuggingFaceBackend
 from supernova.storage.local import LocalBackend
@@ -261,6 +262,7 @@ def embed(config, num_jobs, job_rank, dry_run):
 
     source = build_source(dict(cfg["source"]))
     engine = build_engine(cfg)
+    chunker = build_chunker(cfg.get("chunking"))
     storage = build_storage(dict(cfg["storage"]))
 
     pipeline_cfg = cfg.get("pipeline", {})
@@ -299,6 +301,7 @@ def embed(config, num_jobs, job_rank, dry_run):
         click.echo(f"Config: {config_path}")
         click.echo(f"Source: {cfg['source']['type']}")
         click.echo(f"Engine: {', '.join(k for k in ['dense', 'sparse', 'multivector'] if getattr(engine, 'has_' + k))} embedding")
+        click.echo(f"Chunking: {chunker.__class__.__name__}")
         click.echo(f"Storage: {cfg['storage']['type']}")
         click.echo(f"Filename prefix: '{filename_prefix}'")
         if num_jobs:
@@ -311,6 +314,7 @@ def embed(config, num_jobs, job_rank, dry_run):
             source=source,
             engine=engine,
             storage=storage,
+            chunker=chunker,
             chunk_size=pipeline_cfg.get("chunk_size", 10_000),
             num_workers=pipeline_cfg.get("num_workers", 8),
             flush_threshold=pipeline_cfg.get("flush_threshold", 100_000),

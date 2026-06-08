@@ -15,6 +15,16 @@ sparse_embedder:
   model: Qdrant/bm25
   batch_size: 256
 
+# How each row's text is split into pieces BEFORE embedding. Model-agnostic:
+# every embedder above receives the same pieces. Omit for the default
+# (passthrough = no split; each model truncates overflow at its own token limit).
+# chunking:
+#   strategy: fixed_char    # split into fixed-size CHARACTER windows
+#   chunk_chars: 1024
+#   overlap: 0
+#   # strategy: passthrough  # no-op (default)
+#   # strategy: semantic     # not implemented yet (issue #13)
+
 # storage:
 #   type: s3
 #   bucket: qdrant--vectorforge

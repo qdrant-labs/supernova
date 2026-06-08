@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from tqdm import tqdm
 
 from supernova.sources.base import DatasetSource
+from supernova.chunkers import Chunker
 from supernova.embedders.engine import EmbeddingEngine
 from supernova.pipeline.buffer import ResultBuffer
 from supernova.pipeline.worker import worker
@@ -21,6 +22,7 @@ async def run(
     source: DatasetSource,
     engine: EmbeddingEngine,
     storage: StorageBackend,
+    chunker: Chunker,
     chunk_size: int = 10_000,
     num_workers: int = 8,
     flush_threshold: int = 100_000,
@@ -85,7 +87,7 @@ async def run(
     async def run_chunker():
         try:
             for chunk_id, records in source.get_chunks(
-                engine, chunk_size, max_text_length
+                chunker, chunk_size, max_text_length
             ):
                 await work_queue.put((chunk_id, records))
         finally:
@@ -153,6 +155,7 @@ async def run(
         "sparse_column": sparse_column,
         "multivector_column": multivector_column,
         "chunk_size": chunk_size,
+        "chunking_strategy": chunker.__class__.__name__,
         "max_tokens": engine.max_tokens,
         "num_workers": num_workers,
         "flush_threshold": flush_threshold,

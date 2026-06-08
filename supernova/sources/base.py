@@ -4,7 +4,7 @@ from typing import Iterator, TYPE_CHECKING
 from supernova.models import Record
 
 if TYPE_CHECKING:
-    from supernova.embedders.engine import EmbeddingEngine
+    from supernova.chunkers import Chunker
 
 
 class DatasetSource(ABC):
@@ -39,14 +39,18 @@ class DatasetSource(ABC):
 
     def get_chunks(
         self,
-        engine: "EmbeddingEngine",
+        chunker: "Chunker",
         chunk_size: int = 10_000,
         max_text_length: int | None = None,
     ) -> Iterator[tuple[int, list[Record]]]:
         """
-        Default chunking logic. Yields (chunk_id, records[]).
-        Long texts are split using the engine's tokenizer.
-        If max_text_length is set, texts are truncated before splitting.
+        Default batching logic. Yields (chunk_id, records[]).
+
+        Each row's text is split into pieces by ``chunker`` (model-agnostic),
+        and the pieces are packed into batches of ``chunk_size`` records. Note
+        ``chunk_size`` is the embedding *batch* size, distinct from the chunker's
+        text splitting. If max_text_length is set, texts are truncated before
+        splitting.
         """
         chunk: list[Record] = []
         chunk_id = 0
@@ -61,7 +65,7 @@ class DatasetSource(ABC):
             if max_text_length and len(text) > max_text_length:
                 text = text[:max_text_length]
 
-            for piece in engine.split_text(text):
+            for piece in chunker.chunk(text):
                 chunk.append(Record(text=piece, columns=base_record.columns))
 
                 if len(chunk) == chunk_size:

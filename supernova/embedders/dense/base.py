@@ -32,12 +32,9 @@ class DenseEmbedder(ABC):
 
     @property
     def max_tokens(self) -> int:
-        """Max token length this embedder supports. Must be overridden."""
-        raise NotImplementedError("DenseEmbedder subclass must define max_tokens")
+        """Max token length this embedder supports. Must be overridden.
 
-    def split_text(self, text: str) -> list[str]:
-        """
-        Split text into pieces that fit within this embedder's token limit.
-        Must be overridden -- each embedder should use its own tokenizer.
-        """
-        raise NotImplementedError("DenseEmbedder subclass must implement split_text")
+        Used for the manifest and to size the model's own encode-time
+        truncation. Text splitting is NOT an embedder concern — it's owned by
+        the chunkers module (see issue #12)."""
+        raise NotImplementedError("DenseEmbedder subclass must define max_tokens")

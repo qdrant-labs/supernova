@@ -40,7 +40,6 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
         device: str | None = None,
         dtype: str = "float32",
         max_tokens: int | None = None,
-        truncate: bool = False,
     ):
         try:
             from FlagEmbedding import BGEM3FlagModel
@@ -71,11 +70,6 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
         # bge-m3 native max is 8192; allow user to clamp lower
         native_max = 8192
         self._max_tokens = min(native_max, max_tokens) if max_tokens else native_max
-        self._truncate = truncate
-
-        from transformers import AutoTokenizer
-
-        self._tokenizer = AutoTokenizer.from_pretrained(model)
         # per-vector dimension is known: colbert head of bge-m3 outputs 1024
         self._dimensions = 1024
 
@@ -90,23 +84,6 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
     @property
     def max_tokens(self) -> int:
         return self._max_tokens
-
-    def split_text(self, text: str) -> list[str]:
-        # truncate mode: emit one piece, let the encoder chop at max_tokens.
-        if self._truncate:
-            return [text]
-
-        # split mode: tokenize and break into max_tokens-sized pieces; each piece
-        # becomes its own multivector record. Useful when you want passage-level
-        # multivector coverage of long docs rather than truncating.
-        tokens = self._tokenizer.encode(text, add_special_tokens=False)
-        if len(tokens) <= self._max_tokens:
-            return [text]
-        pieces = []
-        for i in range(0, len(tokens), self._max_tokens):
-            chunk = tokens[i : i + self._max_tokens]
-            pieces.append(self._tokenizer.decode(chunk, skip_special_tokens=True))
-        return pieces
 
     def _encode(self, texts: list[str]) -> list[MultiVectorEmbedding]:
         output = self._model.encode(

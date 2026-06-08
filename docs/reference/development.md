@@ -11,7 +11,7 @@ How supernova is laid out, and how to test un-released changes on a real fleet.
 supernova/
 ├── cli/                          # the `nova` CLI
 │   ├── cli.py                    # entry point (LazyGroup) + subcommand map
-│   ├── run_<verb>.py             # one per command: embed, load, partition,
+│   ├── run_<verb>.py             # one per command: embed, load, storm,
 │   │                             #   brute_force, generate_queries, subsample, ...
 │   ├── run_<verb>_distributed.py # the `-dist` SkyPilot dispatcher for each verb
 │   └── skypilot_utils.py         # shared dispatch helpers (worker bootstrap, pools,
@@ -43,7 +43,7 @@ Every workload follows the same shape — copy it when adding a new one:
 Workers do **not** receive your code by file-sync. The `-dist` wrapper makes each
 worker `pip install "supernova[<extra>]==<the controller's version>"` from PyPI, so
 the controller and its workers always run identical code. Dependency extras
-(`embed`, `load`, `partition`, `eval`, `dist`) are declared in `pyproject.toml`.
+(`embed`, `load`, `storm`, `eval`, `dist`) are declared in `pyproject.toml`.
 
 ### Local state
 

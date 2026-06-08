@@ -70,12 +70,6 @@ class SentenceTransformerHybridEmbedder:
         self._dimensions_val = self._dense_model.get_sentence_embedding_dimension()
         self._max_tokens = self._dense_model.max_seq_length
 
-        from transformers import AutoTokenizer
-
-        self._splitter_tokenizer = AutoTokenizer.from_pretrained(
-            model, trust_remote_code=trust_remote_code
-        )
-
     @property
     def model_name(self) -> str:
         return self._model_name
@@ -87,20 +81,6 @@ class SentenceTransformerHybridEmbedder:
     @property
     def max_tokens(self) -> int:
         return self._max_tokens
-
-    def split_text(self, text: str) -> list[str]:
-        tokens = self._splitter_tokenizer.encode(text, add_special_tokens=False)
-
-        if len(tokens) <= self._max_tokens:
-            return [text]
-
-        chunks = []
-        for i in range(0, len(tokens), self._max_tokens):
-            chunk_tokens = tokens[i : i + self._max_tokens]
-            chunks.append(
-                self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-            )
-        return chunks
 
     def _encode(
         self, texts: list[str]

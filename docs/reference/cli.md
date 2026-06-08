@@ -44,30 +44,6 @@ nova embed-dist <config> [options]
 | `--on-demand` | Use on-demand instead of spot — separate AWS quota, no preemption. |
 | `--ramp` | Opt into SkyPilot's gradual autoscaler (`min_workers=0`). Default is burst (`min_workers=max_workers`) since EC2 provisioning is slow and the autoscaler ramps ~1 replica per 3 minutes. |
 
-## nova partition
-
-Run the embed pipeline with the **no-op embedder**: same I/O and sharding as `nova embed` but no GPU forward pass. Output parquets carry every column except the float vectors, so you can validate clean partitioning (`scripts/verify_no_duplicates.py`) before committing GPU time.
-
-```bash
-nova partition <config> [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--num-jobs N` | Total parallel jobs (auto-computes per-rank slice from dataset size). |
-| `--job-rank N` | This job's rank (defaults to `$SKYPILOT_JOB_RANK`). |
-| `--list-files` | Dry-run: list matched parquet files + per-rank plan and exit. Meaningful for `source.type=huggingface` or its alias `huggingface_parquet`. |
-
-## nova partition-dist
-
-Distribute `nova partition` across a SkyPilot CPU pool. Same flag shape as `nova embed-dist` but cheaper resources.
-
-```bash
-nova partition-dist <config> [options]
-```
-
-Flags: `--dry-run`, `--num-jobs N`, `--chunk-size N`, `--pool-name NAME`, `--max-workers N`, `--on-demand`, `--ramp` — same semantics as `nova embed-dist`.
-
 ---
 
 ## nova load

@@ -33,7 +33,6 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
         dtype: str = "float32",
         trust_remote_code: bool = False,
         max_tokens: int | None = None,
-        truncate: bool = False,
     ):
         self._device = device or _detect_device()
         torch_dtype = self.DTYPE_MAP.get(dtype, torch.float32)
@@ -54,15 +53,7 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
             # protect against user error here by capping it at the model's max if they set something too high
             self._model.max_seq_length = min(self._model.max_seq_length, max_tokens)
         self._max_tokens = self._model.max_seq_length
-        self._truncate = truncate
         self._encode_lock = threading.Lock()
-        # Separate tokenizer copy for split_text to avoid "Already borrowed"
-        # race with the model's internal tokenizer used during encode()
-        from transformers import AutoTokenizer
-
-        self._splitter_tokenizer = AutoTokenizer.from_pretrained(
-            model, trust_remote_code=trust_remote_code
-        )
 
     @property
     def model_name(self) -> str:
@@ -75,27 +66,6 @@ class SentenceTransformerDenseEmbedder(DenseEmbedder):
     @property
     def max_tokens(self) -> int:
         return self._max_tokens
-
-    def split_text(self, text: str) -> list[str]:
-        # truncate mode: let the encoder's tokenizer chop overlong input; emit one piece.
-        # useful for cutting long documents off to speed up inference
-        # at the cost of potentially worse embeddings (losing semantic content after the cutoff)
-        # if a dataset has many many long documents and is bottlenecked on encoding, this can be a useful speed/quality tradeoff to consider
-        if self._truncate:
-            return [text]
-
-        tokens = self._splitter_tokenizer.encode(text, add_special_tokens=False)
-
-        if len(tokens) <= self._max_tokens:
-            return [text]
-
-        chunks = []
-        for i in range(0, len(tokens), self._max_tokens):
-            chunk_tokens = tokens[i : i + self._max_tokens]
-            chunks.append(
-                self._splitter_tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-            )
-        return chunks
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
         with self._encode_lock:
