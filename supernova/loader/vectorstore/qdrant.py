@@ -22,6 +22,10 @@ _COMPARATOR_MAP = {
     "max_sim": models.MultiVectorComparator.MAX_SIM,
 }
 
+# params that tune behavior rather than feed create_collection; excluded from
+# the create kwargs and from the "extra_params" creation log line.
+_NON_CREATION_PARAMS = frozenset({"upsert_wait", "recreate"})
+
 
 def _resolve_distance(name: str | None) -> models.Distance:
     return _DISTANCE_MAP[(name or "cosine").lower()]
@@ -41,6 +45,7 @@ class QdrantVectorStore(VectorStore):
         {
             # non-collection-creation params
             "upsert_wait",
+            "recreate",
             # create_collection scalar params
             "shard_number",
             "sharding_method",
@@ -76,6 +81,7 @@ class QdrantVectorStore(VectorStore):
                 f"Valid keys: {sorted(self._VALID_PARAM_KEYS)}"
             )
         self.upsert_wait = self._resolve_upsert_wait()
+        self.recreate = bool(self.params.get("recreate", False))
         self._client = AsyncQdrantClient(url=url, api_key=api_key, timeout=180, prefer_grpc=True)
 
     def _resolve_upsert_wait(self) -> bool:
@@ -167,22 +173,83 @@ class QdrantVectorStore(VectorStore):
 
         return kwargs
 
+    def _existing_mismatches(self, info, dimensions: dict[str, int]) -> list[str]:
+        """Compare a live collection against this config, returning human-readable
+        mismatch strings (empty list = compatible).
+
+        Only checks the params that are both *immutable after creation* and
+        *benchmark-defining* — vector size+distance, shard_number,
+        replication_factor — so a stale collection can't silently masquerade as
+        the topology you configured. shard_number/replication_factor are only
+        checked when the config pins them (otherwise Qdrant's chosen default is
+        not a "mismatch").
+        """
+        mism: list[str] = []
+        params = info.config.params
+
+        live_vectors = params.vectors or {}
+        for name, spec in self.vectors.items():
+            if spec["type"] == "sparse":
+                continue
+            live = (
+                live_vectors.get(name)
+                if isinstance(live_vectors, dict)
+                else live_vectors
+            )
+            if live is None:
+                mism.append(f"vector {name!r}: absent in existing collection")
+                continue
+            if live.size != dimensions[name]:
+                mism.append(
+                    f"vector {name!r} size: existing {live.size} != config {dimensions[name]}"
+                )
+            want_dist = _resolve_distance(spec.get("distance"))
+            if live.distance != want_dist:
+                mism.append(
+                    f"vector {name!r} distance: existing {live.distance} != config {want_dist}"
+                )
+
+        for key in ("shard_number", "replication_factor"):
+            if key in self.params and getattr(params, key) != self.params[key]:
+                mism.append(
+                    f"{key}: existing {getattr(params, key)} != config {self.params[key]}"
+                )
+
+        return mism
+
     async def ensure_collection(self, dimensions: dict[str, int]) -> None:
         collections = await self._client.get_collections()
         existing = [c.name for c in collections.collections]
 
         if self.collection_name in existing:
-            logger.info(
-                f"Collection '{self.collection_name}' already exists, skipping creation"
+            if not self.recreate:
+                info = await self._client.get_collection(self.collection_name)
+                mismatches = self._existing_mismatches(info, dimensions)
+                if mismatches:
+                    raise ValueError(
+                        f"Collection '{self.collection_name}' already exists but does not "
+                        f"match this config:\n"
+                        + "\n".join(f"  - {m}" for m in mismatches)
+                        + "\n\nThese params are immutable after creation. Set "
+                        "`params: {recreate: true}` to drop and recreate it, or point at "
+                        "a fresh collection_name."
+                    )
+                logger.info(
+                    f"Collection '{self.collection_name}' already exists and matches "
+                    f"config, skipping creation"
+                )
+                return
+            logger.warning(
+                f"Collection '{self.collection_name}' exists; recreate=true, dropping it"
             )
-            return
+            await self._client.delete_collection(self.collection_name)
 
         kwargs = self._build_create_collection_kwargs(dimensions)
         await self._client.create_collection(**kwargs)
         logger.info(
             f"Created collection '{self.collection_name}' with vectors={list(kwargs['vectors_config'])}, "
             f"sparse={list(kwargs.get('sparse_vectors_config') or [])}, "
-            f"extra_params={sorted(set(self.params) - {'upsert_wait'})}"
+            f"extra_params={sorted(set(self.params) - _NON_CREATION_PARAMS)}"
         )
 
     async def defer_indexing(self) -> None:

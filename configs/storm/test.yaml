@@ -13,7 +13,7 @@ target:
 # What to query with.
 query:
   vector_name: dense          # which named vector to search
-  top_k: 250
+  top_k: 10
   source:
     # Query vectors — ideally the parquet produced by `nova generate-queries`.
     uri: s3://qdrant--vectorforge/queries/poshmark_1000.parquet
@@ -30,10 +30,11 @@ query:
 # Load profile — applied PER WORKER and replicated across the fleet, so total
 # offered load is roughly num_workers × {concurrency or qps} (NOT sharded).
 load:
-  concurrency: 128              # closed-loop: in-flight held per worker.
+  concurrency: 8                # closed-loop: in-flight held per worker.
                                 # paced (qps set): in-flight ceiling / safety cap.
   duration_s: 300               # how long to keep the load going
-  # qps: 1200                   # optional target queries/sec PER WORKER. Set it to
+  # optional target queries/sec PER WORKER. Set it to
+  qps: 75                   
                                 # pace at a fixed offered rate (open-loop); omit / 0
                                 # to measure max throughput at the concurrency above.
                                 # Fleet target = num_workers × qps.

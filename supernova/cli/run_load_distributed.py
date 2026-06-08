@@ -244,11 +244,13 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
         print_dry_run(pool_name_eff, num_shards_eff, pool_path, job_path)
         return
 
-    # Setup Qdrant: create collection + defer indexing
+    # Setup Qdrant: create collection + defer indexing. Keep `params` — this is
+    # the ONLY create_collection call in the distributed path (workers run
+    # --no-manage-indexing), so dropping it here silently creates the collection
+    # with default shard_number / replication_factor instead of the configured ones.
     logger.info("Setting up Qdrant collection...")
     vs_cfg = dict(resolved_config["vectorstore"])
     vs_cfg.pop("type", None)
-    vs_cfg.pop("params", None)
     store = QdrantVectorStore(vectors=vectors_spec, **vs_cfg)
 
     # Use the first corpus file to probe vector dimensions. Assumes all files

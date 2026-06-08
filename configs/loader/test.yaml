@@ -24,6 +24,12 @@ vectorstore:
   collection_name: mteb_tweets_all-MiniLM-L6-v2
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
+  # params:
+  #   shard_number: 12
+  #   replication_factor: 2
+  #   recreate: false   # if the collection already exists with different shard/
+  #                     # replication/vector params, the load errors (those are
+  #                     # immutable after creation). Set true to drop + recreate.
 
 loader:
   batch_size: 256
