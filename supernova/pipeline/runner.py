@@ -74,8 +74,10 @@ async def run(
         # preserve any subdir structure from filename_prefix (e.g. "rank00/") so
         # storage backends can replicate the layout remotely.
         remote_subpath = os.path.relpath(local_path, output_dir)
+        # upload_file consumes local_path (cloud backends upload then delete the
+        # staging copy; LocalBackend moves it into place / no-ops if it's already
+        # there). Deleting it here would nuke LocalBackend's saved file.
         await storage.upload_file(local_path, remote_subpath=remote_subpath)
-        os.remove(local_path)
 
     buffer = ResultBuffer(flush_fn=flush, flush_threshold=flush_threshold)
 

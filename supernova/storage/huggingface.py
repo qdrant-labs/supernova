@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 from supernova.storage.base import StorageBackend
 
@@ -67,6 +68,7 @@ class HuggingFaceBackend(StorageBackend):
             add=[(local_path, remote)],
             token=self.token,
         )
+        os.remove(local_path)  # staging copy is uploaded; clean it up
         logger.info("Uploaded %s -> hf://buckets/%s/%s", local_path, self.bucket_id, remote)
 
     async def upload_bytes(self, data: bytes, filename: str) -> None:

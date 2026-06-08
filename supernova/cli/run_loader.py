@@ -8,6 +8,7 @@ import yaml
 
 from supernova.loader.datasource.s3 import S3DataReader
 from supernova.loader.datasource.huggingface import HuggingFaceDataReader
+from supernova.loader.datasource.local import LocalDataReader
 from supernova.loader.vectorstore.qdrant import QdrantVectorStore
 from supernova.loader.runner import run_loader
 
@@ -15,6 +16,7 @@ from supernova.loader.runner import run_loader
 DATASOURCE_REGISTRY = {
     "s3": S3DataReader,
     "huggingface": HuggingFaceDataReader,
+    "local": LocalDataReader,
 }
 
 VECTORSTORE_REGISTRY = {

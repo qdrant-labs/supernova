@@ -14,6 +14,10 @@ class StorageBackend(ABC):
         If `remote_subpath` is provided, it is used as the destination path under the
         backend's base location (preserves directory structure). Defaults to the file's
         basename for backward compatibility.
+
+        Consumes ``local_path``: on success the file has been persisted (uploaded and
+        its staging copy removed, or moved into place for local storage), so the caller
+        must not read or delete it afterward.
         """
         pass
 

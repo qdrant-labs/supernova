@@ -15,11 +15,15 @@ sparse_embedder:
   model: Qdrant/bm25
   batch_size: 256
 
+# storage:
+#   type: s3
+#   bucket: qdrant--vectorforge
+#   prefix: mteb_tweets/all-MiniLM-L6-v2
+#   output_dir: /tmp/supernova
+
 storage:
-  type: s3
-  bucket: qdrant--vectorforge
-  prefix: mteb_tweets/all-MiniLM-L6-v2
-  output_dir: /tmp/supernova
+  type: local
+  output_dir: /tmp/mteb_tweets_all-MiniLM-L6-v2
 
 pipeline:
   chunk_size: 1000

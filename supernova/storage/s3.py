@@ -1,4 +1,5 @@
 import logging
+import os
 
 import aiobotocore.session
 from botocore.exceptions import ClientError
@@ -42,6 +43,7 @@ class S3Backend(StorageBackend):
             with open(local_path, "rb") as f:
                 await client.put_object(Bucket=self.bucket, Key=key, Body=f)
 
+        os.remove(local_path)  # staging copy is uploaded; clean it up
         logger.info("Uploaded s3://%s/%s", self.bucket, key)
 
     async def upload_bytes(self, data: bytes, filename: str) -> None:

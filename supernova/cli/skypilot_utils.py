@@ -221,7 +221,8 @@ def worker_run(argv: str) -> str:
 
 
 def config_mount(run_dir: Path, config_path: str) -> tuple[dict[str, str], str]:
-    """Stage a config for a worker; return ``(file_mounts, remote_path)``.
+    """
+    Stage a config for a worker; return ``(file_mounts, remote_path)``.
 
     The config is copied verbatim (unresolved) into the run dir and mounted at
     ``/cfg`` on the worker. We ship the *raw* config — secrets travel as

@@ -42,9 +42,13 @@ class StormResults:
 
 
 async def run_storm(
-    tester: BaseLoadTester, vectors: list[list[float]], profile: LoadProfile
+    tester: BaseLoadTester,
+    vectors: list[list[float]],
+    profile: LoadProfile
 ) -> StormResults:
-    """Drive one worker's load profile (closed-loop) and collect latencies."""
+    """
+    Drive one worker's load profile (closed-loop) and collect latencies.
+    """
     await tester.setup()
     latencies: list[float] = []
     n_ok = n_err = 0

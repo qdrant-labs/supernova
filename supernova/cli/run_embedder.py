@@ -195,7 +195,12 @@ def build_storage(cfg: dict):
     default=None,
     help="This job's rank (0-indexed, used with --num-jobs).",
 )
-def embed(config, num_jobs, job_rank):
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Generate configs and print plan, don't run the pipeline.",
+)
+def embed(config, num_jobs, job_rank, dry_run):
     """Run a supernova embedding pipeline."""
     logging.basicConfig(
         level=logging.WARNING,
@@ -286,6 +291,20 @@ def embed(config, num_jobs, job_rank):
     # expected_total_rows drives the progress bar's "X/Y chunks + pct" display.
     # prefer the per-job limit (set by --num-jobs slicing); fall back to source-level limit.
     expected_total_rows = cfg["source"].get("limit")
+
+    if dry_run:
+        click.echo("=" * 60)
+        click.echo("supernova embedding pipeline DRY RUN")
+        click.echo("=" * 60)
+        click.echo(f"Config: {config_path}")
+        click.echo(f"Source: {cfg['source']['type']}")
+        click.echo(f"Engine: {', '.join(k for k in ['dense', 'sparse', 'multivector'] if getattr(engine, 'has_' + k))} embedding")
+        click.echo(f"Storage: {cfg['storage']['type']}")
+        click.echo(f"Filename prefix: '{filename_prefix}'")
+        if num_jobs:
+            click.echo(f"Distributed slicing: job_rank={job_rank} / num_jobs={num_jobs}")
+        click.echo("=" * 60)
+        return
 
     asyncio.run(
         run(
