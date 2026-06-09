@@ -26,14 +26,15 @@ logger = logging.getLogger("supernova.metrics")
 
 _SCHEMA = """
 create table if not exists runs (
-    run_id      text primary key,
-    command     text,
-    node_id     text,
-    started_at  timestamptz not null default now(),
-    finished_at timestamptz,
-    status      text,
-    config      jsonb,
-    summary     jsonb
+    run_id        text primary key,
+    command       text,
+    node_id       text,
+    experiment_id text,
+    started_at    timestamptz not null default now(),
+    finished_at   timestamptz,
+    status        text,
+    config        jsonb,
+    summary       jsonb
 );
 create table if not exists samples (
     ts      timestamptz not null,
@@ -89,6 +90,8 @@ class PostgresBackend(MetricsBackend):
         with self._conn.cursor() as cur:
             for stmt in filter(str.strip, _SCHEMA.split(";")):
                 cur.execute(stmt)
+            # Backfill the column on tables created before experiments existed.
+            cur.execute("alter table runs add column if not exists experiment_id text")
             try:
                 cur.execute("create extension if not exists timescaledb")
                 cur.execute("select create_hypertable('samples', 'ts', if_not_exists => true)")
@@ -105,9 +108,15 @@ class PostgresBackend(MetricsBackend):
         # ON CONFLICT DO NOTHING so replicated fleet workers (sharing one run_id
         # via NOVA_RUN_ID) don't fight over the row; the first one writes it.
         self._conn.execute(
-            "insert into runs (run_id, command, node_id, status, config) "
-            "values (%s, %s, %s, 'running', %s) on conflict (run_id) do nothing",
-            (run_id, context.get("command"), self._node_id, Jsonb(_redact(context.get("config", {})))),
+            "insert into runs (run_id, command, node_id, experiment_id, status, config) "
+            "values (%s, %s, %s, %s, 'running', %s) on conflict (run_id) do nothing",
+            (
+                run_id,
+                context.get("command"),
+                self._node_id,
+                context.get("experiment_id"),
+                Jsonb(_redact(context.get("config", {}))),
+            ),
         )
 
     def log(self, name, value, **tags):
