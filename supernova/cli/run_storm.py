@@ -125,7 +125,15 @@ def storm(config, duration, concurrency, qps):
     metrics_backend = build_metrics(cfg.get("metrics"))
     set_current(metrics_backend)
     metrics_backend.init()
-    metrics_backend.start(run_id, {"command": "storm", "node_id": node_id, "config": cfg})
+    metrics_backend.start(
+        run_id,
+        {
+            "command": "storm",
+            "node_id": node_id,
+            "experiment_id": os.environ.get("NOVA_EXPERIMENT_ID"),
+            "config": cfg,
+        },
+    )
     logger.info("storm run: %s (node %s)", run_id, node_id)
 
     status = "ok"

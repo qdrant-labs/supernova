@@ -9,6 +9,7 @@ mid-run would corrupt the measurement window.
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -138,6 +139,11 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
     referenced = sorted(set(re.findall(r"\$\{(\w+)\}", Path(config).read_text())))
     envs = build_env_dict(referenced)
     envs["NOVA_RUN_ID"] = metrics_run_id  # every worker writes into this one run
+    # When launched under `nova experiment`, tag this run's workers with the
+    # experiment so Grafana can group reads + the write phase on one timeline.
+    exp_id = os.environ.get("NOVA_EXPERIMENT_ID")
+    if exp_id:
+        envs["NOVA_EXPERIMENT_ID"] = exp_id
     logger.info("Creating pool '%s' with %d workers...", pool_name_eff, num_workers_eff)
     launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_workers_eff, envs)
 

@@ -3,10 +3,35 @@
   "title": "Supernova — Storm",
   "editable": true,
   "schemaVersion": 39,
-  "version": 4,
+  "version": 5,
   "refresh": "5s",
   "timezone": "browser",
   "time": { "from": "now-3h", "to": "now" },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Experiment phases",
+        "datasource": { "type": "postgres", "uid": "${ds}" },
+        "enable": true,
+        "iconColor": "semi-dark-orange",
+        "target": {
+          "refId": "anno",
+          "rawQuery": true,
+          "format": "table",
+          "rawSql": "SELECT ts AS time, message AS text FROM events WHERE run_id = (SELECT experiment_id FROM runs WHERE run_id = '$run') AND $__timeFilter(ts) ORDER BY ts"
+        }
+      }
+    ]
+  },
   "templating": {
     "list": [
       {

@@ -1,0 +1,54 @@
+# `nova experiment` — observe the effect of heavy writes on steady-state reads.
+#
+#   nova experiment configs/experiment/write_contention.yaml --dry-run
+#   nova experiment configs/experiment/write_contention.yaml
+#
+# Timeline: launch a distributed read load (storm-dist) at the cluster, let it
+# stabilize, then run a heavy local write load (load) against the SAME cluster
+# and watch read p99 degrade + recover. The write window is bracketed by
+# `writes:start` / `writes:end` events — use those as Grafana annotations over
+# the read-latency panel (filter by this experiment in the Run/Experiment view).
+
+experiment:
+  name: write_contention
+  subject: "qdrant://products"      # informational: the shared subject under test
+
+  # Phase events + child-run linkage land here. Same backend the units stream to,
+  # so reads and the write window share one timeline in Grafana.
+  metrics:
+    type: postgres
+    dsn: ${SN_METRICS_DB_URL}
+
+  cooldown_s: 180                   # keep observing reads after writes stop (recovery)
+
+  steps:
+    # Steady-state reads across an in-region fleet. `launcher: true` because
+    # storm-dist returns once the fleet is dispatched — reads then run on their
+    # own `duration_s` (set that long enough to cover warmup + writes + cooldown).
+    - id: reads
+      run: storm-dist
+      config: configs/storm/poshmark.yaml
+      launcher: true
+
+    # Heavy writes against the same cluster. Foreground: the experiment brackets
+    # it with writes:start / writes:end while the read fleet keeps measuring.
+    - id: writes
+      run: load
+      config: ~/.nova/poshmark.yaml
+      # --no-manage-indexing: just insert into the EXISTING collection storm is
+      # reading — don't recreate it or run the defer/enable-indexing lifecycle.
+      # (Indexing then builds live during the writes — the realistic contention load.)
+      args: ["--no-manage-indexing"]
+      delay_s: 240                  # warmup: let the fleet come up + reads settle
+      timeout_s: 600                # bounded write burst — stop after 10 min, however
+                                    # big the corpus is (omit to load the whole thing)
+
+# All-local variant (no SkyPilot): swap the reads step to a local, backgrounded
+# storm so it overlaps the writes —
+#   - id: reads
+#     run: storm
+#     config: ~/.nova/poshmark-storm.yaml
+#     background: true            # concurrent local reader; torn down at the end
+# Set that storm's duration_s >= delay_s + timeout_s + cooldown_s so it doesn't
+# self-exit before teardown. (Local reads measure laptop->cluster RTT, so absolute
+# p99 is inflated — the bump-and-recover shape is still what you're after.)
