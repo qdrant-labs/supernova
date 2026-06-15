@@ -11,7 +11,6 @@
 #   bucket: qdrant--vectorforge
 #   prefix: mteb_tweets/all-MiniLM-L6-v2
 #   id_expression: "vf_point_id(filename, file_row_number)"
-#   # prefetch: true   # not yet implemented in nova-load; files read directly via httpfs
 #   payload_fields:
 #     text: text
 #     label: label
@@ -22,7 +21,6 @@ datasource:
   type: local
   path: /tmp/mteb_tweets_all-MiniLM-L6-v2
   id_expression: "vf_point_id(filename, file_row_number)"
-  # prefetch: true   # not yet implemented in nova-load; files read directly via httpfs
   payload_fields:
     text: text
     label: label
@@ -43,6 +41,7 @@ vectorstore:
   collection_name: mteb_tweets_all-MiniLM-L6-v2
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
+  upsert_wait: false
   # params:
   #   shard_number: 12
   #   replication_factor: 2

@@ -8,9 +8,11 @@
 //! rate reflects what the store can actually sustain.
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
@@ -43,6 +45,7 @@ pub async fn run_loader(
     cfg: &LoaderConfig,
     manage_indexing: bool,
 ) -> Result<LoadStats, LoadError> {
+    tracing::info!("scanning corpus (counting records + reading dimensions)…");
     // Metadata reads hit DuckDB (blocking), so run them off the async runtime.
     let (dims, total, reader) = tokio::task::spawn_blocking(move || {
         let mut reader = reader;
@@ -128,14 +131,43 @@ async fn drive(
     // Consumer: spawn a semaphore-capped upsert task per batch.
     let sem = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
     let mut workers: JoinSet<(usize, Result<(), StoreError>)> = JoinSet::new();
-    let step = (total / 20).max(1); // log progress ~every 5%
+
+    // Interactive terminal → live bar; otherwise (CI, redirected) periodic logs.
+    let interactive = std::io::stderr().is_terminal();
+    let progress = if interactive && total > 0 {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] {wide_bar} {pos}/{len} pts ({per_sec}, eta {eta}) {msg}",
+            )
+            .unwrap(),
+        );
+        // Animate immediately so the first-chunk read (DuckDB fetching row
+        // groups, slow over httpfs) shows as working rather than frozen.
+        pb.set_message("reading first batch…");
+        pb.enable_steady_tick(Duration::from_millis(120));
+        pb
+    } else {
+        ProgressBar::hidden()
+    };
+    let step = (total / 20).max(1);
     let mut dispatched = 0u64;
     let mut next_log = step;
+    let mut started = false;
+
     while let Some(batch) = rx.recv().await {
-        dispatched += batch.len() as u64;
-        if total > 0 && dispatched >= next_log {
-            tracing::info!(dispatched, total, "loading progress");
-            next_log = dispatched + step;
+        if !started {
+            started = true;
+            progress.set_message("");
+        }
+        let n = batch.len() as u64;
+        progress.inc(n);
+        if !interactive && total > 0 {
+            dispatched += n;
+            if dispatched >= next_log {
+                tracing::info!(dispatched, total, "loading progress");
+                next_log = dispatched + step;
+            }
         }
         let permit = sem.clone().acquire_owned().await.expect("semaphore open");
         let store = store.clone();
@@ -146,6 +178,7 @@ async fn drive(
             (n, res)
         });
     }
+    progress.finish_and_clear();
 
     let mut loaded = 0u64;
     let mut errors = 0u64;

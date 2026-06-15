@@ -170,11 +170,15 @@ impl VectorStore for QdrantVectorStore {
 
     async fn wait_for_indexing(&self) -> Result<(), StoreError> {
         loop {
-            let info = self.client.collection_info(&self.collection_name).await?;
-            let status = info.result.map(|r| r.status).unwrap_or_default();
+            let info = self.client.collection_info(&self.collection_name).await?.result;
+            let status = info.as_ref().map(|r| r.status).unwrap_or_default();
             if status == CollectionStatus::Green as i32 {
                 return Ok(());
             }
+            // Surface progress so the index build doesn't look frozen.
+            let indexed = info.as_ref().and_then(|r| r.indexed_vectors_count).unwrap_or(0);
+            let total = info.as_ref().and_then(|r| r.points_count).unwrap_or(0);
+            tracing::info!(indexed, total, "indexing in progress");
             sleep(Duration::from_secs(STATUS_POLL_SECS)).await;
         }
     }
@@ -300,7 +304,6 @@ pub struct QdrantParams {
     pub hnsw_config: Option<HnswConfig>,
     pub optimizers_config: Option<OptimizersConfig>,
     pub quantization: Option<QuantizationConfig>,
-    // TODO: wal_config / strict_mode_config when a benchmark needs them.
 }
 
 #[derive(Debug, Deserialize)]

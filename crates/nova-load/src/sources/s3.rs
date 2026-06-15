@@ -15,10 +15,6 @@ pub struct S3Config {
     pub prefix: Option<String>,
     #[serde(default)]
     pub file_list: Option<Vec<String>>,
-    #[serde(default)]
-    pub prefetch: bool,
-    #[serde(default)]
-    pub prefetch_dir: Option<String>,
 
     #[serde(flatten)]
     pub reader: ReaderOptions,
@@ -30,9 +26,7 @@ impl S3Config {
         vectors: &HashMap<String, VectorSpec>,
         chunk_size: usize,
     ) -> DuckDbReader<S3Backend> {
-        // TODO: `prefetch`/`prefetch_dir` (download each file locally before the
-        // scan) is not yet implemented — files are read directly over httpfs,
-        // which is correct, just without the local-cache optimization.
+        // Files are read directly over DuckDB's httpfs.
         let backend = S3Backend::new(self.bucket, self.prefix, self.file_list);
         DuckDbReader::new(backend, vectors, self.reader, chunk_size)
     }
