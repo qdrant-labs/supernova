@@ -9,6 +9,7 @@ from supernova.embedders.sparse.sentence_transformer import (
 )
 from supernova.embedders.engine import EmbeddingEngine, EmbedResult
 from supernova.embedders.hybrid import SentenceTransformerHybridEmbedder
+from supernova.embedders.runner import run_embedder
 
 __all__ = [
     "DenseEmbedder",
@@ -19,4 +20,5 @@ __all__ = [
     "SentenceTransformerHybridEmbedder",
     "EmbeddingEngine",
     "EmbedResult",
+    "run_embedder",
 ]

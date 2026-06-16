@@ -85,9 +85,9 @@ datasource:
   id_expression: "vf_point_id(filename, file_row_number)"
 ```
 
-The macro hashes `(parquet path, physical row index)` into a deterministic UUID — the same form used by `nova brute-force` and `nova generate-queries`, so recall ground truth lines up across the eval pipeline.
+The macro hashes `(parquet path, physical row index)` into a deterministic UUID, so recall ground truth from the eval pipeline lines up with the loaded point IDs.
 
-`file_row_number` is critical here: it's a DuckDB virtual column that always reflects the physical row index, regardless of parallel scan order. Do **not** use `ROW_NUMBER() OVER (PARTITION BY filename)` — that reflects DuckDB's scan ordering and produces different IDs from the brute-force side under concurrency. There's a regression test for this in `tests/test_loader_id_expression.py`.
+`file_row_number` is critical here: it's a DuckDB virtual column that always reflects the physical row index, regardless of parallel scan order. Do **not** use `ROW_NUMBER() OVER (PARTITION BY filename)` — that reflects DuckDB's scan ordering and produces different IDs from one run to the next under concurrency. There's a regression test for this in `tests/test_loader_id_expression.py`.
 
 The base reader auto-enables `read_parquet(..., filename=true, file_row_number=true)` whenever your `id_expression` mentions either column, so you don't have to wire that yourself. See [Loader Architecture](../reference/loader-architecture.md#id-space-anchoring) for the full ID-space discussion.
 

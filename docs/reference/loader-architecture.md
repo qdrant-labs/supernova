@@ -70,7 +70,7 @@ Base class for all parquet data sources. Handles DuckDB connection, SQL generati
 - `row_id` — use a pre-baked id column
 - `hash(text)` — content-deduplicated ids
 - `uuid()` — random per-row UUIDs
-- `vf_point_id(filename, file_row_number)` — **recommended** for supernova-produced corpora; matches `nova brute-force` and `nova generate-queries` so recall ground truth aligns
+- `vf_point_id(filename, file_row_number)` — **recommended** for supernova-produced corpora; produces deterministic IDs so recall ground truth from the eval pipeline aligns
 
 The base reader (`supernova/loader/datasource/base.py`) registers three macros at connection time:
 
@@ -78,7 +78,7 @@ The base reader (`supernova/loader/datasource/base.py`) registers three macros a
 - `make_point_id(source_file, source_row)` — `vf_uuid_from_hex(md5(source_file || ':' || source_row))`. Mirrors `supernova.utils.make_point_id` exactly.
 - `vf_point_id(fname, rnum)` — `make_point_id(substr(fname, prefix_len + 1), rnum)`, where `prefix_len` is the URI-prefix length each subclass declares via `_root_uri_prefix()`.
 
-If the `id_expression` references `filename` or `file_row_number`, the base reader auto-injects `read_parquet(..., filename=true, file_row_number=true)` so those virtual columns are available. **Use `file_row_number`, not `ROW_NUMBER() OVER (PARTITION BY filename)`** — `file_row_number` is the physical row index and is stable under DuckDB's parallel parquet scan; window-function row numbers reflect scan order and can produce different IDs from the brute-force side. There's an explicit regression test in `tests/test_loader_id_expression.py` that documents both behaviours.
+If the `id_expression` references `filename` or `file_row_number`, the base reader auto-injects `read_parquet(..., filename=true, file_row_number=true)` so those virtual columns are available. **Use `file_row_number`, not `ROW_NUMBER() OVER (PARTITION BY filename)`** — `file_row_number` is the physical row index and is stable under DuckDB's parallel parquet scan; window-function row numbers reflect scan order and can produce different IDs from one run to the next. There's an explicit regression test in `tests/test_loader_id_expression.py` that documents both behaviours.
 
 **`vectors`** (top-level config) — declares one or more named vectors. Passed to both the reader (which knows the parquet column to read) and the vector store (which knows how to configure the collection):
 
@@ -113,7 +113,7 @@ Default: `{}` (no payload).
 
 **`source_sql`** — the DuckDB FROM clause. Defaults to `'<glob_path>'` but subclasses override it with `read_parquet([...])` when `file_list` is set. This is how distributed workers read only their assigned files.
 
-**`_root_uri_prefix()`** — the URI prefix the base class strips from DuckDB's `filename` column to recover the bare key passed into `make_point_id`. Each subclass declares this once (`f"s3://{bucket}/"` for S3, `f"hf://datasets/{repo_id}/"` for HF) and the base class registers `vf_point_id` automatically. Both this loader and the brute-force / generate-queries pipelines must agree on the bare-key form, otherwise IDs won't match — see `supernova/destinations.py:bare_key_for_uri`.
+**`_root_uri_prefix()`** — the URI prefix the base class strips from DuckDB's `filename` column to recover the bare key passed into `make_point_id`. Each subclass declares this once (`f"s3://{bucket}/"` for S3, `f"hf://datasets/{repo_id}/"` for HF) and the base class registers `vf_point_id` automatically. Both this loader and any recall-eval tooling must agree on the bare-key form, otherwise IDs won't match — see `supernova/destinations.py:bare_key_for_uri`.
 
 ### S3DataReader
 
@@ -132,7 +132,7 @@ Note: the embed-side storage backend now writes to `hf://buckets/...` (HF Storag
 
 ## ID space anchoring
 
-Point IDs are `md5(bare_key + ":" + row_index)` as a UUID. The same `bare_key` form is computed by *three* places that must agree: the loader's `vf_point_id` macro (when writing to Qdrant), `generate-queries` (when stamping `__source_file__` on sampled rows), and `brute-force` (when emitting hit IDs). If any of those drifts, recall@k breaks silently — payloads still match but UUIDs don't.
+Point IDs are `md5(bare_key + ":" + row_index)` as a UUID. The `bare_key` form must be computed identically everywhere it's used: the loader's `vf_point_id` macro (when writing to Qdrant) and any recall-eval tooling (when mapping query rows back to corpus point IDs). If the derivations drift, recall@k breaks silently — payloads still match but UUIDs don't.
 
 The bare key is anchored at the **top-level container**: the S3 bucket, or the HF dataset repo. So:
 
@@ -143,7 +143,7 @@ Two consequences fall out of this anchor choice:
 
 **Stable across scope within a container.** Loading just `s3://b/fineweb/cc-2025-26/...` and loading the wider `s3://b/fineweb/...` produce the *same* IDs for the same physical rows. You can do incremental or partial loads, then later widen the scope, without invalidating earlier ground-truth or fragmenting the ID space.
 
-**Reset across containers.** Migrating S3 bucket A → S3 bucket B, or S3 → HF, changes the anchor and therefore the IDs. The recall ground-truth (`queries_*.parquet`, `brute_force_*.parquet`) must be regenerated on the new side; you cannot reuse a Qdrant collection across container migrations.
+**Reset across containers.** Migrating S3 bucket A → S3 bucket B, or S3 → HF, changes the anchor and therefore the IDs. Any recall ground-truth under `eval/` must be regenerated on the new side; you cannot reuse a Qdrant collection across container migrations.
 
 This is a deliberate trade-off, not an oversight. There is no unforced way to make a hash function span containers — they're literally different ID universes — without introducing an external "logical dataset name" registry that someone has to set correctly per run. The current scheme prioritises the workflow that's actually common (scoped loads within one bucket/repo) over the one that's rare (cross-backend migrations). The seam where this is implemented is `DataReader._root_uri_prefix()` and `supernova.destinations.bare_key_for_uri()` — both must strip the same prefix.
 

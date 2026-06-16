@@ -125,7 +125,7 @@ Add a branch in each of the scheme-keyed helpers in `supernova/destinations.py`.
 | `fs_path_for_uri(uri)` | strip the scheme to whatever path your filesystem expects |
 | `bare_key_for_uri(uri)` | the per-file identifier used by `make_point_id`; must agree on both sides of the loader/eval split |
 | `list_parquets_under(prefix_uri)` | recursive `.parquet` list for arbitrary prefixes (eval artifacts) — does not exclude `eval/` |
-| `upload_file_to_uri(local, dest_uri)` | one-shot eval-artifact uploads (queries, brute-force outputs) |
+| `upload_file_to_uri(local, dest_uri)` | one-shot eval-artifact uploads under `eval/` |
 | `upload_bytes_to_uri(data, dest_uri)` | same, for in-memory bytes |
 | `datasource_to_destination(ds_cfg)` | build a `Destination` from a loader-config `datasource:` block |
 
@@ -255,7 +255,7 @@ class GcsDataReader(DataReader):
     def _root_uri_prefix(self) -> str:
         # The base class uses this to register vf_point_id. The bare key fed
         # to make_point_id is everything after this prefix — must agree with
-        # bare_key_for_uri("gs://...") on the brute-force / query-gen side.
+        # bare_key_for_uri("gs://...") on any recall-eval side.
         return f"gs://{self.gcs_bucket}/"
 
     def _iter_sources(self) -> Iterable[str]:

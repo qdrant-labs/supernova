@@ -43,8 +43,10 @@ supernova/
     sparse/           # Sparse embedding backends (sentence-transformers SparseEncoder)
     engine.py         # EmbeddingEngine -- orchestrates dense/sparse/hybrid
     hybrid.py         # HybridEmbedder -- single forward pass for both
+    runner.py         # Embedding orchestration (run_embedder)
+    worker.py         # Per-chunk embed worker
+    buffer.py         # Result buffering + flush
   storage/            # Output backends (S3, HuggingFace Hub, local)
-  pipeline/           # Embedding orchestration (runner, worker, buffer)
   loader/
     datasource/       # Parquet readers (S3, HuggingFace)
     vectorstore/      # Vector store backends (Qdrant)

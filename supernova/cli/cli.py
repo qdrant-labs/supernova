@@ -39,31 +39,6 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
         "supernova.cli.run_experiment:experiment",
         "Compose units over a timeline (workload tests).",
     ),
-    "generate-queries": (
-        "supernova.cli.run_generate_queries:generate_queries",
-        "Sample N rows as eval queries (launches EC2; --local to run here).",
-    ),
-    "subsample": (
-        "supernova.cli.run_subsample:subsample",
-        "Sample N random rows from a corpus to a local parquet file.",
-    ),
-    "brute-force": (
-        "supernova.cli.run_brute_force:brute_force",
-        "Exhaustive nearest-neighbor search for recall eval (single GPU).",
-    ),
-    "brute-force-dist": (
-        "supernova.cli.run_brute_force_distributed:brute_force_dist",
-        "Distributed brute-force via SkyPilot GPU pool.",
-    ),
-    "brute-force-merge": (
-        "supernova.cli.run_brute_force:brute_force_merge",
-        "Merge partial results from a distributed brute-force run.",
-    ),
-    "analysis": ("supernova.cli.run_analysis:analysis", "Analyze a (distributed) embedding run."),
-    "throughput-predict": (
-        "supernova.cli.run_throughput_predict:throughput_predict",
-        "Predict embedding throughput + cost from a config.",
-    ),
 }
 
 

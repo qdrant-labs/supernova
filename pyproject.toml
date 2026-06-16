@@ -71,10 +71,6 @@ load = [
     "duckdb>=1.5.1",
     "qdrant-client>=1.9.0",
 ]
-# Recall evaluation -- brute-force nearest-neighbor search (GPU)
-eval = [
-    "torch",
-]
 # Load testing -- `nova storm` query workers
 storm = [
     "qdrant-client>=1.9.0",

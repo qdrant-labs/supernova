@@ -21,14 +21,14 @@ The actual pipelines live under optional extras so embed workers don't pull in q
 |-------|----------|----------|
 | `embed` | sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `nova embed` workers locally |
 | `load` | duckdb, qdrant-client | Running `nova load` (loader workers) |
-| `eval` | torch | `nova brute-force --local` |
+| `storm` | qdrant-client, duckdb | Running `nova storm` load-test workers |
 | `dist` | skypilot[aws] | Dispatching distributed jobs from your laptop / Hetzner box |
 
 Pick the extras that match your role. Common combinations:
 
 ```bash
-# Local laptop dispatching distributed embed + load + eval
-uv sync --extra dist --extra load --extra eval
+# Local laptop dispatching distributed embed + load
+uv sync --extra dist --extra load
 
 # A single embed worker
 uv sync --extra embed
@@ -40,7 +40,7 @@ uv sync --extra load
 uv sync --all-extras
 ```
 
-The dispatch CLIs (`nova embed-dist`, `nova load-dist`, `nova brute-force-dist`) bake the right `uv sync --extra ...` into the pool's `setup:` script, so workers install the right slice automatically.
+The dispatch CLIs (`nova embed-dist`, `nova load-dist`, `nova storm-dist`) bake the right `uv sync --extra ...` into the pool's `setup:` script, so workers install the right slice automatically.
 
 ## Environment variables
 
@@ -69,7 +69,7 @@ Set the variables relevant to your workflow.
 
 ## SkyPilot setup
 
-SkyPilot is used to parallelize embedding generation (GPU instances), loading (CPU spot instances), and brute-force eval (GPU instances). It's only needed if you'll be **dispatching** distributed jobs — workers themselves don't need it.
+SkyPilot is used to parallelize embedding generation (GPU instances), loading (CPU spot instances), and load testing (`nova storm-dist`). It's only needed if you'll be **dispatching** distributed jobs — workers themselves don't need it.
 
 ```bash
 uv sync --extra dist
@@ -84,7 +84,7 @@ SkyPilot requires IAM permissions to launch EC2 instances. See the [SkyPilot AWS
 nova --help                # lists every subcommand; should run in well under a second
 nova embed --help
 nova load --help
-nova brute-force --help
+nova storm --help
 
 uv run pytest tests/ -v
 ```

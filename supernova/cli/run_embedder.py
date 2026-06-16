@@ -22,7 +22,7 @@ from supernova.chunkers import build_chunker
 from supernova.storage.s3 import S3Backend
 from supernova.storage.huggingface import HuggingFaceBackend
 from supernova.storage.local import LocalBackend
-from supernova.pipeline.runner import run
+from supernova.embedders.runner import run_embedder
 
 # available sources, embedders, and storage backends. Used to construct from config.
 # mapping from string identifiers in config → actual classes. Factored out to avoid circular imports and keep main() clean.
@@ -310,7 +310,7 @@ def embed(config, num_jobs, job_rank, dry_run):
         return
 
     asyncio.run(
-        run(
+        run_embedder(
             source=source,
             engine=engine,
             storage=storage,

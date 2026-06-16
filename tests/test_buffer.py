@@ -1,6 +1,6 @@
 import pytest
 
-from supernova.pipeline.buffer import ResultBuffer
+from supernova.embedders.buffer import ResultBuffer
 from supernova.models import ChunkResult, EmbeddedRecord
 
 

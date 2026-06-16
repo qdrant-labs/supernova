@@ -90,7 +90,7 @@ loader:
 
 The top-level `vectors:` block is required — it tells the loader which parquet column carries each vector and the vector store how to configure the collection.
 
-`id_expression` is a DuckDB SQL expression that yields the point id per row. The `vf_point_id(filename, file_row_number)` macro is the recommended choice: it produces stable UUIDs that match what `nova brute-force` and `nova generate-queries` emit, so recall ground truth lines up across the eval pipeline. See [Loader Architecture](../reference/loader-architecture.md) for the details.
+`id_expression` is a DuckDB SQL expression that yields the point id per row. The `vf_point_id(filename, file_row_number)` macro is the recommended choice: it produces stable, deterministic UUIDs so recall ground truth from the eval pipeline lines up with the loaded point IDs. See [Loader Architecture](../reference/loader-architecture.md) for the details.
 
 Run:
 

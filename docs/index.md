@@ -23,7 +23,7 @@ Destinations and corpora are addressed by URI. Three schemes are supported today
 | `hf://buckets/ns/name[/subdir]` | HuggingFace Storage Buckets (mutable object storage on the Hub, good for community sharing) |
 | `file:///abs/path` | Local filesystem (handy for tests and single-machine flows) |
 
-The same URI is recognised by every command that operates on a corpus -- `nova load`, `nova brute-force`, `nova generate-queries`, etc.
+The same URI is recognised by every command that operates on a corpus -- `nova embed` writes it, `nova load` reads it, etc.
 
 ### Embedding pipeline
 
@@ -62,20 +62,17 @@ All subcommands are dispatched through a single `nova` entrypoint (a click group
 | `nova load` | Load pre-embedded data into a vector store |
 | `nova load-dist` | Distribute loading across a SkyPilot pool. `--finalize` enables Qdrant indexing afterwards |
 
-### Eval (queries + ground truth)
+### Storm (load testing)
 
 | Command | Purpose |
 |---------|---------|
-| `nova generate-queries` | Sample N rows from a corpus as eval queries (writes `{corpus}/eval/queries_<N>.parquet`) |
-| `nova brute-force` | Single-GPU exact-NN search for recall ground truth |
-| `nova brute-force-dist` | Distribute brute-force across a SkyPilot GPU pool, writing partial results |
-| `nova brute-force-merge` | Merge per-rank partial results into the final top-K parquet |
+| `nova storm` | Load-test a vector store from a single machine |
+| `nova storm-dist` | Replicated load test across a SkyPilot pool |
 
-### Introspect
+### Experiment
 
 | Command | Purpose |
 |---------|---------|
-| `nova analysis` | Analyze a completed embedding run (schema, throughput, cost) |
-| `nova throughput-predict` | Predict embedding throughput + cost from a config |
+| `nova experiment` | Compose units over a timeline (workload tests) |
 
 See [CLI reference](reference/cli.md) for all flags, [config reference](reference/config.md) for every YAML knob and tuning advice, and [S3 layout](reference/s3-layout.md) for how corpora and eval artifacts are organised.

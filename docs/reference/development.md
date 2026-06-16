@@ -11,21 +11,21 @@ How supernova is laid out, and how to test un-released changes on a real fleet.
 supernova/
 ├── cli/                          # the `nova` CLI
 │   ├── cli.py                    # entry point (LazyGroup) + subcommand map
-│   ├── run_<verb>.py             # one per command: embed, load, storm,
-│   │                             #   brute_force, generate_queries, subsample, ...
+│   ├── run_<verb>.py             # one per command: embed, load, storm, experiment
 │   ├── run_<verb>_distributed.py # the `-dist` SkyPilot dispatcher for each verb
 │   └── skypilot_utils.py         # shared dispatch helpers (worker bootstrap, pools,
 │                                 #   make_run_dir, nova_home, config_mount, ...)
 ├── sources/        # dataset sources to embed (HuggingFace)        [ABC: DatasetSource]
-├── embedders/      # dense / sparse / multivector embedders        [ABCs per family]
-├── pipeline/       # streaming embed pipeline (buffer/runner/worker)
+├── embedders/      # dense / sparse / multivector embedders + the [ABCs per family]
+│                   #   streaming embed pipeline (buffer/runner/worker)
 ├── storage/        # embedding output sinks: s3 / local / hf       [ABC: StorageBackend]
 ├── destinations.py # s3:// and hf:// URI helpers
 ├── loader/         # load pre-embedded parquet into vector stores
 │   ├── datasource/ #   read parquet from s3 / hf                   [ABC: DataReader]
 │   └── vectorstore/#   write to a vector DB (Qdrant)               [ABC: VectorStore]
-├── eval/           # brute-force kNN ground truth, query sampling
-└── throughput.py, models.py, utils.py
+├── storm/          # load-test a vector store (the `nova storm` workload)
+├── experiment/     # compose units over a timeline (workload tests)
+└── models.py, utils.py
 ```
 
 ### The three-layer pattern
@@ -43,7 +43,7 @@ Every workload follows the same shape — copy it when adding a new one:
 Workers do **not** receive your code by file-sync. The `-dist` wrapper makes each
 worker `pip install "supernova[<extra>]==<the controller's version>"` from PyPI, so
 the controller and its workers always run identical code. Dependency extras
-(`embed`, `load`, `storm`, `eval`, `dist`) are declared in `pyproject.toml`.
+(`embed`, `load`, `storm`, `dist`) are declared in `pyproject.toml`.
 
 ### Local state
 

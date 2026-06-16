@@ -187,7 +187,7 @@ def worker_install_spec(extra: str | None = None) -> str:
     """pip/uv install target for workers.
 
     ``extra`` is the optional-dependency group (e.g. "load", "embed"); pass
-    None for commands that only need base deps (e.g. generate-queries).
+    None for commands that only need base deps.
 
     Default: the pinned PyPI release matching the controller's own version.
     Override with ``NOVA_WORKER_INSTALL_SPEC`` to test code that isn't on PyPI

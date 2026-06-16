@@ -1,29 +1,6 @@
 # Cost and Time Estimation
 
-Before embedding a dataset, estimate how long it will take and what it will cost. The fastest path is `nova throughput-predict`; the back-of-envelope arithmetic below is useful when you want a rough sense without running the predictor.
-
-## `nova throughput-predict`
-
-The predictor reads dataset, model, text rendering, and per-text cutoff straight from your embedder YAML. It tokenizes a sample of the source to build an empirical length distribution, simulates batched padding, and prints throughput + wall-clock + cost estimates.
-
-```bash
-# Single-cutoff estimate
-nova throughput-predict configs/embedder/finewiki_en_all_mini.yaml --gpu a10g
-
-# Sweep across cutoffs to find the padding sweet spot
-nova throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
-  --gpu a10g --cutoff 256 --cutoff 512 --cutoff 1024
-
-# Distributed wall-clock estimate (10× A10G in parallel)
-nova throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
-  --gpu a10g --num-gpus 10
-
-# Save JSON + plot
-nova throughput-predict configs/embedder/finewiki_en_all_mini.yaml \
-  --gpu a10g --output predictions.json
-```
-
-`nova throughput-predict --help` lists every override (model, total rows, batch size, sample size, GPU rate, …). The GPU catalogue lives in `supernova/throughput.py:GPU_TABLE`.
+Before embedding a dataset, estimate how long it will take and what it will cost. The back-of-envelope arithmetic below gives a rough sense from a quick sample of the source.
 
 ## Manual back-of-envelope
 
@@ -87,7 +64,7 @@ Self-hosted GPU embedding is ~10× cheaper than OpenAI at this scale.
 
 ## Padding waste
 
-Transformer models pad every batch to the length of the longest sequence in that batch. `nova throughput-predict --cutoff <N1> --cutoff <N2> --cutoff <N3>` sweeps cutoffs and reports padding efficiency for each.
+Transformer models pad every batch to the length of the longest sequence in that batch, so a truncation cutoff that trims the long tail of sequence lengths can sharply improve throughput.
 
 Typical findings:
 
@@ -99,7 +76,7 @@ Set `dense_embedder.max_tokens` (or `multivector_embedder.max_tokens`) in your c
 
 ## Caveats
 
-- **Throughput varies by model and GPU.** `throughput_exp/throughput_bench.py` measures the actual sustained tok/s on your hardware.
+- **Throughput varies by model and GPU.** The reference values above are budget estimates; measure sustained tok/s on your actual hardware for a tighter number.
 - **Long texts create multiple records.** A 50K-token text with `max_tokens=8192` becomes ~6 records (one embedding per piece) when `truncate: false`.
 - **GPU utilization matters.** Add ~20% buffer for data loading, uploads, and container startup.
 - **Cost scales linearly, wall time doesn't.** More GPUs reduces wall time but total cost stays the same.

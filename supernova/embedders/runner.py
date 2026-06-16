@@ -10,15 +10,15 @@ from tqdm import tqdm
 from supernova.sources.base import DatasetSource
 from supernova.chunkers import Chunker
 from supernova.embedders.engine import EmbeddingEngine
-from supernova.pipeline.buffer import ResultBuffer
-from supernova.pipeline.worker import worker
+from supernova.embedders.buffer import ResultBuffer
+from supernova.embedders.worker import worker
 from supernova.storage.base import StorageBackend
 from supernova.storage.writer import write_batch
 
 logger = logging.getLogger(__name__)
 
 
-async def run(
+async def run_embedder(
     source: DatasetSource,
     engine: EmbeddingEngine,
     storage: StorageBackend,
