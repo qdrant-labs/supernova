@@ -1567,6 +1567,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nova-storm"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "duckdb",
+ "indicatif",
+ "qdrant-client",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

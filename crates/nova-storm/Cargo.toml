@@ -1,0 +1,31 @@
+[package]
+name = "nova-storm"
+version = "0.0.0"
+edition = "2024"
+
+[[bin]]
+name = "nova-storm"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif = { workspace = true }
+
+# Query vectors are always read from parquet (local or s3://) via DuckDB, so
+# the engine is a hard dependency — not feature-gated like the targets.
+duckdb = { workspace = true }
+
+# target backends
+qdrant-client = { workspace = true, optional = true }
+
+[features]
+default = []
+qdrant = ["dep:qdrant-client"]
