@@ -100,6 +100,41 @@ pub async fn run_loader(
     })
 }
 
+/// Control-plane only: probe vector dimensions, create/verify the collection,
+/// and defer indexing for the bulk load — then exit. The distributed controller
+/// runs this once (`nova-load --setup-only`); workers then load with
+/// `--no-manage-indexing`, so the collection is created exactly once with the
+/// configured params.
+pub async fn setup_collection(
+    reader: Box<dyn DataReader>,
+    store: Arc<dyn VectorStore>,
+    vectors_spec: &HashMap<String, VectorSpec>,
+) -> Result<(), LoadError> {
+    // The reader's dimension probe hits DuckDB (blocking) — keep it off the runtime.
+    let dims = tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        reader.dimensions()
+    })
+    .await
+    .map_err(join_panic)??;
+
+    let schema = resolve_schema(vectors_spec, &dims);
+    store.ensure_collection(&schema).await?;
+    store.defer_indexing().await?;
+    store.close().await?;
+    Ok(())
+}
+
+/// Control-plane only: re-enable indexing and block until the build completes —
+/// then exit. The distributed controller runs this (`nova-load --finalize`)
+/// after every worker has finished loading.
+pub async fn finalize(store: Arc<dyn VectorStore>) -> Result<(), LoadError> {
+    store.enable_indexing().await?;
+    store.wait_for_indexing().await?;
+    store.close().await?;
+    Ok(())
+}
+
 /// The producer/consumer core: returns (loaded, errors).
 async fn drive(
     reader: Box<dyn DataReader>,

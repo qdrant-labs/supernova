@@ -267,6 +267,27 @@ def rust_worker_run(binary: str, argv: str) -> str:
     return f'source "$HOME/.cargo/env" && {binary} {argv}'
 
 
+def resolve_binary(name: str) -> str:
+    """Locate a nova subcommand binary on **this** machine: ``$NOVA_<NAME>_BIN``
+    override, then PATH.
+
+    Used controller-side when a Python orchestrator must invoke a Rust tool
+    locally — e.g. ``load-dist`` running ``nova-load --setup-only`` for the
+    one-time collection setup before it launches workers.
+    """
+    env = f"NOVA_{name.removeprefix('nova-').upper().replace('-', '_')}_BIN"
+    override = os.environ.get(env)
+    if override:
+        return override
+    found = shutil.which(name)
+    if found:
+        return found
+    raise RuntimeError(
+        f"`{name}` not found on PATH (needed for distributed control-plane ops). "
+        f"Install it with `cargo install --git {REPO_URL} {name}`, or set {env}."
+    )
+
+
 def config_mount(run_dir: Path, config_path: str) -> tuple[dict[str, str], str]:
     """
     Stage a config for a worker; return ``(file_mounts, remote_path)``.

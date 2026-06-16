@@ -13,34 +13,37 @@ cd supernova
 uv sync
 ```
 
-`uv sync` alone installs the **base** deps (pyarrow, numpy, click, boto3, huggingface_hub, etc.) — enough to run `nova --help`, parse configs, and use the `supernova.destinations` / URI helpers.
+`uv sync` alone installs the **base** deps (pyarrow, numpy, click, boto3, huggingface_hub, etc.) — enough to run `nova --help`, parse configs, dispatch the `nova dist *` orchestrators, and use the `supernova.destinations` / URI helpers.
 
-The actual pipelines live under optional extras so embed workers don't pull in qdrant-client and load workers don't pull in torch:
+supernova is polyglot, so installation splits by language:
+
+- **`nova storm` / `nova load` are Rust binaries** (`nova-storm` / `nova-load`). Install them with cargo — they're self-contained (statically link qdrant/duckdb/postgres), so they need no Python extras:
+  ```bash
+  cargo install --git https://github.com/qdrant-labs/supernova nova-storm nova-load
+  ```
+  For local dev against your working tree, point the dispatcher at a built binary instead: `export NOVA_STORM_BIN=$(pwd)/target/release/nova-storm`.
+- **`nova embed` is Python** (a `nova-embed` subprocess) and its ML stack lives under an extra.
+
+Python extras:
 
 | Extra | Installs | Use when |
 |-------|----------|----------|
-| `embed` | sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `nova embed` workers locally |
-| `load` | duckdb, qdrant-client | Running `nova load` (loader workers) |
-| `storm` | qdrant-client, duckdb | Running `nova storm` load-test workers |
-| `dist` | skypilot[aws] | Dispatching distributed jobs from your laptop / Hetzner box |
-
-Pick the extras that match your role. Common combinations:
+| `embed` | sentence-transformers, torch, transformers, FlagEmbedding, fastembed, openai, tiktoken, aiobotocore | Running `nova embed` locally |
+| `dist` | skypilot[aws] | Dispatching `nova dist *` jobs from your laptop / Hetzner box |
+| `pg` | psycopg | The Python metrics backend logging to Postgres/Timescale |
 
 ```bash
-# Local laptop dispatching distributed embed + load
-uv sync --extra dist --extra load
+# Local laptop dispatching distributed jobs
+uv sync --extra dist
 
 # A single embed worker
 uv sync --extra embed
 
-# A single load worker
-uv sync --extra load
-
-# Everything (heavy)
+# Everything Python (heavy)
 uv sync --all-extras
 ```
 
-The dispatch CLIs (`nova embed-dist`, `nova load-dist`, `nova storm-dist`) bake the right `uv sync --extra ...` into the pool's `setup:` script, so workers install the right slice automatically.
+The `nova dist embed` orchestrator bakes `uv sync --extra embed` into its pool `setup:`; `nova dist load` / `nova dist storm` bake `cargo install … nova-load|nova-storm` instead, so workers get the right slice automatically.
 
 ## Environment variables
 
@@ -69,7 +72,7 @@ Set the variables relevant to your workflow.
 
 ## SkyPilot setup
 
-SkyPilot is used to parallelize embedding generation (GPU instances), loading (CPU spot instances), and load testing (`nova storm-dist`). It's only needed if you'll be **dispatching** distributed jobs — workers themselves don't need it.
+SkyPilot is used to parallelize embedding generation (GPU instances), loading (CPU spot instances), and load testing (`nova dist storm`). It's only needed if you'll be **dispatching** distributed jobs — workers themselves don't need it.
 
 ```bash
 uv sync --extra dist

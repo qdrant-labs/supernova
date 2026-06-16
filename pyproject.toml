@@ -66,23 +66,17 @@ embed = [
     # out at ~10 MB/s on a 10 Gbps NIC.
     "hf_transfer",
 ]
-# Vector store loading -- loader workers
-load = [
-    "duckdb>=1.5.1",
-    "qdrant-client>=1.9.0",
-]
-# Load testing -- `nova storm` query workers
-storm = [
-    "qdrant-client>=1.9.0",
-    "duckdb>=1.5.1",
-]
+# NOTE: load + storm are Rust binaries now (`cargo install nova-load|nova-storm`),
+# self-contained (they statically link qdrant/duckdb/postgres). They have no
+# Python extras — see the polyglot CLI in `supernova/cli/cli.py`.
+
 # Distributed job dispatch -- local / Hetzner only, never on workers
 dist = [
     "skypilot[aws]",
 ]
-# Metrics sink driver -- the postgres/timescale backend. The dispatcher composes
-# this onto a command's extras only when the config's metrics.type needs it, so
-# embed/load/storm workers pull a DB driver only when they actually log to one.
+# Postgres/timescale driver for the Python metrics backend (embed path). The
+# Rust tools link their own postgres client, so this is only for Python workers
+# that log metrics.
 pg = [
     "psycopg[binary]>=3.3.4",
 ]

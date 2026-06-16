@@ -3,7 +3,7 @@ use clap::Parser;
 use nova_metrics::{RunContext, build_sink, resolve_run_id};
 use nova_load::config::{LoadConfig, load_config_file_with_json};
 use nova_load::errors::LoadError;
-use nova_load::runner::run_loader;
+use nova_load::runner::{finalize, run_loader, setup_collection};
 
 /// Load pre-embedded data into a vector store.
 #[derive(Parser)]
@@ -24,6 +24,16 @@ struct Cli {
     /// This job's rank (0-indexed). Defaults to $SKYPILOT_JOB_RANK, else 0.
     #[arg(long)]
     job_rank: Option<usize>,
+
+    /// Control plane only: create/verify the collection + defer indexing, then
+    /// exit. The distributed controller runs this once before launching workers.
+    #[arg(long, conflicts_with_all = ["finalize", "num_jobs"])]
+    setup_only: bool,
+
+    /// Control plane only: re-enable indexing + wait for the build, then exit.
+    /// The distributed controller runs this after all workers complete.
+    #[arg(long, conflicts_with_all = ["setup_only", "num_jobs"])]
+    finalize: bool,
 }
 
 #[tokio::main]
@@ -51,6 +61,21 @@ async fn run() -> Result<(), LoadError> {
         loader,
         metrics,
     } = cfg;
+
+    // Control-plane-only modes for the distributed controller. They bracket the
+    // workers' data load (which runs --no-manage-indexing), so neither opens a
+    // metrics run — they're brief, single-shot Qdrant calls.
+    if cli.finalize {
+        finalize(vectorstore.into_store()?).await?;
+        tracing::info!("indexing finalized");
+        return Ok(());
+    }
+    if cli.setup_only {
+        let reader = datasource.into_reader(&vectors, loader.batch_size.max(1))?;
+        setup_collection(reader, vectorstore.into_store()?, &vectors).await?;
+        tracing::info!("collection ready (indexing deferred)");
+        return Ok(());
+    }
 
     if let Some(num_jobs) = cli.num_jobs {
         let job_rank = cli.job_rank.unwrap_or_else(default_job_rank);

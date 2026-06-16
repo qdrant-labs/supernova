@@ -13,17 +13,16 @@ Reads the same configs as `nova load` (configs/loader/*.yaml). The single-machin
 loader ignores `dispatch:` / `resources:` blocks; this CLI consumes them.
 """
 
-import asyncio
 import json
 import logging
-import os
-import re
+import subprocess
 import time
 from pathlib import Path
 
 import click
 import yaml
 
+from supernova.cli.config_resolve import resolve_config
 from supernova.cli.skypilot_utils import (
     build_env_dict,
     build_rust_worker_setup,
@@ -32,43 +31,12 @@ from supernova.cli.skypilot_utils import (
     make_run_dir,
     print_dry_run,
     print_monitor,
+    resolve_binary,
     rust_worker_run,
 )
-
-from supernova.loader.vectorstore.qdrant import QdrantVectorStore
 from supernova.destinations import datasource_to_destination
 
 logger = logging.getLogger(__name__)
-
-
-def resolve_env_vars(value: str) -> str:
-    """
-    Replace ${VAR_NAME} references with environment variable values.
-    """
-
-    def _replace(match):
-        var_name = match.group(1)
-        val = os.environ.get(var_name)
-        if val is None:
-            raise ValueError(f"Environment variable '{var_name}' is not set")
-        return val
-
-    if isinstance(value, str):
-        return re.sub(r"\$\{(\w+)\}", _replace, value)
-    return value
-
-
-def resolve_config(obj):
-    """
-    Recursively resolve env vars in config values.
-    """
-    if isinstance(obj, str):
-        return resolve_env_vars(obj)
-    elif isinstance(obj, dict):
-        return {k: resolve_config(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [resolve_config(v) for v in obj]
-    return obj
 
 
 def discover_parquet_files(ds_cfg: dict) -> list[str]:
@@ -83,18 +51,6 @@ def discover_parquet_files(ds_cfg: dict) -> list[str]:
 
     dest = datasource_to_destination(ds_cfg)
     return discover_corpus_parquets(dest)
-
-
-async def _setup_collection(store: QdrantVectorStore, dimensions: dict[str, int]):
-    await store.ensure_collection(dimensions)
-    await store.defer_indexing()
-    await store.close()
-
-
-async def _enable_and_wait(store: QdrantVectorStore):
-    await store.enable_indexing()
-    await store.wait_for_indexing()
-    await store.close()
 
 
 @click.command(name="load-dist", help="Distribute loading across SkyPilot instances.")
@@ -142,18 +98,13 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     if not vectors_spec:
         raise click.UsageError("config is missing required top-level 'vectors:' block")
 
-    # just enable indexing and exit
+    # just enable indexing and exit — delegated to the loader binary's control
+    # plane (it owns the Qdrant lifecycle now; the controller only orchestrates).
     if finalize:
-        logger.info("Enabling Qdrant indexing...")
-        vs_cfg = dict(resolved_config["vectorstore"])
-        vs_cfg.pop("type", None)
-        vs_cfg.pop("params", None)
-        store = QdrantVectorStore(vectors=vectors_spec, **vs_cfg)
-
+        logger.info("Enabling Qdrant indexing (nova-load --finalize)...")
         t0 = time.perf_counter()
-        asyncio.run(_enable_and_wait(store))
-        elapsed = time.perf_counter() - t0
-        logger.info(f"Indexing complete in {elapsed:.1f}s")
+        subprocess.run([resolve_binary("nova-load"), "--finalize", config], check=True)
+        logger.info(f"Indexing complete in {time.perf_counter() - t0:.1f}s")
         return
 
     dispatch_cfg = cfg["dispatch"]
@@ -245,46 +196,12 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
         print_dry_run(pool_name_eff, num_shards_eff, pool_path, job_path)
         return
 
-    # Setup Qdrant: create collection + defer indexing. Keep `params` — this is
-    # the ONLY create_collection call in the distributed path (workers run
-    # --no-manage-indexing), so dropping it here silently creates the collection
-    # with default shard_number / replication_factor instead of the configured ones.
-    logger.info("Setting up Qdrant collection...")
-    vs_cfg = dict(resolved_config["vectorstore"])
-    vs_cfg.pop("type", None)
-    store = QdrantVectorStore(vectors=vectors_spec, **vs_cfg)
-
-    # Use the first corpus file to probe vector dimensions. Assumes all files
-    # share the same schema (guaranteed by the embedding pipeline) and avoids
-    # the glob hitting eval/ parquets that have a different schema entirely.
-    from supernova.destinations import S3Destination, HfDestination
-
-    if isinstance(dest, S3Destination):
-        from supernova.loader.datasource.s3 import S3DataReader
-
-        reader = S3DataReader(
-            bucket=dest.bucket,
-            prefix=dest.prefix,
-            vectors=vectors_spec,
-            file_list=[files[0]],
-        )
-    elif isinstance(dest, HfDestination):
-        from supernova.loader.datasource.huggingface import HuggingFaceDataReader
-
-        reader = HuggingFaceDataReader(
-            repo_id=dest.repo_id,
-            subdir=dest.subdir or None,
-            vectors=vectors_spec,
-            file_list=[files[0]],
-        )
-    else:
-        raise ValueError(
-            f"Unsupported destination for dim probe: {type(dest).__name__}"
-        )
-    dimensions = reader.get_dimensions()
-    reader.close()
-
-    asyncio.run(_setup_collection(store, dimensions))
+    # Create the collection + defer indexing ONCE, here on the controller, by
+    # running the loader binary in control-plane mode. Workers then load with
+    # --no-manage-indexing. nova-load probes vector dims and applies the
+    # configured collection params itself, so this is the single create call.
+    logger.info("Setting up Qdrant collection (nova-load --setup-only)...")
+    subprocess.run([resolve_binary("nova-load"), "--setup-only", config], check=True)
     logger.info("Qdrant collection ready (indexing deferred)")
 
     envs = build_env_dict(["QDRANT_URL", "QDRANT_API_KEY", "HF_TOKEN"])
