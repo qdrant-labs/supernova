@@ -24,6 +24,9 @@ pub struct LoadConfig {
     pub vectorstore: VectorStoreConfig,
     #[serde(default)]
     pub loader: LoaderConfig,
+    /// Where load metrics go. Absent → stdout (local-first, no setup).
+    #[serde(default)]
+    pub metrics: Option<nova_metrics::MetricsConfig>,
 }
 
 /// One named vector's spec.
@@ -142,6 +145,22 @@ pub enum ConfigError {
 pub fn load_config_file(path: &str) -> Result<LoadConfig, ConfigError> {
     let yaml = std::fs::read_to_string(path)?;
     load_config_str(&yaml)
+}
+
+/// Like [`load_config_file`], but also returns the resolved config as JSON for
+/// the metrics `runs.config` blob. Built from the env-expanded YAML value (not
+/// a re-serialization of the typed struct), so it captures the config verbatim
+/// without needing `Serialize` on every backend struct. Secrets are redacted by
+/// the sink before this is persisted.
+pub fn load_config_file_with_json(
+    path: &str,
+) -> Result<(LoadConfig, serde_json::Value), ConfigError> {
+    let yaml = std::fs::read_to_string(path)?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&yaml)?;
+    resolve_env_vars(&mut value)?;
+    let json = serde_json::to_value(&value).unwrap_or(serde_json::Value::Null);
+    let cfg = serde_yaml::from_value(value)?;
+    Ok((cfg, json))
 }
 
 /// Parse a load config from a YAML string, resolving `${VAR}` references

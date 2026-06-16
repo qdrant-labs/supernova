@@ -54,6 +54,9 @@ pub enum StormError {
     Target(#[from] TargetError),
     #[error(transparent)]
     QueryLoad(#[from] QueryLoadError),
+    /// Metrics-sink setup failed (e.g. a bad DSN) — fail fast before the run.
+    #[error(transparent)]
+    Metrics(#[from] nova_metrics::MetricsError),
     #[error("{0}")]
     Other(String),
 }

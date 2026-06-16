@@ -10,16 +10,22 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
-use tokio::sync::{Semaphore, mpsc};
+use nova_metrics::MetricsSink;
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::config::{LoaderConfig, VectorSpec, resolve_schema};
 use crate::errors::{LoadError, ReaderError, StoreError};
 use crate::sources::DataReader;
 use crate::stores::{Point, VectorStore};
+
+/// How often the sampler emits the cumulative count + velocity. Off the hot
+/// path (workers just bump an atomic), so this only sets the plot resolution.
+const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Outcome of a load, for the caller to report.
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +50,7 @@ pub async fn run_loader(
     vectors_spec: &HashMap<String, VectorSpec>,
     cfg: &LoaderConfig,
     manage_indexing: bool,
+    sink: Arc<dyn MetricsSink>,
 ) -> Result<LoadStats, LoadError> {
     tracing::info!("scanning corpus (counting records + reading dimensions)…");
     // Metadata reads hit DuckDB (blocking), so run them off the async runtime.
@@ -65,8 +72,9 @@ pub async fn run_loader(
         store.defer_indexing().await?;
     }
 
+    sink.event("bulk upload started");
     let started = Instant::now();
-    let (loaded, errors) = drive(reader, store.clone(), cfg, total).await?;
+    let (loaded, errors) = drive(reader, store.clone(), cfg, total, sink.clone()).await?;
     tracing::info!(
         loaded,
         errors,
@@ -75,10 +83,12 @@ pub async fn run_loader(
     );
 
     if manage_indexing {
+        sink.event("re-enabling indexing");
         tracing::info!("re-enabling indexing");
         store.enable_indexing().await?;
         tracing::info!("waiting for indexing to complete");
         store.wait_for_indexing().await?;
+        sink.event("indexing complete");
     }
     store.close().await?;
 
@@ -96,6 +106,7 @@ async fn drive(
     store: Arc<dyn VectorStore>,
     cfg: &LoaderConfig,
     total: u64,
+    sink: Arc<dyn MetricsSink>,
 ) -> Result<(u64, u64), LoadError> {
     let (tx, mut rx) = mpsc::channel::<Vec<Point>>(cfg.concurrency.max(1) * 2);
     let batch_size = cfg.batch_size.max(1);
@@ -127,6 +138,19 @@ async fn drive(
             Ok(())
         })
     });
+
+    // Live counters: workers bump these per batch (a single atomic add —
+    // negligible against an upsert round-trip), and a 1 Hz sampler turns them
+    // into a cumulative `points_loaded` plus a `wps` velocity sample. All the
+    // metric work happens on the sampler task, off the upsert hot path.
+    let loaded_pts = Arc::new(AtomicU64::new(0));
+    let errors_pts = Arc::new(AtomicU64::new(0));
+    let sampler_stop = Arc::new(Notify::new());
+    let sampler = tokio::spawn(sample_progress(
+        sink,
+        loaded_pts.clone(),
+        sampler_stop.clone(),
+    ));
 
     // Consumer: spawn a semaphore-capped upsert task per batch.
     let sem = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
@@ -171,33 +195,69 @@ async fn drive(
         }
         let permit = sem.clone().acquire_owned().await.expect("semaphore open");
         let store = store.clone();
+        let loaded_pts = loaded_pts.clone();
+        let errors_pts = errors_pts.clone();
         workers.spawn(async move {
             let n = batch.len();
             let res = store.upsert_batch(batch).await;
+            // Bump the live counter the sampler reads. Confirmed upserts only,
+            // so `points_loaded` tracks what's actually in the store.
+            match &res {
+                Ok(()) => loaded_pts.fetch_add(n as u64, Ordering::Relaxed),
+                Err(_) => errors_pts.fetch_add(n as u64, Ordering::Relaxed),
+            };
             drop(permit);
             (n, res)
         });
     }
     progress.finish_and_clear();
 
-    let mut loaded = 0u64;
-    let mut errors = 0u64;
     while let Some(joined) = workers.join_next().await {
-        match joined {
-            Ok((n, Ok(()))) => loaded += n as u64,
-            // A persistent upsert failure (already retried in the store) or a
-            // panicked worker counts toward errors rather than aborting.
-            Ok((n, Err(e))) => {
-                errors += n as u64;
-                tracing::warn!(points = n, error = %e, "upsert batch failed");
-            }
-            Err(_) => {}
+        // A persistent upsert failure (already retried in the store) is counted
+        // via the atomic above; surface it here. A panicked worker (join Err)
+        // is counted toward neither, matching the prior behaviour.
+        if let Ok((n, Err(e))) = joined {
+            tracing::warn!(points = n, error = %e, "upsert batch failed");
         }
     }
+
+    // Stop the sampler (it emits one final cumulative sample) and read the
+    // authoritative totals from the same counters it was sampling.
+    sampler_stop.notify_one();
+    let _ = sampler.await;
+    let loaded = loaded_pts.load(Ordering::Relaxed);
+    let errors = errors_pts.load(Ordering::Relaxed);
 
     // Surface a reader failure now that the channel has drained.
     producer.await.map_err(join_panic)??;
     Ok((loaded, errors))
+}
+
+/// Periodically emit the cumulative loaded count and an instantaneous velocity
+/// (`wps`) until signalled to stop, then emit one final cumulative sample.
+/// Lives on its own task so emission cadence is decoupled from the upsert path.
+async fn sample_progress(sink: Arc<dyn MetricsSink>, loaded: Arc<AtomicU64>, stop: Arc<Notify>) {
+    let mut ticker = tokio::time::interval(METRICS_INTERVAL);
+    let mut last = 0u64;
+    let mut last_t = Instant::now();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let total = loaded.load(Ordering::Relaxed);
+                let now = Instant::now();
+                let dt = now.duration_since(last_t).as_secs_f64();
+                let wps = if dt > 0.0 { (total - last) as f64 / dt } else { 0.0 };
+                sink.log("points_loaded", total as f64);
+                sink.log("wps", wps);
+                last = total;
+                last_t = now;
+            }
+            _ = stop.notified() => {
+                sink.log("points_loaded", loaded.load(Ordering::Relaxed) as f64);
+                break;
+            }
+        }
+    }
 }
 
 /// Advance the virtual schedule by one batch's worth of points and sleep to it.
@@ -287,9 +347,16 @@ mod tests {
             wps: None,
         };
 
-        let stats = run_loader(reader, store, &vectors, &loader_cfg, true)
-            .await
-            .unwrap();
+        let stats = run_loader(
+            reader,
+            store,
+            &vectors,
+            &loader_cfg,
+            true,
+            Arc::new(nova_metrics::NullSink),
+        )
+        .await
+        .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 

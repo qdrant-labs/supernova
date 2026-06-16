@@ -6,7 +6,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use qdrant_client::qdrant::QueryPointsBuilder;
 use qdrant_client::{Qdrant, QdrantError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{QueryOutcome, QueryTarget};
 use crate::config::QueryConfig;
@@ -20,7 +20,7 @@ pub struct QdrantTarget {
     top_k: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QdrantConfig {
     pub url: String,

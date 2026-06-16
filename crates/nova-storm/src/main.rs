@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::Parser;
 use indicatif::ProgressBar;
 
+use nova_metrics::{RunContext, build_sink, resolve_run_id};
 use nova_storm::config::{LoadProfile, StormConfig, load_config_file};
 use nova_storm::errors::StormError;
 use nova_storm::queries::load_query_vectors;
@@ -34,15 +35,19 @@ async fn main() {
 async fn run() -> Result<(), StormError> {
     let cli = Cli::parse();
 
-    let StormConfig { target, query, load, .. } = load_config_file(&cli.config)?;
+    let cfg = load_config_file(&cli.config)?;
+    // Snapshot the resolved config for the `runs` row before consuming `cfg`.
+    // The sink redacts secrets (api_key, dsn, ...) before persisting it.
+    let config_json = serde_json::to_value(&cfg).unwrap_or(serde_json::Value::Null);
+    let StormConfig {
+        target,
+        query,
+        load,
+        metrics,
+        ..
+    } = cfg;
 
-    // CLI flags win over the YAML's load block.
-    let profile = LoadProfile {
-        concurrency: load.concurrency,
-        duration_s: load.duration_s,
-        ramp_s: load.ramp_s,
-        target_qps: load.target_qps,
-    };
+    let profile: LoadProfile = load;
 
     let vectors = load_query_vectors(&query.source)?;
     if vectors.is_empty() {
@@ -54,6 +59,23 @@ async fn run() -> Result<(), StormError> {
 
     let target = target.into_target(&query)?;
 
+    // Metrics: build the sink (a bad DSN fails fast here), then open the run.
+    // run_id comes from $NOVA_RUN_ID when a controller minted one (so a fleet
+    // reports under one run); node_id is the worker's rank.
+    let sink = build_sink(metrics.as_ref())?;
+    let run_id = resolve_run_id("storm");
+    let node_id = std::env::var("SKYPILOT_JOB_RANK").unwrap_or_else(|_| "local".into());
+    let experiment_id = std::env::var("NOVA_EXPERIMENT_ID").ok();
+    sink.start(
+        &run_id,
+        &RunContext {
+            command: "storm",
+            node_id: Some(&node_id),
+            experiment_id: experiment_id.as_deref(),
+            config: &config_json,
+        },
+    );
+
     let mode = if profile.target_qps > 0.0 {
         format!(
             "paced {:.0} qps/worker (cap {} in-flight)",
@@ -63,6 +85,8 @@ async fn run() -> Result<(), StormError> {
         format!("closed-loop concurrency={}", profile.concurrency)
     };
     tracing::info!(
+        run_id = %run_id,
+        node_id = %node_id,
         target = %target,
         query_vectors = vectors.len(),
         duration_s = profile.duration_s,
@@ -79,10 +103,13 @@ async fn run() -> Result<(), StormError> {
         ProgressBar::hidden()
     };
 
-    let results = run_storm(target, vectors, &profile).await;
+    let results = run_storm(target, vectors, &profile, sink.clone()).await;
     spinner.finish_and_clear();
 
     let summary = results.summary();
+    sink.summary(&serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null));
+    sink.finish("ok");
+
     println!("{}", "=".repeat(50));
     println!("{summary}");
     println!("{}", "=".repeat(50));

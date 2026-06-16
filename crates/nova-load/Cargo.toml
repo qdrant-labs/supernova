@@ -19,6 +19,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 indicatif = { workspace = true }
 
+# Metrics sink (postgres compiled in so one binary serves stdout + postgres
+# configs; the backend is chosen at runtime from metrics.type).
+nova-metrics = { workspace = true, features = ["postgres"] }
+
 # feature-specific dependencies
 qdrant-client = { workspace = true, optional = true }
 duckdb = { workspace = true, optional = true }

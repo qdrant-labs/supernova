@@ -23,6 +23,10 @@ indicatif = { workspace = true }
 # the engine is a hard dependency — not feature-gated like the targets.
 duckdb = { workspace = true }
 
+# Metrics sink. Postgres is compiled in so one binary can serve both stdout and
+# postgres configs (the backend is chosen at runtime from metrics.type).
+nova-metrics = { workspace = true, features = ["postgres"] }
+
 # target backends
 qdrant-client = { workspace = true, optional = true }
 

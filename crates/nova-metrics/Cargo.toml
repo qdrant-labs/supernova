@@ -1,0 +1,20 @@
+[package]
+name = "nova-metrics"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Postgres/TimescaleDB sink. Gated so a tool that only wants the stdout/null
+# sinks doesn't pull a DB driver + TLS stack (mirrors the Python `pg` extra).
+postgres = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
+
+[features]
+default = []
+postgres = ["dep:postgres", "dep:postgres-native-tls", "dep:native-tls"]

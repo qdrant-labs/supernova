@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use nova_metrics::MetricsSink;
 use serde::Serialize;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -102,21 +103,26 @@ struct Sample {
 ///
 /// `vectors` is the query set to cycle through (round-robin). A query failure
 /// is recorded as an error sample, not a hard error — see [`QueryOutcome`].
+/// Every sample is also streamed to `sink` (live latency in Grafana when the
+/// Postgres backend is configured; a no-op for the null sink).
 pub async fn run_storm(
     target: Arc<dyn QueryTarget>,
     vectors: Vec<Vec<f32>>,
     profile: &LoadProfile,
+    sink: Arc<dyn MetricsSink>,
 ) -> StormResults {
     let vectors = Arc::new(vectors);
     let (tx, mut rx) = mpsc::unbounded_channel::<Sample>();
 
-    // Collector: drain samples into the raw distribution + counts. Owning the
-    // accumulation in one task keeps the workers lock-free on the hot path.
+    // Collector: drain samples into the raw distribution + counts, and forward
+    // each as a live observation. Owning the accumulation in one task keeps the
+    // workers lock-free on the hot path; `observe` only enqueues, never blocks.
     let collector = tokio::spawn(async move {
         let mut latencies = Vec::new();
         let mut n_ok = 0u64;
         let mut n_err = 0u64;
         while let Some(s) = rx.recv().await {
+            sink.observe("latency_ms", s.latency_ms, s.ok);
             latencies.push(s.latency_ms);
             if s.ok {
                 n_ok += 1;
@@ -245,6 +251,7 @@ mod tests {
     use super::*;
     use crate::targets::QueryOutcome;
     use async_trait::async_trait;
+    use nova_metrics::NullSink;
 
     /// A target that "answers" instantly, for exercising the generator without
     /// a real cluster.
@@ -280,7 +287,8 @@ mod tests {
             ramp_s: 0.0,
             target_qps: 0.0,
         };
-        let results = run_storm(Arc::new(MockTarget), vectors(), &profile).await;
+        let results =
+            run_storm(Arc::new(MockTarget), vectors(), &profile, Arc::new(NullSink)).await;
         let summary = results.summary();
 
         assert!(summary.requests > 0);
@@ -300,7 +308,8 @@ mod tests {
             ramp_s: 0.0,
             target_qps,
         };
-        let results = run_storm(Arc::new(MockTarget), vectors(), &profile).await;
+        let results =
+            run_storm(Arc::new(MockTarget), vectors(), &profile, Arc::new(NullSink)).await;
         let summary = results.summary();
 
         // The whole point: pacing holds the offered rate at/under target. Allow

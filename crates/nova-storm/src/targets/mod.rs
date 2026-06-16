@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::QueryConfig;
 use crate::errors::TargetError;
@@ -49,7 +49,7 @@ pub trait QueryTarget: Send + Sync + std::fmt::Display {
 
 /// Target backend config, dispatched on `type:`. Each backend owns its config
 /// struct in its own module; the variant is gated on the same feature.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TargetConfig {
     #[cfg(feature = "qdrant")]

@@ -2,7 +2,8 @@
 resolver = "3"
 members = [
     "crates/nova-storm",
-    "crates/nova-load"
+    "crates/nova-load",
+    "crates/nova-metrics"
 ]
 
 [workspace.dependencies]
@@ -18,3 +19,8 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.18"
+# metrics sink — sync Postgres client + TLS (Neon requires SSL)
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+nova-metrics = { path = "crates/nova-metrics" }

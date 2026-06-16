@@ -1,6 +1,7 @@
 use clap::Parser;
 
-use nova_load::config::{LoadConfig, load_config_file};
+use nova_metrics::{RunContext, build_sink, resolve_run_id};
+use nova_load::config::{LoadConfig, load_config_file_with_json};
 use nova_load::errors::LoadError;
 use nova_load::runner::run_loader;
 
@@ -42,12 +43,14 @@ async fn main() {
 async fn run() -> Result<(), LoadError> {
     let cli = Cli::parse();
 
+    let (cfg, config_json) = load_config_file_with_json(&cli.config)?;
     let LoadConfig {
         vectors,
         mut datasource,
         vectorstore,
         loader,
-    } = load_config_file(&cli.config)?;
+        metrics,
+    } = cfg;
 
     if let Some(num_jobs) = cli.num_jobs {
         let job_rank = cli.job_rank.unwrap_or_else(default_job_rank);
@@ -68,16 +71,63 @@ async fn run() -> Result<(), LoadError> {
     let reader = datasource.into_reader(&vectors, chunk_size)?;
     let store = vectorstore.into_store()?;
 
-    let stats = run_loader(reader, store, &vectors, &loader, !cli.no_manage_indexing).await?;
-
-    tracing::info!(
-        loaded = stats.loaded,
-        total = stats.total,
-        errors = stats.errors,
-        elapsed_secs = stats.elapsed_secs,
-        "load complete"
+    // Metrics: build the sink (a bad DSN fails fast here), then open the run.
+    // A distributed fleet shares one run via $NOVA_RUN_ID; node_id is the rank.
+    let sink = build_sink(metrics.as_ref())?;
+    let run_id = resolve_run_id("load");
+    let node_id = cli
+        .job_rank
+        .map(|r| r.to_string())
+        .or_else(|| std::env::var("SKYPILOT_JOB_RANK").ok())
+        .unwrap_or_else(|| "local".into());
+    let experiment_id = std::env::var("NOVA_EXPERIMENT_ID").ok();
+    sink.start(
+        &run_id,
+        &RunContext {
+            command: "load",
+            node_id: Some(&node_id),
+            experiment_id: experiment_id.as_deref(),
+            config: &config_json,
+        },
     );
-    Ok(())
+
+    let result = run_loader(
+        reader,
+        store,
+        &vectors,
+        &loader,
+        !cli.no_manage_indexing,
+        sink.clone(),
+    )
+    .await;
+
+    match &result {
+        Ok(stats) => {
+            tracing::info!(
+                loaded = stats.loaded,
+                total = stats.total,
+                errors = stats.errors,
+                elapsed_secs = stats.elapsed_secs,
+                "load complete"
+            );
+            let wps_avg = if stats.elapsed_secs > 0.0 {
+                stats.loaded as f64 / stats.elapsed_secs
+            } else {
+                0.0
+            };
+            sink.summary(&serde_json::json!({
+                "total": stats.total,
+                "loaded": stats.loaded,
+                "errors": stats.errors,
+                "elapsed_secs": stats.elapsed_secs,
+                "wps_avg": wps_avg,
+            }));
+            sink.finish("ok");
+        }
+        Err(_) => sink.finish("error"),
+    }
+
+    result.map(|_| ())
 }
 
 /// Distributed workers get their rank from SkyPilot's env var by default.

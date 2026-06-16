@@ -57,4 +57,7 @@ pub enum LoadError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Reader(#[from] ReaderError),
+    /// Metrics-sink setup failed (e.g. a bad DSN) — fail fast before the load.
+    #[error(transparent)]
+    Metrics(#[from] nova_metrics::MetricsError),
 }

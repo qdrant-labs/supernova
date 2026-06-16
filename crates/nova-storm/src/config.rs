@@ -8,12 +8,14 @@
 //! and SkyPilot; the binary ignores them but parses them so the shipped config
 //! validates under `deny_unknown_fields`.
 
-use serde::Deserialize;
+use nova_metrics::MetricsConfig;
+use serde::{Deserialize, Serialize};
 
 use crate::targets::TargetConfig;
 
-/// The full parsed storm config.
-#[derive(Debug, Deserialize)]
+/// The full parsed storm config. `Serialize` so the resolved config can be
+/// stored on the `runs` row (secrets are redacted by the metrics sink).
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StormConfig {
     pub target: TargetConfig,
@@ -21,10 +23,11 @@ pub struct StormConfig {
     #[serde(default)]
     pub load: LoadProfile,
 
+    /// Where measurements go. Absent → stdout (local-first, no setup).
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
     // Consumed by `nova storm-dist` / SkyPilot; ignored here. Parsed as opaque
     // values so the keys are allowed but never silently mistyped into `target`.
-    #[serde(default)]
-    pub metrics: Option<serde_yaml::Value>,
     #[serde(default)]
     pub dispatch: Option<serde_yaml::Value>,
     #[serde(default)]
@@ -33,7 +36,7 @@ pub struct StormConfig {
 
 /// What to query with: the named vector, how many neighbours, and where the
 /// query vectors are read from.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryConfig {
     /// Named vector to search (`None` for a single-vector collection).
@@ -52,7 +55,7 @@ pub struct QueryConfig {
 
 /// Where the query vectors come from — a parquet at a local path or `s3://`
 /// URI, read via DuckDB.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuerySource {
     pub uri: String,
@@ -63,7 +66,7 @@ pub struct QuerySource {
 }
 
 /// Per-worker load shape, replicated (NOT sharded) across the fleet.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadProfile {
     /// Closed-loop: requests held in flight. Paced: in-flight ceiling.
