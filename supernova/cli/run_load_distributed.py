@@ -34,12 +34,23 @@ from supernova.cli.skypilot_utils import (
     print_monitor,
     referenced_env_vars,
     resolve_binary,
+    resolve_resources,
     rust_worker_run,
 )
 from supernova.destinations import datasource_to_destination
 from supernova.metrics import make_run_id
 
 logger = logging.getLogger(__name__)
+
+# CPU loader workers. Used when the config omits a `resources:` block; spot is
+# fine because each shard's upserts are idempotent (point id is content-derived)
+# and SkyPilot re-queues a preempted job. `--on-demand` flips use_spot off.
+DEFAULT_RESOURCES = {
+    "cpus": 4,
+    "memory": 16,
+    "cloud": "aws",
+    "use_spot": True,
+}
 
 
 def discover_parquet_files(ds_cfg: dict) -> list[str]:
@@ -61,7 +72,15 @@ def discover_parquet_files(ds_cfg: dict) -> list[str]:
 @click.option(
     "--dry-run", is_flag=True, help="Generate configs and print plan, don't launch."
 )
-@click.option("--num-shards", type=int, default=None, help="Override number of shards.")
+@click.option(
+    "--num-workers",
+    "--num-shards",
+    "num_workers",
+    type=int,
+    default=None,
+    help="Number of workers; the corpus is split into one shard each. "
+    "(--num-shards: deprecated alias.)",
+)
 @click.option(
     "--pool-name", default=None, help="SkyPilot pool name (default: auto-generated)."
 )
@@ -71,6 +90,8 @@ def discover_parquet_files(ds_cfg: dict) -> list[str]:
     help="Use on-demand instances instead of spot (higher cost, no preemption, "
     "separate AWS quota).",
 )
+@click.option("--cloud", default=None, help="Override resources.cloud (e.g. aws, gcp).")
+@click.option("--cpus", type=int, default=None, help="Override resources.cpus per worker.")
 @click.option(
     "--ramp",
     is_flag=True,
@@ -82,7 +103,7 @@ def discover_parquet_files(ds_cfg: dict) -> list[str]:
     is_flag=True,
     help="Enable Qdrant indexing (run after all jobs complete).",
 )
-def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize):
+def load_dist(config, dry_run, num_workers, pool_name, on_demand, cloud, cpus, ramp, finalize):
     """Dispatch distributed loading via SkyPilot pools."""
     logging.basicConfig(
         level=logging.WARNING,
@@ -110,11 +131,25 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
         logger.info(f"Indexing complete in {time.perf_counter() - t0:.1f}s")
         return
 
-    dispatch_cfg = cfg["dispatch"]
-    resources = dict(cfg["resources"])
+    # dispatch / resources are optional: the worker count can come from
+    # --num-workers and resources from ~/.nova/resources.yaml or the CPU default,
+    # so a plain `nova load` config (which has neither) also works with load-dist.
+    dispatch_cfg = cfg.get("dispatch") or {}
+    # Layered: built-in default < ~/.nova resources file < config `resources:` <
+    # flags. --on-demand only forces spot off (load defaults to spot — shards are
+    # idempotent and SkyPilot re-queues a preemption).
+    overrides = {"cloud": cloud, "cpus": cpus}
     if on_demand:
-        resources["use_spot"] = False
-    num_shards_eff = num_shards or dispatch_cfg["num_shards"]
+        overrides["use_spot"] = False
+    resources = resolve_resources("load", cfg.get("resources"), overrides, DEFAULT_RESOURCES)
+    # Accept dispatch.num_workers, or the legacy dispatch.num_shards key.
+    num_workers_eff = (
+        num_workers or dispatch_cfg.get("num_workers") or dispatch_cfg.get("num_shards")
+    )
+    if not num_workers_eff:
+        raise click.UsageError(
+            "worker count is required: pass --num-workers N or set dispatch.num_workers in the config"
+        )
     config_name = Path(config).stem
     run_name = dispatch_cfg.get("run_name", config_name)
     pool_name_eff = pool_name or f"nova-load-{run_name}"
@@ -145,8 +180,8 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     click.echo("=" * 60)
     click.echo(f"  Destination:  {dest.root_uri}")
     click.echo(f"  Total files:  {len(files)}")
-    click.echo(f"  Num shards:   {num_shards_eff}")
-    click.echo(f"  Files/shard:  ~{len(files) // num_shards_eff}")
+    click.echo(f"  Num workers:  {num_workers_eff}")
+    click.echo(f"  Files/worker: ~{len(files) // num_workers_eff}")
     click.echo(f"  Pool name:    {pool_name_eff}")
     click.echo(f"  Metrics run:  {metrics_run_id}")
     click.echo(
@@ -164,8 +199,8 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     # SkyPilot's autoscaler ramp is too slow when we know the target count up front.
     pool_yaml = {
         "pool": {
-            "min_workers": 0 if ramp else num_shards_eff,
-            "max_workers": num_shards_eff,
+            "min_workers": 0 if ramp else num_workers_eff,
+            "max_workers": num_workers_eff,
         },
         "resources": resources,
         "file_mounts": cfg_mounts,
@@ -181,7 +216,7 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
         "resources": resources,
         "run": rust_worker_run(
             "nova-load",
-            f"{remote_cfg} --num-jobs {num_shards_eff} --no-manage-indexing",
+            f"{remote_cfg} --num-jobs {num_workers_eff} --no-manage-indexing",
         ),
     }
     job_path = run_dir / "job.yaml"
@@ -192,7 +227,7 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     manifest = {
         "run_id": run_id,
         "config": config,
-        "num_shards": num_shards_eff,
+        "num_workers": num_workers_eff,
         "total_files": len(files),
         "pool_name": pool_name_eff,
     }
@@ -202,7 +237,7 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     logger.info(f"Generated configs in {run_dir}/")
 
     if dry_run:
-        print_dry_run(pool_name_eff, num_shards_eff, pool_path, job_path)
+        print_dry_run(pool_name_eff, num_workers_eff, pool_path, job_path)
         return
 
     # Create the collection + defer indexing ONCE, here on the controller, by
@@ -223,10 +258,10 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     if exp_id:
         envs["NOVA_EXPERIMENT_ID"] = exp_id
     logger.info(f"Creating pool '{pool_name_eff}'...")
-    logger.info(f"Submitting {num_shards_eff} jobs to pool '{pool_name_eff}'...")
-    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_shards_eff, envs)
+    logger.info(f"Submitting {num_workers_eff} jobs to pool '{pool_name_eff}'...")
+    launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_workers_eff, envs)
 
-    click.echo(f"\nSubmitted {num_shards_eff} loading jobs to pool '{pool_name_eff}'")
+    click.echo(f"\nSubmitted {num_workers_eff} loading jobs to pool '{pool_name_eff}'")
     print_monitor(pool_name_eff)
     click.echo("\nAfter all jobs complete, enable Qdrant indexing:")
     click.echo(f"  nova load-dist {config} --finalize")

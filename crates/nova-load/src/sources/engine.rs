@@ -27,9 +27,10 @@ pub trait SourceBackend: Send {
     /// queries — count, dimensions — where one parallel scan is cheap).
     fn source_sql(&self, parquet_kwargs: &str) -> String;
 
-    /// One FROM-clause expression per file, so DuckDB releases decode buffers
-    /// between files instead of buffering the whole corpus.
-    fn iter_sources(&self, parquet_kwargs: &str) -> Vec<String>;
+    /// The concrete files to load — one query each, so DuckDB materializes a
+    /// single file at a time instead of buffering the whole-corpus glob. An
+    /// explicit shard `file_list` wins; otherwise every file is discovered.
+    fn resolved_files(&self) -> Result<Vec<String>, ReaderError>;
 
     /// URI prefix stripped from the `filename` column to recover the bare key
     /// fed to the `make_point_id` macro.
@@ -220,13 +221,21 @@ impl<B: SourceBackend> super::DataReader for DuckDbReader<B> {
     ) -> Result<(), ReaderError> {
         self.ensure_connection()?;
         let select = self.build_select();
-        let sources = self.backend.iter_sources(&self.parquet_kwargs);
-        // Move the connection into a local so per-source statements can borrow
-        // it without making `self` self-referential.
+        // Read one file per query. duckdb-rs's row API materializes the entire
+        // result set before the first row, so a single whole-corpus glob would
+        // buffer every file at once (and OOM on a large corpus). Per-file caps
+        // peak memory at one file and lets the first batch flow immediately. A
+        // sharded run supplies an explicit file list; otherwise discover all.
+        let files = self.backend.resolved_files()?;
+        // Move the connection into a local so per-file statements can borrow it
+        // without making `self` self-referential.
         let conn = self.conn.take().unwrap();
 
-        for source in sources {
-            let sql = format!("SELECT {select} FROM {source}");
+        for file in &files {
+            let sql = format!(
+                "SELECT {select} FROM read_parquet('{file}'{kwargs})",
+                kwargs = self.parquet_kwargs
+            );
             let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query([])?;
             let mut chunk: Vec<Point> = Vec::with_capacity(self.chunk_size);
@@ -262,24 +271,6 @@ pub(crate) fn combined_source(
         }
         None if !parquet_kwargs.is_empty() => format!("read_parquet('{glob}'{parquet_kwargs})"),
         None => format!("'{glob}'"),
-    }
-}
-
-/// One FROM-clause per file, so DuckDB releases decode buffers between files.
-pub(crate) fn per_file_sources(
-    glob: &str,
-    file_list: Option<&[String]>,
-    parquet_kwargs: &str,
-) -> Vec<String> {
-    match file_list {
-        Some(files) => files
-            .iter()
-            .map(|f| format!("read_parquet('{f}'{parquet_kwargs})"))
-            .collect(),
-        None if !parquet_kwargs.is_empty() => {
-            vec![format!("read_parquet('{glob}'{parquet_kwargs})")]
-        }
-        None => vec![combined_source(glob, None, parquet_kwargs)],
     }
 }
 

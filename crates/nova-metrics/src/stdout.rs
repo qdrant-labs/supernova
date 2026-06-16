@@ -1,8 +1,12 @@
 //! The local-dev sink: route measurements to `tracing`.
 //!
 //! The default when a config has no `metrics:` block — local-first, you see
-//! your numbers with zero setup. Per-sample `observe` goes to DEBUG so a
-//! high-rate storm doesn't flood the terminal; everything else is INFO.
+//! your numbers with zero setup. High-rate scalar streams go to DEBUG so they
+//! don't flood the terminal: per-sample `observe`, and the per-second `log`
+//! samples (rolling QPS/wps, cumulative counts) a long run emits — those are
+//! for a real time-series backend, and a TTY already gets the live progress
+//! bar while a non-TTY run gets the runner's periodic milestone logs.
+//! Lifecycle output (`start`/`event`/`summary`/`finish`) stays at INFO.
 
 use std::sync::Mutex;
 
@@ -53,7 +57,10 @@ impl MetricsSink for StdoutSink {
     }
 
     fn log(&self, name: &str, value: f64) {
-        tracing::info!("{} {}={}", self.prefix(), name, value);
+        // DEBUG, not INFO: a load/storm emits these every second for the whole
+        // run. The live progress bar (TTY) and the runner's milestone logs
+        // (non-TTY) cover human-facing progress; this stream is for a TSDB sink.
+        tracing::debug!("{} {}={}", self.prefix(), name, value);
     }
 
     fn observe(&self, name: &str, value: f64, ok: bool) {

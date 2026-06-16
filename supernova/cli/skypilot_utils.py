@@ -16,6 +16,8 @@ from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+import yaml
+
 # Base AWS credential vars forwarded to every SkyPilot job.
 AWS_ENV_VARS = [
     "AWS_ACCESS_KEY_ID",
@@ -69,6 +71,52 @@ def nova_home() -> Path:
     runs ``git ls-files`` inside a repo subtree (which trips a git bug).
     """
     return Path(os.environ.get("NOVA_HOME", Path.home() / ".nova"))
+
+
+def load_resource_defaults() -> dict:
+    """User-level SkyPilot resource defaults, so the fleet spec lives in one
+    place instead of every run's config.
+
+    Read from ``$NOVA_RESOURCES_FILE`` if set, else ``$NOVA_HOME/resources.yaml``;
+    returns ``{}`` when absent. Shape: an optional ``all:`` base merged under
+    every tool, plus per-tool sections, each a SkyPilot resources dict::
+
+        all:   {cloud: aws}
+        load:  {cpus: 8}
+        storm: {cpus: 4}
+        embed: {accelerators: A10G:1, instance_type: g5.4xlarge}
+    """
+    override = os.environ.get("NOVA_RESOURCES_FILE")
+    path = Path(override) if override else nova_home() / "resources.yaml"
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def resolve_resources(
+    tool: str,
+    config_resources: dict | None = None,
+    overrides: dict | None = None,
+    builtin: dict | None = None,
+) -> dict:
+    """Resolve a SkyPilot ``resources`` dict by layering, low → high:
+
+      built-in tool default  <  ``~/.nova`` file (``all:`` then ``<tool>:``)
+        <  per-run config ``resources:``  <  CLI flag overrides
+
+    Each layer key-merges over the previous, so you set only what differs — your
+    standard fleet lives in the file and a config/flag tweaks a key. ``overrides``
+    values that are ``None`` (an unset flag) are ignored so they don't clobber a
+    lower layer.
+    """
+    defaults = load_resource_defaults()
+    merged = dict(builtin or {})
+    merged.update(defaults.get("all") or {})
+    merged.update(defaults.get(tool) or {})
+    merged.update(config_resources or {})
+    merged.update({k: v for k, v in (overrides or {}).items() if v is not None})
+    return merged
 
 
 def make_run_dir(name: str) -> Path:
@@ -239,36 +287,50 @@ def worker_run(argv: str) -> str:
 
 REPO_URL = "https://github.com/qdrant-labs/supernova"
 
+# cargo features each Rust worker crate needs. Both crates default to `[]`
+# features (no backends), so the install MUST request them explicitly:
+# nova-load needs a source reader (s3/local) + the store (qdrant); nova-storm
+# needs a target backend (qdrant) or it fails to compile. Owned here, not in the
+# install override, so a dev override only has to name the source (git/branch).
+RUST_WORKER_FEATURES = {
+    "nova-load": "qdrant,s3,local",
+    "nova-storm": "qdrant",
+}
 
-def rust_install_spec(binary: str) -> str:
-    """`cargo install` target for a Rust subcommand worker.
+
+def rust_install_source(binary: str) -> str:
+    """cargo *source* selectors (`--git`/`--tag`, or a dev override) for a Rust
+    worker crate. The crate's `--features` and the package name are appended by
+    [`build_rust_worker_setup`], so a dev override only names where the code is.
 
     Defaults to the git tag matching the controller's supernova version, so the
-    binary and the Python controller track the same release. Override with
-    ``NOVA_RUST_INSTALL_SPEC`` to pin a sha/branch for dev (a literal
-    ``{binary}`` is replaced with the crate name), e.g.::
+    binary tracks the controller's release. Override with ``NOVA_RUST_INSTALL_SPEC``
+    to point at un-released code (it must be pushed — cargo clones from GitHub)::
 
-        NOVA_RUST_INSTALL_SPEC='--git https://github.com/qdrant-labs/supernova --rev <sha> {binary}'
+        NOVA_RUST_INSTALL_SPEC='--git https://github.com/qdrant-labs/supernova --branch my-feature'
+        NOVA_RUST_INSTALL_SPEC="--git https://github.com/qdrant-labs/supernova --rev $(git rev-parse HEAD)"
     """
-    override = os.environ.get("NOVA_RUST_INSTALL_SPEC")
-    if override:
-        return override.replace("{binary}", binary)
-    return f"--git {REPO_URL} --tag v{worker_version()} {binary}"
+    return os.environ.get(
+        "NOVA_RUST_INSTALL_SPEC", f"--git {REPO_URL} --tag v{worker_version()}"
+    )
 
 
 def build_rust_worker_setup(binary: str) -> str:
     """SkyPilot ``setup`` for a Rust subcommand worker: ensure cargo, then
-    ``cargo install`` the binary onto PATH (``~/.cargo/bin``).
+    ``cargo install`` the binary (with its required features) onto PATH
+    (``~/.cargo/bin``).
 
     TODO(#16): replace the on-worker compile with a prebuilt-binary download — this
     pulls a Rust toolchain and builds from source on every fresh pool worker.
     """
-    spec = rust_install_spec(binary)
+    source = rust_install_source(binary)
+    features = RUST_WORKER_FEATURES.get(binary)
+    feat_arg = f" --features {features}" if features else ""
     return (
         "command -v cargo >/dev/null || "
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; "
         'source "$HOME/.cargo/env" && '
-        f"cargo install --locked {spec}"
+        f"cargo install --locked {source}{feat_arg} {binary}"
     )
 
 

@@ -60,6 +60,7 @@ async fn run() -> Result<(), LoadError> {
         vectorstore,
         loader,
         metrics,
+        ..  // dispatch / resources are for load-dist; ignored here
     } = cfg;
 
     // Control-plane-only modes for the distributed controller. They bracket the

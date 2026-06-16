@@ -3,9 +3,10 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use super::engine::{combined_source, per_file_sources};
+use super::engine::combined_source;
 use super::{DuckDbReader, ReaderOptions, SourceBackend};
 use crate::config::VectorSpec;
+use crate::errors::ReaderError;
 
 #[derive(Debug, Deserialize)]
 pub struct LocalConfig {
@@ -68,8 +69,11 @@ impl SourceBackend for LocalBackend {
         combined_source(&self.glob_path(), self.file_list.as_deref(), parquet_kwargs)
     }
 
-    fn iter_sources(&self, parquet_kwargs: &str) -> Vec<String> {
-        per_file_sources(&self.glob_path(), self.file_list.as_deref(), parquet_kwargs)
+    fn resolved_files(&self) -> Result<Vec<String>, ReaderError> {
+        match &self.file_list {
+            Some(files) => Ok(files.clone()),
+            None => self.discover(),
+        }
     }
 
     fn root_uri_prefix(&self) -> String {

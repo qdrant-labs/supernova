@@ -24,6 +24,7 @@ from supernova.cli.skypilot_utils import (
     print_dry_run,
     print_monitor,
     referenced_env_vars,
+    resolve_resources,
     rust_worker_run,
 )
 from supernova.metrics import make_run_id
@@ -56,7 +57,9 @@ DEFAULT_RESOURCES = {
     is_flag=True,
     help="Use spot instances (default: on-demand; preemption skews a load test).",
 )
-def storm_dist(config, dry_run, num_workers, pool_name, spot):
+@click.option("--cloud", default=None, help="Override resources.cloud (e.g. aws, gcp).")
+@click.option("--cpus", type=int, default=None, help="Override resources.cpus per worker.")
+def storm_dist(config, dry_run, num_workers, pool_name, spot, cloud, cpus):
     """Dispatch a replicated storm across a SkyPilot pool."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
@@ -76,8 +79,14 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
     # node_id = SKYPILOT_JOB_RANK) instead of each minting its own.
     metrics_run_id = make_run_id(run_name)
 
-    resources = dict(cfg.get("resources") or DEFAULT_RESOURCES)
-    resources["use_spot"] = bool(spot)
+    # Layered: built-in default < ~/.nova resources file < config `resources:` <
+    # these flags. `--spot` only forces spot on (storm defaults to on-demand, since
+    # a preempted load generator skews the measurement); omit it to take the
+    # layered default, e.g. a `storm: {use_spot: true}` in your defaults file.
+    overrides = {"cloud": cloud, "cpus": cpus}
+    if spot:
+        overrides["use_spot"] = True
+    resources = resolve_resources("storm", cfg.get("resources"), overrides, DEFAULT_RESOURCES)
 
     run_dir = make_run_dir(pool_name_eff)
     cfg_mounts, remote_cfg = config_mount(run_dir, config)

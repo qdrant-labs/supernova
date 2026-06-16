@@ -27,6 +27,14 @@ pub struct LoadConfig {
     /// Where load metrics go. Absent → stdout (local-first, no setup).
     #[serde(default)]
     pub metrics: Option<nova_metrics::MetricsConfig>,
+    // Consumed by `nova load-dist` / SkyPilot; ignored by the single-machine
+    // binary. Parsed as opaque values so the keys are allowed under
+    // `deny_unknown_fields` (one config drives both `nova load` and `load-dist`)
+    // without being silently mistyped into another block.
+    #[serde(default)]
+    pub dispatch: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub resources: Option<serde_yaml::Value>,
 }
 
 /// One named vector's spec.
@@ -251,7 +259,7 @@ mod tests {
 /// Guards that the shipped example config stays valid against the schema.
 #[cfg(all(test, feature = "s3", feature = "qdrant"))]
 mod shipped_configs {
-    use super::load_config_file;
+    use super::{load_config_file, load_config_str};
 
     #[test]
     fn loader_test_yaml_parses() {
@@ -262,5 +270,21 @@ mod shipped_configs {
         }
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/loader/test.yaml");
         load_config_file(path).expect("configs/loader/test.yaml should parse");
+    }
+
+    #[test]
+    fn dispatch_and_resources_blocks_are_accepted() {
+        // The single-machine binary ignores these (load-dist consumes them), but
+        // one config feeds both, so they must parse rather than trip
+        // deny_unknown_fields.
+        let yaml = "
+vectors:
+  dense: {type: dense, column: dense_embedding}
+datasource: {type: s3, bucket: b, prefix: p}
+vectorstore: {type: qdrant, collection_name: c, url: http://localhost:6334}
+dispatch: {num_shards: 8, run_name: arxiv}
+resources: {cpus: 4, use_spot: true}
+";
+        load_config_str(yaml).expect("dispatch/resources should be accepted and ignored");
     }
 }

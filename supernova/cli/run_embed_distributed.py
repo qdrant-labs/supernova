@@ -26,6 +26,7 @@ from supernova.cli.skypilot_utils import (
     print_dry_run,
     print_monitor,
     referenced_env_vars,
+    resolve_resources,
     worker_run,
 )
 
@@ -195,6 +196,7 @@ def _retry_one_rank(
     is_flag=True,
     help="Use on-demand instances instead of spot (higher cost, no preemption, separate AWS quota).",
 )
+@click.option("--cloud", default=None, help="Override resources.cloud (e.g. aws, gcp).")
 @click.option(
     "--ramp",
     is_flag=True,
@@ -226,6 +228,7 @@ def embed_dist(
     pool_name,
     max_workers,
     on_demand,
+    cloud,
     ramp,
     retry_rank,
     run_dir_override,
@@ -248,9 +251,12 @@ def embed_dist(
 
     source_cfg = cfg["source"]
     pipeline_cfg = cfg.get("pipeline", {})
-    resources = cfg.get("resources", dict(DEFAULT_RESOURCES))
+    # Layered: built-in GPU default < ~/.nova resources file < config `resources:`
+    # < flags. --on-demand only forces spot off (embed defaults to spot).
+    overrides = {"cloud": cloud}
     if on_demand:
-        resources["use_spot"] = False
+        overrides["use_spot"] = False
+    resources = resolve_resources("embed", cfg.get("resources"), overrides, DEFAULT_RESOURCES)
 
     # get dataset size (source-agnostic)
     from supernova.cli.run_embedder import build_source

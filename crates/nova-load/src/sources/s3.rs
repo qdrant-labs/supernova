@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use duckdb::Connection;
 use serde::Deserialize;
 
-use super::engine::{combined_source, per_file_sources};
+use super::engine::combined_source;
 use super::{DuckDbReader, ReaderOptions, SourceBackend};
 use crate::config::VectorSpec;
 use crate::errors::ReaderError;
@@ -61,8 +61,11 @@ impl SourceBackend for S3Backend {
         combined_source(&self.glob_path(), self.file_list.as_deref(), parquet_kwargs)
     }
 
-    fn iter_sources(&self, parquet_kwargs: &str) -> Vec<String> {
-        per_file_sources(&self.glob_path(), self.file_list.as_deref(), parquet_kwargs)
+    fn resolved_files(&self) -> Result<Vec<String>, ReaderError> {
+        match &self.file_list {
+            Some(files) => Ok(files.clone()),
+            None => self.discover(),
+        }
     }
 
     fn root_uri_prefix(&self) -> String {
@@ -114,11 +117,11 @@ mod tests {
     }
 
     #[test]
-    fn file_list_overrides_glob() {
+    fn explicit_file_list_skips_discovery() {
         let b = S3Backend::new("b".into(), None, Some(vec!["s3://b/a.parquet".into()]));
         assert_eq!(
-            b.iter_sources(""),
-            vec!["read_parquet('s3://b/a.parquet')".to_string()]
+            b.resolved_files().unwrap(),
+            vec!["s3://b/a.parquet".to_string()]
         );
     }
 }

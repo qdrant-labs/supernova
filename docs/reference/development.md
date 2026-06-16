@@ -62,6 +62,35 @@ Run metadata — generated pool/job YAMLs, manifests, the staged config — live
 `~/.nova/runs/` (override with `$NOVA_HOME`). It's intentionally outside any repo so an
 installed `nova` writes to a stable location no matter where it's invoked.
 
+### Fleet resources (`~/.nova/resources.yaml`)
+
+The SkyPilot hardware spec (cloud, cpus, accelerators, instance type, spot, …) is usually
+the *same across runs*, so it doesn't belong in every config. Set it once in
+`~/.nova/resources.yaml` (override the path with `$NOVA_RESOURCES_FILE`): an optional `all:`
+base merged under every tool, plus per-tool sections.
+
+```yaml
+# ~/.nova/resources.yaml
+all:   {cloud: aws}
+load:  {cpus: 8}
+storm: {cpus: 4}
+embed: {accelerators: A10G:1, instance_type: g5.4xlarge}
+```
+
+Each `nova dist <tool>` resolves its `resources` by layering, low → high (each layer
+key-merges over the previous, so you set only what differs):
+
+1. built-in per-tool default (GPU for embed, CPU for load/storm)
+2. `~/.nova/resources.yaml` — `all:` then the `<tool>:` section
+3. the per-run config's `resources:` block (override for one workload)
+4. CLI flags — `--cloud`, `--cpus` (load/storm), and the spot toggle
+   (`--spot` for storm, `--on-demand` for load/embed)
+
+So a per-run config typically carries only `datasource`/`vectors`/`vectorstore`; `resources`
+and `dispatch` are optional everywhere (the single-machine Rust/Python tools ignore them, and
+the dispatchers fill them from the file + flags). Worker count comes from `--num-workers`
+(load/storm) or `--num-jobs` (embed), or a `dispatch:` block.
+
 ## Dev mode: testing un-released changes on a fleet
 
 Workers install the *published* version by default, so local edits never reach them.
@@ -123,17 +152,18 @@ nova-dev() {
 ### Rust tools (`storm` / `load`)
 
 `storm` and `load` are Rust binaries, so they have their own knob. The worker `setup` runs
-`cargo install --git <repo> --tag v<version> <crate>` by default (pinned to the controller's
-release). Point it at un-released code with `NOVA_RUST_INSTALL_SPEC` — the literal
-`cargo install` args, with `{binary}` substituted per crate (`nova-storm` / `nova-load`):
+`cargo install --git <repo> --tag v<version> --features <crate-features> <crate>` by default
+(pinned to the controller's release). Point it at un-released code with `NOVA_RUST_INSTALL_SPEC`
+— just the cargo **source** selectors; the dispatcher appends the crate's required `--features`
+and the package name, so you don't repeat them:
 
 ```bash
 git checkout -b my-feature
 git commit -am "wip" && git push          # cargo clones the ref from GitHub
 # pin a branch — a plain `git push` is then enough, the env var stays put:
-export NOVA_RUST_INSTALL_SPEC='--git https://github.com/qdrant-labs/supernova --branch my-feature {binary}'
+export NOVA_RUST_INSTALL_SPEC='--git https://github.com/qdrant-labs/supernova --branch my-feature'
 # …or pin a sha (re-export after each push, like the Python loop):
-export NOVA_RUST_INSTALL_SPEC="--git https://github.com/qdrant-labs/supernova --rev $(git rev-parse HEAD) {binary}"
+export NOVA_RUST_INSTALL_SPEC="--git https://github.com/qdrant-labs/supernova --rev $(git rev-parse HEAD)"
 nova dist storm configs/storm/test.yaml
 ```
 
