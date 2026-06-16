@@ -18,15 +18,15 @@ import yaml
 
 from supernova.cli.skypilot_utils import (
     build_env_dict,
-    build_worker_setup,
+    build_rust_worker_setup,
     config_mount,
     launch_pool_and_jobs,
     make_run_dir,
     print_dry_run,
     print_monitor,
-    worker_run,
+    rust_worker_run,
 )
-from supernova.metrics import make_run_id, required_extra
+from supernova.metrics import make_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
         level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
     )
 
-    from supernova.cli.run_loader import resolve_config
+    from supernova.cli.config_resolve import resolve_config
 
     with open(config) as f:
         cfg = resolve_config(yaml.safe_load(f))
@@ -93,18 +93,13 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
     click.echo(f"  Run dir:      {run_dir}")
     click.echo("=" * 60)
 
-    # storm extra + (only if the config logs to a backend needing a driver) that
-    # backend's extra, e.g. postgres -> pg (psycopg). stdout/null add nothing.
-    worker_extras = "storm"
-    pg_extra = required_extra(cfg.get("metrics"))
-    if pg_extra:
-        worker_extras = f"{worker_extras},{pg_extra}"
-
+    # storm is a Rust binary: the worker needs nova-storm on PATH, nothing else
+    # (it statically links qdrant/duckdb/postgres — no Python extras to compose).
     pool_yaml = {
         "pool": {"min_workers": num_workers_eff, "max_workers": num_workers_eff},
         "resources": resources,
         "file_mounts": cfg_mounts,
-        "setup": build_worker_setup(worker_extras),
+        "setup": build_rust_worker_setup("nova-storm"),
     }
     pool_path = run_dir / "pool.yaml"
     with open(pool_path, "w") as f:
@@ -114,7 +109,7 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
     job_yaml = {
         "name": f"storm-{run_name}",
         "resources": resources,
-        "run": worker_run(f"storm {remote_cfg}"),
+        "run": rust_worker_run("nova-storm", remote_cfg),
     }
     job_path = run_dir / "job.yaml"
     with open(job_path, "w") as f:

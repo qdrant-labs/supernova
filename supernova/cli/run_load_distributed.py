@@ -26,13 +26,13 @@ import yaml
 
 from supernova.cli.skypilot_utils import (
     build_env_dict,
-    build_worker_setup,
+    build_rust_worker_setup,
     config_mount,
     launch_pool_and_jobs,
     make_run_dir,
     print_dry_run,
     print_monitor,
-    worker_run,
+    rust_worker_run,
 )
 
 from supernova.loader.vectorstore.qdrant import QdrantVectorStore
@@ -209,7 +209,7 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
         },
         "resources": resources,
         "file_mounts": cfg_mounts,
-        "setup": build_worker_setup("load"),
+        "setup": build_rust_worker_setup("nova-load"),
     }
     pool_path = run_dir / "pool.yaml"
     with open(pool_path, "w") as f:
@@ -219,8 +219,9 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     job_yaml = {
         "name": f"load-{run_name}",
         "resources": resources,
-        "run": worker_run(
-            f"load {remote_cfg} --num-jobs {num_shards_eff} --no-manage-indexing"
+        "run": rust_worker_run(
+            "nova-load",
+            f"{remote_cfg} --num-jobs {num_shards_eff} --no-manage-indexing",
         ),
     }
     job_path = run_dir / "job.yaml"

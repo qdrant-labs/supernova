@@ -44,7 +44,7 @@ def experiment(config, dry_run):
         level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
     )
 
-    from supernova.cli.run_loader import resolve_config
+    from supernova.cli.config_resolve import resolve_config
 
     with open(config) as f:
         cfg = resolve_config(yaml.safe_load(f))

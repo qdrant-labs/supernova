@@ -101,6 +101,10 @@ include = ["supernova*"]
 
 [project.scripts]
 nova = "supernova.cli.cli:main"
+# Embed runs as its own subprocess (like the Rust storm/load binaries), so the
+# `nova` dispatcher never imports the ML stack in-process. Requires the `embed`
+# extra at runtime; the script itself ships with the base package.
+nova-embed = "supernova.cli.run_embedder:embed"
 
 [dependency-groups]
 dev = [

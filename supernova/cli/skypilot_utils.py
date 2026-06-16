@@ -220,6 +220,53 @@ def worker_run(argv: str) -> str:
     return f"{WORKER_VENV}/bin/nova {argv}"
 
 
+# --- Rust subcommand workers ------------------------------------------------
+#
+# storm/load are standalone Rust binaries, not Python. Their workers need only
+# the binary on PATH — no venv, no `nova` dispatcher, no Python extras (the
+# binary statically links its qdrant/duckdb/postgres deps). For now we compile
+# it on the worker via `cargo install`; prebuilt-binary download tracked in #16.
+
+REPO_URL = "https://github.com/qdrant-labs/supernova"
+
+
+def rust_install_spec(binary: str) -> str:
+    """`cargo install` target for a Rust subcommand worker.
+
+    Defaults to the git tag matching the controller's supernova version, so the
+    binary and the Python controller track the same release. Override with
+    ``NOVA_RUST_INSTALL_SPEC`` to pin a sha/branch for dev (a literal
+    ``{binary}`` is replaced with the crate name), e.g.::
+
+        NOVA_RUST_INSTALL_SPEC='--git https://github.com/qdrant-labs/supernova --rev <sha> {binary}'
+    """
+    override = os.environ.get("NOVA_RUST_INSTALL_SPEC")
+    if override:
+        return override.replace("{binary}", binary)
+    return f"--git {REPO_URL} --tag v{worker_version()} {binary}"
+
+
+def build_rust_worker_setup(binary: str) -> str:
+    """SkyPilot ``setup`` for a Rust subcommand worker: ensure cargo, then
+    ``cargo install`` the binary onto PATH (``~/.cargo/bin``).
+
+    TODO(#16): replace the on-worker compile with a prebuilt-binary download — this
+    pulls a Rust toolchain and builds from source on every fresh pool worker.
+    """
+    spec = rust_install_spec(binary)
+    return (
+        "command -v cargo >/dev/null || "
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; "
+        'source "$HOME/.cargo/env" && '
+        f"cargo install --locked {spec}"
+    )
+
+
+def rust_worker_run(binary: str, argv: str) -> str:
+    """SkyPilot ``run`` command invoking a cargo-installed Rust binary."""
+    return f'source "$HOME/.cargo/env" && {binary} {argv}'
+
+
 def config_mount(run_dir: Path, config_path: str) -> tuple[dict[str, str], str]:
     """
     Stage a config for a worker; return ``(file_mounts, remote_path)``.
