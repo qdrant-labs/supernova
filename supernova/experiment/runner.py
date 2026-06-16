@@ -41,6 +41,16 @@ logger = logging.getLogger(__name__)
 _STOP_GRACE_S = 30  # SIGINT then wait this long before SIGKILL
 
 
+def _run_argv(run: str) -> list[str]:
+    """Map a step's ``run`` token to ``nova`` argv. The ``-dist`` dispatchers live
+    under the ``dist`` subgroup (``nova dist storm``), so ``storm-dist`` ->
+    ``["dist", "storm"]``; a plain local unit (``load``, ``storm``) passes through.
+    """
+    if run.endswith("-dist"):
+        return ["dist", run[: -len("-dist")]]
+    return [run]
+
+
 def _sleep(seconds: float, label: str) -> None:
     if seconds and seconds > 0:
         logger.info("experiment: %s — sleeping %.0fs", label, seconds)
@@ -83,7 +93,7 @@ def run_experiment(experiment_id: str, steps: list[dict], cooldown: float = 0.0,
             step_id = step["id"]
             _sleep(step.get("delay", 0), f"before {step_id}")
 
-            cmd = [sys.executable, "-m", "supernova.cli.cli", step["run"], step["config"]]
+            cmd = [sys.executable, "-m", "supernova.cli.cli", *_run_argv(step["run"]), step["config"]]
             cmd += [str(a) for a in (step.get("args") or [])]  # extra unit flags, e.g. --no-manage-indexing
             disposition = (
                 "background" if step.get("background")

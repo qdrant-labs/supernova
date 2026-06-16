@@ -10,7 +10,6 @@ mid-run would corrupt the measurement window.
 import json
 import logging
 import os
-import re
 from pathlib import Path
 
 import click
@@ -24,6 +23,7 @@ from supernova.cli.skypilot_utils import (
     make_run_dir,
     print_dry_run,
     print_monitor,
+    referenced_env_vars,
     rust_worker_run,
 )
 from supernova.metrics import make_run_id
@@ -131,8 +131,7 @@ def storm_dist(config, dry_run, num_workers, pool_name, spot):
 
     # Forward exactly the secrets the config references via ${VAR} — vendor-agnostic,
     # so a non-Qdrant target's creds get forwarded without a hardcoded list.
-    referenced = sorted(set(re.findall(r"\$\{(\w+)\}", Path(config).read_text())))
-    envs = build_env_dict(referenced)
+    envs = build_env_dict(referenced_env_vars(config))
     envs["NOVA_RUN_ID"] = metrics_run_id  # every worker writes into this one run
     # When launched under `nova experiment`, tag this run's workers with the
     # experiment so Grafana can group reads + the write phase on one timeline.

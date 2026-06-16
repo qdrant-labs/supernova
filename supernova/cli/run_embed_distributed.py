@@ -25,6 +25,7 @@ from supernova.cli.skypilot_utils import (
     nova_home,
     print_dry_run,
     print_monitor,
+    referenced_env_vars,
     worker_run,
 )
 
@@ -154,7 +155,9 @@ def _retry_one_rank(
         click.echo(f"To run manually: sky jobs launch -p {pool_name} -y {retry_path}")
         return
 
-    envs = build_env_dict(["HF_TOKEN", "OPENAI_API_KEY"])
+    # Forward config-referenced ${VAR}s, plus HF_TOKEN / OPENAI_API_KEY (read from
+    # the env by the HF source / OpenAI embedder, not always named in the YAML).
+    envs = build_env_dict(referenced_env_vars(config) + ["HF_TOKEN", "OPENAI_API_KEY"])
     logger.info("Submitting retry for rank %d to pool '%s'...", retry_rank, pool_name)
     launch_single_job_to_pool(pool_name, retry_path, envs)
     click.echo(f"\nSubmitted retry for rank {retry_rank} to pool '{pool_name}'")
@@ -337,7 +340,9 @@ def embed_dist(
         print_dry_run(pool_name_eff, num_jobs_eff, pool_path, job_path)
         return
 
-    envs = build_env_dict(["HF_TOKEN", "OPENAI_API_KEY"])
+    # Forward config-referenced ${VAR}s, plus HF_TOKEN / OPENAI_API_KEY (read from
+    # the env by the HF source / OpenAI embedder, not always named in the YAML).
+    envs = build_env_dict(referenced_env_vars(config) + ["HF_TOKEN", "OPENAI_API_KEY"])
     logger.info(f"Creating pool '{pool_name_eff}'...")
     logger.info(f"Submitting {num_jobs_eff} jobs to pool '{pool_name_eff}'...")
     launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_jobs_eff, envs)

@@ -8,6 +8,7 @@ the package pulls in a lot at import time.
 """
 
 import os
+import re
 import shutil
 import sys
 
@@ -48,6 +49,15 @@ def build_env_dict(extra_vars: list[str] | None = None) -> dict[str, str]:
         if val:
             envs[var] = val
     return envs
+
+
+def referenced_env_vars(config_path: str | Path) -> list[str]:
+    """Env vars the config references via ``${VAR}`` — forward exactly these to
+    workers. Vendor-agnostic: a non-Qdrant target or a differently-named secret
+    is picked up without a hardcoded provider list. Pair with a per-tool baseline
+    (e.g. HF_TOKEN) for auth that's read from the env but never named in the YAML.
+    """
+    return sorted(set(re.findall(r"\$\{(\w+)\}", Path(config_path).read_text())))
 
 
 def nova_home() -> Path:

@@ -21,9 +21,6 @@ class FakeDenseEmbedder(DenseEmbedder):
     def max_tokens(self) -> int:
         return 100
 
-    def split_text(self, text: str) -> list[str]:
-        return [text]
-
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return [[float(len(t)), 0.0, 1.0] for t in texts]
 
@@ -38,9 +35,6 @@ class FakeSparseEmbedder(SparseEmbedder):
     @property
     def max_tokens(self) -> int:
         return 100
-
-    def split_text(self, text: str) -> list[str]:
-        return [text]
 
     async def embed(self, texts: list[str]) -> list[SparseEmbedding]:
         return [SparseEmbedding(indices=[0, 1], values=[1.0, 0.5]) for _ in texts]
@@ -71,6 +65,10 @@ def test_dense_embedder_properties():
 
 
 def test_base_dense_embedder_requires_max_tokens():
+    # A minimal embedder need only implement model_name + embed. dimensions
+    # defaults to None (inferred from the first batch); max_tokens must be
+    # overridden. Text splitting is NOT an embedder concern — it lives in the
+    # chunkers module (issue #12), so there's no split_text to define.
     class MinimalEmbedder(DenseEmbedder):
         @property
         def model_name(self) -> str:
@@ -83,8 +81,6 @@ def test_base_dense_embedder_requires_max_tokens():
     assert e.dimensions is None
     with pytest.raises(NotImplementedError):
         e.max_tokens
-    with pytest.raises(NotImplementedError):
-        e.split_text("hello")
 
 
 @pytest.mark.asyncio

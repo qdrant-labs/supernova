@@ -15,6 +15,7 @@ loader ignores `dispatch:` / `resources:` blocks; this CLI consumes them.
 
 import json
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -31,10 +32,12 @@ from supernova.cli.skypilot_utils import (
     make_run_dir,
     print_dry_run,
     print_monitor,
+    referenced_env_vars,
     resolve_binary,
     rust_worker_run,
 )
 from supernova.destinations import datasource_to_destination
+from supernova.metrics import make_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +118,11 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     config_name = Path(config).stem
     run_name = dispatch_cfg.get("run_name", config_name)
     pool_name_eff = pool_name or f"nova-load-{run_name}"
+    # Mint ONE run id on the controller and forward it (NOVA_RUN_ID) to every
+    # shard, so the partitioned fleet writes into a single run (each worker is a
+    # node_id = SKYPILOT_JOB_RANK) instead of each shard minting its own. Mirrors
+    # storm-dist; nova-load's resolve_run_id picks this up.
+    metrics_run_id = make_run_id(run_name)
 
     # create run directory
     run_dir = make_run_dir(run_name)
@@ -140,6 +148,7 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     click.echo(f"  Num shards:   {num_shards_eff}")
     click.echo(f"  Files/shard:  ~{len(files) // num_shards_eff}")
     click.echo(f"  Pool name:    {pool_name_eff}")
+    click.echo(f"  Metrics run:  {metrics_run_id}")
     click.echo(
         f"  Provision:    {'ramp (autoscaler)' if ramp else 'burst (all workers at startup)'}"
     )
@@ -204,7 +213,15 @@ def load_dist(config, dry_run, num_shards, pool_name, on_demand, ramp, finalize)
     subprocess.run([resolve_binary("nova-load"), "--setup-only", config], check=True)
     logger.info("Qdrant collection ready (indexing deferred)")
 
-    envs = build_env_dict(["QDRANT_URL", "QDRANT_API_KEY", "HF_TOKEN"])
+    # Forward exactly the secrets the config references via ${VAR} (vendor-agnostic),
+    # plus HF_TOKEN (an HF datasource reads it from the env, not from the YAML).
+    envs = build_env_dict(referenced_env_vars(config) + ["HF_TOKEN"])
+    envs["NOVA_RUN_ID"] = metrics_run_id  # every shard writes into this one run
+    # When launched under `nova experiment`, tag this run so Grafana can group the
+    # write phase with the concurrent reads on one timeline.
+    exp_id = os.environ.get("NOVA_EXPERIMENT_ID")
+    if exp_id:
+        envs["NOVA_EXPERIMENT_ID"] = exp_id
     logger.info(f"Creating pool '{pool_name_eff}'...")
     logger.info(f"Submitting {num_shards_eff} jobs to pool '{pool_name_eff}'...")
     launch_pool_and_jobs(pool_name_eff, pool_path, job_path, num_shards_eff, envs)
