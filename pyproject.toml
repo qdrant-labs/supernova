@@ -1,6 +1,6 @@
 [project]
 name = "supernova"
-version = "0.1.4"
+version = "0.1.5"
 description = "Stream massive datasets, embed at scale, store as parquet in S3."
 readme = "README.md"
 license = "Apache-2.0"
