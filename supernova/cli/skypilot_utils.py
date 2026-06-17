@@ -280,63 +280,55 @@ def worker_run(argv: str) -> str:
 
 # --- Rust subcommand workers ------------------------------------------------
 #
-# storm/load are standalone Rust binaries, not Python. Their workers need only
-# the binary on PATH — no venv, no `nova` dispatcher, no Python extras (the
-# binary statically links its qdrant/duckdb/postgres deps). For now we compile
-# it on the worker via `cargo install`; prebuilt-binary download tracked in #16.
+# storm/load are standalone Rust binaries, not Python. A worker just needs the
+# binary on disk — no venv, no `nova` dispatcher, no Python extras. We ship a
+# *prebuilt* binary (built once in CI, see .github/workflows/rust-binaries.yml)
+# and the worker downloads it: `curl` in seconds, no Rust toolchain, no on-worker
+# compile (which took minutes per fresh provision — the old `cargo install` path).
 
 REPO_URL = "https://github.com/qdrant-labs/supernova"
 
-# cargo features each Rust worker crate needs. Both crates default to `[]`
-# features (no backends), so the install MUST request them explicitly:
-# nova-load needs a source reader (s3/local) + the store (qdrant); nova-storm
-# needs a target backend (qdrant) or it fails to compile. Owned here, not in the
-# install override, so a dev override only has to name the source (git/branch).
-RUST_WORKER_FEATURES = {
-    "nova-load": "qdrant,s3,local",
-    "nova-storm": "qdrant",
-}
+# Where downloaded worker binaries land. Invoked by absolute path (no PATH/venv
+# setup), so the `run` phase and `setup` phase agree without sourcing anything.
+RUST_BIN_DIR = "$HOME/.nova/bin"
 
 
-def rust_install_source(binary: str) -> str:
-    """cargo *source* selectors (`--git`/`--tag`, or a dev override) for a Rust
-    worker crate. The crate's `--features` and the package name are appended by
-    [`build_rust_worker_setup`], so a dev override only names where the code is.
+def rust_binary_url(binary: str) -> str:
+    """Download URL for a prebuilt Rust worker binary (linux x86_64).
 
-    Defaults to the git tag matching the controller's supernova version, so the
-    binary tracks the controller's release. Override with ``NOVA_RUST_INSTALL_SPEC``
-    to point at un-released code (it must be pushed — cargo clones from GitHub)::
+    Default: the GitHub Release asset matching the controller's version — the
+    `rust-binaries.yml` workflow attaches `nova-load` / `nova-storm` to each `v*`
+    release. Override with ``NOVA_RUST_BIN_URL`` to point at un-released code; a
+    literal ``{binary}`` is replaced with the crate name. For a dev branch that's
+    the rolling ``dev-<branch>`` pre-release the same workflow publishes on push::
 
-        NOVA_RUST_INSTALL_SPEC='--git https://github.com/qdrant-labs/supernova --branch my-feature'
-        NOVA_RUST_INSTALL_SPEC="--git https://github.com/qdrant-labs/supernova --rev $(git rev-parse HEAD)"
+        NOVA_RUST_BIN_URL='https://github.com/qdrant-labs/supernova/releases/download/dev-my-feature/{binary}'
     """
-    return os.environ.get(
-        "NOVA_RUST_INSTALL_SPEC", f"--git {REPO_URL} --tag v{worker_version()}"
-    )
+    override = os.environ.get("NOVA_RUST_BIN_URL")
+    if override:
+        return override.replace("{binary}", binary)
+    return f"{REPO_URL}/releases/download/v{worker_version()}/{binary}"
 
 
 def build_rust_worker_setup(binary: str) -> str:
-    """SkyPilot ``setup`` for a Rust subcommand worker: ensure cargo, then
-    ``cargo install`` the binary (with its required features) onto PATH
-    (``~/.cargo/bin``).
+    """SkyPilot ``setup`` for a Rust subcommand worker: download the prebuilt
+    binary and mark it executable. No toolchain, no compile — seconds, not the
+    minutes a from-source `cargo install` cost on every fresh provision (#16).
 
-    TODO(#16): replace the on-worker compile with a prebuilt-binary download — this
-    pulls a Rust toolchain and builds from source on every fresh pool worker.
+    ``-f`` makes curl fail loudly on a 404 (e.g. CI hasn't published this
+    version/branch yet) instead of writing an error page to the binary path.
     """
-    source = rust_install_source(binary)
-    features = RUST_WORKER_FEATURES.get(binary)
-    feat_arg = f" --features {features}" if features else ""
+    url = rust_binary_url(binary)
+    dest = f"{RUST_BIN_DIR}/{binary}"
     return (
-        "command -v cargo >/dev/null || "
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; "
-        'source "$HOME/.cargo/env" && '
-        f"cargo install --locked {source}{feat_arg} {binary}"
+        f'mkdir -p "{RUST_BIN_DIR}" && '
+        f"curl -fsSL '{url}' -o \"{dest}\" && chmod +x \"{dest}\""
     )
 
 
 def rust_worker_run(binary: str, argv: str) -> str:
-    """SkyPilot ``run`` command invoking a cargo-installed Rust binary."""
-    return f'source "$HOME/.cargo/env" && {binary} {argv}'
+    """SkyPilot ``run`` command invoking the downloaded Rust binary by path."""
+    return f'"{RUST_BIN_DIR}/{binary}" {argv}'
 
 
 def resolve_binary(name: str) -> str:
@@ -356,7 +348,8 @@ def resolve_binary(name: str) -> str:
         return found
     raise RuntimeError(
         f"`{name}` not found on PATH (needed for distributed control-plane ops). "
-        f"Install it with `cargo install --git {REPO_URL} {name}`, or set {env}."
+        f"Build it (`cargo build --release -p {name} --features full`) and set {env} "
+        f"to the binary, or `cargo install --git {REPO_URL} {name} --features full`."
     )
 
 

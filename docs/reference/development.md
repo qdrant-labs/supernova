@@ -52,9 +52,10 @@ Every workload follows the same shape — copy it when adding a new one:
 Workers do **not** receive your code by file-sync. The dispatcher bootstraps each worker to
 install a *pinned, named* artifact matching the controller's version, so controller and
 workers always run identical code: the Python `embed` worker `pip install`s
-`supernova[<extra>]==<version>` from PyPI; the Rust `storm`/`load` worker `cargo install`s
-the crate at tag `v<version>` from GitHub. Python extras (`embed`, `dist`, `pg`) live in
-`pyproject.toml`; the Rust crates are in the workspace `Cargo.toml`.
+`supernova[<extra>]==<version>` from PyPI; the Rust `storm`/`load` worker downloads the
+prebuilt `v<version>` binary from the GitHub Release (built by `rust-binaries.yml`). Python
+extras (`embed`, `dist`, `pg`) live in `pyproject.toml`; the Rust crates are in the workspace
+`Cargo.toml`.
 
 ### Local state
 
@@ -96,7 +97,7 @@ the dispatchers fill them from the file + flags). Worker count comes from `--num
 Workers install the *published* version by default, so local edits never reach them.
 To run your working changes on a fleet you override where each worker gets the tool —
 and because the tools are polyglot, the knob depends on the language:
-`NOVA_WORKER_INSTALL_SPEC` for the Python `embed` worker, `NOVA_RUST_INSTALL_SPEC` for the
+`NOVA_WORKER_INSTALL_SPEC` for the Python `embed` worker, `NOVA_RUST_BIN_URL` for the
 Rust `storm` / `load` workers. For a single-machine run, `NOVA_<TOOL>_BIN` points straight
 at a built binary (see [Local binary override](#local-binary-override-nova_tool_bin)).
 
@@ -151,46 +152,42 @@ nova-dev() {
 
 ### Rust tools (`storm` / `load`)
 
-`storm` and `load` are Rust binaries, so they have their own knob. The worker `setup` runs
-`cargo install --git <repo> --tag v<version> --features <crate-features> <crate>` by default
-(pinned to the controller's release). Point it at un-released code with `NOVA_RUST_INSTALL_SPEC`
-— just the cargo **source** selectors; the dispatcher appends the crate's required `--features`
-and the package name, so you don't repeat them:
+`storm` and `load` are Rust binaries. Workers don't compile them — they **download a prebuilt
+binary**: `.github/workflows/rust-binaries.yml` builds `nova-load`/`nova-storm` for linux and
+attaches them to a GitHub Release, and the worker `setup` is just `curl + chmod` (seconds, no
+toolchain). By default a worker pulls the release matching the controller's version.
+
+To test un-released code on a fleet, push your branch — the workflow publishes a rolling
+`dev-<branch>` pre-release on every branch push — then point workers at it with
+`NOVA_RUST_BIN_URL` (a literal `{binary}` is substituted per crate):
 
 ```bash
 git checkout -b my-feature
-git commit -am "wip" && git push          # cargo clones the ref from GitHub
-# pin a branch — a plain `git push` is then enough, the env var stays put:
-export NOVA_RUST_INSTALL_SPEC='--git https://github.com/qdrant-labs/supernova --branch my-feature'
-# …or pin a sha (re-export after each push, like the Python loop):
-export NOVA_RUST_INSTALL_SPEC="--git https://github.com/qdrant-labs/supernova --rev $(git rev-parse HEAD)"
+git commit -am "wip" && git push          # CI builds + publishes dev-my-feature (~2-4 min, once)
+# branch-keyed: set once, then a plain `git push` re-publishes and you re-run
+export NOVA_RUST_BIN_URL='https://github.com/qdrant-labs/supernova/releases/download/dev-my-feature/{binary}'
 nova dist storm configs/storm/test.yaml
 ```
 
-Same gotchas as the Python path: **push is required** (cargo clones from GitHub —
-uncommitted work is invisible to workers), and **pools persist** so `setup:` won't re-run —
-`sky jobs pool down <pool>` between iterations. `unset NOVA_RUST_INSTALL_SPEC` to resume
-auto-pinning the release tag.
-
-> Each fresh worker compiles from source (a full Rust toolchain + build). Swapping the
-> on-worker compile for a prebuilt-binary download is tracked in #16; until then there's no
-> uncommitted-tree path for the Rust tools either.
+Gotchas: **push + wait for CI** (the download 404s — curl fails loudly — until the workflow
+has published the binary for that branch/version), and **pools persist** so `setup:` won't
+re-run — `sky jobs pool down <pool>` between iterations to pick up a fresh binary. `unset
+NOVA_RUST_BIN_URL` to resume pulling the controller's release version.
 
 ### Local binary override (`NOVA_<TOOL>_BIN`)
 
-For single-machine runs (`nova storm`, `nova load`), skip the install dance entirely and
-point the dispatcher at a binary you just built. `nova <tool>` checks `NOVA_<TOOL>_BIN`
-before falling back to `PATH`:
+For single-machine runs (`nova storm`, `nova load`), skip the download entirely and point the
+dispatcher at a binary you just built. `nova <tool>` checks `NOVA_<TOOL>_BIN` before `PATH`:
 
 ```bash
 cargo build --release -p nova-storm -p nova-load
 export NOVA_STORM_BIN="$(pwd)/target/release/nova-storm"
 export NOVA_LOAD_BIN="$(pwd)/target/release/nova-load"
-nova storm configs/storm/test.yaml      # runs your working-tree binary, no cargo install
+nova storm configs/storm/test.yaml      # runs your working-tree binary, no download
 ```
 
-This is the tightest loop for iterating on the Rust code itself — no commit, no push. It
-only affects *this* machine; remote workers still come from `NOVA_RUST_INSTALL_SPEC`.
+This is the tightest loop for iterating on the Rust code itself — no commit, no push, no CI. It
+only affects *this* machine; remote workers still download via `NOVA_RUST_BIN_URL` / the release.
 
 ## Releasing
 

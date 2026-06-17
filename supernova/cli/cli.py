@@ -65,6 +65,9 @@ _DIST_COMMANDS: dict[str, tuple[str, str]] = {
 # Python console script (embed) — same dispatch either way; only the install
 # hint shown when it's missing differs.
 #   name → (binary, short_help, install_hint)
+# The Rust crates default to no backend features, so the install hint must name
+# them explicitly — `cargo install … nova-storm` with no `--features` builds a
+# binary with no target backend (and nova-storm won't even compile).
 _CARGO = "cargo install --git https://github.com/qdrant-labs/supernova"
 _BINARY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "embed": (
@@ -75,12 +78,12 @@ _BINARY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "storm": (
         "nova-storm",
         "Load-test a vector store (single machine).",
-        f"{_CARGO} nova-storm",
+        f"{_CARGO} nova-storm --features qdrant",
     ),
     "load": (
         "nova-load",
         "Load pre-embedded data into a vector store.",
-        f"{_CARGO} nova-load",
+        f"{_CARGO} nova-load --features qdrant,s3,local",
     ),
 }
 

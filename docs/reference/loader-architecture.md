@@ -61,7 +61,7 @@ Controller (your laptop / Hetzner — Python orchestrator):
   5. (after all workers complete) nova load --finalize → enable indexing + wait for HNSW
 
 Workers (SkyPilot spot instances):
-  - setup: cargo install nova-load   (binary statically links qdrant/duckdb)
+  - setup: curl the prebuilt nova-load binary from the GitHub Release (statically links qdrant/duckdb)
   - run:   nova-load <cfg> --num-jobs N --no-manage-indexing
   - shard by $SKYPILOT_JOB_RANK → read only their slice of files
   - upsert to the shared Qdrant collection; no indexing lifecycle (controller owns it)

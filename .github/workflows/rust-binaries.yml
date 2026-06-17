@@ -1,0 +1,64 @@
+name: Build Rust binaries
+
+# Builds the prebuilt `nova-load` / `nova-storm` binaries that SkyPilot workers
+# download (see `build_rust_worker_setup` in supernova/cli/skypilot_utils.py),
+# so workers `curl` a binary in seconds instead of compiling from source.
+#
+# Two flavors, both published as GitHub Release assets:
+#   * version tag `v*`  -> release `v<version>`        (the default workers pull)
+#   * any other branch  -> pre-release `dev-<branch>`  (the NOVA_RUST_BIN_URL dev loop)
+#
+# Built on ubuntu-22.04 (older glibc) so the binary runs on 22.04+ workers; the
+# GitHub runner already has the C/C++ toolchain + libssl-dev the build needs.
+
+on:
+  push:
+    tags: ["v*"]
+    branches-ignore: ["master"] # master ships via version tags; branches get dev-<branch>
+  workflow_dispatch: {}
+
+# A new push to the same ref supersedes an in-flight build.
+concurrency:
+  group: rust-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & publish linux binaries
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # create/update the release + upload assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2 # caches target/ (incl. the slow bundled-duckdb build)
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Features must be explicit — both crates default to no backends. Keep in
+      # sync with the comment in skypilot_utils.py (RUST_BIN_DIR section).
+      - name: Build linux binaries
+        run: |
+          cargo build --release --locked -p nova-load --features qdrant,s3,local
+          cargo build --release --locked -p nova-storm --features qdrant
+
+      - name: Publish to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: |
+            target/release/nova-load
+            target/release/nova-storm

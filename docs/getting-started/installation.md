@@ -17,11 +17,12 @@ uv sync
 
 supernova is polyglot, so installation splits by language:
 
-- **`nova storm` / `nova load` are Rust binaries** (`nova-storm` / `nova-load`). Install them with cargo — they're self-contained (statically link qdrant/duckdb/postgres), so they need no Python extras:
+- **`nova storm` / `nova load` are Rust binaries** (`nova-storm` / `nova-load`). They're self-contained (statically link qdrant/duckdb/postgres) and need no Python extras. Install with cargo — the crates default to no backends, so name the features:
   ```bash
-  cargo install --git https://github.com/qdrant-labs/supernova nova-storm nova-load
+  cargo install --git https://github.com/qdrant-labs/supernova nova-storm --features qdrant
+  cargo install --git https://github.com/qdrant-labs/supernova nova-load --features qdrant,s3,local
   ```
-  For local dev against your working tree, point the dispatcher at a built binary instead: `export NOVA_STORM_BIN=$(pwd)/target/release/nova-storm`.
+  For local dev against your working tree, build once and point the dispatcher at the binary instead: `cargo build --release -p nova-storm --features full && export NOVA_STORM_BIN=$(pwd)/target/release/nova-storm`.
 - **`nova embed` is Python** (a `nova-embed` subprocess) and its ML stack lives under an extra.
 
 Python extras:
@@ -43,7 +44,7 @@ uv sync --extra embed
 uv sync --all-extras
 ```
 
-The `nova dist embed` orchestrator bakes `uv sync --extra embed` into its pool `setup:`; `nova dist load` / `nova dist storm` bake `cargo install … nova-load|nova-storm` instead, so workers get the right slice automatically.
+The `nova dist embed` orchestrator bakes `uv sync --extra embed` into its pool `setup:`; `nova dist load` / `nova dist storm` have the worker download the prebuilt `nova-load` / `nova-storm` binary from the matching GitHub Release instead, so workers get the right slice automatically.
 
 ## Environment variables
 
