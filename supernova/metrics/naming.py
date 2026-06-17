@@ -8,7 +8,7 @@ a run.
 """
 
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 
 _ADJECTIVES = (
     "frosty", "amber", "brisk", "cobalt", "dapper", "eager", "fuzzy", "gilded",
@@ -31,5 +31,8 @@ def make_run_id(name: str) -> str:
     """Unique id for ONE execution: base name + timestamp. The runs table keys on
     this, so rerunning with the same dispatch.run_name no longer collides.
     Distributed workers must share one id — the controller mints it and forwards
-    NOVA_RUN_ID rather than each worker calling this."""
-    return f"{name}-{datetime.now():%Y%m%d-%H%M%S}"
+    NOVA_RUN_ID rather than each worker calling this.
+
+    Timestamp is UTC to match every stored metric ts (samples/events/started_at
+    are all UTC); a local-time suffix here would read hours off from the data."""
+    return f"{name}-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"

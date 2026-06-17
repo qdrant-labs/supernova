@@ -115,7 +115,13 @@ def experiment(config, dry_run):
     metrics_backend = build_metrics(exp.get("metrics"))
     set_current(metrics_backend)
     metrics_backend.init()
-    metrics_backend.start(experiment_id, {"command": "experiment", "config": cfg})
+    # Self-tag experiment_id == run_id so the Grafana annotation query (which
+    # keys phase events off the selected run's experiment_id) also resolves when
+    # the experiment run itself is selected, not only its child storm runs.
+    metrics_backend.start(
+        experiment_id,
+        {"command": "experiment", "experiment_id": experiment_id, "config": cfg},
+    )
     logger.info("experiment run: %s", experiment_id)
 
     # Children inherit the experiment id; they each mint their own run_id but tag
