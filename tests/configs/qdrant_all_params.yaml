@@ -1,0 +1,70 @@
+# Coverage fixture: exercises every collection param the loader currently
+# supports, so the qdrant coverage test in
+# `crates/nova-load/src/stores/qdrant.rs` can assert each one flows through into
+# the CreateCollection request.
+#
+# Keep this in sync with `VectorSpec` (per-vector knobs) and `QdrantParams`
+# (collection-wide knobs): a new param should gain a line here AND an assertion
+# in `all_collection_params_flow_through`.
+
+loader:
+  batch_size: 256
+  concurrency: 4
+
+datasource:
+  type: local
+  path: /tmp/parquet
+
+vectors:
+  # Dense vector with every per-vector knob set.
+  dense:
+    type: dense
+    column: dense_embedding
+    size: 384
+    distance: cosine
+    datatype: float32
+    on_disk: true
+  # Multivector (late-interaction / ColBERT-style) exercising `comparator`.
+  colbert:
+    type: multivector
+    column: colbert_embedding
+    size: 128
+    distance: dot
+    datatype: float16
+    comparator: max_sim
+    on_disk: false
+  # Sparse vector exercising the sparse-index knobs + IDF modifier.
+  sparse:
+    type: sparse
+    column: sparse_embedding
+    on_disk: true
+    modifier: idf
+
+vectorstore:
+  type: qdrant
+  collection_name: everything
+  url: http://localhost:6334
+  api_key: secret
+  upsert_wait: true
+  params:
+    shard_number: 12
+    replication_factor: 2
+    write_consistency_factor: 3
+    on_disk_payload: true
+    recreate: true
+    # Collection-wide HNSW, quantization, and optimizer overrides.
+    hnsw:
+      m: 16
+      ef_construct: 100
+      full_scan_threshold: 10000
+      max_indexing_threads: 4
+      on_disk: true
+      payload_m: 8
+    quantization:
+      type: int8
+      quantile: 0.99
+      always_ram: true
+    optimizers:
+      default_segment_number: 4
+      memmap_threshold: 50000
+      indexing_threshold: 20000

@@ -1,0 +1,38 @@
+# Load config for the `nova-load` binary:
+#   nova-load configs/loader/test.yaml
+# For distributed loading, shard the corpus across jobs with CLI flags:
+#   nova-load configs/loader/test.yaml --num-jobs 25 --job-rank $SKYPILOT_JOB_RANK
+# (workers should also pass --no-manage-indexing so only the master creates the
+# collection). Resources/dispatch are an orchestration concern now, not part of
+# this file — the loader rejects unknown top-level keys.
+
+datasource:
+  type: s3
+  bucket: qdrant--vectorforge
+  prefix: mteb_tweets/all-MiniLM-L6-v2
+  id_expression: "vf_point_id(filename, file_row_number)"
+  payload_fields:
+    text: text
+    label: label
+    label_text: label_text
+    tweet_id: id
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+  sparse:
+    type: sparse
+    column: sparse_embedding
+
+vectorstore:
+  type: qdrant
+  collection_name: mteb_tweets_all-MiniLM-L6-v2
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  upsert_wait: false
+
+loader:
+  batch_size: 256
+  concurrency: 4

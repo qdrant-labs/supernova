@@ -1,0 +1,34 @@
+[package]
+name = "nova-load"
+version = "0.0.1"
+edition = "2024"
+
+[[bin]]
+name = "nova-load"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+object_store = { workspace = true }
+futures = { workspace = true }
+indicatif = { workspace = true }
+
+# Metrics sink (postgres compiled in so one binary serves stdout + postgres
+# configs; the backend is chosen at runtime from metrics.type).
+# nova-metrics = { workspace = true, features = ["postgres"] }
+
+# feature-specific dependencies
+qdrant-client = { workspace = true }
+duckdb = { workspace = true, optional = true }
+
+[dev-dependencies]
+rstest = "0.26.1"
