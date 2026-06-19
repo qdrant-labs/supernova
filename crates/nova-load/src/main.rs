@@ -1,9 +1,9 @@
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::Parser;
 
 use nova_load::config::LoadConfig;
-use nova_load::sources::DataSource;
 
 /// Load vectors from a datasource into a vector store, per a YAML config.
 #[derive(Debug, Parser)]
@@ -14,23 +14,29 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), std::convert::Infallible> {
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "nova_load=info".into()),
+        )
+        .init();
+
     let cli = Cli::parse();
 
-    let config = LoadConfig::from_path(&cli.config).unwrap_or_else(|err| {
-        eprintln!("Error parsing config file `{}`: {err}", cli.config.display());
-        std::process::exit(1);
-    });
+    let config = match LoadConfig::from_path(&cli.config) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("error: failed to load config `{}`: {err}", cli.config.display());
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let source_cfg = config.datasource;
-    let files = source_cfg.list_files().await.unwrap_or_else(|err| {
-        eprintln!("Error listing files from datasource: {err}");
-        std::process::exit(1);
-    });
-    println!("Found {} files to load.", files.len());
-    for file in files {
-        println!("  {} ({})", file.key, file.size.map_or("unknown size".to_string(), |s| format!("{} mB", s / 1_000_000)));
+    match nova_load::run_loader(config).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: load failed: {err}");
+            ExitCode::FAILURE
+        }
     }
-
-    Ok(())
 }

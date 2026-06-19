@@ -28,7 +28,7 @@ indicatif = { workspace = true }
 
 # feature-specific dependencies
 qdrant-client = { workspace = true }
-duckdb = { workspace = true, optional = true }
+duckdb = { workspace = true }
 
 [dev-dependencies]
 rstest = "0.26.1"

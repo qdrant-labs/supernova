@@ -91,6 +91,16 @@ pub trait DataSource {
     async fn fetch(&self, file: &FileRef) -> Result<LocalFile>;
 }
 
+impl DataSourceConfig {
+    /// Shared read options, regardless of backend.
+    pub fn reader(&self) -> &ReaderOptions {
+        match self {
+            DataSourceConfig::Local(c) => &c.reader,
+            DataSourceConfig::S3(c) => &c.reader,
+        }
+    }
+}
+
 /// Dispatch to the concrete backend so callers can hold a `DataSourceConfig`
 /// and treat it as a `DataSource` directly.
 #[async_trait]
