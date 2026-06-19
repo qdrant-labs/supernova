@@ -27,7 +27,7 @@ use crate::stores::{CollectionSchema, Point, PointId, StoreError, VectorStore, V
 /// schema). The `CreateCollection` request is assembled in
 /// [`build_create_collection`] from those vector specs plus the collection-wide
 /// [`QdrantParams`] here.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QdrantConfig {
     pub url: String,
@@ -41,6 +41,20 @@ pub struct QdrantConfig {
     /// Collection-wide creation params. All optional; Qdrant defaults apply.
     #[serde(default)]
     pub params: Option<QdrantParams>,
+}
+
+/// Manual `Debug` so the API key never lands in logs, errors, or `--dry-run`
+/// output — only whether one is set.
+impl fmt::Debug for QdrantConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QdrantConfig")
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("collection_name", &self.collection_name)
+            .field("upsert_wait", &self.upsert_wait)
+            .field("params", &self.params)
+            .finish()
+    }
 }
 
 /// Collection-wide knobs — attributes of the whole collection, not of any single
@@ -319,7 +333,10 @@ pub struct QdrantStore {
 impl QdrantConfig {
     /// Build the client once. Consumes the config to avoid cloning its fields.
     pub async fn connect(self) -> Result<QdrantStore, StoreError> {
-        let client = Qdrant::from_url(&self.url).api_key(self.api_key).build()?;
+        let client = Qdrant::from_url(&self.url)
+            .api_key(self.api_key)
+            // .check_compatibility(false) // skip since the log is annoying
+            .build()?;
         Ok(QdrantStore {
             client,
             collection_name: self.collection_name,

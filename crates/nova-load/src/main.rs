@@ -17,6 +17,9 @@ struct Cli {
     /// This job's index, in `[0, num_jobs)`. Each job loads its own slice.
     #[arg(long, default_value_t = 0)]
     job_rank: usize,
+    /// Inspect the config and file list without connecting or loading anything.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[tokio::main]
@@ -40,10 +43,16 @@ async fn main() -> ExitCode {
         }
     };
 
-    match nova_load::run_loader(config).await {
+    let result = if cli.dry_run {
+        nova_load::dry_run(config, cli.num_jobs, cli.job_rank).await
+    } else {
+        nova_load::run_loader(config).await
+    };
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: load failed: {err}");
+            eprintln!("error: {err}");
             ExitCode::FAILURE
         }
     }

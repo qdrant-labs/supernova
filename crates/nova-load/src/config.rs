@@ -24,6 +24,11 @@ pub struct LoaderConfig {
     pub batch_size: usize,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    /// How many files to download + read *ahead* while the current file's
+    /// batches are still being upserted, so the store connection stays busy
+    /// during S3/DuckDB time. 1 = no prefetch.
+    #[serde(default = "default_file_look_ahead")]
+    pub file_look_ahead: usize,
 }
 
 impl Default for LoaderConfig {
@@ -31,12 +36,17 @@ impl Default for LoaderConfig {
         Self {
             batch_size: default_batch_size(),
             concurrency: default_concurrency(),
+            file_look_ahead: default_file_look_ahead(),
         }
     }
 }
 
 fn default_batch_size() -> usize {
     256
+}
+
+fn default_file_look_ahead() -> usize {
+    2
 }
 
 impl LoadConfig {
