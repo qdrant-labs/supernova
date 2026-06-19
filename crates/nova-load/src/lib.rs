@@ -3,6 +3,8 @@ pub mod engine;
 pub mod sources;
 pub mod stores;
 
+use futures::{StreamExt, TryStreamExt};
+
 use config::LoadConfig;
 use sources::DataSource;
 use stores::CollectionSchema;
@@ -23,11 +25,13 @@ pub enum LoadError {
 /// upsert in batches. The collection is created (and indexing deferred) lazily
 /// from the first file's data, so dimensions are inferred from the parquet.
 ///
-/// Sequential for now: file-level partitioning for distributed runs and
-/// intra-worker concurrency are TODOs.
+/// Files are processed one at a time; within a file, batches upsert with
+/// bounded concurrency (`loader.concurrency`). File-level partitioning for
+/// distributed runs is still a TODO.
 pub async fn run_loader(config: LoadConfig) -> Result<(), LoadError> {
     let LoadConfig { datasource, vectorstore, vectors, loader } = config;
     let batch_size = loader.batch_size.max(1);
+    let concurrency = loader.concurrency.max(1);
     let id_expression = datasource.reader().id_expression.clone();
     let payload = datasource.reader().payload_fields.clone();
 
@@ -62,9 +66,15 @@ pub async fn run_loader(config: LoadConfig) -> Result<(), LoadError> {
             store.defer_indexing().await?;
         }
 
-        for chunk in points.chunks(batch_size) {
-            store.upsert_batch(chunk.to_vec()).await?;
-        }
+        // Upsert this file's batches with up to `concurrency` requests in flight
+        // at once. `buffer_unordered` is the idiomatic bounded-concurrency
+        // primitive — effectively a semaphore over a stream of upsert futures —
+        // and lets each future borrow `store` without `Arc`/spawning.
+        futures::stream::iter(points.chunks(batch_size))
+            .map(|chunk| store.upsert_batch(chunk.to_vec()))
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<()>>()
+            .await?;
         total += points.len() as u64;
         tracing::info!("{} ({}/{}) → {} points", file.key, i + 1, files.len(), points.len());
     }

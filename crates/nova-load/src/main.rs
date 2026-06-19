@@ -11,6 +11,12 @@ use nova_load::config::LoadConfig;
 struct Cli {
     /// Path to the loader config YAML.
     config: PathBuf,
+    /// Total number of parallel loader jobs (for distributed runs).
+    #[arg(long, default_value_t = 1)]
+    num_jobs: usize,
+    /// This job's index, in `[0, num_jobs)`. Each job loads its own slice.
+    #[arg(long, default_value_t = 0)]
+    job_rank: usize,
 }
 
 #[tokio::main]
@@ -23,6 +29,8 @@ async fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
+    // Parsed now; partitioning the file list by these is a TODO in run_loader.
+    tracing::info!(job_rank = cli.job_rank, num_jobs = cli.num_jobs, "starting nova-load");
 
     let config = match LoadConfig::from_path(&cli.config) {
         Ok(config) => config,
