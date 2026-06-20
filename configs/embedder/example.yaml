@@ -1,0 +1,45 @@
+source:
+  type: huggingface_parquet
+  dataset_name: mteb/tweet_sentiment_extraction
+  split: train
+  text_field: text
+
+dense_embedder:
+  type: sentence_transformer
+  model: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 128
+  dtype: bfloat16
+
+sparse_embedder:
+  type: fastembed
+  model: Qdrant/bm25
+  batch_size: 256
+
+# multivector_embedder:
+#   type: bge_m3
+#   model: BAAI/bge-m3
+#   batch_size: 8
+
+# How each row's text is split into pieces BEFORE embedding. Model-agnostic:
+# every embedder above receives the same pieces. Omit for the default
+# (passthrough = no split; each model truncates overflow at its own token limit).
+# chunking:
+#   strategy: fixed_char    # split into fixed-size CHARACTER windows
+#   chunk_chars: 1024
+#   overlap: 0
+#   # strategy: passthrough  # no-op (default)
+#   # strategy: semantic     # not implemented yet (issue #13)
+
+# storage:
+#   type: s3
+#   bucket: qdrant--vectorforge
+#   prefix: mteb_tweets/all-MiniLM-L6-v2
+#   output_dir: /tmp/supernova
+
+storage:
+  type: local
+  output_dir: /tmp/mteb_tweets_all-MiniLM-L6-v2
+
+pipeline:
+  chunk_size: 1000
+  flush_threshold: 10000
