@@ -40,6 +40,9 @@ pub struct ReadJob {
     pub payload: HashMap<String, String>,
     /// SQL id expression, e.g. `vf_point_id(filename, file_row_number)`.
     pub id_expression: String,
+    /// Cap the number of rows read. `None` reads the whole file; `Some(n)` is
+    /// used to cheaply sample a file (e.g. inferring dimensions from one row).
+    pub limit: Option<usize>,
 }
 
 impl ReadJob {
@@ -73,12 +76,17 @@ impl ReadJob {
         for (field, column) in &self.payload {
             projections.push(format!("{} AS \"{}\"", column, esc_ident(field)));
         }
+        let limit = match self.limit {
+            Some(n) => format!(" LIMIT {n}"),
+            None => String::new(),
+        };
         format!(
             "SELECT {} FROM (SELECT *, '{}' AS filename \
-             FROM read_parquet('{}', file_row_number = true))",
+             FROM read_parquet('{}', file_row_number = true)){}",
             projections.join(", "),
             esc_str(&self.filename),
             esc_str(&self.path.to_string_lossy()),
+            limit,
         )
     }
 

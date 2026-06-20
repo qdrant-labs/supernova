@@ -47,5 +47,46 @@ format.
 
 ## Distributed fleet lifecycle
 
-See `--no-manage-indexing` and the master/fleet/finalize flow. (Document the
-chosen design here once implemented.)
+The load is split into phases, exposed as CLI subcommands so an orchestrator can
+drive a fleet with no inter-worker coordination:
+
+```
+nova-load run <config>                              # single node: all phases
+nova-load prepare <config>                          # master, once
+nova-load load <config> --num-jobs N --job-rank R   # each worker
+nova-load finalize <config>                         # master, once
+nova-load inspect <config> [--num-jobs --job-rank]  # dry inspection
+```
+
+Phase → `VectorStore` trait methods:
+
+| Phase    | Does                                            | Who         |
+|----------|-------------------------------------------------|-------------|
+| prepare  | `ensure_collection` + `defer_indexing`          | master      |
+| load     | partition files → read → `upsert_batch`         | every worker|
+| finalize | `enable_indexing` + `wait_for_indexing`         | master      |
+
+Orchestration (e.g. SkyPilot):
+
+1. master: `nova-load prepare config.yaml`
+2. fleet:  `nova-load load config.yaml --num-jobs $N --job-rank $SKYPILOT_JOB_RANK`
+3. master (after all workers exit): `nova-load finalize config.yaml`
+
+### Design rationale
+
+- **Master-controller, not leader-election.** Setup fully completes before any
+  worker starts, so workers never poll/wait for the collection or race on the
+  indexing toggle. Preserves the zero-coordination property of stride
+  partitioning (`plan::partition`).
+- **Subcommands, not just flags.** Each phase is independently retryable and
+  idempotent — re-run a dead worker's rank, or re-run `finalize` if it timed out.
+  Deterministic point ids mean a re-run rank just re-upserts the same points.
+- **`recreate` footgun is closed structurally.** Dropping a collection only
+  happens in `ensure_collection`, which only `prepare`/`run` call. A fleet
+  `load` physically cannot drop data, regardless of config.
+
+### Dimension inference in `prepare`
+
+`prepare` needs vector dims before the fleet starts. If every vector has an
+explicit `size:`, no read happens. Otherwise it samples **one row** of the first
+file (`ReadJob.limit = Some(1)`) to measure them — cheap, master-only, once.
