@@ -1,0 +1,20 @@
+[project]
+name = "nova-embed"
+version = "0.1.0"
+description = "Embedding generation for the supernova toolset (PyTorch / sentence-transformers)."
+requires-python = ">=3.9"
+# Heavy ML deps live here, NOT in nova-cli — install this only where you run
+# embedding generation.
+dependencies = [
+    "sentence-transformers>=3.0",
+    "torch>=2.0",
+]
+
+# Exposes `nova-embed` on PATH, so `nova embed ...` dispatches here just like a
+# Rust `nova-<cmd>` binary would.
+[project.scripts]
+nova-embed = "nova_embed.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
