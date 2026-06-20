@@ -1,4 +1,4 @@
-"""Git-style command dispatcher.
+"""nova — a git-style dispatcher for the supernova toolset.
 
 `nova <cmd> [args...]` discovers an executable named `nova-<cmd>` on PATH and
 *replaces* this process with it via os.execv — so exit codes, signals, and
@@ -15,14 +15,13 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__
+__version__ = "0.1.0"
 
 PREFIX = "nova-"
 
 
 def discover() -> dict[str, Path]:
-    """
-    Map command name -> executable for every `nova-*` on PATH.
+    """Map command name -> executable for every `nova-*` on PATH.
 
     Earlier PATH entries win, mirroring normal shell resolution.
     """
@@ -37,7 +36,7 @@ def discover() -> dict[str, Path]:
             continue  # unreadable/nonexistent PATH entry — skip
         for entry in entries:
             name = entry.name
-            if not name.startswith(PREFIX) or name == "nova-cli":
+            if not name.startswith(PREFIX):
                 continue
             if entry.is_file() and os.access(entry, os.X_OK):
                 found.setdefault(name[len(PREFIX):], entry)
@@ -72,22 +71,18 @@ def main() -> int:
         return 0
 
     command, rest = argv[0], argv[1:]
-    commands = discover()
-    exe = commands.get(command)
+    prog = f"{PREFIX}{command}"
+    exe = discover().get(command)
 
     if exe is None:
-        prog = f"{PREFIX}{command}"
         print(f"nova: '{command}' is not a nova command (no '{prog}' on PATH).", file=sys.stderr)
+        commands = discover()
         if commands:
             print(f"available: {', '.join(sorted(commands))}", file=sys.stderr)
         return 127
 
     # Replace this process. argv[0] is the conventional program name.
-    os.execv(str(exe), [prog_name(command), *rest])
-
-
-def prog_name(command: str) -> str:
-    return f"{PREFIX}{command}"
+    os.execv(str(exe), [prog, *rest])
 
 
 if __name__ == "__main__":
