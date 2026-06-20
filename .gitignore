@@ -39,3 +39,4 @@ htmlcov/
 
 # zensical docs build output
 site/
+.cache/
