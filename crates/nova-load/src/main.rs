@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use nova_load::config::LoadConfig;
+use nova_load::plan::Partition;
 
 /// Load vectors from a datasource into a vector store, per a YAML config.
 #[derive(Debug, Parser)]
@@ -32,8 +33,15 @@ async fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
-    // Parsed now; partitioning the file list by these is a TODO in run_loader.
-    tracing::info!(job_rank = cli.job_rank, num_jobs = cli.num_jobs, "starting nova-load");
+
+    let partition = match (Partition { rank: cli.job_rank, num_jobs: cli.num_jobs }).validate() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(job_rank = partition.rank, num_jobs = partition.num_jobs, "starting nova-load");
 
     let config = match LoadConfig::from_path(&cli.config) {
         Ok(config) => config,
@@ -44,9 +52,9 @@ async fn main() -> ExitCode {
     };
 
     let result = if cli.dry_run {
-        nova_load::dry_run(config, cli.num_jobs, cli.job_rank).await
+        nova_load::dry_run(config, partition).await
     } else {
-        nova_load::run_loader(config).await
+        nova_load::run_loader(config, partition).await
     };
 
     match result {

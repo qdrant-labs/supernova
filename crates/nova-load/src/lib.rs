@@ -1,5 +1,6 @@
 pub mod config;
 pub mod engine;
+pub mod plan;
 pub mod sources;
 pub mod stores;
 
@@ -10,6 +11,7 @@ use futures::{StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use config::LoadConfig;
+use plan::Partition;
 use sources::DataSource;
 use stores::{CollectionSchema, Point, StoreError};
 
@@ -33,21 +35,24 @@ pub enum LoadError {
 /// downloading anything: dump the resolved config (secrets redacted) and list
 /// the source files. Listing does hit the source (e.g. an S3 `ListObjects`),
 /// since enumerating files is the whole point.
-pub async fn dry_run(config: LoadConfig, num_jobs: usize, job_rank: usize) -> Result<(), LoadError> {
+pub async fn dry_run(config: LoadConfig, partition: Partition) -> Result<(), LoadError> {
     println!("== nova-load dry run ==\n");
-    println!("partition:   job_rank={job_rank} num_jobs={num_jobs}");
-    if num_jobs > 1 {
-        println!("             (note: file partitioning is not yet applied during load)");
-    }
+    println!("partition:   job_rank={} num_jobs={}", partition.rank, partition.num_jobs);
     println!("loader:      {:?}", config.loader);
     println!("vectorstore: {:?}", config.vectorstore);
     println!("datasource:  {:?}", config.datasource);
     println!("vectors:     {:?}", config.vectors);
 
-    let files = config.datasource.list_files().await?;
-    let total: u64 = files.iter().filter_map(|f| f.size).sum();
-    println!("\nfiles: {} found, {} total", files.len(), human_size(total));
-    for f in &files {
+    let all_files = config.datasource.list_files().await?;
+    let mine = plan::partition(&all_files, partition);
+    let total: u64 = mine.iter().filter_map(|f| f.size).sum();
+    println!(
+        "\nfiles: this worker loads {} of {} found ({} of its slice)",
+        mine.len(),
+        all_files.len(),
+        human_size(total),
+    );
+    for f in &mine {
         let size = f.size.map(human_size).unwrap_or_else(|| "?".to_string());
         println!("  {} ({size})", f.key);
     }
@@ -71,9 +76,9 @@ fn human_size(bytes: u64) -> String {
 }
 
 /// Files are processed one at a time; within a file, batches upsert with
-/// bounded concurrency (`loader.concurrency`). File-level partitioning for
-/// distributed runs is still a TODO.
-pub async fn run_loader(config: LoadConfig) -> Result<(), LoadError> {
+/// bounded concurrency (`loader.concurrency`). For distributed runs, `partition`
+/// selects this worker's slice of the (deterministically ordered) file list.
+pub async fn run_loader(config: LoadConfig, partition: Partition) -> Result<(), LoadError> {
     let LoadConfig { datasource, vectorstore, vectors, loader } = config;
     let batch_size = loader.batch_size.max(1);
     let concurrency = loader.concurrency.max(1);
@@ -82,12 +87,23 @@ pub async fn run_loader(config: LoadConfig) -> Result<(), LoadError> {
     let payload = datasource.reader().payload_fields.clone();
 
     let store = vectorstore.connect().await?;
-    let files = datasource.list_files().await?;
+    let all_files = datasource.list_files().await?;
+    let total_files = all_files.len();
+    let files = plan::partition(&all_files, partition);
     if files.is_empty() {
-        tracing::warn!("no files to load");
+        tracing::warn!(
+            "worker {}/{} has no files of {total_files} to load (did you provision more workers than files?)",
+            partition.rank,
+            partition.num_jobs,
+        );
         return Ok(());
     }
-    tracing::info!("loading {} file(s) into {store}", files.len());
+    tracing::info!(
+        "worker {}/{} loading {} of {total_files} file(s) into {store}",
+        partition.rank,
+        partition.num_jobs,
+        files.len(),
+    );
 
     // Files progress + a live aggregate upsert rate (points/sec across all the
     // concurrent in-flight upserts). The bar draws to stderr, clear of the
