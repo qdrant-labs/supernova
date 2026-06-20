@@ -13,7 +13,7 @@ Requirements: [uv](https://docs.astral.sh/uv/), and [Rust](https://rustup.rs/)
 (`cargo`) for the `load` / `storm` tools.
 
 ```bash
-make all        # nova dispatcher + embed + load + storm
+make all        # nova dispatcher + embed + load + storm + dist
 ```
 
 Or install just what you need:
@@ -23,6 +23,7 @@ make cli        # the `nova` dispatcher only (zero deps, instant)
 make embed      # nova embed   (heavy: torch, sentence-transformers)
 make load       # nova load    (Rust binary)
 make storm      # nova storm    (Rust binary)
+make dist       # nova dist    (SkyPilot orchestration; controller-side)
 ```
 
 Make sure your tool dirs are on `PATH` so `nova` can find the sub-tools:
@@ -57,19 +58,31 @@ expanded from the environment. See the [docs](#docs) for each tool's config.
 
 ### Distributed
 
-Each tool partitions its own work, so a fleet is N copies with a rank:
+Each tool partitions its own work, so a fleet is N copies with a rank — the rank
+is the only thing that differs between workers:
 
 ```bash
-# one master prepares the collection, then every worker loads its slice
+nova embed configs/embedder/test.yaml --num-jobs 50 --job-rank $RANK
+# load splits into prepare (once) / load (per worker) / finalize (once):
 nova load prepare configs/loader/test.yaml
 nova load load    configs/loader/test.yaml --num-jobs 50 --job-rank $RANK
 nova load finalize configs/loader/test.yaml
-
-nova embed configs/embedder/test.yaml --num-jobs 50 --job-rank $RANK
 ```
 
-Orchestration (SkyPilot, etc.) is external: it just invokes `nova <tool>` on each
-node with that node's rank.
+You can run that yourself on any fleet, or let **`nova dist`** drive SkyPilot for
+you (`make dist` to install it). It provisions a pool and submits the ranked jobs;
+compute is defined by a SkyPilot YAML you point at (`--resources`), kept entirely
+separate from the workload config:
+
+```bash
+nova dist embed configs/embedder/test.yaml --resources configs/skypilot/embed.yaml --num-jobs 50
+nova dist load  configs/loader/test.yaml  --resources configs/skypilot/load.yaml  --num-jobs 50
+nova dist load  configs/loader/test.yaml  --finalize        # after workers finish
+nova dist storm configs/storm/test.yaml   --resources configs/skypilot/storm.yaml --num-jobs 10
+```
+
+Add `--dry-run` to generate and inspect the pool/job YAMLs without launching.
+Resource templates live in `configs/skypilot/`.
 
 ## Project structure
 
@@ -81,8 +94,9 @@ supernova/
 │   ├── nova-load/          #   nova load
 │   └── nova-storm/         #   nova storm
 ├── python/
-│   └── nova-embed/         # nova embed (ML pipeline; [embed] extra)
-├── configs/                # example YAML configs
+│   ├── nova-embed/         # nova embed (ML pipeline; [embed] extra)
+│   └── nova-dist/          # nova dist  (SkyPilot orchestration)
+├── configs/                # example YAML configs (+ skypilot/ resource templates)
 ├── docs/                   # zensical docs site
 └── Makefile
 ```

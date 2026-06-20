@@ -21,7 +21,8 @@ PREFIX = "nova-"
 
 
 def discover() -> dict[str, Path]:
-    """Map command name -> executable for every `nova-*` on PATH.
+    """
+    Map command name -> executable for every `nova-*` on PATH.
 
     Earlier PATH entries win, mirroring normal shell resolution.
     """

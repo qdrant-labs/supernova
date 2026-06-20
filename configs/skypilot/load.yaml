@@ -1,0 +1,22 @@
+# Resources for `nova dist load` — copy and tweak.
+#
+#   nova dist load configs/loader/test.yaml --resources configs/skypilot/load.yaml --num-jobs 50
+#   # ...then, after all workers finish:
+#   nova dist load configs/loader/test.yaml --finalize
+#
+# `prepare` (create collection, defer indexing) runs on your machine before the
+# fan-out; `finalize` (build the index) is a separate command after. Workers just
+# run `nova-load load <cfg> --num-jobs N --job-rank $SKYPILOT_JOB_RANK`.
+
+resources:
+  cloud: aws
+  cpus: 8+
+  use_spot: true
+  disk_size: 100
+
+# Install nova-load on each worker (the Rust binary). Pin to a tag/SHA.
+setup: |
+  curl -LsSf https://astral.sh/uv/install.sh >/dev/null 2>&1 || true
+  command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  source "$HOME/.cargo/env"
+  cargo install --git https://github.com/qdrant-labs/supernova nova-load

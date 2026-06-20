@@ -18,6 +18,7 @@ nav = [
   {"Loading" = [
     "loading/overview.md",
   ]},
+  {"Distributed" = "distributed.md"},
   {"Reference" = [
     "reference/cli.md",
   ]},

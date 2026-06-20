@@ -1,0 +1,27 @@
+# Resources for `nova dist embed` — copy and tweak.
+#
+#   nova dist embed configs/embedder/test.yaml --resources configs/skypilot/embed.yaml --num-jobs 50
+#
+# nova-dist adds the pool wrapper, the staged config, and the per-rank `run:`
+# (nova-embed <cfg> --num-jobs N; the rank comes from $SKYPILOT_JOB_RANK).
+# You own `resources` and `setup` (how a worker installs nova-embed).
+
+resources:
+  cloud: aws
+  accelerators: A10G:1
+  use_spot: true
+  disk_size: 150
+  # Deep-learning AMI with CUDA, per region (a plain Ubuntu AMI has no GPU drivers):
+  image_id:
+    us-east-1: ami-0038d79e7270bb987
+    us-west-2: ami-08a03808395c1b31f
+
+# Install nova-embed on each worker. Pin to a tag/SHA so the fleet runs identical
+# code. Adjust the git URL/ref to your fork.
+setup: |
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  uv tool install 'nova-embed[embed] @ git+https://github.com/qdrant-labs/supernova@main#subdirectory=python/nova-embed'
+
+envs:
+  HF_HUB_ENABLE_HF_TRANSFER: "1"

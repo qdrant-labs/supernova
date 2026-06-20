@@ -1,0 +1,17 @@
+# Resources for `nova dist storm` — copy and tweak.
+#
+#   nova dist storm configs/storm/test.yaml --resources configs/skypilot/storm.yaml --num-jobs 10
+#
+# storm is REPLICATED, not partitioned: every worker runs the same profile, so
+# total offered load ≈ num_jobs × (concurrency or qps). Workers run
+# `nova-storm <cfg>`.
+
+resources:
+  cloud: aws
+  cpus: 4+
+  use_spot: true
+
+setup: |
+  command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  source "$HOME/.cargo/env"
+  cargo install --git https://github.com/qdrant-labs/supernova nova-storm
