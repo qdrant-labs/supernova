@@ -32,6 +32,27 @@ as just-another-package. It's deliberately dependency-free.
 Heavy commands are separate packages under `python/`, installed only where
 needed — like `git-*` subcommands.
 
+### nova-embed
+
+Embedding generation (chunkers → embedders → storage), streamed from a dataset
+source and written as parquet. Honors the same `--num-jobs` / `--job-rank`
+distributed contract as `nova-load`: each rank computes its own `offset`/`limit`
+slice of the dataset (from `--job-rank`, or `$SKYPILOT_JOB_RANK`).
+
+Config is validated with **pydantic** (`nova_embed.config`): `pipeline` knobs are
+typed with defaults in one place, while `source`/`*_embedder`/`storage` carry a
+`type` plus flexible backend-specific kwargs. `${VAR}` / `${VAR:-default}`
+references are env-expanded, matching the Rust crates.
+
+The base package is light (pydantic, pyarrow, …); the actual ML stack (torch,
+sentence-transformers, …) is the `embed` extra:
+
+```sh
+uv pip install -e 'python/nova-embed[embed]'
+nova embed configs/embedder/test.yaml --num-jobs 50 --job-rank $SKYPILOT_JOB_RANK
+nova embed configs/embedder/test.yaml --dry-run
+```
+
 ## Dev setup
 
 ```sh

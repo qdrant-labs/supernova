@@ -1,20 +1,47 @@
 [project]
 name = "nova-embed"
 version = "0.1.0"
-description = "Embedding generation for the supernova toolset (PyTorch / sentence-transformers)."
-requires-python = ">=3.9"
-# Heavy ML deps live here, NOT in nova-cli — install this only where you run
-# embedding generation.
+description = "Embedding generation for the supernova toolset — stream datasets, embed at scale, write parquet."
+requires-python = ">=3.11"
+# Base deps are light enough to import the config layer and the CLI scaffolding.
+# The heavy ML stack (torch, sentence-transformers, …) is in the `embed` extra,
+# installed only on embedding workers.
 dependencies = [
-    "sentence-transformers>=3.0",
-    "torch>=2.0",
+    "pydantic>=2",
+    "pyarrow",
+    "numpy",
+    "pyyaml",
+    "tqdm",
+    "boto3",
+    "huggingface_hub>=1.5",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+# The actual embedding workers. `nova embed` won't run without these.
+embed = [
+    # See upstream notes: aiobotocore/aiohttp pinned around a put_object hang.
+    "aiobotocore<3.5",
+    "aiohttp<3.13.5",
+    "tiktoken>=0.12.0",
+    "openai",
+    "sentence-transformers",
+    "torch",
+    "transformers",
+    "FlagEmbedding",
+    "einops>=0.8.2",
+    "fastembed",
+    "hf_transfer",
 ]
 
 # Exposes `nova-embed` on PATH, so `nova embed ...` dispatches here just like a
 # Rust `nova-<cmd>` binary would.
 [project.scripts]
-nova-embed = "nova_embed.cli:main"
+nova-embed = "nova_embed.cli.run_embedder:embed"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nova_embed"]
