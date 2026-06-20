@@ -36,3 +36,6 @@ dist/
 .coverage
 htmlcov/
 
+
+# zensical docs build output
+site/

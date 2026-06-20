@@ -1,0 +1,37 @@
+[project]
+site_name = "supernova"
+site_description = "Generate massive pre-embedded datasets, then load them into vector databases."
+docs_dir = "docs"
+site_dir = "site"
+
+nav = [
+  {"Home" = "index.md"},
+  {"Getting Started" = [
+    "getting-started/installation.md",
+    "getting-started/quickstart.md",
+  ]},
+  {"Embedding" = [
+    "embedding/overview.md",
+    "embedding/dense-embedders.md",
+    "embedding/sparse-embedders.md",
+  ]},
+  {"Loading" = [
+    "loading/overview.md",
+  ]},
+  {"Reference" = [
+    "reference/cli.md",
+  ]},
+]
+
+extra_css = ["stylesheets/extra.css"]
+
+[project.theme]
+variant = "modern"
+features = [
+  "navigation.instant",
+  "navigation.tabs",
+  "navigation.sections",
+  "navigation.indexes",
+  "navigation.path",
+  "toc.follow",
+]

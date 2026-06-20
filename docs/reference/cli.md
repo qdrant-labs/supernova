@@ -1,0 +1,85 @@
+# CLI Reference
+
+`nova` is a dispatcher: `nova <cmd> [args...]` finds `nova-<cmd>` on your `PATH`
+and execs it, forwarding all arguments untouched. Exit codes, signals, and
+stdio pass straight through.
+
+```bash
+nova --help        # list every nova-* tool found on PATH
+nova --version     # dispatcher version
+```
+
+Each sub-tool owns its own argument parsing — `nova <cmd> --help` shows that
+tool's real flags.
+
+All tools read a YAML config and expand `${VAR}` / `${VAR:-default}` references
+from the environment. All shard themselves with `--num-jobs` / `--job-rank`
+(rank defaults to `$SKYPILOT_JOB_RANK`).
+
+## nova embed
+
+Embed a dataset into parquet (Python).
+
+```bash
+nova embed <config> [--num-jobs N --job-rank R] [--dry-run]
+```
+
+| Flag | Meaning |
+|------|---------|
+| `<config>` | Path to the embedder YAML (or `NOVA_CONFIG_PATH`) |
+| `--num-jobs` | Total parallel jobs; each rank embeds its `offset`/`limit` slice of the dataset |
+| `--job-rank` | This job's rank (0-indexed); defaults to `$SKYPILOT_JOB_RANK` |
+| `--dry-run` | Print the resolved plan (source, engine, storage, slice) and exit |
+
+See [Embedding overview](../embedding/overview.md) for the config.
+
+## nova load
+
+Load pre-embedded parquet into a vector store (Rust). Subcommands split the
+lifecycle so a fleet can prepare once, load in parallel, and finalize once.
+
+```bash
+nova load run      <config>                          # single machine: all phases
+nova load prepare  <config>                          # master: create collection, defer indexing
+nova load load     <config> --num-jobs N --job-rank R  # worker: load this slice (no indexing mgmt)
+nova load finalize <config>                          # master: re-enable + await indexing
+nova load inspect  <config> [--num-jobs N --job-rank R]  # dry inspection (config + file slice)
+```
+
+- **`run`** is the single-machine shorthand for `prepare` + `load` + `finalize`.
+- For a fleet: `prepare` once, then `load` on every worker with its rank, then
+  `finalize` once after all workers exit. Files are partitioned by a deterministic
+  stride, so workers need no coordination.
+- `--num-jobs` / `--job-rank` apply to `load` and `inspect` only (the phases that
+  operate on a slice).
+
+Files are partitioned by a deterministic stride, point ids are content-addressed
+(`vf_point_id`), and HNSW indexing is deferred during the bulk load and built
+once at `finalize`.
+
+## nova storm
+
+Load-test a vector store (Rust). Work is **replicated**, not partitioned — every
+worker runs the same profile, so total offered load ≈ `num_workers × {concurrency
+or qps}`.
+
+```bash
+nova storm <config>
+```
+
+The config's `load` block picks the mode:
+
+- **closed-loop** (default, `qps` unset) — hold `concurrency` requests in flight
+  for `duration_s`; measures max throughput at that depth.
+- **open-loop paced** (`qps > 0`) — launch on a fixed `1/qps` schedule with
+  `concurrency` as an in-flight cap; avoids coordinated omission.
+
+Prints a latency summary (requests, errors, throughput, p50/p95/p99, max) at the
+end.
+
+## Local dev: overriding a tool's location
+
+`nova` resolves `nova-<cmd>` on `PATH`. For local iteration, build a tool and put
+it ahead on `PATH` (e.g. `cargo build -p nova-load && export
+PATH="$PWD/target/debug:$PATH"`), or install it into place with the matching
+`make` target.

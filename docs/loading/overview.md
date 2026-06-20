@@ -1,0 +1,134 @@
+# Loading Overview
+
+supernova's loading pipeline streams pre-embedded parquet files from S3 or HuggingFace into vector stores like Qdrant. An embedding run typically produces many parquet files (one per chunk/slice) under a shared S3 prefix -- the loader reads all of them. It uses DuckDB for efficient remote parquet reads and async concurrency for parallel upserts.
+
+![Loading Pipeline](../fig/ingestion_pipelione.svg)
+
+## Configuration
+
+Loader configs live in `configs/loader/`. The same file drives a single-machine run (`nova load run`) and a distributed fleet (`nova load prepare` / `load --num-jobs N --job-rank R` / `finalize`). See the [CLI reference](../reference/cli.md#nova-load) for the lifecycle.
+
+```yaml
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+  sparse:
+    type: sparse
+    column: sparse_embedding
+  colbert:
+    type: multivector
+    column: multivector_embedding
+    distance: cosine
+    comparator: max_sim
+
+datasource:
+  type: s3                          # s3 or huggingface
+  bucket: my-bucket
+  prefix: dataset/model
+  id_expression: "vf_point_id(filename, file_row_number)"   # see below
+  payload_fields:                   # what ends up in the vector store payload
+    text: text                      # payload key: parquet column name
+    source: source
+
+vectorstore:
+  type: qdrant
+  collection_name: my-collection
+  url: ${QDRANT_URL}                # env var substitution with ${VAR}
+  api_key: ${QDRANT_API_KEY}
+
+loader:
+  batch_size: 1000                  # points per upsert call
+  prefetch_size: 100000             # rows per DuckDB fetch
+  concurrency: 8                    # parallel upsert tasks
+```
+
+## Running
+
+```bash
+nova load configs/loader/my_dataset.yaml
+```
+
+## Datasources
+
+### S3
+
+Streams parquet files via DuckDB's httpfs extension. No local download.
+
+```yaml
+datasource:
+  type: s3
+  bucket: my-bucket
+  prefix: stanford-oval--ccnews/baai_bge_large_en_v1.5
+```
+
+Reads all parquet files matching `s3://bucket/prefix/**/*.parquet`.
+
+### HuggingFace
+
+Streams directly from HuggingFace Hub via DuckDB's `hf://` protocol.
+
+```yaml
+datasource:
+  type: huggingface
+  repo_id: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+  subdir: en
+```
+
+## Point IDs (`id_expression`)
+
+`id_expression` is a **DuckDB SQL expression** the loader evaluates per row to produce the Qdrant point ID. The default (`row_id`) is just a bare column name and works if your parquets carry a pre-baked `row_id` column. The recommended form for supernova-produced corpora is the built-in macro:
+
+```yaml
+datasource:
+  id_expression: "vf_point_id(filename, file_row_number)"
+```
+
+The macro hashes `(parquet path, physical row index)` into a deterministic UUID, so recall ground truth from the eval pipeline lines up with the loaded point IDs.
+
+`file_row_number` is critical here: it's a DuckDB virtual column that always reflects the physical row index, regardless of parallel scan order. Do **not** use `ROW_NUMBER() OVER (PARTITION BY filename)` — that reflects DuckDB's scan ordering and produces different IDs from one run to the next under concurrency. There's a regression test for this in `tests/test_loader_id_expression.py`.
+
+The base reader auto-enables `read_parquet(..., filename=true, file_row_number=true)` whenever your `id_expression` mentions either column, so you don't have to wire that yourself.
+
+## Vectors
+
+The top-level `vectors:` block declares one or more named vectors. Each key becomes the vector name in Qdrant; each entry needs `type` (`dense`, `sparse`, or `multivector`) and `column` (the parquet column).
+
+| Type | Distance | Other |
+|------|----------|-------|
+| `dense` | `cosine` (default), `dot`, `euclid`, `manhattan` | -- |
+| `sparse` | -- | -- |
+| `multivector` | same as dense | `comparator: max_sim` (default) |
+
+A collection with multiple named vectors lets you do hybrid retrieval (e.g. dense + sparse + late-interaction multivector).
+
+## Payload composition
+
+`payload_fields` controls what data gets stored alongside each vector:
+
+```yaml
+payload_fields:
+  text: text              # store parquet "text" column as "text" in payload
+  abstract: text          # ...or rename it to "abstract"
+  source: source
+  url: url
+```
+
+JSON-string columns that parse to a dict are automatically unpacked into the payload.
+
+## How it works
+
+1. **DuckDB streams** parquet data in large chunks (`prefetch_size` rows per fetch)
+2. **Chunks are sliced** into `batch_size` upsert batches locally
+3. **Async upserts** run concurrently, controlled by a semaphore (`concurrency`)
+4. **Deferred indexing** -- HNSW construction is disabled during load, then built in one pass
+5. **Retry with backoff** -- failed upserts are retried up to 3 times
+
+## Tuning
+
+| Parameter | Default | Guidance |
+|-----------|---------|----------|
+| `batch_size` | 1000 | Larger = fewer HTTP calls. 1000 is good for 768-1024 dim vectors. |
+| `prefetch_size` | batch_size * 10 | Larger = fewer S3 round trips. 100k works well. |
+| `concurrency` | 8 | Lower if you're getting timeouts. |
