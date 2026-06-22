@@ -1,6 +1,6 @@
 [project]
 name = "nova-dist"
-version = "0.1.0"
+version = "0.0.1"
 description = "Distributed orchestration for the supernova toolset — fan embed/load/storm across a SkyPilot fleet."
 requires-python = ">=3.11"
 # This package IS the SkyPilot orchestrator, so the SDK is a core dep (not an
