@@ -92,12 +92,6 @@ async def run_embedder(
             ):
                 await work_queue.put((chunk_id, records))
         finally:
-            # always send sentinels so workers exit even if the source raised;
-            # otherwise drain_results hangs waiting on `finished_workers` and
-            # the original exception gets masked.
-            logger.info(
-                "Chunker finished, sending stop signals to %d workers", num_workers
-            )
             for _ in range(num_workers):
                 await work_queue.put(None)
 
