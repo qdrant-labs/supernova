@@ -2,10 +2,17 @@
 name = "nova-storm"
 version = "0.0.1"
 edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
 
 [[bin]]
 name = "nova-storm"
 path = "src/main.rs"
+
+# `cargo binstall nova-storm` fetches the prebuilt binary from the matching
+# `v*` release (see .github/workflows/rust-binaries.yml) instead of compiling.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
 
 [dependencies]
 async-trait = { workspace = true }

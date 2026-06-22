@@ -1,4 +1,6 @@
-# Resources for `nova dist embed` — copy and tweak.
+# OPTIONAL override for `nova dist embed` — not required (built-in defaults
+# install nova-embed from git). Use this to change resources/GPU or pin a ref.
+# Copy and tweak.
 #
 #   nova dist embed configs/embedder/test.yaml --resources configs/skypilot/embed.yaml --num-jobs 50
 #

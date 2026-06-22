@@ -1,12 +1,14 @@
-# Resources for `nova dist load` — copy and tweak.
+# OPTIONAL override for `nova dist load`. You don't need this file — nova dist
+# has built-in defaults that download the prebuilt nova-load binary from the
+# latest release (fast, no compile). Pass it with --resources, or drop it at
+# ~/.nova/skypilot/load.yaml. Only the keys you set override the defaults.
 #
 #   nova dist load configs/loader/test.yaml --resources configs/skypilot/load.yaml --num-jobs 50
-#   # ...then, after all workers finish:
-#   nova dist load configs/loader/test.yaml --finalize
+#   nova dist load configs/loader/test.yaml --finalize     # after workers finish
 #
-# `prepare` (create collection, defer indexing) runs on your machine before the
-# fan-out; `finalize` (build the index) is a separate command after. Workers just
-# run `nova-load load <cfg> --num-jobs N --job-rank $SKYPILOT_JOB_RANK`.
+# This example overrides `setup` to build from a dev branch (the common reason to
+# override) — testing un-released code on a fleet. Omit `setup` to keep the
+# default prebuilt-binary download; omit `resources` to keep the default cpus.
 
 resources:
   cloud: aws
@@ -14,9 +16,10 @@ resources:
   use_spot: true
   disk_size: 100
 
-# Install nova-load on each worker (the Rust binary). Pin to a tag/SHA.
+# Build from source on each worker (slow cold compile). Useful for an un-released
+# branch; for released code the default download is much faster.
 setup: |
-  curl -LsSf https://astral.sh/uv/install.sh >/dev/null 2>&1 || true
   command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   source "$HOME/.cargo/env"
-  cargo install --git https://github.com/qdrant-labs/supernova nova-load
+  cargo install --git https://github.com/qdrant-labs/supernova@my-branch nova-load
+  sudo install -m 0755 "$HOME/.cargo/bin/nova-load" /usr/local/bin/nova-load

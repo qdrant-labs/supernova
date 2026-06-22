@@ -1,4 +1,6 @@
-# Resources for `nova dist storm` — copy and tweak.
+# OPTIONAL override for `nova dist storm` — not required (built-in defaults
+# download the prebuilt nova-storm binary). Use this to change resources, or to
+# build from a dev branch. Copy and tweak.
 #
 #   nova dist storm configs/storm/test.yaml --resources configs/skypilot/storm.yaml --num-jobs 10
 #

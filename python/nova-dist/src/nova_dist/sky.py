@@ -65,6 +65,33 @@ def forward_env(config_path: str, extra: list[str] | None = None) -> dict[str, s
 
 _REPO = "https://github.com/qdrant-labs/supernova"
 
+
+def _rust_worker_setup(binary: str) -> str:
+    """
+    Install a prebuilt Rust binary on a worker (seconds), falling back to a
+    source compile if no release asset matches the arch (e.g. before the first
+    release). Installs to `/usr/local/bin` so it's on `PATH` in both SkyPilot's
+    `setup` and `run` shells (they're separate).
+    """
+    return (
+        "set -e\n"
+        'case "$(uname -m)" in\n'
+        "  x86_64) t=x86_64-unknown-linux-gnu ;;\n"
+        "  aarch64|arm64) t=aarch64-unknown-linux-gnu ;;\n"
+        "  *) t= ;;\n"
+        "esac\n"
+        f'if [ -n "$t" ] && curl -fsSL "{_REPO}/releases/latest/download/{binary}-$t" -o /tmp/{binary}; then\n'
+        f"  sudo install -m 0755 /tmp/{binary} /usr/local/bin/{binary}\n"
+        "else\n"
+        f'  echo "no prebuilt {binary} for $(uname -m) / latest release — building from source"\n'
+        "  command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n"
+        '  . "$HOME/.cargo/env"\n'
+        f"  cargo install --git {_REPO} {binary}\n"
+        f'  sudo install -m 0755 "$HOME/.cargo/bin/{binary}" /usr/local/bin/{binary}\n'
+        "fi"
+    )
+
+
 # Built-in fallbacks per tool: resources + the worker-install `setup` + envs. Used
 # when neither --resources nor ~/.nova/skypilot/<tool>.yaml is present, so a
 # first-time `nova dist <tool>` works with zero extra files. An override (file or
@@ -83,28 +110,22 @@ DEFAULTS: dict[str, dict] = {
                 "us-west-2": "ami-08a03808395c1b31f",
             },
         },
+        # Python tool — installs from git, then symlinks into /usr/local/bin so
+        # it's on PATH in the run shell too.
         "setup": (
             "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
-            'export PATH="$HOME/.local/bin:$PATH"\n'
-            f"uv tool install 'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed'"
+            f"$HOME/.local/bin/uv tool install 'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed'\n"
+            'sudo ln -sf "$HOME/.local/bin/nova-embed" /usr/local/bin/nova-embed'
         ),
         "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     },
     "load": {
         "resources": {"cloud": "aws", "cpus": "8+", "use_spot": True, "disk_size": 100},
-        "setup": (
-            'command -v cargo >/dev/null || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n'
-            'source "$HOME/.cargo/env"\n'
-            f"cargo install --git {_REPO} nova-load"
-        ),
+        "setup": _rust_worker_setup("nova-load"),
     },
     "storm": {
         "resources": {"cloud": "aws", "cpus": "4+", "use_spot": True},
-        "setup": (
-            'command -v cargo >/dev/null || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n'
-            'source "$HOME/.cargo/env"\n'
-            f"cargo install --git {_REPO} nova-storm"
-        ),
+        "setup": _rust_worker_setup("nova-storm"),
     },
 }
 
@@ -114,14 +135,17 @@ _MERGE_KEYS = ("resources", "setup", "envs")
 
 
 def skypilot_dir() -> Path:
-    """Where per-tool default SkyPilot YAMLs live. `$NOVA_SKYPILOT_DIR` overrides;
-    defaults to `$NOVA_HOME/skypilot`."""
+    """
+    Where per-tool default SkyPilot YAMLs live. `$NOVA_SKYPILOT_DIR` overrides;
+    defaults to `$NOVA_HOME/skypilot`.
+    """
     override = os.environ.get("NOVA_SKYPILOT_DIR")
     return Path(override) if override else nova_home() / "skypilot"
 
 
 def resolve_resources(tool: str, flag_path: str | None) -> tuple[dict, str]:
-    """Resolve the SkyPilot spec for `tool`, layering low → high:
+    """
+    Resolve the SkyPilot spec for `tool`, layering low → high:
 
         built-in DEFAULTS  <  ~/.nova/skypilot/<tool>.yaml  <  --resources flag
 

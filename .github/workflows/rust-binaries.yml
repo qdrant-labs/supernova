@@ -1,0 +1,67 @@
+name: rust-binaries
+
+# Pre-build the Rust tools (nova-load, nova-storm) so workers download a binary
+# instead of compiling duckdb's bundled C++ from scratch on every ephemeral node.
+#
+# Triggers:
+#   - push to master  -> rolling `dev` pre-release (overwritten each merge)
+#   - tag v*          -> the matching versioned release
+#
+# Assets are named `<bin>-<target>` (raw binaries) and attached to the release.
+# Workers curl the one matching `uname -m`; `cargo binstall` also resolves them
+# via [package.metadata.binstall] in each crate's Cargo.toml.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # create/update releases
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm   # native arm64 runner — no cross-compile
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      # duckdb's `bundled` feature compiles a large C++ amalgamation; the runners
+      # have a C++ toolchain, but cmake/build-essential makes it reliable.
+      - name: Build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake
+
+      - name: Build (release)
+        run: cargo build --release -p nova-load -p nova-storm
+
+      - name: Stage assets as <bin>-<target>
+        run: |
+          mkdir -p dist
+          for bin in nova-load nova-storm; do
+            cp "target/release/$bin" "dist/$bin-${{ matrix.target }}"
+          done
+
+      # Versioned release on a tag.
+      - name: Release (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+      # Rolling pre-release on master so un-tagged code is testable on a fleet.
+      - name: Release (rolling dev)
+        if: github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          prerelease: true
+          files: dist/*

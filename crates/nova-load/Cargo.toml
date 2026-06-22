@@ -2,10 +2,18 @@
 name = "nova-load"
 version = "0.0.1"
 edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
 
 [[bin]]
 name = "nova-load"
 path = "src/main.rs"
+
+# `cargo binstall nova-load` fetches the prebuilt binary the rust-binaries.yml
+# workflow attaches to each `v*` release (named `<bin>-<target>`), instead of
+# compiling. Matches the asset naming in that workflow.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
 
 [dependencies]
 async-trait = { workspace = true }
