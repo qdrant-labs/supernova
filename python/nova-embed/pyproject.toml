@@ -27,7 +27,10 @@ embed = [
     "openai",
     "sentence-transformers",
     "torch",
-    "transformers",
+    # Cap below 5: transformers 5.x breaks the attention-mask/unpadding path that
+    # trust_remote_code models (e.g. Alibaba-NLP/gte-multilingual-base) rely on,
+    # surfacing as a CUDA "index out of bounds" assert in the forward pass.
+    "transformers>=4.41,<5",
     "FlagEmbedding",
     "einops>=0.8.2",
     "fastembed",
