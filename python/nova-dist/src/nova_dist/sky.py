@@ -112,12 +112,16 @@ DEFAULTS: dict[str, dict] = {
             # passthrough handled); torch (with its bundled CUDA) installs into it.
             "image_id": "docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04",
         },
-        # Python tool — installs from git, then symlinks into /usr/local/bin so
-        # it's on PATH in the run shell too.
+        # Python tool. Robust to a minimal CUDA container (root, no curl/sudo)
+        # *and* a normal VM (non-root, has sudo): pick sudo only when needed, and
+        # apt-get curl if it's missing. Then install from git and symlink into
+        # /usr/local/bin so it's on PATH in the (separate) run shell too.
         "setup": (
+            'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"\n'
+            "command -v curl >/dev/null || ($SUDO apt-get update && $SUDO apt-get install -y curl)\n"
             "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
             f"$HOME/.local/bin/uv tool install 'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed'\n"
-            'sudo ln -sf "$HOME/.local/bin/nova-embed" /usr/local/bin/nova-embed'
+            '$SUDO ln -sf "$HOME/.local/bin/nova-embed" /usr/local/bin/nova-embed'
         ),
         "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     },
