@@ -118,9 +118,12 @@ DEFAULTS: dict[str, dict] = {
         # UV_TOOL_BIN_DIR=/usr/local/bin installs the console script straight onto
         # a PATH dir — no symlink, and no reliance on the run shell inheriting
         # `export PATH` from the setup shell (it does NOT).
+        # The CUDA image is minimal — no curl (for the uv installer) and no git
+        # (uv needs it to clone the git+ spec). Install both if missing.
         "setup": (
             "set -e\n"
-            "command -v curl >/dev/null || (apt-get update && apt-get install -y curl)\n"
+            "command -v curl >/dev/null && command -v git >/dev/null || "
+            "(apt-get update && apt-get install -y curl git)\n"
             "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
             'export PATH="$HOME/.local/bin:$PATH"\n'
             f"UV_TOOL_BIN_DIR=/usr/local/bin uv tool install 'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed'"
