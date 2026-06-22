@@ -13,9 +13,10 @@ resources:
   accelerators: A10G:1
   use_spot: true
   disk_size: 150
-  # SkyPilot's region-agnostic GPU image (CUDA preinstalled). Prefer this over a
-  # raw AMI id — AMIs are per-region and get deregistered over time.
-  image_id: skypilot:gpu-ubuntu-2204
+  # CUDA Docker image — guarantees the CUDA libs regardless of region or SkyPilot
+  # version (raw AMI ids rot; skypilot: aliases vary by version). SkyPilot runs
+  # the job in this container with GPU passthrough.
+  image_id: docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 # Install nova-embed on each worker. Pin to a tag/SHA so the fleet runs identical
 # code. Adjust the git URL/ref to your fork.
