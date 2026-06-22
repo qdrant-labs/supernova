@@ -25,9 +25,15 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm   # native arm64 runner — no cross-compile
+            runner: ubuntu-22.04-arm   # native arm64 runner — no cross-compile
+    # Build on the OLDEST Ubuntu we support, NOT ubuntu-latest. glibc is only
+    # backward-compatible: a binary linked against 24.04's glibc (2.39) won't run
+    # on an older worker ("GLIBC_2.38 not found"). 22.04 ships glibc 2.35, which
+    # runs on 22.04+ workers. If your EC2 AMI is older still (Amazon Linux 2,
+    # Ubuntu 20.04), either pin the worker AMI to 22.04+ or switch to
+    # cargo-zigbuild targeting an old glibc / a musl static build.
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
