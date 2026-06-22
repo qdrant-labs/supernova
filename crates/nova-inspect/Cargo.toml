@@ -1,0 +1,22 @@
+[package]
+name = "nova-inspect"
+version = "0.0.3"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+[[bin]]
+name = "nova-inspect"
+path = "src/main.rs"
+
+# `cargo binstall nova-inspect` fetches the prebuilt binary the rust-binaries.yml
+# workflow attaches to each `v*` release (named `<bin>-<target>`), instead of
+# compiling. Matches the asset naming in that workflow.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+
+[dependencies]
+clap = { workspace = true }
+# `bundled` already includes parquet. httpfs (for s3://) is auto-loaded at
+# runtime by DuckDB on first S3 access — no extra build-time feature needed.
+duckdb = { workspace = true }

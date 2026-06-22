@@ -5,7 +5,8 @@ from .base import Chunker
 
 @CHUNKERS.register("fixed_char")
 class FixedCharChunker(Chunker):
-    """Splits text into fixed-size character windows (characters, NOT tokens).
+    """
+    Splits text into fixed-size character windows (characters, NOT tokens).
 
     ``chunk_chars`` is the window size; ``overlap`` repeats the trailing N
     characters at the start of the next window (0 = no overlap), which helps

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/nova-storm",
     "crates/nova-load",
+    "crates/nova-inspect",
     # "crates/nova-metrics"
 ]
 version = "0.0.3"

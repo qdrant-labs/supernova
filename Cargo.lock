@@ -1633,6 +1633,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nova-inspect"
+version = "0.0.3"
+dependencies = [
+ "clap",
+ "duckdb",
+]
+
+[[package]]
 name = "nova-load"
 version = "0.0.3"
 dependencies = [
