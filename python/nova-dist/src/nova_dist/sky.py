@@ -105,10 +105,12 @@ DEFAULTS: dict[str, dict] = {
             "accelerators": "A10G:1",
             "use_spot": True,
             "disk_size": 150,
-            "image_id": {
-                "us-east-1": "ami-0038d79e7270bb987",
-                "us-west-2": "ami-08a03808395c1b31f",
-            },
+            # SkyPilot's region-agnostic GPU image alias (CUDA preinstalled). Do
+            # NOT hardcode raw AMI IDs — they're per-region and AWS deregisters
+            # them over time. 22.04 also matches the glibc the binaries are built
+            # against. (If your SkyPilot version doesn't know this tag, run
+            # `sky` docs / drop image_id to use the default GPU image.)
+            "image_id": "skypilot:gpu-ubuntu-2204",
         },
         # Python tool — installs from git, then symlinks into /usr/local/bin so
         # it's on PATH in the run shell too.

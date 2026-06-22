@@ -5,6 +5,7 @@ pub mod sources;
 pub mod stores;
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -215,18 +216,29 @@ async fn load_files(
         files.len(),
     );
 
-    // Files progress + a live aggregate upsert rate (points/sec across all the
-    // concurrent in-flight upserts). The bar draws to stderr, clear of the
-    // stdout logs.
-    let progress = ProgressBar::new(files.len() as u64);
-    progress.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{bar:30.cyan/blue}] {pos}/{len} files · {msg}",
-        )
-        .expect("valid template")
-        .progress_chars("=>-"),
-    );
-    progress.enable_steady_tick(Duration::from_millis(120));
+    // Progress + a live aggregate upsert rate (points/sec across all the
+    // concurrent in-flight upserts). On a TTY this is a pretty bar; on a headless
+    // worker (fleet logs captured to a file, not a terminal) `indicatif` hides the
+    // bar, so we instead emit the rate through `tracing` on a coarse interval —
+    // see the rate block in the loop below.
+    let tty = std::io::stderr().is_terminal();
+    // Refresh the live bar ~4×/sec; on the fleet, log the rate every 10s so tens
+    // of thousands of files don't flood the log.
+    let rate_interval = if tty { 0.25 } else { 10.0 };
+    let progress = if tty {
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{bar:30.cyan/blue}] {pos}/{len} files · {msg}",
+            )
+            .expect("valid template")
+            .progress_chars("=>-"),
+        );
+        pb.enable_steady_tick(Duration::from_millis(120));
+        pb
+    } else {
+        ProgressBar::hidden()
+    };
 
     // `points_done` is the running total; `rate_window` holds the last sample
     // (time, count) for an instantaneous rate, vs. the cumulative average at end.
@@ -280,14 +292,19 @@ async fn load_files(
                 store.upsert_batch(chunk.to_vec()).await?;
                 let done = points_done.fetch_add(n, Ordering::Relaxed) + n;
 
-                // Recompute the rate over the most recent window (~4×/sec).
+                // Recompute the rate over the most recent window, then either
+                // refresh the bar (TTY) or log it (headless fleet worker).
                 let mut w = rate_window.lock().expect("rate window");
                 let dt = w.0.elapsed().as_secs_f64();
-                if dt >= 0.25 {
+                if dt >= rate_interval {
                     let rate = (done - w.1) as f64 / dt;
                     *w = (Instant::now(), done);
                     drop(w);
-                    progress.set_message(format!("{done} pts · {rate:.0} pts/s"));
+                    if tty {
+                        progress.set_message(format!("{done} pts · {rate:.0} pts/s"));
+                    } else {
+                        tracing::info!("{done} pts · {rate:.0} pts/s");
+                    }
                 }
                 Ok::<(), StoreError>(())
             })
@@ -301,6 +318,9 @@ async fn load_files(
 
     let avg = total as f64 / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
     progress.finish_with_message(format!("{total} pts · {avg:.0} pts/s avg"));
+    if !tty {
+        tracing::info!("{total} pts · {avg:.0} pts/s avg");
+    }
     Ok(total)
 }
 
