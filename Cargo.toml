@@ -4,9 +4,8 @@ members = [
     "crates/nova-storm",
     "crates/nova-load",
     "crates/nova-inspect",
-    # "crates/nova-metrics"
 ]
-version = "0.0.3"
+version = "0.0.4"
 
 [workspace.dependencies]
 async-trait="0.1.89"

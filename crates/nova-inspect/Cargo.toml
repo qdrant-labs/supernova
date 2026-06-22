@@ -1,6 +1,6 @@
 [package]
 name = "nova-inspect"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 repository = "https://github.com/qdrant-labs/supernova"
 
