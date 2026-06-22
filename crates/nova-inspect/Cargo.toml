@@ -8,12 +8,10 @@ repository = "https://github.com/qdrant-labs/supernova"
 name = "nova-inspect"
 path = "src/main.rs"
 
-# `cargo binstall nova-inspect` fetches the prebuilt binary the rust-binaries.yml
-# workflow attaches to each `v*` release (named `<bin>-<target>`), instead of
-# compiling. Matches the asset naming in that workflow.
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
-pkg-fmt = "bin"
+# No binstall/prebuilt binary: this is a local inspection tool (run on your
+# laptop / dispatch box), never a fleet workload — so it's only ever built from
+# source via `make inspect` (cargo install). Unlike nova-load/nova-storm, it
+# doesn't need to be downloaded onto cold workers.
 
 [dependencies]
 clap = { workspace = true }

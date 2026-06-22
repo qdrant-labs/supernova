@@ -69,15 +69,55 @@ fn inspect(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<Result<_, _>>()?;
 
+    // Vector columns are written as variable-length lists (`FLOAT[]`), so DESCRIBE
+    // omits the dimension. Probe it from the first row — the one thing you most
+    // want when inspecting embeddings. Fixed-size arrays (`FLOAT[768]`) already
+    // carry the size, so we only probe the empty-bracket lists.
+    let probe: Vec<&str> = schema
+        .iter()
+        .filter(|(_, ty)| ty == "FLOAT[]" || ty == "DOUBLE[]")
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let dims = if rows > 0 && !probe.is_empty() {
+        probe_dims(&conn, &glob, &probe)?
+    } else {
+        Vec::new()
+    };
+
     println!("path:   {glob}");
     println!("files:  {}", fmt_int(files));
     println!("rows:   {}", fmt_int(rows));
     println!("\nschema:");
     let width = schema.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
     for (name, ty) in &schema {
-        println!("  {name:<width$}  {ty}");
+        match dims.iter().find(|(n, _)| n == name).and_then(|(_, d)| *d) {
+            Some(dim) => println!("  {name:<width$}  {ty}  (dim {dim})"),
+            None => println!("  {name:<width$}  {ty}"),
+        }
     }
     Ok(())
+}
+
+/// Read each listed column's element count from the first row (one query, one
+/// row). Returns `(column, Some(dim))`, or `None` for a column null in that row.
+fn probe_dims(
+    conn: &Connection,
+    glob: &str,
+    cols: &[&str],
+) -> Result<Vec<(String, Option<i64>)>, duckdb::Error> {
+    let projection = cols
+        .iter()
+        .map(|c| format!("len(\"{}\")", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {projection} FROM read_parquet('{}') LIMIT 1", esc(glob));
+    conn.query_row(&sql, [], |row| {
+        Ok(cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.to_string(), row.get::<_, Option<i64>>(i).unwrap_or(None)))
+            .collect())
+    })
 }
 
 /// A bare directory/prefix becomes a recursive parquet glob; an explicit glob or

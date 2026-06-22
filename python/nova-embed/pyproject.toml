@@ -27,10 +27,12 @@ embed = [
     "openai",
     "sentence-transformers",
     "torch",
-    # Cap below 5: transformers 5.x breaks the attention-mask/unpadding path that
-    # trust_remote_code models (e.g. Alibaba-NLP/gte-multilingual-base) rely on,
-    # surfacing as a CUDA "index out of bounds" assert in the forward pass.
-    "transformers<5",
+    # Unpinned: do NOT cap `transformers<5`. huggingface-hub 1.0 split the stack —
+    # transformers 4.x needs hub<1.0, but sentence-transformers/fastembed/datasets
+    # need hub>=1.0, so a `<5` pin is unsatisfiable. If a specific trust_remote_code
+    # model breaks on transformers 5, prefer a model without custom code (e.g.
+    # BAAI/bge-m3) rather than pinning the whole stack back.
+    "transformers",
     "FlagEmbedding",
     "einops>=0.8.2",
     "fastembed",
