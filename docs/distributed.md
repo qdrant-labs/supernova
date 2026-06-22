@@ -29,29 +29,46 @@ make dist        # installs nova-dist (controller-side only; workers don't need 
 runs only on your controller (laptop / dispatch box); workers just run the tool
 binaries.
 
-### Resources are separate from the workload
+### Resources (separate from the workload)
 
-Compute is defined by a **SkyPilot YAML you point at** with `--resources`, kept
-entirely separate from the workload config. That YAML owns the three things that
-vary by environment:
+Compute — cloud, accelerators, spot, and how a worker installs the tool — is
+defined separately from the workload config. You don't *need* to define
+anything: `nova dist` ships built-in defaults so a first run works out of the
+box. It resolves the spec in three tiers, highest priority first:
+
+1. **`--resources <sky.yaml>`** — an explicit override for this run
+2. **`~/.nova/skypilot/<tool>.yaml`** — your standing default (override the dir
+   with `$NOVA_SKYPILOT_DIR`)
+3. **built-in defaults** — sensible resources + a `setup:` that installs the tool
+   from git
+
+An override is **merged by top-level key**, not wholesale: a file with only
+`setup:` keeps the default `resources:` (handy for a dev build), and a file with
+only `resources:` keeps the default `setup:`. The three mergeable keys:
 
 - `resources:` — cloud, accelerators, spot, regions, disk, image
 - `setup:` — how a worker installs the tool (Rust binary or Python package)
-- `envs:` — any extra environment
+- `envs:` — extra environment
 
-`nova dist` adds only the pool wrapper, the staged workload config, and the
-per-rank `run:` command. Copy a template from `configs/skypilot/` and tweak it:
+So the minimal run needs no resources file at all:
+
+```bash
+nova dist load configs/loader/test.yaml --num-jobs 50
+```
+
+To override — e.g. test a working-tree build on the fleet — drop a partial file in
+`~/.nova/skypilot/load.yaml`:
 
 ```yaml
-# configs/skypilot/load.yaml  (you own this)
-resources:
-  cloud: aws
-  cpus: 8+
-  use_spot: true
+# only overrides setup; default resources are kept
 setup: |
   source "$HOME/.cargo/env"
-  cargo install --git https://github.com/qdrant-labs/supernova nova-load
+  cargo install --git https://github.com/you/supernova@my-branch nova-load
 ```
+
+Or pass a full `--resources my.yaml` for a one-off. Copy-and-tweak templates live
+in `configs/skypilot/`. `nova dist` prints which source it resolved
+(`resources: built-in defaults` / a path).
 
 Secrets are **not** written to worker disk: `nova dist` forwards AWS credentials,
 every `${VAR}` your workload config references, and per-tool baselines (e.g.
@@ -62,8 +79,8 @@ every `${VAR}` your workload config references, and per-tool baselines (e.g.
 Fan-out: each rank embeds its slice of the dataset.
 
 ```bash
-nova dist embed configs/embedder/test.yaml \
-    --resources configs/skypilot/embed.yaml --num-jobs 50
+nova dist embed configs/embedder/test.yaml --num-jobs 50
+# (add --resources my.yaml to override the default GPU resources/setup)
 ```
 
 ### load
@@ -74,8 +91,7 @@ index must be built after:
 ```bash
 # 1. controller: create the collection + defer indexing
 # 2. fleet:      N workers, each loading its file slice
-nova dist load configs/loader/test.yaml \
-    --resources configs/skypilot/load.yaml --num-jobs 50
+nova dist load configs/loader/test.yaml --num-jobs 50
 
 # 3. controller, after all workers finish: build the index
 nova dist load configs/loader/test.yaml --finalize
@@ -92,8 +108,7 @@ Replicated, **not** partitioned — every worker runs the same profile, so total
 offered load ≈ `num_jobs × (concurrency or qps)`.
 
 ```bash
-nova dist storm configs/storm/test.yaml \
-    --resources configs/skypilot/storm.yaml --num-jobs 10
+nova dist storm configs/storm/test.yaml --num-jobs 10
 ```
 
 ## Inspect before launching
@@ -105,7 +120,7 @@ to run the launch by hand with the `sky` CLI.
 
 ```bash
 nova dist load configs/loader/test.yaml \
-    --resources configs/skypilot/load.yaml --num-jobs 50 --dry-run
+    --num-jobs 50 --dry-run
 ```
 
 ## Monitor & tear down

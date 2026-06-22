@@ -43,7 +43,7 @@ def _fanout(
     Stage the config, generate pool+job YAMLs from the user's resources YAML,
     and launch `num_jobs` ranked jobs.
     """
-    sky_cfg = sky.load_resources_yaml(resources)
+    sky_cfg, source = sky.resolve_resources(tool, resources)
     pool = pool_name or f"nova-{tool}-{Path(config).stem}"
     run_dir = sky.make_run_dir(pool)
     file_mounts, remote_cfg = sky.stage_config(run_dir, config)
@@ -53,6 +53,7 @@ def _fanout(
     pool_path, job_path = sky.write_pool_and_job(run_dir, sky_cfg, cmd, file_mounts, num_jobs)
 
     click.echo(f"tool={tool}  config={config}  num_jobs={num_jobs}  pool={pool}")
+    click.echo(f"resources: {source}")
     click.echo(f"run: {cmd}")
     click.echo(f"staged: {run_dir}")
 
@@ -84,7 +85,7 @@ def main() -> None:
 # Shared options for the fan-out commands.
 def _common(fn):
     fn = click.argument("config")(fn)
-    fn = click.option("--resources", required=True, help="SkyPilot YAML: resources + setup (worker install) + envs.")(fn)
+    fn = click.option("--resources", default=None, help="SkyPilot YAML override (resources/setup/envs). Defaults to ~/.nova/skypilot/<tool>.yaml, then built-in defaults.")(fn)
     fn = click.option("--num-jobs", type=int, required=True, help="Number of parallel jobs/workers.")(fn)
     fn = click.option("--pool-name", default=None, help="SkyPilot pool name (default: nova-<tool>-<config>).")(fn)
     fn = click.option("--dry-run", is_flag=True, help="Generate the pool/job YAMLs and print the plan; don't launch.")(fn)
@@ -107,7 +108,7 @@ def embed(config, resources, num_jobs, pool_name, dry_run):
 
 @main.command()
 @click.argument("config")
-@click.option("--resources", default=None, help="SkyPilot YAML (required unless --finalize).")
+@click.option("--resources", default=None, help="SkyPilot YAML override. Defaults to ~/.nova/skypilot/load.yaml, then built-in defaults.")
 @click.option("--num-jobs", type=int, default=None, help="Number of parallel load workers.")
 @click.option("--pool-name", default=None)
 @click.option("--dry-run", is_flag=True)
@@ -123,8 +124,8 @@ def load(config, resources, num_jobs, pool_name, dry_run, finalize):
     if finalize:
         _run_local("nova-load", ["finalize", config])
         return
-    if not resources or not num_jobs:
-        raise click.UsageError("--resources and --num-jobs are required (unless --finalize).")
+    if num_jobs is None:
+        raise click.UsageError("--num-jobs is required (unless --finalize).")
 
     # 1. Master creates the collection + defers indexing.
     if not dry_run:

@@ -63,19 +63,94 @@ def forward_env(config_path: str, extra: list[str] | None = None) -> dict[str, s
     return {v: os.environ[v] for v in dict.fromkeys(wanted) if os.environ.get(v)}
 
 
-def load_resources_yaml(path: str) -> dict:
+_REPO = "https://github.com/qdrant-labs/supernova"
+
+# Built-in fallbacks per tool: resources + the worker-install `setup` + envs. Used
+# when neither --resources nor ~/.nova/skypilot/<tool>.yaml is present, so a
+# first-time `nova dist <tool>` works with zero extra files. An override (file or
+# flag) is shallow-merged OVER these by top-level key — set only what you want to
+# change (e.g. just `setup:` for a dev build keeps the default `resources:`).
+# These mirror the copy-and-tweak examples in configs/skypilot/.
+DEFAULTS: dict[str, dict] = {
+    "embed": {
+        "resources": {
+            "cloud": "aws",
+            "accelerators": "A10G:1",
+            "use_spot": True,
+            "disk_size": 150,
+            "image_id": {
+                "us-east-1": "ami-0038d79e7270bb987",
+                "us-west-2": "ami-08a03808395c1b31f",
+            },
+        },
+        "setup": (
+            "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
+            'export PATH="$HOME/.local/bin:$PATH"\n'
+            f"uv tool install 'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed'"
+        ),
+        "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
+    },
+    "load": {
+        "resources": {"cloud": "aws", "cpus": "8+", "use_spot": True, "disk_size": 100},
+        "setup": (
+            'command -v cargo >/dev/null || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n'
+            'source "$HOME/.cargo/env"\n'
+            f"cargo install --git {_REPO} nova-load"
+        ),
+    },
+    "storm": {
+        "resources": {"cloud": "aws", "cpus": "4+", "use_spot": True},
+        "setup": (
+            'command -v cargo >/dev/null || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n'
+            'source "$HOME/.cargo/env"\n'
+            f"cargo install --git {_REPO} nova-storm"
+        ),
+    },
+}
+
+# Top-level keys an override may replace. `run:` is intentionally not here — we
+# always inject the per-rank command.
+_MERGE_KEYS = ("resources", "setup", "envs")
+
+
+def skypilot_dir() -> Path:
+    """Where per-tool default SkyPilot YAMLs live. `$NOVA_SKYPILOT_DIR` overrides;
+    defaults to `$NOVA_HOME/skypilot`."""
+    override = os.environ.get("NOVA_SKYPILOT_DIR")
+    return Path(override) if override else nova_home() / "skypilot"
+
+
+def resolve_resources(tool: str, flag_path: str | None) -> tuple[dict, str]:
+    """Resolve the SkyPilot spec for `tool`, layering low → high:
+
+        built-in DEFAULTS  <  ~/.nova/skypilot/<tool>.yaml  <  --resources flag
+
+    Only the top-level keys present in an override (`resources`/`setup`/`envs`)
+    replace the default's value for that key — so a file with just `setup:` keeps
+    the default `resources:`, and vice versa. Returns `(spec, source)` where
+    `source` describes where the override came from (for logging).
     """
-    Read the user's SkyPilot YAML. We use its `resources` / `setup` / `envs`;
-    a `run:` in it is ignored (we inject the per-rank command).
-    """
-    with open(path) as f:
-        data = yaml.safe_load(f) or {}
-    if "resources" not in data:
-        raise ValueError(f"{path}: a SkyPilot resources YAML must define `resources:`")
-    if data.get("run"):
-        # Harmless but a footgun — make it explicit that we override it.
-        data.pop("run")
-    return data
+    if tool not in DEFAULTS:
+        raise ValueError(f"no built-in defaults for tool {tool!r}")
+    spec = {k: v for k, v in DEFAULTS[tool].items()}  # shallow copy of top level
+
+    if flag_path:
+        override_path: Path | None = Path(flag_path)
+        if not override_path.exists():  # an explicit flag must exist
+            raise FileNotFoundError(f"--resources file not found: {flag_path}")
+        source = str(override_path)
+    else:
+        candidate = skypilot_dir() / f"{tool}.yaml"
+        override_path = candidate if candidate.exists() else None
+        source = str(candidate) if override_path else "built-in defaults"
+
+    if override_path:
+        with open(override_path) as f:
+            override = yaml.safe_load(f) or {}
+        for k in _MERGE_KEYS:
+            if k in override:
+                spec[k] = override[k]
+    return spec, source
 
 
 def stage_config(run_dir: Path, config_path: str) -> tuple[dict, str]:

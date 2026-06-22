@@ -70,19 +70,21 @@ nova load finalize configs/loader/test.yaml
 ```
 
 You can run that yourself on any fleet, or let **`nova dist`** drive SkyPilot for
-you (`make dist` to install it). It provisions a pool and submits the ranked jobs;
-compute is defined by a SkyPilot YAML you point at (`--resources`), kept entirely
-separate from the workload config:
+you (`make dist` to install it). It provisions a pool and submits the ranked jobs.
+Compute (resources + how a worker installs the tool) has sensible built-in
+defaults, so it works with no extra files:
 
 ```bash
-nova dist embed configs/embedder/test.yaml --resources configs/skypilot/embed.yaml --num-jobs 50
-nova dist load  configs/loader/test.yaml  --resources configs/skypilot/load.yaml  --num-jobs 50
+nova dist embed configs/embedder/test.yaml --num-jobs 50
+nova dist load  configs/loader/test.yaml  --num-jobs 50
 nova dist load  configs/loader/test.yaml  --finalize        # after workers finish
-nova dist storm configs/storm/test.yaml   --resources configs/skypilot/storm.yaml --num-jobs 10
+nova dist storm configs/storm/test.yaml   --num-jobs 10
 ```
 
-Add `--dry-run` to generate and inspect the pool/job YAMLs without launching.
-Resource templates live in `configs/skypilot/`.
+To override, drop a `~/.nova/skypilot/<tool>.yaml` or pass `--resources my.yaml`
+— merged by key over the defaults, so you can change just `setup:` (e.g. a dev
+build) and keep the default resources. Add `--dry-run` to inspect the generated
+pool/job YAMLs without launching. Templates live in `configs/skypilot/`.
 
 ## Project structure
 
