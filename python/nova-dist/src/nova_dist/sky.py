@@ -103,7 +103,7 @@ DEFAULTS: dict[str, dict] = {
         "resources": {
             "cloud": "aws",
             "accelerators": "A10G:1",
-            "use_spot": True,
+            "use_spot": False,
             "disk_size": 150,
             # A CUDA Docker image guarantees the CUDA libs are present, immune to
             # both failure modes we hit: raw AMI ids rot (deregistered per region)
@@ -128,11 +128,11 @@ DEFAULTS: dict[str, dict] = {
         "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     },
     "load": {
-        "resources": {"cloud": "aws", "cpus": "8+", "use_spot": True, "disk_size": 100},
+        "resources": {"cloud": "aws", "cpus": "8+", "use_spot": False, "disk_size": 100},
         "setup": _rust_worker_setup("nova-load"),
     },
     "storm": {
-        "resources": {"cloud": "aws", "cpus": "4+", "use_spot": True},
+        "resources": {"cloud": "aws", "cpus": "4+", "use_spot": False},
         "setup": _rust_worker_setup("nova-storm"),
     },
 }
