@@ -18,12 +18,16 @@ resources:
   # the job in this container with GPU passthrough.
   image_id: docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
-# Install nova-embed on each worker. Pin to a tag/SHA so the fleet runs identical
-# code. Adjust the git URL/ref to your fork.
+# Install nova-embed on each worker. Pin @master to a tag/SHA so the fleet runs
+# identical code. Adjust the git URL/ref to your fork.
+# Note: UV_TOOL_BIN_DIR puts the `nova-embed` console script directly on PATH so
+# the (separate) run shell finds it — `export PATH` here only affects setup.
 setup: |
+  set -e
+  command -v curl >/dev/null || (apt-get update && apt-get install -y curl)
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
-  uv tool install 'nova-embed[embed] @ git+https://github.com/qdrant-labs/supernova@main#subdirectory=python/nova-embed'
+  UV_TOOL_BIN_DIR=/usr/local/bin uv tool install 'nova-embed[embed] @ git+https://github.com/qdrant-labs/supernova@master#subdirectory=python/nova-embed'
 
 envs:
   HF_HUB_ENABLE_HF_TRANSFER: "1"

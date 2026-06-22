@@ -112,16 +112,18 @@ DEFAULTS: dict[str, dict] = {
             # passthrough handled); torch (with its bundled CUDA) installs into it.
             "image_id": "docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04",
         },
-        # Python tool. Robust to a minimal CUDA container (root, no curl/sudo)
-        # *and* a normal VM (non-root, has sudo): pick sudo only when needed, and
-        # apt-get curl if it's missing. Then install from git and symlink into
-        # /usr/local/bin so it's on PATH in the (separate) run shell too.
+        # Python tool, installed into the CUDA container (runs as root). `set -e`
+        # so any failure aborts the setup phase loudly (visible in setup logs)
+        # instead of silently surfacing later as `nova-embed: command not found`.
+        # UV_TOOL_BIN_DIR=/usr/local/bin installs the console script straight onto
+        # a PATH dir — no symlink, and no reliance on the run shell inheriting
+        # `export PATH` from the setup shell (it does NOT).
         "setup": (
-            'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"\n'
-            "command -v curl >/dev/null || ($SUDO apt-get update && $SUDO apt-get install -y curl)\n"
+            "set -e\n"
+            "command -v curl >/dev/null || (apt-get update && apt-get install -y curl)\n"
             "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
-            f"$HOME/.local/bin/uv tool install 'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed'\n"
-            '$SUDO ln -sf "$HOME/.local/bin/nova-embed" /usr/local/bin/nova-embed'
+            'export PATH="$HOME/.local/bin:$PATH"\n'
+            f"UV_TOOL_BIN_DIR=/usr/local/bin uv tool install 'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed'"
         ),
         "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     },
