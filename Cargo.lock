@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "nova-load"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "clap",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "nova-storm"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "clap",
