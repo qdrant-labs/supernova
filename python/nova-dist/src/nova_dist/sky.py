@@ -112,21 +112,25 @@ DEFAULTS: dict[str, dict] = {
             # passthrough handled); torch (with its bundled CUDA) installs into it.
             "image_id": "docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04",
         },
-        # Python tool, installed into the CUDA container (runs as root). `set -e`
-        # so any failure aborts the setup phase loudly (visible in setup logs)
-        # instead of silently surfacing later as `nova-embed: command not found`.
-        # UV_TOOL_BIN_DIR=/usr/local/bin installs the console script straight onto
-        # a PATH dir — no symlink, and no reliance on the run shell inheriting
-        # `export PATH` from the setup shell (it does NOT).
-        # The CUDA image is minimal — no curl (for the uv installer) and no git
-        # (uv needs it to clone the git+ spec). Install both if missing.
+        # Python tool. Works on BOTH a root CUDA container and a non-root GPU VM
+        # (e.g. the skypilot:custom-gpu-ubuntu-cuda13 AMI, which runs as `ubuntu`):
+        #   - `set -e` so any failure aborts setup loudly (visible in setup logs)
+        #     instead of surfacing later as `nova-embed: command not found`.
+        #   - SUDO only when not root.
+        #   - apt-get curl/git if missing (the minimal CUDA *container* lacks both;
+        #     a real VM AMI already has them, so this no-ops there).
+        #   - install the console script to ~/.local/bin (pinned via UV_TOOL_BIN_DIR
+        #     so it's deterministic), then symlink into /usr/local/bin — which IS on
+        #     PATH in the separate run shell (an `export PATH` here would not be).
         "setup": (
             "set -e\n"
+            'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"\n'
             "command -v curl >/dev/null && command -v git >/dev/null || "
-            "(apt-get update && apt-get install -y curl git)\n"
+            "($SUDO apt-get update && $SUDO apt-get install -y curl git)\n"
             "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
             'export PATH="$HOME/.local/bin:$PATH"\n'
-            f"UV_TOOL_BIN_DIR=/usr/local/bin uv tool install 'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed'"
+            f'UV_TOOL_BIN_DIR="$HOME/.local/bin" uv tool install \'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed\'\n'
+            '$SUDO ln -sf "$HOME/.local/bin/nova-embed" /usr/local/bin/nova-embed'
         ),
         "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     },
