@@ -72,6 +72,35 @@ impl DataSource for S3Config {
         Ok(files)
     }
 
+    /// Stop at the first `.parquet` instead of listing the whole prefix — the
+    /// `list` stream is lazy/paginated, so this returns after the first page.
+    async fn first_file(&self) -> Result<Option<FileRef>> {
+        let store = self.store()?;
+        if let Some(list) = &self.file_list {
+            return match list.first() {
+                Some(name) => {
+                    let key = join(self.prefix.as_deref(), name);
+                    let meta = store
+                        .head(&ObjPath::from(key.clone()))
+                        .await
+                        .map_err(|e| SourceError::List(format!("head `{key}`: {e}")))?;
+                    Ok(Some(FileRef { key, size: Some(meta.size as u64) }))
+                }
+                None => Ok(None),
+            };
+        }
+        let prefix = self.prefix.as_deref().map(ObjPath::from);
+        let mut stream = store.list(prefix.as_ref());
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|e| SourceError::List(e.to_string()))?;
+            let key = meta.location.to_string();
+            if key.ends_with(".parquet") {
+                return Ok(Some(FileRef { key, size: Some(meta.size as u64) }));
+            }
+        }
+        Ok(None)
+    }
+
     async fn fetch(&self, file: &FileRef) -> Result<LocalFile> {
         let store = self.store()?;
         let path = ObjPath::from(file.key.clone());

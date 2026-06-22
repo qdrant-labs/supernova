@@ -89,6 +89,17 @@ pub trait DataSource {
     /// name. Remote sources download to a temp removed when the handle drops;
     /// the local source borrows the input file in place.
     async fn fetch(&self, file: &FileRef) -> Result<LocalFile>;
+
+    /// Return *a* file cheaply, without enumerating the whole source — used to
+    /// sample the schema (e.g. `prepare` inferring vector dimensions). Order
+    /// doesn't matter: every parquet in a corpus shares a schema. Listing 500k
+    /// S3 objects just to peek at one is the hang this avoids.
+    ///
+    /// This default has no speedup (it lists everything); each backend overrides
+    /// it to short-circuit — e.g. stop S3 listing after the first page.
+    async fn first_file(&self) -> Result<Option<FileRef>> {
+        Ok(self.list_files().await?.into_iter().next())
+    }
 }
 
 impl DataSourceConfig {
@@ -116,6 +127,13 @@ impl DataSource for DataSourceConfig {
         match self {
             DataSourceConfig::Local(c) => c.fetch(file).await,
             DataSourceConfig::S3(c) => c.fetch(file).await,
+        }
+    }
+
+    async fn first_file(&self) -> Result<Option<FileRef>> {
+        match self {
+            DataSourceConfig::Local(c) => c.first_file().await,
+            DataSourceConfig::S3(c) => c.first_file().await,
         }
     }
 }

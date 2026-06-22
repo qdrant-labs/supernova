@@ -40,12 +40,13 @@ pub enum LoadError {
 /// Single-node: create the collection, load every file, then finalize indexing.
 pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
-    let all_files = config.datasource.list_files().await?;
 
-    let dims = resolve_dims(&config.datasource, &config.vectors, &all_files).await?;
+    let dims = resolve_dims(&config.datasource, &config.vectors).await?;
     create_collection(store.as_ref(), &config.vectors, dims).await?;
     store.defer_indexing().await?;
 
+    // `load_files` lists + partitions internally.
+    let all_files = config.datasource.list_files().await?;
     let n = load_files(
         store.as_ref(),
         &config.datasource,
@@ -66,9 +67,9 @@ pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
 /// an existing collection.
 pub async fn prepare(config: LoadConfig) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
-    let all_files = config.datasource.list_files().await?;
-
-    let dims = resolve_dims(&config.datasource, &config.vectors, &all_files).await?;
+    // No file listing — dims come from sampling one file (or explicit config),
+    // so prepare doesn't pay to enumerate a huge corpus.
+    let dims = resolve_dims(&config.datasource, &config.vectors).await?;
     create_collection(store.as_ref(), &config.vectors, dims).await?;
     store.defer_indexing().await?;
     tracing::info!("prepared collection on {store}");
@@ -134,13 +135,15 @@ pub async fn inspect(config: LoadConfig, partition: Partition) -> Result<(), Loa
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Resolve each vector's dimensions. Explicit `size:` in config wins; otherwise
-/// sample one row of the first file and measure the vectors. Sparse vectors have
-/// no fixed size and are simply absent from the map.
+/// Resolve each vector's dimensions. Explicit `size:` in config wins (and needs
+/// no file access at all); otherwise sample one row of *a* file and measure the
+/// vectors. Sparse vectors have no fixed size and are simply absent from the map.
+///
+/// Uses `first_file()` rather than a full listing, so `prepare` on a 500k-object
+/// corpus doesn't hang enumerating everything just to peek at one schema.
 async fn resolve_dims(
     datasource: &DataSourceConfig,
     vectors: &HashMap<String, VectorSpec>,
-    files: &[FileRef],
 ) -> Result<HashMap<String, u64>, LoadError> {
     // If every dense/multivector spec has an explicit size, no read is needed.
     let needs_inference = vectors
@@ -150,8 +153,8 @@ async fn resolve_dims(
         return Ok(vectors.iter().filter_map(|(k, s)| s.size.map(|d| (k.clone(), d))).collect());
     }
 
-    let first = files.first().ok_or(LoadError::NoFilesToPrepare)?;
-    let local = datasource.fetch(first).await?;
+    let first = datasource.first_file().await?.ok_or(LoadError::NoFilesToPrepare)?;
+    let local = datasource.fetch(&first).await?;
     let read_job = engine::ReadJob {
         path: local.path().to_path_buf(),
         filename: local.source.key.clone(),

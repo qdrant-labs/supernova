@@ -1,6 +1,6 @@
 [project]
 name = "nova-cli"
-version = "0.0.2"
+version = "3"
 description = "Git-style dispatcher for the nova/supernova toolset: `nova <cmd>` runs `nova-<cmd>`."
 requires-python = ">=3.9"
 # Intentionally zero dependencies: the dispatcher must install instantly

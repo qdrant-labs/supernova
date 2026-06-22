@@ -46,6 +46,38 @@ impl DataSource for LocalConfig {
             location: Location::Borrowed(PathBuf::from(&file.key)),
         })
     }
+
+    /// First `.parquet` found, without walking the whole tree (no sort).
+    async fn first_file(&self) -> Result<Option<FileRef>> {
+        let base = Path::new(&self.path);
+        if let Some(list) = &self.file_list {
+            return match list.first() {
+                Some(name) => Ok(Some(file_ref(&base.join(name))?)),
+                None => Ok(None),
+            };
+        }
+        find_first_parquet(base)
+    }
+}
+
+/// Depth-first search for the first `*.parquet` under `dir`; stops as soon as it
+/// finds one. Entry order is filesystem-defined (fine for schema sampling).
+fn find_first_parquet(dir: &Path) -> Result<Option<FileRef>> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| SourceError::List(format!("read dir `{}`: {e}", dir.display())))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|e| SourceError::List(format!("read dir `{}`: {e}", dir.display())))?
+            .path();
+        if path.is_dir() {
+            if let Some(found) = find_first_parquet(&path)? {
+                return Ok(Some(found));
+            }
+        } else if path.extension().is_some_and(|ext| ext == "parquet") {
+            return Ok(Some(file_ref(&path)?));
+        }
+    }
+    Ok(None)
 }
 
 /// Build a `FileRef` for a local path, reading its size via `stat`.
