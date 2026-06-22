@@ -61,7 +61,10 @@ class PipelineConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     chunk_size: int = 10_000
-    num_workers: int = 8
+    # A single model instance is serialized by an encode lock, so workers beyond
+    # ~2 just contend on it. 2 is enough to keep the device fed (one prepping the
+    # next chunk while one encodes). Bump only if embedding is genuinely parallel.
+    num_workers: int = 2
     flush_threshold: int = 100_000
     row_group_size: int | None = None
     max_text_length: int | None = None

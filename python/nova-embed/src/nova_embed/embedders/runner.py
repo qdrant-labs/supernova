@@ -95,15 +95,19 @@ async def run_embedder(
             for _ in range(num_workers):
                 await work_queue.put(None)
 
-    # drain: pulls from result queue into buffer until all workers are done
-    expected_chunks = None
-    if expected_total_rows is not None and chunk_size > 0:
-        expected_chunks = (expected_total_rows + chunk_size - 1) // chunk_size
-    progress = tqdm(unit=" chunks", desc="Embedding", total=expected_chunks)
-    embedded_records = 0
+    # drain: pulls from result queue into buffer until all workers are done.
+    # The bar counts *texts* (not chunks), so tqdm shows the embedded count, the
+    # %/ETA against the dataset, and a texts/sec rate. `total` is the per-job row
+    # count (from --num-jobs slicing or source.limit); None → a count-up bar.
+    progress = tqdm(
+        total=expected_total_rows,
+        unit=" texts",
+        unit_scale=True,
+        desc="Embedding",
+        smoothing=0.1,  # rate reflects recent throughput, not the whole run
+    )
 
     async def drain_results():
-        nonlocal embedded_records
         finished_workers = 0
         while finished_workers < num_workers:
             result = await result_queue.get()
@@ -111,12 +115,7 @@ async def run_embedder(
                 finished_workers += 1
                 continue
             await buffer.push(result)
-            embedded_records += len(result.records)
-            progress.update(1)
-            postfix = {"records": f"{embedded_records:,}"}
-            if expected_total_rows:
-                postfix["pct"] = f"{100 * embedded_records / expected_total_rows:.1f}%"
-            progress.set_postfix(**postfix)
+            progress.update(len(result.records))
         await buffer.drain()
         progress.close()
 
