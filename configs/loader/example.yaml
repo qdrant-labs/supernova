@@ -21,11 +21,26 @@ datasource:
   type: local
   path: /tmp/mteb_tweets_all-MiniLM-L6-v2
   id_expression: "vf_point_id(filename, file_row_number)"
+  # Each payload_fields VALUE is a DuckDB SQL expression evaluated per row during
+  # the upsert read (the KEY is the payload field name). A bare column name like
+  # `text` is just the trivial expression "that column" — but you can use any
+  # scalar expression: transform columns, derive values, or generate synthetic
+  # payloads from scratch. Available helpers (see register_macros): `filename`,
+  # `file_row_number`, `random_choice(list)`, `random_word()`, `random_words(n)`.
+  # Return a scalar (string/int/float/bool); a LIST/STRUCT expression lands as
+  # null, so index into lists to get a scalar.
   payload_fields:
-    text: text
+    text: text                                  # plain column
     label: label
     label_text: label_text
     tweet_id: id
+    # --- synthetic examples (uncomment to try) ---
+    # label_upper: "upper(label_text)"          # transform a column
+    # rand_score: "random()"                    # synthetic float in [0,1)
+    # rand_rank: "(random() * 1000)::int"       # synthetic int
+    # category: "random_choice(['a','b','c'])"  # sample from a set
+    # title: "random_words(5)"                  # synthetic 5-word phrase
+    # ingested_at: "now()"                       # constant/derived
 
 vectors:
   dense:

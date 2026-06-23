@@ -243,10 +243,16 @@ pub fn infer_dims(points: &[Point], vectors: &HashMap<String, VectorSpec>) -> Ha
     dims
 }
 
-/// Register the id macros: a content id derived from `md5(file:row)` formatted
-/// as a UUID. The logical filename is already canonical (the source's key), so
-/// `vf_point_id` is just `make_point_id` — no prefix stripping needed here,
-/// unlike the Python pipeline that fed DuckDB raw URIs.
+/// Register the macros available to `id_expression` and `payload_fields`
+/// expressions:
+///
+/// - id: a content id derived from `md5(file:row)` formatted as a UUID. The
+///   logical filename is already canonical (the source's key), so `vf_point_id`
+///   is just `make_point_id` — no prefix stripping needed here, unlike the
+///   Python pipeline that fed DuckDB raw URIs.
+/// - synthetic payload helpers (`random_choice` / `random_word` / `random_words`)
+///   for generating values at upsert time, e.g. `category: "random_word()"`.
+///   `random()` re-evaluates per row (and per element inside `random_words`).
 fn register_macros(conn: &Connection) -> Result<(), EngineError> {
     conn.execute_batch(
         "CREATE OR REPLACE MACRO vf_uuid_from_hex(h) AS (
@@ -254,7 +260,19 @@ fn register_macros(conn: &Connection) -> Result<(), EngineError> {
             substr(h,17,4)||'-'||substr(h,21,12));
          CREATE OR REPLACE MACRO make_point_id(f,r) AS (
             vf_uuid_from_hex(md5(f||':'||CAST(r AS VARCHAR))));
-         CREATE OR REPLACE MACRO vf_point_id(fname,rnum) AS (make_point_id(fname,rnum));",
+         CREATE OR REPLACE MACRO vf_point_id(fname,rnum) AS (make_point_id(fname,rnum));
+
+         -- Synthetic payload generation. `items` is any list literal; index is
+         -- 1-based in DuckDB, so floor(random()*len)+1 covers the whole list.
+         CREATE OR REPLACE MACRO random_choice(items) AS
+            items[CAST(floor(random() * len(items)) AS INTEGER) + 1];
+         CREATE OR REPLACE MACRO random_word() AS
+            random_choice(['lorem','ipsum','dolor','sit','amet','vector','search',
+                'qdrant','tweet','signal','cluster','payload','index','query',
+                'recall','latency','shard','embedding','token','cosine']);
+         CREATE OR REPLACE MACRO random_words(n) AS
+            array_to_string(
+                list_transform(range(CAST(n AS INTEGER)), x -> random_word()), ' ');",
     )?;
     Ok(())
 }
@@ -311,4 +329,41 @@ fn esc_str(s: &str) -> String {
 /// Escape a double-quoted SQL identifier.
 fn esc_ident(s: &str) -> String {
     s.replace('"', "\"\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The id + synthetic-payload macros register and evaluate in the bundled
+    /// DuckDB (the version the loader actually links), not just in pip duckdb.
+    #[test]
+    fn macros_register_and_evaluate() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_macros(&conn).unwrap();
+
+        // id macro still formats md5 as a 36-char uuid
+        let id: String = conn
+            .query_row("SELECT vf_point_id('f.parquet', 3)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id.len(), 36);
+
+        // random_choice samples from the given list (single element is deterministic)
+        let only: String = conn
+            .query_row("SELECT random_choice(['only'])", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(only, "only");
+
+        // random_word yields a non-empty built-in word
+        let word: String = conn
+            .query_row("SELECT random_word()", [], |r| r.get(0))
+            .unwrap();
+        assert!(!word.is_empty());
+
+        // random_words(n) yields exactly n space-separated words
+        let phrase: String = conn
+            .query_row("SELECT random_words(5)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(phrase.split(' ').count(), 5);
+    }
 }
