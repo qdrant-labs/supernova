@@ -92,6 +92,31 @@ def _rust_worker_setup(binary: str) -> str:
     )
 
 
+def _python_worker_setup(binary: str, pip_spec: str) -> str:
+    """
+    Install a Python tool (`binary`, from `pip_spec`) on a worker. Works on BOTH
+    a root CUDA container and a non-root GPU VM:
+      - `set -e` so failures abort setup loudly (visible in setup logs) instead of
+        surfacing later as `<binary>: command not found`;
+      - `sudo` only when not root;
+      - apt-get curl/git if missing (a minimal CUDA container lacks both; a real
+        VM AMI has them, so this no-ops there);
+      - install the console script to ~/.local/bin (pinned via UV_TOOL_BIN_DIR),
+        then symlink into /usr/local/bin — which IS on PATH in the separate run
+        shell (an `export PATH` here would not be).
+    """
+    return (
+        "set -e\n"
+        'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"\n'
+        "command -v curl >/dev/null && command -v git >/dev/null || "
+        "($SUDO apt-get update && $SUDO apt-get install -y curl git)\n"
+        "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
+        'export PATH="$HOME/.local/bin:$PATH"\n'
+        f"UV_TOOL_BIN_DIR=\"$HOME/.local/bin\" uv tool install '{pip_spec}'\n"
+        f'$SUDO ln -sf "$HOME/.local/bin/{binary}" /usr/local/bin/{binary}'
+    )
+
+
 # Built-in fallbacks per tool: resources + the worker-install `setup` + envs. Used
 # when neither --resources nor ~/.nova/skypilot/<tool>.yaml is present, so a
 # first-time `nova dist <tool>` works with zero extra files. An override (file or
@@ -112,25 +137,9 @@ DEFAULTS: dict[str, dict] = {
             # passthrough handled); torch (with its bundled CUDA) installs into it.
             "image_id": "docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04",
         },
-        # Python tool. Works on BOTH a root CUDA container and a non-root GPU VM
-        # (e.g. the skypilot:custom-gpu-ubuntu-cuda13 AMI, which runs as `ubuntu`):
-        #   - `set -e` so any failure aborts setup loudly (visible in setup logs)
-        #     instead of surfacing later as `nova-embed: command not found`.
-        #   - SUDO only when not root.
-        #   - apt-get curl/git if missing (the minimal CUDA *container* lacks both;
-        #     a real VM AMI already has them, so this no-ops there).
-        #   - install the console script to ~/.local/bin (pinned via UV_TOOL_BIN_DIR
-        #     so it's deterministic), then symlink into /usr/local/bin — which IS on
-        #     PATH in the separate run shell (an `export PATH` here would not be).
-        "setup": (
-            "set -e\n"
-            'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"\n'
-            "command -v curl >/dev/null && command -v git >/dev/null || "
-            "($SUDO apt-get update && $SUDO apt-get install -y curl git)\n"
-            "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
-            'export PATH="$HOME/.local/bin:$PATH"\n'
-            f'UV_TOOL_BIN_DIR="$HOME/.local/bin" uv tool install \'nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed\'\n'
-            '$SUDO ln -sf "$HOME/.local/bin/nova-embed" /usr/local/bin/nova-embed'
+        "setup": _python_worker_setup(
+            "nova-embed",
+            f"nova-embed[embed] @ git+{_REPO}@master#subdirectory=python/nova-embed",
         ),
         "envs": {"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     },
@@ -141,6 +150,21 @@ DEFAULTS: dict[str, dict] = {
     "storm": {
         "resources": {"cloud": "aws", "cpus": "4+", "use_spot": False},
         "setup": _rust_worker_setup("nova-storm"),
+    },
+    "bf": {
+        # GPU brute force, same CUDA image story as embed (immune to AMI rot /
+        # alias drift; torch's bundled CUDA installs into the container).
+        "resources": {
+            "cloud": "aws",
+            "accelerators": "A10G:1",
+            "use_spot": False,
+            "disk_size": 150,
+            "image_id": "docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04",
+        },
+        "setup": _python_worker_setup(
+            "nova-bf",
+            f"nova-bf[compute] @ git+{_REPO}@master#subdirectory=python/nova-bf",
+        ),
     },
 }
 

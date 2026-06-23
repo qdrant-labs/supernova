@@ -1,0 +1,30 @@
+# Brute-force ground-truth config for `nova bf`:
+#   nova bf compute configs/brute_force/example.yaml                 # 1 GPU
+#   nova dist bf compute configs/brute_force/example.yaml --num-jobs 8   # fleet
+#   nova bf merge   configs/brute_force/example.yaml                 # combine partials
+#
+# Output: {output.path}/bf_<queries-stem>_k<K>.parquet with columns
+#   query_id (str), <carried payload...>, hit_ids (list[str]), hit_scores (list[float])
+# Sanity check: if a query is also in the corpus, its top hit is itself (score ~1.0).
+
+corpus:
+  # The embedded parquets to search over (same files the loader ingests).
+  path: s3://qdrant--vectorforge/fiqa/bge-m3
+  dense_column: dense_embedding
+
+queries:
+  # Query embeddings (a parquet file or a dir of them).
+  path: s3://qdrant--vectorforge/fiqa/bge-m3/queries.parquet
+  dense_column: dense_embedding
+  # Use an existing column as the query id; omit to derive make_point_id(file, row).
+  # id_column: query_id
+  # Columns to carry from the queries file into each output row.
+  payload_fields:
+    - text
+
+output:
+  path: s3://qdrant--vectorforge/fiqa/bge-m3/eval
+
+params:
+  k: 1000
+  metric: cosine          # cosine | dot | euclidean

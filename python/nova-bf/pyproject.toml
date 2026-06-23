@@ -1,0 +1,30 @@
+[project]
+name = "nova-bf"
+version = "0.0.1"
+description = "Brute-force exact nearest-neighbor ground truth for the supernova toolset."
+requires-python = ">=3.11"
+# Base deps cover config + the merge phase + IO. `compute` (GPU topk) needs torch,
+# which lives in the `compute` extra so the controller-side `merge` stays light.
+dependencies = [
+    "pydantic>=2",
+    "pyarrow",
+    "numpy",
+    "pyyaml",
+    "tqdm",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+# The GPU compute phase (`nova bf compute`). Torch is the only heavy dep.
+compute = ["torch"]
+
+# Exposes `nova-bf` on PATH so `nova bf ...` dispatches here like a Rust binary.
+[project.scripts]
+nova-bf = "nova_bf.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nova_bf"]

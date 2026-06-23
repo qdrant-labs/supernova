@@ -178,5 +178,43 @@ def storm(config, resources, num_jobs, pool_name, dry_run):
     )
 
 
+_AWS_ENV = [
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_REGION", "AWS_DEFAULT_REGION",
+]
+
+
+@main.group()
+def bf() -> None:
+    """
+    Brute-force ground truth: fan out `compute`, then `merge` on the controller.
+    """
+
+
+@bf.command("compute")
+@_common
+def bf_compute(config, resources, num_jobs, pool_name, dry_run):
+    """
+    Search the corpus across a GPU pool — each rank takes a slice of the files.
+    """
+    _fanout(
+        "bf", config, resources, num_jobs, pool_name, dry_run,
+        run_cmd="nova-bf compute {cfg} --num-jobs {n} --job-rank $SKYPILOT_JOB_RANK",
+        env_extra=_AWS_ENV + ["HF_TOKEN"],
+    )
+    if not dry_run:
+        click.echo("\nwhen all workers finish, merge the partials:")
+        click.echo(f"  nova dist bf merge {config}")
+
+
+@bf.command("merge")
+@click.argument("config")
+def bf_merge(config):
+    """
+    Merge per-rank partial results into one top-K parquet (runs on the controller).
+    """
+    _run_local("nova-bf", ["merge", config])
+
+
 if __name__ == "__main__":
     main()
