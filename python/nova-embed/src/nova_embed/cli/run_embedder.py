@@ -13,6 +13,7 @@ from nova_embed.registry import (
     SPARSE_EMBEDDERS,
     STORAGE,
 )
+from nova_embed.sources.base import files_in_window
 
 # Import the component packages for their registration side-effects: the
 # @*.register decorators on the concrete classes populate the registries above.
@@ -99,6 +100,69 @@ def build_engine(config: dict) -> EmbeddingEngine:
     )
 
 
+def _configured_embedders(cfg) -> list[str]:
+    """`kind=model` for each embedder set in the config (no models loaded)."""
+    out = []
+    for kind in ("dense", "sparse", "multivector"):
+        section = getattr(cfg, f"{kind}_embedder", None)
+        if section:
+            d = section.build_dict()
+            out.append(f"{kind}={d.get('model') or d.get('type') or '?'}")
+    return out
+
+
+def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | None) -> None:
+    """
+    Inspect the source and print how the dataset partitions across `num_jobs`
+    workers — rows per rank, and (for file-based sources) how many parquet files
+    each rank reads. Footers only: no data download, no embedding model loaded.
+    """
+    click.echo("=" * 70)
+    click.echo("nova-embed DRY RUN")
+    click.echo("=" * 70)
+    click.echo(f"config:    {config_path}")
+    click.echo(f"source:    {cfg.source.type}")
+    click.echo(f"embedders: {', '.join(_configured_embedders(cfg)) or '(none configured!)'}")
+    click.echo(f"chunking:  {cfg.chunking.type if cfg.chunking else 'passthrough'}")
+    click.echo(f"storage:   {cfg.storage.type}")
+
+    source = SOURCES.build(dict(source_dict))
+    total = source.get_total_rows()
+    list_files = getattr(source, "list_files", None)
+    files = list_files() if callable(list_files) else None
+
+    click.echo("-" * 70)
+    if files is not None:
+        click.echo(f"dataset:   {total:,} rows across {len(files):,} parquet files")
+    else:
+        click.echo(f"dataset:   {total:,} rows")
+
+    jobs = num_jobs or 1
+    rows_per_job = math.ceil(total / jobs) if total else 0
+    click.echo(f"partition: {jobs} job(s), ~{rows_per_job:,} rows/job")
+    click.echo("-" * 70)
+
+    width = max(1, len(str(jobs - 1)))
+    empty = 0
+    for rank in range(jobs):
+        offset = rank * rows_per_job
+        limit = max(0, min(rows_per_job, total - offset))
+        empty += limit == 0
+        line = f"  rank {rank:>{width}}: rows [{offset:>12,} .. {offset + limit:>12,})  {limit:>12,} rows"
+        if files is not None:
+            line += f"  ·  {len(files_in_window(files, offset, limit)) if limit else 0} files"
+        click.echo(line)
+
+    if empty:
+        click.echo(f"\n  ⚠  {empty} job(s) receive 0 rows — num_jobs exceeds the data; reduce it.")
+    if files is not None and num_jobs and num_jobs > len(files):
+        click.echo(
+            f"\n  ⚠  num_jobs ({num_jobs}) > file count ({len(files)}): ranks splitting the "
+            "same file each download that whole file (row windows don't split files)."
+        )
+    click.echo("=" * 70)
+
+
 @click.command(name="embed", help="Embed a dataset locally.")
 @click.argument("config", required=False)
 @click.option(
@@ -145,6 +209,13 @@ def embed(config, num_jobs, job_rank, dry_run):
             "Use --num-jobs / --job-rank for distributed slicing."
         )
 
+    # Dry run short-circuits BEFORE building the engine — we must not download or
+    # load the embedding model just to print a plan. It inspects the source
+    # (parquet footers only) to show how the dataset partitions across workers.
+    if dry_run:
+        _print_dry_run(cfg, config_path, source_dict, num_jobs)
+        return
+
     filename_prefix = ""
     if num_jobs is not None:
         if job_rank is None:
@@ -179,6 +250,12 @@ def embed(config, num_jobs, job_rank, dry_run):
         separator = "/" if pipeline.shard_by_rank else "_"
         filename_prefix = f"rank{job_rank:0{rank_width}d}{separator}"
 
+    # Carry source provenance (source_file_name + source_row_number) into the
+    # output when enabled. Injected only when on, so sources that don't support
+    # it aren't forced to accept the kwarg.
+    if pipeline.include_source_provenance:
+        source_dict["include_provenance"] = True
+
     source = SOURCES.build(dict(source_dict))
 
     # build_engine still takes a dict keyed by *_embedder; feed it the validated
@@ -211,21 +288,6 @@ def embed(config, num_jobs, job_rank, dry_run):
 
     # prefer the per-job limit (set by --num-jobs slicing); else there's no cap
     expected_total_rows = source_dict.get("limit")
-
-    if dry_run:
-        click.echo("=" * 60)
-        click.echo("nova-embed pipeline DRY RUN")
-        click.echo("=" * 60)
-        click.echo(f"Config: {config_path}")
-        click.echo(f"Source: {cfg.source.type}")
-        click.echo(f"Engine: {', '.join(k for k in ['dense', 'sparse', 'multivector'] if getattr(engine, 'has_' + k))} embedding")
-        click.echo(f"Chunking: {chunker.__class__.__name__}")
-        click.echo(f"Storage: {cfg.storage.type}")
-        click.echo(f"Filename prefix: '{filename_prefix}'")
-        if num_jobs:
-            click.echo(f"Distributed slicing: job_rank={job_rank} / num_jobs={num_jobs}")
-        click.echo("=" * 60)
-        return
 
     asyncio.run(
         run_embedder(

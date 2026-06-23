@@ -75,6 +75,11 @@ class PipelineConfig(BaseModel):
     # shard_by_rank=true  -> "rank00/batch_*.parquet" (subdir per rank)
     # shard_by_rank=false -> "rank00_batch_*.parquet" (flat)
     shard_by_rank: bool = False
+    # Stamp each embedded row with where it came from: `source_file_name` (the
+    # original parquet path in the source repo) and `source_row_number` (its row
+    # index WITHIN that file). Lets you trace any embedding back to its origin —
+    # the same (file, row) coordinate nova-load uses to derive point ids.
+    include_source_provenance: bool = False
 
 
 class EmbedConfig(BaseModel):

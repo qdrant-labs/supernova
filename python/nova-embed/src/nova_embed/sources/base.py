@@ -7,6 +7,27 @@ if TYPE_CHECKING:
     from nova_embed.chunkers import Chunker
 
 
+def files_in_window(
+    files_with_counts: list[tuple[str, int]], offset: int, limit: int | None
+) -> list[tuple[str, int]]:
+    """
+    Of an ordered ``[(path, row_count)]`` list, return the files whose row range
+    overlaps the window ``[offset, offset + limit)`` (``limit=None`` = open-ended).
+
+    Row-window → file mapping: rank slices are row offsets/limits, but a worker
+    only needs the parquet files those rows actually fall in. Shared by the HF
+    source's prefetch and the distributed partition estimate so they never drift.
+    """
+    out: list[tuple[str, int]] = []
+    cumulative = 0
+    for path, num_rows in files_with_counts:
+        file_end = cumulative + num_rows
+        if file_end > offset and (limit is None or cumulative < offset + limit):
+            out.append((path, num_rows))
+        cumulative = file_end
+    return out
+
+
 class DatasetSource(ABC):
     """
     Abstract base for all dataset sources.

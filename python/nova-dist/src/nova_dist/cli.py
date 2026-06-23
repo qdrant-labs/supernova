@@ -37,7 +37,8 @@ def _fanout(
     resources: str,
     num_jobs: int,
     pool_name: str | None, dry_run: bool, run_cmd: str,
-    env_extra: list[str]
+    env_extra: list[str],
+    dry_run_extra=None,
 ) -> None:
     """
     Stage the config, generate pool+job YAMLs from the user's resources YAML,
@@ -59,6 +60,8 @@ def _fanout(
 
     if dry_run:
         sky.print_dry_run(pool, num_jobs, pool_path, job_path)
+        if dry_run_extra:
+            dry_run_extra()
         return
 
     envs = sky.forward_env(config, env_extra)
@@ -73,6 +76,23 @@ def _run_local(binary: str, args: list[str]) -> None:
     exe = _resolve_binary(binary)
     click.echo(f"local: {exe} {' '.join(args)}")
     subprocess.run([exe, *args], check=True)
+
+
+def _embed_partition_preview(config: str, num_jobs: int) -> None:
+    """
+    Best-effort: ask the locally-installed nova-embed to inspect the source and
+    print how the dataset partitions across `num_jobs` workers. Skips with a hint
+    if nova-embed isn't on the controller (it's only required on the workers).
+    """
+    exe = _resolve_binary("nova-embed")
+    click.echo("\ndata partition (nova-embed --dry-run):")
+    try:
+        subprocess.run([exe, config, "--num-jobs", str(num_jobs), "--dry-run"], check=False)
+    except FileNotFoundError:
+        click.echo(
+            "  (nova-embed not installed on this controller — run `make embed` to "
+            "see the per-worker file/row estimate)"
+        )
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -103,6 +123,7 @@ def embed(config, resources, num_jobs, pool_name, dry_run):
         "embed", config, resources, num_jobs, pool_name, dry_run,
         run_cmd="nova-embed {cfg} --num-jobs {n}",
         env_extra=["HF_TOKEN", "OPENAI_API_KEY", "HF_HUB_ENABLE_HF_TRANSFER"],
+        dry_run_extra=lambda: _embed_partition_preview(config, num_jobs),
     )
 
 

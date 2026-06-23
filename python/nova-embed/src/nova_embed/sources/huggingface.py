@@ -18,9 +18,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
-from nova_embed.sources.base import DatasetSource
+from nova_embed.sources.base import DatasetSource, files_in_window
 from nova_embed.models import Record
 from nova_embed.registry import SOURCES
+
+# Provenance columns stamped onto each row when include_provenance=True.
+SOURCE_FILE_COLUMN = "source_file_name"
+SOURCE_ROW_COLUMN = "source_row_number"
 
 
 def _build_text_extractor(text_field: str | None, text_template: str | None):
@@ -96,6 +100,7 @@ class HuggingFaceSource(DatasetSource):
         metadata_workers: int = 4,
         prefetch: bool = False,
         prefetch_dir: str = "/tmp/nova_embed_parquet",
+        include_provenance: bool = False,
     ):
         """
         Args:
@@ -128,6 +133,7 @@ class HuggingFaceSource(DatasetSource):
         self._metadata_workers = metadata_workers
         self._prefetch = prefetch
         self._prefetch_dir = prefetch_dir
+        self._include_provenance = include_provenance
         self._local_paths: dict[str, str] = {}
         self._extract_text = _build_text_extractor(text_field, text_template)
 
@@ -259,16 +265,12 @@ class HuggingFaceSource(DatasetSource):
         from huggingface_hub import hf_hub_download
 
         self._ensure_counts()
-        offset = self._offset
-        limit = self._limit
-
-        cumulative = 0
-        to_download = []
-        for path, num_rows in self._files_with_counts:
-            file_end = cumulative + num_rows
-            if file_end > offset and (limit is None or cumulative < offset + limit):
-                to_download.append(path)
-            cumulative = file_end
+        to_download = [
+            path
+            for path, _ in files_in_window(
+                self._files_with_counts, self._offset, self._limit
+            )
+        ]
 
         Path(self._prefetch_dir).mkdir(parents=True, exist_ok=True)
 
@@ -323,6 +325,10 @@ class HuggingFaceSource(DatasetSource):
 
             # offset within this file (0 if we're past the start of our window)
             intra_offset = max(0, offset - file_start)
+            # File-local index where this file's window begins. `intra_offset` is
+            # mutated inside the batch loop, so capture it now to compute each
+            # row's source_row_number.
+            start_in_file = intra_offset
             available_in_file = num_rows - intra_offset
             want_from_file = (
                 min(available_in_file, limit - rows_yielded)
@@ -356,6 +362,13 @@ class HuggingFaceSource(DatasetSource):
 
                 # Reset intra_offset since we've now entered the window
                 intra_offset = 0
+
+                if self._include_provenance:
+                    # base = file-local index of the first row in this slice
+                    base = start_in_file + taken_from_file
+                    for j, row in enumerate(rows):
+                        row[SOURCE_FILE_COLUMN] = path
+                        row[SOURCE_ROW_COLUMN] = base + j
 
                 yield from rows
 
