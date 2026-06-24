@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
-from queue import Queue
+from queue import Empty, Queue
 from threading import Thread
 
 import numpy as np
@@ -133,27 +134,51 @@ def run_compute(
     top_scores = torch.full((n_q, k), float("-inf"), device=device)
     top_enc = torch.zeros((n_q, k), dtype=torch.int64, device=device)
 
-    # prefetch corpus files (dense column only) in a thread → overlap IO + GPU.
-    fq: Queue = Queue(maxsize=PREFETCH_QUEUE_SIZE)
+    # Prefetch corpus files (dense column only) with a POOL of reader threads so
+    # many S3 GETs are in flight at once — otherwise the GPU sits idle behind one
+    # file's latency at a time. Order doesn't matter (the top-K merge is
+    # commutative). pyarrow releases the GIL during IO, so threads parallelize.
     dense_col = cfg.corpus.dense_column
+    io_workers = max(1, cfg.params.io_workers)
+    work: Queue = Queue()
+    for item in mine:
+        work.put(item)
+    fq: Queue = Queue(maxsize=io_workers * 2)  # bounded → backpressure on readers
 
     def reader():
-        for gidx, f in mine:
+        while True:
+            try:
+                gidx, f = work.get_nowait()
+            except Empty:
+                return
+            t0 = time.perf_counter()
             table = cstore.read_columns(f.read_path, [dense_col])
-            fq.put((gidx, dense_to_2d(table[dense_col])))
-        fq.put(None)
+            arr = dense_to_2d(table[dense_col])
+            fq.put((gidx, arr, time.perf_counter() - t0))
 
-    Thread(target=reader, daemon=True).start()
+    for _ in range(io_workers):
+        Thread(target=reader, daemon=True).start()
+
+    # Timing split (debug): `io_wait` is real time the consumer blocked on an
+    # empty queue == the GPU starved waiting for reads — the number that matters
+    # here. `gpu_secs` is just CPU-side enqueue time (CUDA is async and overlaps
+    # the next read), so it being tiny is itself evidence we're not compute-bound.
+    # `read_secs` is summed per-file read latency across the reader threads.
+    io_wait = gpu_secs = read_secs = 0.0
+    rows_seen = 0
 
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
-        while True:
-            item = fq.get()
-            if item is None:
-                break
-            gidx, arr = item
+        for _ in range(len(mine)):
+            w0 = time.perf_counter()
+            gidx, arr, rsec = fq.get()
+            io_wait += time.perf_counter() - w0
+            read_secs += rsec
+            bar.update(1)
             if len(arr) == 0:
-                bar.update(1)
                 continue
+            rows_seen += len(arr)
+
+            g0 = time.perf_counter()
             C = torch.tensor(arr, dtype=torch.float32, device=device)
             scores = _scores(Q, C, metric)  # (n_q, n_rows)
             file_k = min(k, C.shape[0])
@@ -164,7 +189,23 @@ def run_compute(
             merged_e = torch.cat([top_enc, f_enc], dim=1)
             top_scores, idx = torch.topk(merged_s, k=k, dim=1)
             top_enc = merged_e.gather(1, idx)
-            bar.update(1)
+            gpu_secs += time.perf_counter() - g0
+
+            if bar.n % 200 == 0:
+                bar.set_postfix_str(f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s", refresh=False)
+
+    logger.info(
+        "timing: %d files / %d rows | consumer io_wait=%.1fs gpu=%.1fs | "
+        "read latency avg=%.3fs/file (summed %.0fs over %d threads)",
+        len(mine), rows_seen, io_wait, gpu_secs,
+        read_secs / max(1, len(mine)), read_secs, io_workers,
+    )
+    if io_wait > 3 * max(gpu_secs, 1e-6):
+        logger.info(
+            "IO-bound: GPU idle %.0f%% of the time waiting on reads — raise "
+            "params.io_workers (currently %d).",
+            100 * io_wait / max(io_wait + gpu_secs, 1e-9), io_workers,
+        )
 
     # 3. decode the final top-K into hit ids (recompute only K*n_q ids).
     enc = top_enc.cpu().numpy()

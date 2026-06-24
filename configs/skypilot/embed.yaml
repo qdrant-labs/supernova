@@ -13,10 +13,11 @@ resources:
   accelerators: A10G:1
   use_spot: true
   disk_size: 150
-  # CUDA Docker image — guarantees the CUDA libs regardless of region or SkyPilot
-  # version (raw AMI ids rot; skypilot: aliases vary by version). SkyPilot runs
-  # the job in this container with GPU passthrough.
-  image_id: docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+  # A real GPU VM AMI (driver + CUDA preinstalled, torch.cuda works). NOT
+  # docker:nvidia/cuda — the GPU isn't visible inside that container, so torch
+  # falls back to CPU. This alias is catalog-version-specific; if it errors, grep
+  # ~/.sky/catalogs/*/aws/images.csv for the current gpu tag.
+  image_id: skypilot:custom-gpu-ubuntu-cuda13
 
 # Install nova-embed on each worker. Pin @master to a tag/SHA so the fleet runs
 # identical code. Adjust the git URL/ref to your fork.

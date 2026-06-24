@@ -123,6 +123,16 @@ def _python_worker_setup(binary: str, pip_spec: str) -> str:
 # flag) is shallow-merged OVER these by top-level key — set only what you want to
 # change (e.g. just `setup:` for a dev build keeps the default `resources:`).
 # These mirror the copy-and-tweak examples in configs/skypilot/.
+#
+# GPU image: a SkyPilot catalog GPU AMI alias, NOT `docker:nvidia/cuda`. The
+# docker image looked appealing (version/region-agnostic) but the GPU is not
+# visible inside the container in practice — torch falls back to CPU. This AMI is
+# a real GPU VM with the driver + CUDA preinstalled (torch.cuda works). It is
+# catalog-version-specific: if your SkyPilot errors on the tag, grep
+# ~/.sky/catalogs/*/aws/images.csv for the current gpu tag (and override per-tool
+# in ~/.nova/skypilot/<tool>.yaml).
+_GPU_IMAGE = "skypilot:custom-gpu-ubuntu-cuda13"
+
 DEFAULTS: dict[str, dict] = {
     "embed": {
         "resources": {
@@ -130,12 +140,7 @@ DEFAULTS: dict[str, dict] = {
             "accelerators": "A10G:1",
             "use_spot": False,
             "disk_size": 150,
-            # A CUDA Docker image guarantees the CUDA libs are present, immune to
-            # both failure modes we hit: raw AMI ids rot (deregistered per region)
-            # and `skypilot:` aliases vary by SkyPilot version. SkyPilot runs the
-            # job in this container on the GPU instance (host driver + GPU
-            # passthrough handled); torch (with its bundled CUDA) installs into it.
-            "image_id": "docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04",
+            "image_id": _GPU_IMAGE,
         },
         "setup": _python_worker_setup(
             "nova-embed",
@@ -152,14 +157,13 @@ DEFAULTS: dict[str, dict] = {
         "setup": _rust_worker_setup("nova-storm"),
     },
     "bf": {
-        # GPU brute force, same CUDA image story as embed (immune to AMI rot /
-        # alias drift; torch's bundled CUDA installs into the container).
+        # GPU brute force on the same real-GPU AMI as embed (see _GPU_IMAGE note).
         "resources": {
             "cloud": "aws",
             "accelerators": "A10G:1",
             "use_spot": False,
             "disk_size": 150,
-            "image_id": "docker:nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04",
+            "image_id": _GPU_IMAGE,
         },
         "setup": _python_worker_setup(
             "nova-bf",

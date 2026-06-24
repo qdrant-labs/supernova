@@ -69,6 +69,10 @@ class ParamsConfig(BaseModel):
 
     k: int = 1000
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
+    # Concurrent corpus-file readers. The GPU is idle while a file downloads, so
+    # with many small remote files throughput is bound by S3 latency × 1/threads.
+    # Raise for lots of tiny files on S3; 1–2 is plenty for a few big local files.
+    io_workers: int = 16
 
 
 class BruteForceConfig(BaseModel):
