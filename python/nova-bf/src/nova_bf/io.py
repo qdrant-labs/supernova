@@ -51,7 +51,9 @@ class Store:
         return read_path.split("/", 1)[1] if self.is_s3 else read_path
 
     def list_parquets(self, subpath: str | None = None) -> list[ParquetFile]:
-        """Every `*.parquet` under the root (or root/subpath), sorted."""
+        """
+        Every `*.parquet` under the root (or root/subpath), sorted.
+        """
         base = f"{self.root.rstrip('/')}/{subpath}" if subpath else self.root
         info = self.fs.get_file_info(base)
         if info.type == pafs.FileType.File:
@@ -72,7 +74,9 @@ class Store:
         return pq.read_table(read_path, filesystem=self.fs, columns=columns)
 
     def write(self, filename: str, table: pa.Table) -> str:
-        """Write a table to root/filename (creating local parent dirs)."""
+        """
+        Write a table to root/filename (creating local parent dirs).
+        """
         path = f"{self.root.rstrip('/')}/{filename}"
         if not self.is_s3:
             os.makedirs(os.path.dirname(path), exist_ok=True)

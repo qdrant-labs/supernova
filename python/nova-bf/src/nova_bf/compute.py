@@ -96,6 +96,9 @@ def run_compute(
     cfg: BruteForceConfig,
     num_jobs: int | None = None,
     job_rank: int | None = None,
+    io_workers: int | None = None,
+    io_thread_count: int | None = None,
+    max_files: int | None = None,
 ) -> str:
     try:
         import torch
@@ -127,6 +130,13 @@ def run_compute(
     else:
         mine = list(enumerate(all_files))
     logger.info("corpus files: %d total, %d for this worker", len(all_files), len(mine))
+    if max_files is not None and max_files < len(mine):
+        logger.warning(
+            "--max-files=%d: benchmarking on the first %d of %d slice files — "
+            "OUTPUT WILL BE PARTIAL (not valid ground truth).",
+            max_files, max_files, len(mine),
+        )
+        mine = mine[:max_files]
 
     Q = torch.tensor(Q_np, dtype=torch.float32, device=device)
     if metric == "cosine":
@@ -139,7 +149,12 @@ def run_compute(
     # file's latency at a time. Order doesn't matter (the top-K merge is
     # commutative). pyarrow releases the GIL during IO, so threads parallelize.
     dense_col = cfg.corpus.dense_column
-    io_workers = max(1, cfg.params.io_workers)
+    io_workers = max(1, io_workers if io_workers is not None else cfg.params.io_workers)
+    itc = io_thread_count if io_thread_count is not None else cfg.params.io_thread_count
+    if itc and itc > 0:
+        import pyarrow as pa
+        pa.set_io_thread_count(itc)
+        logger.info("pyarrow IO thread pool set to %d (true S3 fetch concurrency)", itc)
     work: Queue = Queue()
     for item in mine:
         work.put(item)
@@ -166,6 +181,8 @@ def run_compute(
     # `read_secs` is summed per-file read latency across the reader threads.
     io_wait = gpu_secs = read_secs = 0.0
     rows_seen = 0
+    bytes_seen = 0  # decoded float32 bytes consumed (~= wire bytes for snappy-float32)
+    wall0 = time.perf_counter()
 
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for _ in range(len(mine)):
@@ -177,9 +194,12 @@ def run_compute(
             if len(arr) == 0:
                 continue
             rows_seen += len(arr)
+            bytes_seen += int(arr.nbytes)
 
             g0 = time.perf_counter()
-            C = torch.tensor(arr, dtype=torch.float32, device=device)
+            # zero-copy view of the (contiguous float32) array + one H2D copy;
+            # torch.tensor() would add an extra host→host copy first.
+            C = torch.from_numpy(arr).to(device, non_blocking=True)
             scores = _scores(Q, C, metric)  # (n_q, n_rows)
             file_k = min(k, C.shape[0])
             f_scores, f_local = torch.topk(scores, k=file_k, dim=1)
@@ -194,11 +214,25 @@ def run_compute(
             if bar.n % 200 == 0:
                 bar.set_postfix_str(f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s", refresh=False)
 
+    wall = time.perf_counter() - wall0
+    gb = bytes_seen / 1e9
+    wall_mbps = bytes_seen / 1e6 / max(wall, 1e-9)         # effective aggregate S3 throughput
+    stream_mbps = bytes_seen / 1e6 / max(read_secs, 1e-9)  # avg single-connection throughput
     logger.info(
-        "timing: %d files / %d rows | consumer io_wait=%.1fs gpu=%.1fs | "
+        "timing: %d files / %d rows / %.2f GB in %.1fs | consumer io_wait=%.1fs gpu=%.1fs | "
         "read latency avg=%.3fs/file (summed %.0fs over %d threads)",
-        len(mine), rows_seen, io_wait, gpu_secs,
+        len(mine), rows_seen, gb, wall, io_wait, gpu_secs,
         read_secs / max(1, len(mine)), read_secs, io_workers,
+    )
+    # One machine-parseable line per run — for sweeping io_workers and plotting.
+    # `wall_mbps` is the effective aggregate download rate; compare it to the
+    # instance's *sustained* NIC baseline (g5.xlarge ≈ 310 MB/s) to tell whether
+    # you're NIC-bound (plateaus there) or still latency-bound (keeps rising).
+    logger.info(
+        "bf-bench io_workers=%d files=%d rows=%d gb=%.3f wall_s=%.1f "
+        "wall_mbps=%.1f stream_mbps=%.1f io_wait_s=%.1f gpu_s=%.1f",
+        io_workers, len(mine), rows_seen, gb, wall,
+        wall_mbps, stream_mbps, io_wait, gpu_secs,
     )
     if io_wait > 3 * max(gpu_secs, 1e-6):
         logger.info(

@@ -27,12 +27,29 @@ def main() -> None:
 @click.argument("config")
 @click.option("--num-jobs", type=int, default=None, help="Total workers (enables distributed slicing).")
 @click.option("--job-rank", type=int, default=None, help="This worker's rank; defaults to $SKYPILOT_JOB_RANK.")
-def compute(config: str, num_jobs: int | None, job_rank: int | None) -> None:
+@click.option("--io-workers", type=int, default=None, help="Override params.io_workers — concurrent corpus-file reader threads (for sweeping/tuning).")
+@click.option("--io-thread-count", type=int, default=None, help="Override params.io_thread_count — pyarrow's global IO pool (true S3 fetch concurrency).")
+@click.option("--max-files", type=int, default=None, help="Read only the first N corpus files of this slice. Benchmarking aid; output is PARTIAL.")
+def compute(
+    config: str,
+    num_jobs: int | None,
+    job_rank: int | None,
+    io_workers: int | None,
+    io_thread_count: int | None,
+    max_files: int | None,
+) -> None:
     """Search the corpus and write per-query top-K (one worker's slice)."""
     _setup_logging()
     from nova_bf.compute import run_compute
 
-    run_compute(load_config(config), num_jobs=num_jobs, job_rank=job_rank)
+    run_compute(
+        load_config(config),
+        num_jobs=num_jobs,
+        job_rank=job_rank,
+        io_workers=io_workers,
+        io_thread_count=io_thread_count,
+        max_files=max_files,
+    )
 
 
 @main.command()

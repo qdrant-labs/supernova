@@ -1,0 +1,41 @@
+# OPTIONAL resources override for `nova dist bf` — not required (built-in
+# defaults install nova-bf[compute] on an A10G GPU VM). Layering, low → high:
+#   built-in default  <  ~/.nova/skypilot/bf.yaml  <  --resources THIS file
+# Use it with:
+#   nova dist bf compute configs/brute_force/example.yaml \
+#       --resources configs/skypilot/bf.yaml --num-jobs N
+# or copy it to ~/.nova/skypilot/bf.yaml to make it your default. Only the
+# top-level keys present here replace the default's (setup:/envs: are inherited).
+#
+# WHY THIS FILE EXISTS: `nova bf` is dominated by downloading the corpus from S3
+# (the GPU is idle ~96% of the time). Two networking knobs matter most:
+#
+# 1. REGION — pin the worker to the SAME region as the corpus bucket. An
+#    unpinned launch (the default) lets SkyPilot's cost optimizer land workers in
+#    another region, where S3 is hard-capped at ~5 Gbps for <32-vCPU instances
+#    AND every GB is billed as cross-region egress. VERIFY the bucket's region:
+#       aws s3api get-bucket-location --bucket qdrant--vectorforge
+#    (an empty/null LocationConstraint means us-east-1). Set `region:` to match.
+#    NOTE: pinning a region draws spot/on-demand capacity from that region only.
+#
+# 2. SUSTAINED NIC — g5.xlarge/2xlarge advertise "up to 10 Gbps" but that is
+#    burst (credit-limited to minutes); the sustained baseline is only ~2.5/5
+#    Gbps, which is what a full scan actually runs at. If the `bf-bench wall_mbps`
+#    log line shows you pinned at that baseline (NIC-bound), step up to a
+#    fixed-line-rate size: g5.8xlarge = 25 Gbps (still 1× A10G), 12xlarge = 40,
+#    24xlarge = 50. Swap the `accelerators:` line for `instance_type: g5.8xlarge`.
+
+resources:
+  cloud: aws
+  region: us-east-1          # ← VERIFY against the corpus bucket (see note 1)
+  accelerators: A10G:1       # or: instance_type: g5.8xlarge   (25 Gbps fixed NIC)
+  # use_spot stays false for ground truth: a preempted rank that never re-runs
+  # silently drops its corpus slice, and `nova bf merge` can't tell — it merges
+  # whatever partials exist, yielding INCOMPLETE ground truth with no error.
+  # Enable spot only once merge verifies all N ranks are present.
+  use_spot: false
+  disk_size: 150
+  # Region-agnostic GPU image alias (SkyPilot v8 catalog); resolves per region.
+  # In us-east-1 → ami-041c37c1cd2c36a67. If your SkyPilot errors on this tag,
+  # grep ~/.sky/catalogs/*/aws/images.csv for the current gpu tag.
+  image_id: skypilot:custom-gpu-ubuntu-cuda13

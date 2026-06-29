@@ -69,10 +69,23 @@ class ParamsConfig(BaseModel):
 
     k: int = 1000
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
-    # Concurrent corpus-file readers. The GPU is idle while a file downloads, so
-    # with many small remote files throughput is bound by S3 latency × 1/threads.
-    # Raise for lots of tiny files on S3; 1–2 is plenty for a few big local files.
+    # Concurrent corpus-file readers (one thread per in-flight file). IMPORTANT:
+    # pyarrow reads parquet with pre_buffer=True, which dispatches the actual S3
+    # byte-fetches to a SHARED global IO thread pool of size `io_thread_count`
+    # (default ~8). So raising io_workers past ~io_thread_count adds NO real S3
+    # concurrency — it only piles up read_table calls, inflates per-file latency,
+    # and holds more decoded arrays in RAM (each reader ≈ one file; io_workers ×
+    # file_size must fit host memory or the box OOMs — that's what killed the
+    # 96/128-worker runs on a 16 GB g5.xlarge). Keep it modest; the real S3
+    # concurrency knob is io_thread_count below.
     io_workers: int = 16
+    # pyarrow's global IO thread pool size = the TRUE S3 fetch concurrency (see
+    # io_workers). 0 → leave pyarrow's default (~8). Raise it (e.g. 32) to test
+    # whether the IO pool, rather than the NIC, is the throughput ceiling: if
+    # `bf-bench wall_mbps` climbs toward the instance's NIC baseline you were
+    # pool-bound; if it stays flat you're network-bound. Applied via
+    # pa.set_io_thread_count() once at startup.
+    io_thread_count: int = 0
 
 
 class BruteForceConfig(BaseModel):
