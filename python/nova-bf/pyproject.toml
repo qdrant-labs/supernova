@@ -17,6 +17,8 @@ dependencies = [
 [project.optional-dependencies]
 # The GPU compute phase (`nova bf compute`). Torch is the only heavy dep.
 compute = ["torch"]
+# Tests: pytest + torch (the compute-phase test runs the GPU topk path on CPU).
+dev = ["pytest", "torch"]
 
 # Exposes `nova-bf` on PATH so `nova bf ...` dispatches here like a Rust binary.
 [project.scripts]
@@ -28,3 +30,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nova_bf"]
+
+[tool.pytest.ini_options]
+# src-layout: make `nova_bf` importable in tests without an editable install.
+pythonpath = ["src"]
+testpaths = ["tests"]

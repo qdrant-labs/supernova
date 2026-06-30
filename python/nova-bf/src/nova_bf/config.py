@@ -44,6 +44,15 @@ class CorpusConfig(BaseModel):
 
     path: str
     dense_column: str = "dense_embedding"
+    # If set, hit_ids are taken verbatim from this already-unique column (e.g.
+    # fineweb's `id` = "<urn:uuid:...>") — transparent for public data, and
+    # resolvable without reconstructing the loader's hashing. If unset (default),
+    # hit_ids are derived via make_point_id(corpus_file_key, row), matching the
+    # point ids the loader synthesizes at ingest. Unlike make_point_id (a pure
+    # function of file+row, recomputed only for the final K hits), a real id column
+    # lives in the data, so it's read alongside the dense column and kept in RAM
+    # per file for the worker's slice — budget ~(slice_rows × id_size) of host mem.
+    id_column: str | None = None
 
 
 class QueriesConfig(BaseModel):
@@ -86,6 +95,14 @@ class ParamsConfig(BaseModel):
     # pool-bound; if it stays flat you're network-bound. Applied via
     # pa.set_io_thread_count() once at startup.
     io_thread_count: int = 0
+    # Score a corpus file against the queries in row-batches of this many rows,
+    # instead of all at once. The per-file score matrix is (n_queries × rows), so a
+    # big file (or many queries) can OOM the GPU; batching bounds it to
+    # (n_queries × corpus_batch_size). None (default) → whole file in one matmul
+    # (fastest, current behavior). A batch below k is pointless — it can't fill the
+    # top-K and isn't smaller than the always-resident (n_q × k) state — so values
+    # under k are raised to k with a warning.
+    corpus_batch_size: int | None = None
 
 
 class BruteForceConfig(BaseModel):

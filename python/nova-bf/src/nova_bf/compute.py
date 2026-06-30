@@ -11,6 +11,12 @@ Running top-K stores `(score, encoded)` where `encoded = global_file_idx *
 MAX_ROWS_PER_FILE + row`. Keeping an int on the GPU (instead of id strings) makes
 the per-file merge a cheap `torch.topk`; ids are recomputed only for the final
 K via `make_point_id`, so the whole corpus's ids never materialize.
+
+If `corpus.id_column` is set, hit ids come from that pre-existing column instead
+of `make_point_id`. Such an id isn't recomputable from (file, row), so it's read
+alongside the dense column and kept in RAM per file (the worker's slice) to resolve
+the final top-K. Large files can be scored in row-batches (`params.corpus_batch_size`)
+to bound the per-file score matrix `(n_queries × rows)` on the GPU.
 """
 
 from __future__ import annotations
@@ -149,6 +155,21 @@ def run_compute(
     # file's latency at a time. Order doesn't matter (the top-K merge is
     # commutative). pyarrow releases the GIL during IO, so threads parallelize.
     dense_col = cfg.corpus.dense_column
+    id_col = cfg.corpus.id_column  # None → derive make_point_id(file_key, row) at decode
+    read_cols = [dense_col] + ([id_col] if id_col else [])
+    # Corpus id strings carried through to decode, kept in RAM per file (only when
+    # id_column is set). gidx → pyarrow string array aligned with that file's rows.
+    corpus_ids: dict[int, object] = {}
+    # Score each file in row-batches to bound the (n_q × rows) score matrix; None =
+    # whole file. Below k is pointless (a batch can't fill the top-K and isn't
+    # smaller than the resident n_q × k state), so raise it to k with a warning.
+    corpus_batch = cfg.params.corpus_batch_size
+    if corpus_batch is not None and corpus_batch < k:
+        logger.warning(
+            "corpus_batch_size=%d is below k=%d; raising to k (a smaller batch can't "
+            "fill the top-K and gives no memory benefit).", corpus_batch, k,
+        )
+        corpus_batch = k
     io_workers = max(1, io_workers if io_workers is not None else cfg.params.io_workers)
     itc = io_thread_count if io_thread_count is not None else cfg.params.io_thread_count
     if itc and itc > 0:
@@ -167,9 +188,12 @@ def run_compute(
             except Empty:
                 return
             t0 = time.perf_counter()
-            table = cstore.read_columns(f.read_path, [dense_col])
+            table = cstore.read_columns(f.read_path, read_cols)
             arr = dense_to_2d(table[dense_col])
-            fq.put((gidx, arr, time.perf_counter() - t0))
+            # carry the id column (combined to one contiguous array) to decode;
+            # None when id_column isn't configured. Same row order as `arr`.
+            ids = table[id_col].combine_chunks() if id_col else None
+            fq.put((gidx, arr, ids, time.perf_counter() - t0))
 
     for _ in range(io_workers):
         Thread(target=reader, daemon=True).start()
@@ -187,7 +211,7 @@ def run_compute(
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for _ in range(len(mine)):
             w0 = time.perf_counter()
-            gidx, arr, rsec = fq.get()
+            gidx, arr, ids, rsec = fq.get()
             io_wait += time.perf_counter() - w0
             read_secs += rsec
             bar.update(1)
@@ -195,20 +219,28 @@ def run_compute(
                 continue
             rows_seen += len(arr)
             bytes_seen += int(arr.nbytes)
+            if id_col:
+                corpus_ids[gidx] = ids  # kept in RAM; indexed by row at decode
 
             g0 = time.perf_counter()
             # zero-copy view of the (contiguous float32) array + one H2D copy;
             # torch.tensor() would add an extra host→host copy first.
             C = torch.from_numpy(arr).to(device, non_blocking=True)
-            scores = _scores(Q, C, metric)  # (n_q, n_rows)
-            file_k = min(k, C.shape[0])
-            f_scores, f_local = torch.topk(scores, k=file_k, dim=1)
-            rows = torch.arange(C.shape[0], dtype=torch.int64, device=device)
-            f_enc = (gidx * MAX_ROWS_PER_FILE + rows)[f_local]
-            merged_s = torch.cat([top_scores, f_scores], dim=1)
-            merged_e = torch.cat([top_enc, f_enc], dim=1)
-            top_scores, idx = torch.topk(merged_s, k=k, dim=1)
-            top_enc = merged_e.gather(1, idx)
+            n_rows = C.shape[0]
+            step = corpus_batch or n_rows  # None → whole file in one matmul
+            for r0 in range(0, n_rows, step):
+                Cb = C[r0 : r0 + step]
+                scores = _scores(Q, Cb, metric)  # (n_q, ≤step)
+                bk = min(k, Cb.shape[0])
+                f_scores, f_local = torch.topk(scores, k=bk, dim=1)
+                # rows are FILE-LOCAL indices (offset by r0) so the encoding stays
+                # global_file_idx * MAX_ROWS_PER_FILE + row regardless of batching.
+                rows = torch.arange(r0, r0 + Cb.shape[0], dtype=torch.int64, device=device)
+                f_enc = (gidx * MAX_ROWS_PER_FILE + rows)[f_local]
+                merged_s = torch.cat([top_scores, f_scores], dim=1)
+                merged_e = torch.cat([top_enc, f_enc], dim=1)
+                top_scores, idx = torch.topk(merged_s, k=k, dim=1)
+                top_enc = merged_e.gather(1, idx)
             gpu_secs += time.perf_counter() - g0
 
             if bar.n % 200 == 0:
@@ -241,19 +273,27 @@ def run_compute(
             100 * io_wait / max(io_wait + gpu_secs, 1e-9), io_workers,
         )
 
-    # 3. decode the final top-K into hit ids (recompute only K*n_q ids).
+    # 3. decode the final top-K into hit ids. Either recompute make_point_id from
+    #    (file_key, row) — only K*n_q ids, nothing corpus-wide — or, when an id
+    #    column is configured, read it back from the in-RAM per-file arrays.
+    if id_col is not None:
+        def resolve_id(e: int) -> str:
+            gidx = e // MAX_ROWS_PER_FILE
+            row = e % MAX_ROWS_PER_FILE
+            return str(corpus_ids[gidx][row].as_py())
+    else:
+        def resolve_id(e: int) -> str:
+            return make_point_id(
+                all_files[e // MAX_ROWS_PER_FILE].key, e % MAX_ROWS_PER_FILE
+            )
+
     enc = top_enc.cpu().numpy()
     sc = top_scores.cpu().numpy()
     valid = sc > float("-inf")
     hit_ids, hit_scores = [], []
     for q in range(n_q):
         qe, qs = enc[q][valid[q]], sc[q][valid[q]]
-        hit_ids.append(
-            [
-                make_point_id(all_files[int(e) // MAX_ROWS_PER_FILE].key, int(e) % MAX_ROWS_PER_FILE)
-                for e in qe
-            ]
-        )
+        hit_ids.append([resolve_id(int(e)) for e in qe])
         hit_scores.append(qs.tolist())
 
     table = build_result_table(query_ids, payload, hit_ids, hit_scores)

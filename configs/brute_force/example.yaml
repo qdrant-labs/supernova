@@ -11,6 +11,13 @@ corpus:
   # The embedded parquets to search over (same files the loader ingests).
   path: s3://qdrant--vectorforge/fiqa/bge-m3
   dense_column: dense_embedding
+  # Use an already-unique column for hit_ids — transparent for public data (e.g.
+  # fineweb's `id` = "<urn:uuid:...>") and resolvable without the loader's hashing.
+  # Omit to derive make_point_id(corpus_file, row), matching the point ids the
+  # loader synthesizes at ingest. A real id column is read alongside the dense
+  # vectors and kept in RAM per file for this worker's slice of the corpus
+  # (budget ~ slice_rows × id_size of host memory).
+  # id_column: id
 
 queries:
   # Query embeddings (a parquet file or a dir of them).
@@ -28,3 +35,9 @@ output:
 params:
   k: 1000
   metric: cosine          # cosine | dot | euclidean
+  # Score each corpus file against the queries in row-batches of this many rows
+  # instead of all at once, bounding the (n_queries × rows) score matrix on the
+  # GPU. Omit (default) to score the whole file in one matmul — fastest, and fine
+  # until a file is big enough (or the query set large enough) to OOM the GPU.
+  # Values below k are raised to k (a smaller batch can't fill the top-K).
+  # corpus_batch_size: 4096
