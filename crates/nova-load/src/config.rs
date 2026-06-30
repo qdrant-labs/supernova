@@ -29,6 +29,21 @@ pub struct LoaderConfig {
     /// during S3/DuckDB time. 1 = no prefetch.
     #[serde(default = "default_file_look_ahead")]
     pub file_look_ahead: usize,
+    /// Retry a file's download + read this many times (with exponential backoff)
+    /// before giving up on it. 0 = try once, no retries.
+    #[serde(default = "default_file_retries")]
+    pub file_retries: usize,
+    /// Retry a failed batch upsert this many times (exponential backoff) before
+    /// aborting. Unlike a bad file (which is skipped), a persistent upsert failure
+    /// usually means the store is down or misconfigured, so it aborts the run.
+    #[serde(default = "default_upsert_retries")]
+    pub upsert_retries: usize,
+    /// Abort the whole run if more than this many files are skipped after
+    /// exhausting their retries. `None` (default) skips every failing file and
+    /// keeps going; set a ceiling to fail fast on a systemic problem instead of
+    /// silently skipping the whole corpus.
+    #[serde(default)]
+    pub max_failed_files: Option<usize>,
 }
 
 impl Default for LoaderConfig {
@@ -37,6 +52,9 @@ impl Default for LoaderConfig {
             batch_size: default_batch_size(),
             concurrency: default_concurrency(),
             file_look_ahead: default_file_look_ahead(),
+            file_retries: default_file_retries(),
+            upsert_retries: default_upsert_retries(),
+            max_failed_files: None,
         }
     }
 }
@@ -47,6 +65,14 @@ fn default_batch_size() -> usize {
 
 fn default_file_look_ahead() -> usize {
     2
+}
+
+fn default_file_retries() -> usize {
+    5
+}
+
+fn default_upsert_retries() -> usize {
+    5
 }
 
 impl LoadConfig {

@@ -40,8 +40,11 @@ vectorstore:
 
 loader:
   batch_size: 1000                  # points per upsert call
-  prefetch_size: 100000             # rows per DuckDB fetch
-  concurrency: 8                    # parallel upsert tasks
+  concurrency: 8                    # in-flight upsert batches
+  file_look_ahead: 2                # files downloaded + read ahead of the uploader
+  file_retries: 3                   # per-file download+read retries before skipping the file
+  upsert_retries: 3                 # per-batch upsert retries before aborting
+  # max_failed_files: 50            # abort if more than N files are skipped (default: unlimited)
 ```
 
 ## Running
@@ -119,16 +122,19 @@ JSON-string columns that parse to a dict are automatically unpacked into the pay
 
 ## How it works
 
-1. **DuckDB streams** parquet data in large chunks (`prefetch_size` rows per fetch)
-2. **Chunks are sliced** into `batch_size` upsert batches locally
-3. **Async upserts** run concurrently, controlled by a semaphore (`concurrency`)
+1. **Files are prefetched** -- up to `file_look_ahead` files are downloaded + DuckDB-read ahead while the current file's batches upload, so the store connection never stalls on S3/parse time
+2. **Each file's points are sliced** into `batch_size` upsert batches
+3. **Async upserts** run concurrently, controlled by a semaphore (`concurrency`); each batch is retried up to `upsert_retries` times on transient store errors
 4. **Deferred indexing** -- HNSW construction is disabled during load, then built in one pass
-5. **Retry with backoff** -- failed upserts are retried up to 3 times
+5. **Per-file resilience** -- each file's download + read is retried (`file_retries`, default 3) with exponential backoff; a file that still fails is logged and **skipped** so one bad object can't abort the whole load. `max_failed_files` caps how many skips are tolerated before aborting.
 
 ## Tuning
 
 | Parameter | Default | Guidance |
 |-----------|---------|----------|
-| `batch_size` | 1000 | Larger = fewer HTTP calls. 1000 is good for 768-1024 dim vectors. |
-| `prefetch_size` | batch_size * 10 | Larger = fewer S3 round trips. 100k works well. |
-| `concurrency` | 8 | Lower if you're getting timeouts. |
+| `batch_size` | 1000 | Points per upsert call. Larger = fewer HTTP calls; 1000 is good for 768-1024 dim vectors. |
+| `concurrency` | 8 | In-flight upsert batches. Lower if the store times out. |
+| `file_look_ahead` | 2 | Files downloaded + read ahead of the uploader. Higher = more overlap, more RAM/disk. |
+| `file_retries` | 3 | Per-file download+read retries (exponential backoff) before the file is skipped. |
+| `upsert_retries` | 3 | Per-batch upsert retries (exponential backoff) before the run aborts. |
+| `max_failed_files` | _(none)_ | Abort once more than this many files are skipped. Unset = skip every failing file and finish. |

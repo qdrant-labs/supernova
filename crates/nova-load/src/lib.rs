@@ -29,6 +29,8 @@ pub enum LoadError {
     Join(#[from] tokio::task::JoinError),
     #[error("cannot prepare collection: the datasource has no files to infer dimensions from")]
     NoFilesToPrepare,
+    #[error("aborting: {skipped} file(s) failed after retries, exceeding loader.max_failed_files={max}")]
+    TooManyFailedFiles { skipped: u64, max: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -131,10 +133,6 @@ pub async fn inspect(config: LoadConfig, partition: Partition) -> Result<(), Loa
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
-
 /// Resolve each vector's dimensions. Explicit `size:` in config wins (and needs
 /// no file access at all); otherwise sample one row of *a* file and measure the
 /// vectors. Sparse vectors have no fixed size and are simply absent from the map.
@@ -185,9 +183,37 @@ async fn finish_indexing(store: &dyn VectorStore) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Download one file and DuckDB-read it into points — the unit retried per file.
+async fn fetch_and_read(
+    datasource: &DataSourceConfig,
+    file: &FileRef,
+    vectors: &HashMap<String, VectorSpec>,
+    payload: &HashMap<String, String>,
+    id_expression: &str,
+) -> Result<Vec<Point>, LoadError> {
+    let local = datasource.fetch(file).await?;
+    let read_job = engine::ReadJob {
+        path: local.path().to_path_buf(),
+        filename: local.source.key.clone(),
+        vectors: vectors.clone(),
+        payload: payload.clone(),
+        id_expression: id_expression.to_string(),
+        limit: None,
+    };
+    let points = tokio::task::spawn_blocking(move || read_job.run()).await??;
+    drop(local); // read done; delete the temp download
+    Ok(points)
+}
+
 /// The core load loop: partition the files, then download → DuckDB-read →
 /// upsert each, with file prefetch and concurrent batch upserts. Returns the
 /// number of points loaded. Does NOT touch indexing or collection creation.
+///
+/// Resilience: each file's download+read is retried (`loader.file_retries`) with
+/// exponential backoff; a file that still fails is logged and **skipped** so one
+/// bad object can't abort the whole load. `loader.max_failed_files` caps how many
+/// skips are tolerated before aborting (a guard against silently skipping a whole
+/// broken corpus).
 async fn load_files(
     store: &dyn VectorStore,
     datasource: &DataSourceConfig,
@@ -199,6 +225,9 @@ async fn load_files(
     let batch_size = loader.batch_size.max(1);
     let concurrency = loader.concurrency.max(1);
     let look_ahead = loader.file_look_ahead.max(1);
+    let file_retries = loader.file_retries;
+    let upsert_retries = loader.upsert_retries;
+    let max_failed_files = loader.max_failed_files;
     let id_expression = datasource.reader().id_expression.clone();
     let payload = datasource.reader().payload_fields.clone();
 
@@ -261,18 +290,32 @@ async fn load_files(
             let payload = &payload;
             let id_expression = &id_expression;
             async move {
-                let local = datasource.fetch(file).await?;
-                let read_job = engine::ReadJob {
-                    path: local.path().to_path_buf(),
-                    filename: local.source.key.clone(),
-                    vectors: (*vectors).clone(),
-                    payload: payload.clone(),
-                    id_expression: id_expression.clone(),
-                    limit: None,
-                };
-                let points = tokio::task::spawn_blocking(move || read_job.run()).await??;
-                drop(local); // read done; delete the temp download
-                Ok::<Vec<Point>, LoadError>(points)
+                // Retry the whole download+read with exponential backoff; a
+                // re-fetch also recovers from a truncated/corrupt prior download.
+                let mut attempt = 0u32;
+                loop {
+                    match fetch_and_read(datasource, file, vectors, payload, id_expression).await {
+                        Ok(points) => return Ok::<Vec<Point>, (String, LoadError)>(points),
+                        Err(err) => {
+                            attempt += 1;
+                            if attempt > file_retries as u32 {
+                                // Exhausted retries: hand the key + error to the
+                                // consumer to log and skip — don't abort the run.
+                                return Err((file.key.clone(), err));
+                            }
+                            let backoff =
+                                Duration::from_millis((250u64 << (attempt - 1)).min(30_000));
+                            tracing::warn!(
+                                "file `{}` failed (attempt {}/{}): {err}; retrying in {:?}",
+                                file.key,
+                                attempt,
+                                file_retries + 1,
+                                backoff,
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
+                    }
+                }
             }
         })
         .buffered(look_ahead);
@@ -282,8 +325,25 @@ async fn load_files(
     let points_done = &points_done;
     let rate_window = &rate_window;
 
-    while let Some(points) = reads.next().await {
-        let points = points?;
+    let mut skipped = 0u64;
+    while let Some(outcome) = reads.next().await {
+        let points = match outcome {
+            Ok(points) => points,
+            Err((key, err)) => {
+                tracing::warn!(
+                    "skipping file `{key}` after {} attempt(s): {err}",
+                    file_retries + 1,
+                );
+                skipped += 1;
+                if let Some(max) = max_failed_files {
+                    if skipped > max as u64 {
+                        return Err(LoadError::TooManyFailedFiles { skipped, max });
+                    }
+                }
+                progress.inc(1);
+                continue;
+            }
+        };
 
         // Upsert this file's batches with up to `concurrency` requests in flight.
         // `buffer_unordered` is the idiomatic bounded-concurrency primitive — a
@@ -292,7 +352,29 @@ async fn load_files(
         futures::stream::iter(points.chunks(batch_size))
             .map(|chunk| async move {
                 let n = chunk.len() as u64;
-                store.upsert_batch(chunk.to_vec()).await?;
+                // Retry transient store errors with backoff; a persistent failure
+                // (store down / misconfigured) aborts the run via `?` on try_collect.
+                let mut attempt = 0u32;
+                loop {
+                    match store.upsert_batch(chunk.to_vec()).await {
+                        Ok(()) => break,
+                        Err(err) => {
+                            attempt += 1;
+                            if attempt > upsert_retries as u32 {
+                                return Err(err);
+                            }
+                            let backoff =
+                                Duration::from_millis((250u64 << (attempt - 1)).min(30_000));
+                            tracing::warn!(
+                                "upsert batch failed (attempt {}/{}): {err}; retrying in {:?}",
+                                attempt,
+                                upsert_retries + 1,
+                                backoff,
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
+                    }
+                }
                 let done = points_done.fetch_add(n, Ordering::Relaxed) + n;
 
                 // Recompute the rate over the most recent window, then either
@@ -323,6 +405,13 @@ async fn load_files(
     progress.finish_with_message(format!("{total} pts · {avg:.0} pts/s avg"));
     if !tty {
         tracing::info!("{total} pts · {avg:.0} pts/s avg");
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            "{skipped} file(s) were SKIPPED after exhausting {} retries each — \
+             the collection is missing their points",
+            file_retries,
+        );
     }
     Ok(total)
 }
