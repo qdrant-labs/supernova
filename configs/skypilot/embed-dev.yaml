@@ -1,0 +1,71 @@
+# One-off single-node GPU dev box for `nova embed` (a plain `sky launch`, NOT a
+# `nova dist` pool). It ships your LOCAL supernova repo via workdir, installs the
+# `nova` CLI + nova-embed[embed], and mounts your query embed config at
+# /cfg/embed.yaml. Then you SSH in and run by hand.
+#
+#   # launch (forward HF token if your shell has one; harmless if not):
+#   sky launch -c queries-embed configs/skypilot/embed-dev.yaml --env HF_TOKEN
+#
+#   # then drive it interactively:
+#   ssh queries-embed
+#   cd ~/sky_workdir && source .venv/bin/activate
+#   nova embed /cfg/embed.yaml --dry-run     # sanity-check source + partition
+#   nova embed /cfg/embed.yaml               # the real run
+#
+#   sky down queries-embed                   # tear down when done (see autostop note below)
+#
+# WORKDIR vs clone: this ships your current local repo (exact code parity, and no
+# private-repo clone-auth hassle). If you'd rather a fresh `git clone` of master,
+# swap the workdir + the two `-e` installs for a clone (see commented setup below).
+#
+# AWS: SkyPilot propagates your AWS identity to the cluster, so the s3 storage write
+# works with no extra config. If you hit AccessDenied and your creds are env-based,
+# relaunch adding: --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY --env AWS_SESSION_TOKEN
+#
+# AUTOSTOP: a manual SSH `nova embed` run is NOT a SkyPilot-tracked job, so a low
+# `-i` autostop could stop the box mid-run. Either tear down manually with
+# `sky down` when finished, or run the embed via `sky exec queries-embed ...` to
+# keep it tracked. (Embedding ~1M MS MARCO queries on one A10G is tens of minutes.)
+
+name: queries-embed
+
+workdir: .                       # ship the local supernova repo (no git clone needed)
+
+file_mounts:
+  /cfg: /Users/nathanleroy/code/tenbillion/queries   # your embed.yaml lands at /cfg/embed.yaml
+
+resources:
+  infra: aws/us-east-1           # match the output S3 bucket's region (verify it)
+  accelerators: A10G:1           # gte-multilingual-base is small; A10G is plenty
+  disk_size: 150
+  image_id: skypilot:custom-gpu-ubuntu-cuda13
+
+envs:
+  HF_HUB_ENABLE_HF_TRANSFER: "1"
+
+setup: |
+  set -e
+  SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+  command -v curl >/dev/null && command -v git >/dev/null || ($SUDO apt-get update && $SUDO apt-get install -y curl git)
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  cd ~/sky_workdir
+  uv venv --python 3.11 .venv
+  uv pip install --python .venv -e .                          # the `nova` dispatcher (repo root)
+  uv pip install --python .venv -e 'python/nova-embed[embed]'  # embed tool: torch, sentence-transformers, ...
+  # --- fresh-clone alternative (instead of workdir + the two installs above):
+  # git clone https://github.com/qdrant-labs/supernova.git ~/supernova && cd ~/supernova
+  # uv venv --python 3.11 .venv
+  # uv pip install --python .venv -e . -e 'python/nova-embed[embed]'
+
+run: |
+  source ~/sky_workdir/.venv/bin/activate
+  nvidia-smi -L || echo "WARN: no GPU visible"
+  python -c "import torch; print('cuda available:', torch.cuda.is_available())"
+  echo "==> config at /cfg/embed.yaml:"; sed -e 's/^/    /' /cfg/embed.yaml
+  nova embed /cfg/embed.yaml --dry-run || echo "(dry-run needs HF/AWS access — fine to check after you SSH in)"
+  echo
+  echo "READY. SSH in and run:"
+  echo "  ssh queries-embed"
+  echo "  cd ~/sky_workdir && source .venv/bin/activate"
+  echo "  nova embed /cfg/embed.yaml"

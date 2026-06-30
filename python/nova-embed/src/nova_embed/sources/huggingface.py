@@ -100,6 +100,7 @@ class HuggingFaceSource(DatasetSource):
         metadata_workers: int = 4,
         prefetch: bool = False,
         prefetch_dir: str = "/tmp/nova_embed_parquet",
+        prefetch_window: int | None = None,
         include_provenance: bool = False,
     ):
         """
@@ -133,6 +134,13 @@ class HuggingFaceSource(DatasetSource):
         self._metadata_workers = metadata_workers
         self._prefetch = prefetch
         self._prefetch_dir = prefetch_dir
+        # None → download the whole window up front (cached; fast re-runs, but needs
+        # disk for every file at once). An int N → rolling: keep at most N files
+        # downloaded *ahead* of the reader and delete each once consumed, so on-disk
+        # staging stays ~N+1 files (bounds disk for corpora too big to fully cache,
+        # and overlaps the next download with the current file's embedding). Only
+        # files THIS run downloads are deleted; pre-existing cached files are kept.
+        self._prefetch_window = prefetch_window
         self._include_provenance = include_provenance
         self._local_paths: dict[str, str] = {}
         self._extract_text = _build_text_extractor(text_field, text_template)
@@ -300,92 +308,162 @@ class HuggingFaceSource(DatasetSource):
                 )
             self._local_paths[path] = local_path
 
-    def stream(self) -> Iterator[dict]:
-        import pyarrow.parquet as pq
+    def _window_files(self) -> list[tuple[str, int, int]]:
+        """``[(path, num_rows, file_start)]`` for files overlapping this rank's window.
 
+        Same membership as ``files_in_window`` (the sharding contract), plus each
+        file's global start offset so the reader can compute its intra-file slice.
+        """
         self._ensure_counts()
-        if self._prefetch and not self._local_paths:
-            self._prefetch_files()
-        offset = self._offset
-        limit = self._limit
-        rows_yielded = 0
-
+        out: list[tuple[str, int, int]] = []
         cumulative = 0
         for path, num_rows in self._files_with_counts:
             file_start = cumulative
             file_end = cumulative + num_rows
             cumulative = file_end
+            if file_end > self._offset and (
+                self._limit is None or file_start < self._offset + self._limit
+            ):
+                out.append((path, num_rows, file_start))
+        return out
 
-            # this file ends before our window starts -> skip entirely
-            if file_end <= offset:
+    def _read_columns(self, schema_names: list[str]) -> list[str] | None:
+        """Columns to actually READ from each file (parquet column projection).
+
+        Skipping excluded columns at READ time — not just dropping them from the
+        output in ``format_record`` — is what keeps a fat column (e.g. ms_marco's
+        ``passages``, which dwarfs the ``query`` we embed) off the wire and out of
+        the Arrow→Python conversion. Returns None (read everything) when a
+        ``text_template`` is used, since the template may reference arbitrary fields
+        we can't safely drop.
+        """
+        if self.text_template is not None:
+            return None
+        cols = [c for c in schema_names if c not in self.exclude_columns]
+        if self.text_field and self.text_field not in cols and self.text_field in schema_names:
+            cols.append(self.text_field)  # never drop the field we embed
+        return cols
+
+    def _emit_file_rows(self, pf, path, intra_offset, want_from_file, start_in_file):
+        """Yield up to ``want_from_file`` rows from ``pf``, starting ``intra_offset`` rows in."""
+        read_cols = self._read_columns(pf.schema_arrow.names)
+        taken = 0
+        for batch in pf.iter_batches(batch_size=10_000, columns=read_cols):
+            batch_len = len(batch)
+            if intra_offset >= batch_len:  # batch entirely before our start
+                intra_offset -= batch_len
                 continue
-            # we've satisfied limit -> done
+            slice_len = min(batch_len - intra_offset, want_from_file - taken)
+            rows = batch.slice(intra_offset, slice_len).to_pylist()
+            intra_offset = 0  # we've entered the window
+            if self._include_provenance:
+                base = start_in_file + taken  # file-local index of this slice's first row
+                for j, row in enumerate(rows):
+                    row[SOURCE_FILE_COLUMN] = path
+                    row[SOURCE_ROW_COLUMN] = base + j
+            yield from rows
+            taken += len(rows)
+            if taken >= want_from_file:
+                break
+
+    def _file_providers(self, window):
+        """Yield ``(path, num_rows, file_start, ParquetFile, done_fn)`` per window file.
+
+        Three strategies, chosen from the prefetch config:
+          - rolling (prefetch + prefetch_window): a daemon thread downloads window
+            files in order, at most ``prefetch_window`` ahead (the bounded queue is
+            the backpressure); the reader calls ``done_fn`` to delete each file it
+            downloaded once consumed → on-disk staging stays ~window+1 files, and the
+            next download overlaps the current file's embedding.
+          - eager (prefetch, no window): download the whole window up front, read local.
+          - none: open each file remotely over HfFileSystem (the slow range-request path).
+        """
+        import pyarrow.parquet as pq
+
+        if self._prefetch and self._prefetch_window:
+            import os
+            import queue
+            import threading
+
+            from huggingface_hub import hf_hub_download
+
+            os.makedirs(self._prefetch_dir, exist_ok=True)
+            ready: queue.Queue = queue.Queue(maxsize=self._prefetch_window)
+            stop = threading.Event()
+
+            def downloader():
+                for path, _, _ in window:
+                    if stop.is_set():
+                        return
+                    expected = os.path.join(self._prefetch_dir, path)
+                    cached = os.path.exists(expected)
+                    if cached:
+                        local = expected
+                    else:
+                        logger.info("Downloading datasets/%s/%s", self.dataset_name, path)
+                        local = hf_hub_download(
+                            repo_id=self.dataset_name,
+                            filename=path,
+                            repo_type="dataset",
+                            local_dir=self._prefetch_dir,
+                        )
+                    ready.put((path, local, cached))  # blocks when window full → bounds disk
+                ready.put(None)
+
+            threading.Thread(target=downloader, daemon=True).start()
+            info = {p: (n, s) for p, n, s in window}
+            try:
+                while True:
+                    item = ready.get()
+                    if item is None:
+                        return
+                    path, local, cached = item
+                    num_rows, file_start = info[path]
+
+                    def done(local=local, cached=cached):
+                        if not cached:  # only delete what we fetched this run; keep prior caches
+                            try:
+                                os.remove(local)
+                            except OSError:
+                                pass
+
+                    yield path, num_rows, file_start, pq.ParquetFile(local), done
+            finally:
+                stop.set()
+
+        if self._prefetch:
+            if not self._local_paths:
+                self._prefetch_files()
+            for path, num_rows, file_start in window:
+                yield path, num_rows, file_start, pq.ParquetFile(self._local_paths[path]), lambda: None
+            return
+
+        for path, num_rows, file_start in window:
+            pf = pq.ParquetFile(f"datasets/{self.dataset_name}/{path}", filesystem=self._fs)
+            yield path, num_rows, file_start, pf, lambda: None
+
+    def stream(self) -> Iterator[dict]:
+        offset = self._offset
+        limit = self._limit
+        rows_yielded = 0
+
+        for path, num_rows, file_start, pf, done in self._file_providers(self._window_files()):
             if limit is not None and rows_yielded >= limit:
-                return
-
-            # offset within this file (0 if we're past the start of our window)
+                done()
+                break
             intra_offset = max(0, offset - file_start)
-            # File-local index where this file's window begins. `intra_offset` is
-            # mutated inside the batch loop, so capture it now to compute each
-            # row's source_row_number.
-            start_in_file = intra_offset
-            available_in_file = num_rows - intra_offset
-            want_from_file = (
-                min(available_in_file, limit - rows_yielded)
-                if limit is not None
-                else available_in_file
+            available = num_rows - intra_offset
+            want = (
+                min(available, limit - rows_yielded) if limit is not None else available
             )
-            if want_from_file <= 0:
+            if want <= 0:
+                done()
                 continue
-
-            if path in self._local_paths:
-                pf = pq.ParquetFile(self._local_paths[path])
-            else:
-                pf = pq.ParquetFile(
-                    f"datasets/{self.dataset_name}/{path}", filesystem=self._fs
-                )
-            taken_from_file = 0
-
-            for batch in pf.iter_batches(batch_size=10_000):
-                batch_len = len(batch)
-
-                # batch is entirely before the intra-file offset
-                if intra_offset >= batch_len:
-                    intra_offset -= batch_len
-                    continue
-
-                remaining_in_file = want_from_file - taken_from_file
-                slice_len = min(batch_len - intra_offset, remaining_in_file)
-
-                # 1. Zero-copy Arrow slicing before converting to Python list
-                rows = batch.slice(intra_offset, slice_len).to_pylist()
-
-                # Reset intra_offset since we've now entered the window
-                intra_offset = 0
-
-                if self._include_provenance:
-                    # base = file-local index of the first row in this slice
-                    base = start_in_file + taken_from_file
-                    for j, row in enumerate(rows):
-                        row[SOURCE_FILE_COLUMN] = path
-                        row[SOURCE_ROW_COLUMN] = base + j
-
-                yield from rows
-
-                taken_from_file += len(rows)
-                rows_yielded += len(rows)
-
-                if taken_from_file >= want_from_file:
-                    break
-
-            logger.debug(
-                "%s: yielded %d rows (file rows %d..%d, intra-file want %d)",
-                path,
-                taken_from_file,
-                file_start,
-                file_end,
-                want_from_file,
-            )
+            # start_in_file == intra_offset: file-local index where our window begins
+            for row in self._emit_file_rows(pf, path, intra_offset, want, intra_offset):
+                yield row
+                rows_yielded += 1
+            done()
 
     def extract_text(self, row: dict) -> str:
         return self._extract_text(row)
