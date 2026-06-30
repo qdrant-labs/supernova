@@ -32,8 +32,8 @@ embed = [
     # need hub>=1.0, so a `<5` pin is unsatisfiable. If a specific trust_remote_code
     # model breaks on transformers 5, prefer a model without custom code (e.g.
     # BAAI/bge-m3) rather than pinning the whole stack back.
-    "transformers<5",
-    # "FlagEmbedding",
+    "transformers",
+    "FlagEmbedding",
     "einops>=0.8.2",
     "fastembed",
     "hf_transfer",
