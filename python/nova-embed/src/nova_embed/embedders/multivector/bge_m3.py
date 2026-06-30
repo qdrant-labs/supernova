@@ -17,8 +17,7 @@ def _detect_device() -> str:
         return "mps"
     return "cpu"
 
-# TODO: unregistered for now; FlagEmbedding is optional and not in the default env.
-# @MULTIVECTOR_EMBEDDERS.register("bge_m3")
+@MULTIVECTOR_EMBEDDERS.register("bge_m3")
 class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
     """
     Multi-vector (ColBERT-style) output from BAAI/bge-m3 via FlagEmbedding.
