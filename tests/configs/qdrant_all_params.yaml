@@ -66,5 +66,6 @@ vectorstore:
       always_ram: true
     optimizers:
       default_segment_number: 4
+      max_segment_size_kb: 200000   # `_kb` alias for max_segment_size (both names accepted)
       memmap_threshold: 50000
       indexing_threshold: 20000

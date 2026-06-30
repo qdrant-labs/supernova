@@ -207,7 +207,11 @@ pub struct QuantizationConfig {
     pub always_ram: Option<bool>,
 }
 
-/// Optimizer parameters (collection-wide only).
+/// Optimizer parameters (collection-wide only). Passed straight through to
+/// Qdrant's `OptimizersConfigDiff`. The size-based knobs (`max_segment_size`,
+/// `memmap_threshold`, `indexing_threshold`) are in KILOBYTES, matching the
+/// collection API — each also accepts the `*_kb` spelling Qdrant's server
+/// `config.yaml` uses, as an alias, so either name works.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptimizersConfig {
@@ -217,11 +221,11 @@ pub struct OptimizersConfig {
     pub vacuum_min_vector_number: Option<u64>,
     #[serde(default)]
     pub default_segment_number: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "max_segment_size_kb")]
     pub max_segment_size: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "memmap_threshold_kb")]
     pub memmap_threshold: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "indexing_threshold_kb")]
     pub indexing_threshold: Option<u64>,
     #[serde(default)]
     pub flush_interval_sec: Option<u64>,

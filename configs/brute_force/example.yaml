@@ -40,4 +40,4 @@ params:
   # GPU. Omit (default) to score the whole file in one matmul — fastest, and fine
   # until a file is big enough (or the query set large enough) to OOM the GPU.
   # Values below k are raised to k (a smaller batch can't fill the top-K).
-  # corpus_batch_size: 4096
+  corpus_batch_size: 4096

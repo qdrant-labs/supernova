@@ -565,6 +565,7 @@ mod tests {
         // Collection-wide optimizers.
         let opt = cc.optimizers_config.as_ref().expect("optimizers");
         assert_eq!(opt.default_segment_number, Some(4));
+        assert_eq!(opt.max_segment_size, Some(200000)); // set via the `max_segment_size_kb` alias
         assert_eq!(opt.memmap_threshold, Some(50000));
         assert_eq!(opt.indexing_threshold, Some(20000));
 
