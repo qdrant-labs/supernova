@@ -102,6 +102,24 @@ separate command you run once the workers are done (spot workers can't be
 reliably awaited from the launch call). Files are partitioned by a deterministic
 stride, so workers never coordinate.
 
+### bf
+
+Two phases, like `load` — fan out the GPU `compute` workers (each scans a corpus
+stride slice), then `merge` the per-rank partials on the controller:
+
+```bash
+# 1. fleet: N GPU workers, each scoring its corpus slice
+nova dist bf compute configs/brute_force/test.yaml --num-jobs 8
+#    (add --resources my.yaml to override the default GPU resources/setup)
+
+# 2. controller, after all workers finish: combine the partials
+nova dist bf merge configs/brute_force/test.yaml
+```
+
+The default resources are a single-GPU box; pick the size for vCPUs (decode is
+CPU-bound) rather than the GPU. See the [Brute-Force overview](brute-force/overview.md)
+for config and tuning.
+
 ### storm
 
 Replicated, **not** partitioned — every worker runs the same profile, so total

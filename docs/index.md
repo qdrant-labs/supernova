@@ -1,10 +1,11 @@
 # supernova
 
-supernova is a toolkit for building large-scale vector search benchmarks. It does three things:
+supernova is a toolkit for building large-scale vector search benchmarks. It does four things:
 
 1. **Embedding generation** — take a dataset, embed it with any model (dense, sparse, or multivector), produce parquet files
 2. **Vector store loading** — take pre-embedded parquet files, load them into a database
-3. **Load testing** — fire query load at a vector store and measure its latency
+3. **Ground truth** — brute-force exact nearest neighbours over the corpus, to measure a store's recall
+4. **Load testing** — fire query load at a vector store and measure its latency
 
 Each is its own tool, and each shards itself for massive parallelization via `--num-jobs` / `--job-rank`. The datasets we work with are often hundreds of millions of rows and hundreds of gigabytes.
 
@@ -14,6 +15,8 @@ The pipelines are independent. You can run them separately, on different machine
 
 ```
 Source (HuggingFace) ──▶ nova embed ──▶ parquet (S3/HF/local) ──▶ nova load ──▶ Qdrant ──▶ nova storm
+                                              │
+                                              └──▶ nova bf ──▶ ground-truth top-K  (recall@k)
 ```
 
 Corpora are addressed by URI. Three schemes are supported:
@@ -34,6 +37,7 @@ Corpora are addressed by URI. Three schemes are supported:
 |---------|---------|----------|
 | `nova embed` | Embed a dataset into parquet | Python |
 | `nova load`  | Load pre-embedded parquet into a vector store | Rust |
+| `nova bf`    | Brute-force exact k-NN ground truth (GPU) | Python |
 | `nova storm` | Load-test a vector store | Rust |
 
 Distributed runs are just N copies of a tool, each with its own `--job-rank`. Orchestration (SkyPilot, Slurm, a shell loop) is **external** — it provisions nodes and invokes `nova <tool>` on each, passing that node's rank. The tools themselves know nothing about the fleet.
@@ -45,4 +49,4 @@ Distributed runs are just N copies of a tool, each with its own `--job-rank`. Or
 - **YAML-driven** — every run is defined by a YAML config; `${VAR}` / `${VAR:-default}` references are expanded from the environment.
 - **Flat parquet output** — embedding output is flat columnar data (no nested JSON). Payload composition happens at load time.
 
-See the [CLI reference](reference/cli.md) for every flag, and the [Embedding](embedding/overview.md) and [Loading](loading/overview.md) sections for each tool's config.
+See the [CLI reference](reference/cli.md) for every flag, and the [Embedding](embedding/overview.md), [Loading](loading/overview.md), and [Brute Force](brute-force/overview.md) sections for each tool's config.

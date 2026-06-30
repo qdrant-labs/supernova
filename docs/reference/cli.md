@@ -57,6 +57,29 @@ Files are partitioned by a deterministic stride, point ids are content-addressed
 (`vf_point_id`), and HNSW indexing is deferred during the bulk load and built
 once at `finalize`.
 
+## nova bf
+
+Brute-force exact k-NN ground truth (Python, GPU). Two subcommands: `compute`
+scores queries against a slice of the corpus and writes a per-rank partial;
+`merge` folds the partials into one final top-K. A single-GPU `compute` (no
+`--num-jobs`) writes the final result directly — no `merge` needed.
+
+```bash
+nova bf compute <config> [--num-jobs N --job-rank R] [--io-workers N] [--io-thread-count N] [--max-files N]
+nova bf merge   <config>
+```
+
+| Flag | Meaning |
+|------|---------|
+| `<config>` | Path to the brute-force YAML |
+| `--num-jobs` | Total parallel jobs; each rank scans a stride slice of the corpus files |
+| `--job-rank` | This job's rank (0-indexed); defaults to `$SKYPILOT_JOB_RANK` |
+| `--io-workers` | Override `params.io_workers` — concurrent corpus-file reader threads |
+| `--io-thread-count` | Override `params.io_thread_count` — pyarrow's IO pool (the real S3 fetch concurrency) |
+| `--max-files` | Read only the first N corpus files of this slice; a benchmarking aid (output is **partial**) |
+
+See [Brute-Force overview](../brute-force/overview.md) for the config, output schema, and tuning.
+
 ## nova storm
 
 Load-test a vector store (Rust). Work is **replicated**, not partitioned — every
