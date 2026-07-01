@@ -38,6 +38,7 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
             query.source.uri, query.source.column
         )));
     }
+    let with_ground_truth = vectors.iter().filter(|v| v.ground_truth.is_some()).count();
 
     let target = target.into_target(&query)?;
 
@@ -52,6 +53,32 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         duration_s = load.duration_s,
         "storm: {mode}"
     );
+    if query.source.ground_truth_column.is_some() {
+        // Surfaces a wrong column name / all-null column immediately, rather
+        // than silently as a missing `mean_recall` at the end of the run.
+        tracing::info!(
+            "recall tracking: {with_ground_truth}/{} queries have ground truth (column {:?})",
+            vectors.len(),
+            query.source.ground_truth_column,
+        );
+        // recall_at_k divides by top_k, so a ground-truth list shorter than
+        // top_k silently caps recall (e.g. bf's k=10 vs storm's top_k=100 caps
+        // every recall sample at 0.10) with no other signal — warn up front
+        // rather than let it read as a real search-quality regression.
+        let short = vectors
+            .iter()
+            .filter_map(|v| v.ground_truth.as_ref())
+            .filter(|gt| (gt.len() as u64) < query.top_k)
+            .count();
+        if short > 0 {
+            tracing::warn!(
+                "{short}/{with_ground_truth} ground-truth lists hold fewer than top_k={} ids — \
+                 recall will read artificially low for those queries (the ground truth's own k \
+                 must be at least storm's top_k)",
+                query.top_k,
+            );
+        }
+    }
 
     // A spinner so a long run doesn't look frozen; hidden when not a TTY.
     let spinner = if std::io::stderr().is_terminal() {
@@ -63,7 +90,7 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         ProgressBar::hidden()
     };
 
-    let results = runner::run_storm(target, vectors, &load).await;
+    let results = runner::run_storm(target, vectors, &load, query.top_k).await;
     spinner.finish_and_clear();
 
     Ok(results.summary())

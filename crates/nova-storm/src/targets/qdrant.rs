@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
-use qdrant_client::qdrant::QueryPointsBuilder;
+use qdrant_client::qdrant::point_id::PointIdOptions;
+use qdrant_client::qdrant::{QueryPointsBuilder, ScoredPoint};
 use serde::Deserialize;
 
 use super::{QueryOutcome, QueryTarget};
@@ -18,6 +19,11 @@ pub struct QdrantTarget {
     collection_name: String,
     vector_name: Option<String>,
     top_k: u64,
+    /// Whether to materialize `QueryOutcome.ids`. Skipped (leaving `ids` empty)
+    /// when the run has no `ground_truth_column` configured — recall is the
+    /// only consumer of `ids`, so collecting it otherwise is a wasted
+    /// allocation (a `String` clone per returned point) on every query.
+    collect_ids: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +54,7 @@ impl QdrantConfig {
             collection_name: self.collection_name,
             vector_name: query.vector_name.clone(),
             top_k: query.top_k,
+            collect_ids: query.source.ground_truth_column.is_some(),
         })
     }
 }
@@ -75,26 +82,71 @@ impl QueryTarget for QdrantTarget {
                 latency: started.elapsed(),
                 ok: true,
                 matched: resp.result.len(),
+                ids: if self.collect_ids {
+                    resp.result.iter().filter_map(point_id_string).collect()
+                } else {
+                    Vec::new()
+                },
                 error: None,
             },
             Err(e) => QueryOutcome {
                 latency: started.elapsed(),
                 ok: false,
                 matched: 0,
+                ids: vec![],
                 error: Some(e.to_string()),
             },
         }
     }
 }
 
+/// A scored point's id as a plain string — `Uuid` verbatim (what a
+/// `nova-load`-populated collection always uses), `Num` decimal-formatted.
+/// Canonicalizing both to strings here is what lets recall be computed as a
+/// plain string-set intersection against `hit_ids`, which `nova bf` also
+/// always stores as strings (see its own `str(...)` coercion) regardless of
+/// whether the underlying collection uses UUID or integer ids.
+fn point_id_string(point: &ScoredPoint) -> Option<String> {
+    match point.id.as_ref()?.point_id_options.as_ref()? {
+        PointIdOptions::Uuid(s) => Some(s.clone()),
+        PointIdOptions::Num(n) => Some(n.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use qdrant_client::qdrant::PointId;
+
+    use super::*;
     use crate::config::StormConfig;
 
     fn cfg() -> StormConfig {
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  vector_name: dense\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n";
         StormConfig::from_yaml(yaml).expect("parses")
+    }
+
+    fn scored(id: Option<PointId>) -> ScoredPoint {
+        ScoredPoint {
+            id,
+            payload: Default::default(),
+            score: 0.0,
+            version: 0,
+            vectors: None,
+            shard_key: None,
+            order_value: None,
+        }
+    }
+
+    #[test]
+    fn point_id_string_formats_uuid_and_num() {
+        let uuid = PointId { point_id_options: Some(PointIdOptions::Uuid("abc-123".into())) };
+        assert_eq!(point_id_string(&scored(Some(uuid))), Some("abc-123".to_string()));
+
+        let num = PointId { point_id_options: Some(PointIdOptions::Num(42)) };
+        assert_eq!(point_id_string(&scored(Some(num))), Some("42".to_string()));
+
+        assert_eq!(point_id_string(&scored(None)), None);
     }
 
     #[test]
@@ -104,5 +156,24 @@ mod tests {
         let cfg = cfg();
         let target = cfg.target.into_target(&cfg.query).expect("builds");
         assert_eq!(target.to_string(), "qdrant(c)");
+    }
+
+    fn qdrant_config(target: crate::targets::TargetConfig) -> QdrantConfig {
+        match target {
+            crate::targets::TargetConfig::Qdrant(c) => c,
+        }
+    }
+
+    #[test]
+    fn collect_ids_follows_ground_truth_column_config() {
+        let cfg = cfg(); // no ground_truth_column
+        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        assert!(!target.collect_ids);
+
+        let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
+                    query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n    ground_truth_column: hit_ids\n";
+        let cfg = StormConfig::from_yaml(yaml).expect("parses");
+        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        assert!(target.collect_ids);
     }
 }

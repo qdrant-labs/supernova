@@ -27,7 +27,14 @@ impl StormConfig {
     /// Parse from YAML text, expanding `${VAR}` references first.
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigError> {
         let expanded = expand_env(yaml)?;
-        Ok(serde_yaml::from_str(&expanded)?)
+        let cfg: Self = serde_yaml::from_str(&expanded)?;
+        // A `.limit(0)` query returns nothing and, if `ground_truth_column` is
+        // set, divides recall by 0 (NaN) — reject at config time rather than
+        // silently corrupting the summary.
+        if cfg.query.top_k == 0 {
+            return Err(ConfigError::ZeroTopK);
+        }
+        Ok(cfg)
     }
 
     /// Read and parse a config file, expanding `${VAR}` references.
@@ -62,6 +69,14 @@ pub struct QuerySource {
     /// How many query vectors to load and cycle through.
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// A `list<string>` column in the same file holding each query's known-correct
+    /// top-k point ids (e.g. `nova bf`'s own `hit_ids` output, reused directly —
+    /// no separate ground-truth file or id-matching needed since it's read
+    /// alongside the vector in the same row). `None` (default) → no recall
+    /// tracking; a null value for a given row → that row just has no ground
+    /// truth (not an error), so it still contributes latency but no recall.
+    #[serde(default)]
+    pub ground_truth_column: Option<String>,
 }
 
 /// Per-worker load shape, replicated (NOT sharded) across the fleet.
@@ -114,6 +129,8 @@ pub enum ConfigError {
     MissingEnvVar(String),
     #[error("unterminated `${{` placeholder in config (missing closing `}}`)")]
     UnterminatedPlaceholder,
+    #[error("query.top_k must be greater than 0")]
+    ZeroTopK,
 }
 
 /// Expand `${VAR}` references in `input` from the process environment.
@@ -211,6 +228,40 @@ query:
         assert_eq!(cfg.load.concurrency, 32);
         assert_eq!(cfg.load.target_qps, 0.0);
         assert_eq!(cfg.query.top_k, 10);
+        assert_eq!(cfg.query.source.ground_truth_column, None);
+    }
+
+    #[test]
+    fn rejects_zero_top_k() {
+        let yaml = r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  top_k: 0
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+"#;
+        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::ZeroTopK));
+    }
+
+    #[test]
+    fn parses_ground_truth_column() {
+        let yaml = r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+    ground_truth_column: hit_ids
+"#;
+        let cfg = StormConfig::from_yaml(yaml).expect("parses");
+        assert_eq!(cfg.query.source.ground_truth_column.as_deref(), Some("hit_ids"));
     }
 
     fn expand(input: &str, vars: &[(&str, &str)]) -> Result<String, ConfigError> {
