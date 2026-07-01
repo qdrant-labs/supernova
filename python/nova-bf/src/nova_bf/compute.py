@@ -17,6 +17,15 @@ of `make_point_id`. Such an id isn't recomputable from (file, row), so it's read
 alongside the dense column and kept in RAM per file (the worker's slice) to resolve
 the final top-K. Large files can be scored in row-batches (`params.corpus_batch_size`)
 to bound the per-file score matrix `(n_queries × rows)` on the GPU.
+
+If `filter` is set (see `nova_bf.filters`), each file's payload columns are
+read alongside the dense column and evaluated into a keep-mask *before*
+scoring, so filtered-out rows never reach the GPU. The mask compacts `arr` but
+never renumbers rows — `orig_rows` tracks each surviving row's true file-row
+number, since both `make_point_id` and the `id_column` lookup are keyed on it.
+Mask evaluation is timed separately from the read (`filter_secs`, reported
+alongside `read_secs`/`io_wait`/`gpu_secs`) so a slow filter is distinguishable
+from slow IO in the end-of-run timing log.
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ import numpy as np
 from tqdm import tqdm
 
 from nova_bf.config import BruteForceConfig
+from nova_bf.filters import evaluate
 from nova_bf.ids import make_point_id
 from nova_bf.io import Store, dense_to_2d
 from nova_bf.results import build_result_table, partial_dir, result_name
@@ -126,6 +136,8 @@ def run_compute(
         n_q, dim, metric, k, device,
         f" rank={job_rank}/{num_jobs}" if num_jobs else "",
     )
+    if cfg.filter is not None:
+        logger.info("filter: %s", cfg.filter.model_dump(exclude_defaults=True))
 
     # 2. corpus files (global, deterministic order); this worker takes a stride
     #    slice so its global indices stay stable for id decoding.
@@ -156,7 +168,9 @@ def run_compute(
     # commutative). pyarrow releases the GIL during IO, so threads parallelize.
     dense_col = cfg.corpus.dense_column
     id_col = cfg.corpus.id_column  # None → derive make_point_id(file_key, row) at decode
-    read_cols = [dense_col] + ([id_col] if id_col else [])
+    filt = cfg.filter  # None → no filtering; else a corpus-side payload predicate
+    filter_cols = sorted(filt.fields()) if filt else []
+    read_cols = list(dict.fromkeys([dense_col] + ([id_col] if id_col else []) + filter_cols))
     # Corpus id strings carried through to decode, kept in RAM per file (only when
     # id_column is set). gidx → pyarrow string array aligned with that file's rows.
     corpus_ids: dict[int, object] = {}
@@ -193,7 +207,15 @@ def run_compute(
             # carry the id column (combined to one contiguous array) to decode;
             # None when id_column isn't configured. Same row order as `arr`.
             ids = table[id_col].combine_chunks() if id_col else None
-            fq.put((gidx, arr, ids, time.perf_counter() - t0))
+            t1 = time.perf_counter()
+            # None when unfiltered; else a boolean mask over this file's rows,
+            # ORIGINAL row order preserved (no compaction here — see consumer).
+            # Timed separately from the read above: it's CPU-vectorized work over
+            # the whole file, not IO wait, and lumping it into `read_secs` would
+            # make an expensive filter look like slow S3, not slow filtering.
+            keep = evaluate(filt, table) if filt else None
+            t2 = time.perf_counter()
+            fq.put((gidx, arr, ids, keep, t1 - t0, t2 - t1))
 
     for _ in range(io_workers):
         Thread(target=reader, daemon=True).start()
@@ -203,7 +225,10 @@ def run_compute(
     # here. `gpu_secs` is just CPU-side enqueue time (CUDA is async and overlaps
     # the next read), so it being tiny is itself evidence we're not compute-bound.
     # `read_secs` is summed per-file read latency across the reader threads.
-    io_wait = gpu_secs = read_secs = 0.0
+    # `filter_secs` is summed per-file mask-evaluation time (0 when unfiltered),
+    # also across the reader threads — kept apart from `read_secs` so a slow
+    # filter doesn't masquerade as slow IO.
+    io_wait = gpu_secs = read_secs = filter_secs = 0.0
     rows_seen = 0
     bytes_seen = 0  # decoded float32 bytes consumed (~= wire bytes for snappy-float32)
     wall0 = time.perf_counter()
@@ -211,16 +236,30 @@ def run_compute(
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for _ in range(len(mine)):
             w0 = time.perf_counter()
-            gidx, arr, ids, rsec = fq.get()
+            gidx, arr, ids, keep, rsec, fsec = fq.get()
             io_wait += time.perf_counter() - w0
             read_secs += rsec
+            filter_secs += fsec
             bar.update(1)
+            # `orig_rows[i]` is the TRUE file row that arr[i] came from — identity
+            # when unfiltered, else the surviving indices of `keep`. Filtering
+            # compacts `arr` (fewer/smaller matmuls) but must never renumber rows:
+            # both make_point_id(file, row) and corpus_ids[gidx][row] need the row
+            # the vector actually occupies in the parquet file, not its position
+            # in the filtered-down array.
+            if keep is not None:
+                orig_rows = np.nonzero(keep)[0]
+                arr = arr[orig_rows]
+            else:
+                orig_rows = None
             if len(arr) == 0:
                 continue
             rows_seen += len(arr)
             bytes_seen += int(arr.nbytes)
             if id_col:
                 corpus_ids[gidx] = ids  # kept in RAM; indexed by row at decode
+                # unfiltered — always the full per-file array, so `corpus_ids[gidx][row]`
+                # resolves correctly regardless of `keep`.
 
             g0 = time.perf_counter()
             # zero-copy view of the (contiguous float32) array + one H2D copy;
@@ -233,9 +272,13 @@ def run_compute(
                 scores = _scores(Q, Cb, metric)  # (n_q, ≤step)
                 bk = min(k, Cb.shape[0])
                 f_scores, f_local = torch.topk(scores, k=bk, dim=1)
-                # rows are FILE-LOCAL indices (offset by r0) so the encoding stays
-                # global_file_idx * MAX_ROWS_PER_FILE + row regardless of batching.
-                rows = torch.arange(r0, r0 + Cb.shape[0], dtype=torch.int64, device=device)
+                # rows are the TRUE file row for each entry of Cb (see orig_rows
+                # above), so the encoding stays global_file_idx * MAX_ROWS_PER_FILE
+                # + row regardless of batching or filtering.
+                if orig_rows is not None:
+                    rows = torch.from_numpy(orig_rows[r0 : r0 + Cb.shape[0]]).to(device)
+                else:
+                    rows = torch.arange(r0, r0 + Cb.shape[0], dtype=torch.int64, device=device)
                 f_enc = (gidx * MAX_ROWS_PER_FILE + rows)[f_local]
                 merged_s = torch.cat([top_scores, f_scores], dim=1)
                 merged_e = torch.cat([top_enc, f_enc], dim=1)
@@ -244,7 +287,10 @@ def run_compute(
             gpu_secs += time.perf_counter() - g0
 
             if bar.n % 200 == 0:
-                bar.set_postfix_str(f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s", refresh=False)
+                postfix = f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s"
+                if filt:
+                    postfix += f" filter={filter_secs:.0f}s"
+                bar.set_postfix_str(postfix, refresh=False)
 
     wall = time.perf_counter() - wall0
     gb = bytes_seen / 1e9
@@ -252,19 +298,23 @@ def run_compute(
     stream_mbps = bytes_seen / 1e6 / max(read_secs, 1e-9)  # avg single-connection throughput
     logger.info(
         "timing: %d files / %d rows / %.2f GB in %.1fs | consumer io_wait=%.1fs gpu=%.1fs | "
-        "read latency avg=%.3fs/file (summed %.0fs over %d threads)",
+        "read latency avg=%.3fs/file (summed %.0fs over %d threads)%s",
         len(mine), rows_seen, gb, wall, io_wait, gpu_secs,
         read_secs / max(1, len(mine)), read_secs, io_workers,
+        f" | filter eval avg={filter_secs / max(1, len(mine)):.3f}s/file "
+        f"(summed {filter_secs:.0f}s over {io_workers} threads)" if filt else "",
     )
     # One machine-parseable line per run — for sweeping io_workers and plotting.
     # `wall_mbps` is the effective aggregate download rate; compare it to the
     # instance's *sustained* NIC baseline (g5.xlarge ≈ 310 MB/s) to tell whether
     # you're NIC-bound (plateaus there) or still latency-bound (keeps rising).
+    # `filter_s` is 0.0 when unfiltered — always present so the line's schema
+    # stays stable for scripts parsing it across both filtered and plain runs.
     logger.info(
         "bf-bench io_workers=%d files=%d rows=%d gb=%.3f wall_s=%.1f "
-        "wall_mbps=%.1f stream_mbps=%.1f io_wait_s=%.1f gpu_s=%.1f",
+        "wall_mbps=%.1f stream_mbps=%.1f io_wait_s=%.1f gpu_s=%.1f filter_s=%.1f",
         io_workers, len(mine), rows_seen, gb, wall,
-        wall_mbps, stream_mbps, io_wait, gpu_secs,
+        wall_mbps, stream_mbps, io_wait, gpu_secs, filter_secs,
     )
     if io_wait > 3 * max(gpu_secs, 1e-6):
         logger.info(
