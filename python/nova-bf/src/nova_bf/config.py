@@ -4,6 +4,9 @@
     queries:  the query embeddings (a parquet file or dir)
     output:   where results land (local dir / s3:// prefix)
     params:   k, distance metric
+    filter:   optional corpus-side payload predicate restricting eligible
+              neighbors (see Filter) — each condition's `field` is itself the
+              declaration of which corpus column to read for it.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ from typing import Literal
 
 import yaml
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 import os
 
@@ -119,6 +122,70 @@ class ParamsConfig(BaseModel):
     merge_prefetch: bool = False
 
 
+# A single scalar payload value, as it would appear in a corpus column.
+MatchValue = str | int | float | bool
+
+
+class RangeCondition(BaseModel):
+    """Numeric bounds, combinable like Qdrant's Range (e.g. `gte` + `lt` together)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    gt: float | None = None
+    gte: float | None = None
+    lt: float | None = None
+    lte: float | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_bound(self) -> "RangeCondition":
+        if all(v is None for v in (self.gt, self.gte, self.lt, self.lte)):
+            raise ValueError("range condition needs at least one of gt/gte/lt/lte")
+        return self
+
+
+class FilterCondition(BaseModel):
+    """One field predicate: keyword-style equality (`match`) or numeric bounds (`range`).
+
+    `match` takes a scalar (equality) or a list (matches any of them — Qdrant's
+    MatchAny). Exactly one of `match`/`range` must be set.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The corpus column this condition reads and matches against — this is the
+    # only place a filtered field is named; nothing else needs to declare it,
+    # so `compute` reads exactly (and only) the columns the filter references.
+    field: str
+    match: MatchValue | list[MatchValue] | None = None
+    range: RangeCondition | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> "FilterCondition":
+        if (self.match is None) == (self.range is None):
+            raise ValueError(
+                f"filter condition on `{self.field}` must set exactly one of `match` or `range`"
+            )
+        return self
+
+
+class Filter(BaseModel):
+    """A corpus-side payload filter, shaped like Qdrant's own filter (must/should/must_not).
+
+    Restricts which corpus points are eligible neighbors for every query in the
+    run — it does not touch queries themselves, same as a Qdrant search filter.
+    `must` = AND, `should` = OR-at-least-one, `must_not` = AND-NOT.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    must: list[FilterCondition] = []
+    should: list[FilterCondition] = []
+    must_not: list[FilterCondition] = []
+
+    def fields(self) -> set[str]:
+        return {c.field for group in (self.must, self.should, self.must_not) for c in group}
+
+
 class BruteForceConfig(BaseModel):
     # allow extra top-level keys (e.g. a `resources:` block for `nova dist`).
     model_config = ConfigDict(extra="allow")
@@ -127,6 +194,7 @@ class BruteForceConfig(BaseModel):
     queries: QueriesConfig
     output: OutputConfig
     params: ParamsConfig = ParamsConfig()
+    filter: Filter | None = None
 
 
 def load_config(path: str) -> BruteForceConfig:
