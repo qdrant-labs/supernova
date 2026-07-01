@@ -335,10 +335,10 @@ async fn load_files(
                     file_retries + 1,
                 );
                 skipped += 1;
-                if let Some(max) = max_failed_files {
-                    if skipped > max as u64 {
-                        return Err(LoadError::TooManyFailedFiles { skipped, max });
-                    }
+                if let Some(max) = max_failed_files
+                    && skipped > max as u64
+                {
+                    return Err(LoadError::TooManyFailedFiles { skipped, max });
                 }
                 progress.inc(1);
                 continue;
