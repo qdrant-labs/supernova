@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+
+import logging
+
 import pyarrow as pa
 
 from nova_bf.config import BruteForceConfig
@@ -35,3 +39,19 @@ def build_result_table(
     data["hit_ids"] = pa.array(hit_ids, pa.list_(pa.string()))
     data["hit_scores"] = pa.array(hit_scores, pa.list_(pa.float32()))
     return pa.table(data)
+
+
+def warn_if_short(hit_ids: list[list[str]], k: int, logger: logging.Logger) -> None:
+    """Log if any query's FINAL top-K came out shorter than k. Not an error —
+    hit_ids/hit_scores are already correctly truncated (see the `-inf` sentinel
+    handling in compute.py) — just a signal that the corpus, or `filter` if one
+    is configured, didn't have k matches for some queries, so this ground truth
+    is smaller than requested rather than wrong.
+    """
+    short = sum(1 for h in hit_ids if len(h) < k)
+    if short:
+        logger.warning(
+            "%d/%d quer%s returned fewer than k=%d hits — the corpus (after "
+            "any `filter`) didn't have enough matches for them",
+            short, len(hit_ids), "y" if short == 1 else "ies", k,
+        )

@@ -25,8 +25,12 @@ pub mod qdrant;
 pub struct QueryOutcome {
     pub latency: Duration,
     pub ok: bool,
-    /// Number of points the query returned (sanity / future recall checks).
-    pub matched: usize,
+    /// The point ids actually returned, best-first — `None` when there's
+    /// nothing meaningful to report: recall tracking wasn't on for this run
+    /// (`QdrantTarget::collect_ids` is `false`) or the query failed (`!ok`).
+    /// `Some(vec![])` is a real, different thing — recall tracking was on,
+    /// the query succeeded, and it just matched nothing.
+    pub ids: Option<Vec<String>>,
     pub error: Option<String>,
 }
 

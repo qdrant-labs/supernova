@@ -35,7 +35,7 @@ from tqdm import tqdm
 
 from nova_bf.config import BruteForceConfig
 from nova_bf.io import ParquetFile, Store
-from nova_bf.results import RESERVED, partial_dir, result_name
+from nova_bf.results import RESERVED, partial_dir, result_name, warn_if_short
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +224,12 @@ def _reduce(
     sink = out.fs.open_output_stream(path)
     writer: pq.ParquetWriter | None = None
 
+    # Running count of queries whose FINAL top-K came out short of k, tallied
+    # per batch via a vectorized length check (same call _topk_merge already
+    # uses internally) — never materializes a Python hit_ids list, which is
+    # exactly what this streaming rewrite exists to avoid.
+    short_count = 0
+
     total_batches = (n_rows + batch_rows - 1) // batch_rows
     try:
         with tqdm(total=total_batches, unit="batch", desc="merge", dynamic_ncols=True) as bar:
@@ -239,6 +245,9 @@ def _reduce(
                 score_lists = [base.column("hit_scores")] + [o.column("hit_scores") for o in rest]
                 id_lists = [base.column("hit_ids")] + [o.column("hit_ids") for o in rest]
                 ids_arr, scores_arr = _topk_merge(score_lists, id_lists, k)
+
+                lengths = ids_arr.value_lengths().to_numpy(zero_copy_only=False)
+                short_count += int((lengths < k).sum())
 
                 cols = {"query_id": base.column("query_id")}
                 for c in payload_cols:
@@ -256,5 +265,6 @@ def _reduce(
             writer.close()
         sink.close()
 
+    warn_if_short(short_count, n_rows, k, logger)
     logger.info("wrote %s (%d queries)", path, n_rows)
     return path

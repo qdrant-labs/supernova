@@ -42,6 +42,23 @@ params:
 
 `${VAR}` / `${VAR:-default}` references are expanded from the environment, same as every other tool.
 
+### Filtering the corpus
+
+To evaluate recall for a *filtered* search, restrict which corpus rows are eligible neighbors with a top-level `filter`, shaped like a Qdrant filter:
+
+```yaml
+filter:
+  must:
+    - field: language
+      match: eng          # scalar → equality; a list matches any of them (MatchAny)
+    - field: cost
+      range: {lt: 10}     # gt / gte / lt / lte — combinable in one condition
+  should: []               # OR-at-least-one
+  must_not: []              # AND-NOT
+```
+
+A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. The filter applies uniformly to every query in the run: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves.
+
 ## Running
 
 ```bash
@@ -110,4 +127,4 @@ The work splits into three layers: **reading** corpus parquet from S3, **decodin
 
 A good starting point for a large corpus on AWS: a high-vCPU single-GPU instance, `io_thread_count: 128`, `io_workers: 32–64`. Raising query count shifts the balance toward the GPU — at that point batch the matmul (`corpus_batch_size`) and add GPUs/workers.
 
-> **Reading fewer bytes** helps every layer: `compute` already projects only the dense (and optional id) column, so the heavy work is unavoidable corpus data. Storing the dense column as fp16 (half the bytes to transfer *and* decode) is the next lever if the read path is still the bottleneck.
+> **Reading fewer bytes** helps every layer: `compute` already projects only the dense column (plus `id_column`/`filter` fields when configured), so the heavy work is unavoidable corpus data. Storing the dense column as fp16 (half the bytes to transfer *and* decode) is the next lever if the read path is still the bottleneck.
