@@ -45,7 +45,7 @@ from nova_bf.config import BruteForceConfig
 from nova_bf.filters import evaluate
 from nova_bf.ids import make_point_id
 from nova_bf.io import Store, dense_to_2d
-from nova_bf.results import build_result_table, partial_dir, result_name
+from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
 
 logger = logging.getLogger(__name__)
 
@@ -351,8 +351,14 @@ def run_compute(
     if num_jobs is not None:
         width = max(3, len(str(num_jobs - 1)))
         name = f"{partial_dir(cfg)}/rank{job_rank:0{width}d}.parquet"
+        # This worker's slice of the corpus naturally has fewer than k
+        # candidates per query most of the time (stride partitioning spreads
+        # the corpus thin) -- that's expected here, not a signal of anything.
+        # Only `merge` (or this function's own single-node path below) sees
+        # the true final count, so that's the only place worth warning.
     else:
         name = result_name(cfg)
+        warn_if_short(hit_ids, k, logger)
     path = out.write(name, table)
     logger.info("wrote %s (%d queries)", path, n_q)
     return path
