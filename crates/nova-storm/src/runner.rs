@@ -150,8 +150,11 @@ struct Sample {
 
 /// Build a [`Sample`] from a completed query, applying the "only score recall
 /// on success" rule above in one place (both load-shape functions call this).
+/// `out.ids` being `None` already covers both "no ground truth was tracked"
+/// and "the query failed" — see `QueryOutcome::ids` — so `zip` alone is the
+/// whole rule; no separate `out.ok` check is needed here anymore.
 fn sample_from(out: &crate::targets::QueryOutcome, ground_truth: Option<&HashSet<String>>, top_k: u64) -> Sample {
-    let recall = out.ok.then(|| ground_truth.map(|gt| recall_at_k(&out.ids, gt, top_k))).flatten();
+    let recall = out.ids.as_ref().zip(ground_truth).map(|(ids, gt)| recall_at_k(ids, gt, top_k));
     Sample { latency_ms: out.latency.as_secs_f64() * 1000.0, ok: out.ok, recall }
 }
 
@@ -325,7 +328,7 @@ mod tests {
                     latency: Duration::from_micros(100),
                     ok: false,
                     matched: 0,
-                    ids: vec![],
+                    ids: None,
                     error: Some("mock failure".into()),
                 };
             }
@@ -333,7 +336,7 @@ mod tests {
                 latency: Duration::from_micros(100),
                 ok: true,
                 matched: self.ids.len(),
-                ids: self.ids.clone(),
+                ids: Some(self.ids.clone()),
                 error: None,
             }
         }
@@ -498,7 +501,7 @@ mod tests {
                     1 => vec!["a".to_string()], // 1/2 -> recall 0.5
                     _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
                 };
-                QueryOutcome { latency: Duration::from_micros(100), ok: true, matched: ids.len(), ids, error: None }
+                QueryOutcome { latency: Duration::from_micros(100), ok: true, matched: ids.len(), ids: Some(ids), error: None }
             }
         }
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
@@ -510,11 +513,32 @@ mod tests {
         // duration long enough to cycle through all 3 at concurrency=1 several times
         let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_qps: 0.0 };
         let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2).await;
-        let summary = results.summary();
 
+        // Only asserts the pipeline actually produced all 3 distinct values --
+        // NOT their exact proportions, which depend on how many times each of
+        // the 3 round-robin slots happened to be hit inside a fixed wall-clock
+        // window (not guaranteed 1:1:1). The exact mean/median/min math itself
+        // is covered deterministically, with no timing dependency, by
+        // `summary_aggregates_recall_distribution_correctly` below.
         assert!(results.recalls.iter().any(|&r| (r - 0.0).abs() < 1e-9));
         assert!(results.recalls.iter().any(|&r| (r - 0.5).abs() < 1e-9));
         assert!(results.recalls.iter().any(|&r| (r - 1.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn summary_aggregates_recall_distribution_correctly() {
+        // Deterministic, no async/timing involved -- exercises StormResults::summary()
+        // directly, so it can assert exact mean/median/min without depending on
+        // how many times a round-robin cycle happened to repeat within a window.
+        let results = StormResults {
+            latencies_ms: vec![1.0, 2.0, 3.0],
+            recalls: vec![0.0, 0.5, 1.0],
+            n_ok: 3,
+            n_err: 0,
+            wall_s: 1.0,
+        };
+        let summary = results.summary();
+
         assert_eq!(summary.min_recall, Some(0.0)); // the worst query, not hidden by the mean
         assert!((summary.mean_recall.unwrap() - 0.5).abs() < 1e-9); // (0+0.5+1)/3 = 0.5
         assert!((summary.median_recall.unwrap() - 0.5).abs() < 1e-9);

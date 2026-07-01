@@ -25,18 +25,16 @@ pub mod qdrant;
 pub struct QueryOutcome {
     pub latency: Duration,
     pub ok: bool,
-    /// Number of points the query returned (sanity check). NOT guaranteed to
-    /// equal `ids.len()`: `ids` is left empty whenever the target has no
-    /// reason to populate it (no query in the run has `ground_truth_column`
-    /// configured — the common case, since recall tracking is opt-in — see
-    /// `QdrantTarget::collect_ids`), and even when populated, a point lacking
-    /// a resolvable id is dropped from `ids` but still counted here. Use
-    /// `matched` for a raw result-count sanity check; use `ids` for recall.
+    /// Number of points the query returned (sanity check). Independent of
+    /// `ids` — a point lacking a resolvable id is dropped from `ids` but still
+    /// counted here, so don't assume `matched == ids.len()`.
     pub matched: usize,
-    /// The point ids actually returned, best-first. Populated only when this
-    /// run tracks recall — see `matched`'s doc for why it can be empty (or
-    /// shorter than `matched`) even on a successful query. Empty on error.
-    pub ids: Vec<String>,
+    /// The point ids actually returned, best-first — `None` when there's
+    /// nothing meaningful to report: recall tracking wasn't on for this run
+    /// (`QdrantTarget::collect_ids` is `false`) or the query failed (`!ok`).
+    /// `Some(vec![])` is a real, different thing — recall tracking was on,
+    /// the query succeeded, and it just matched nothing.
+    pub ids: Option<Vec<String>>,
     pub error: Option<String>,
 }
 

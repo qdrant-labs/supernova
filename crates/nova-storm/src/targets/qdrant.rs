@@ -82,18 +82,14 @@ impl QueryTarget for QdrantTarget {
                 latency: started.elapsed(),
                 ok: true,
                 matched: resp.result.len(),
-                ids: if self.collect_ids {
-                    resp.result.iter().filter_map(point_id_string).collect()
-                } else {
-                    Vec::new()
-                },
+                ids: self.collect_ids.then(|| resp.result.iter().filter_map(point_id_string).collect()),
                 error: None,
             },
             Err(e) => QueryOutcome {
                 latency: started.elapsed(),
                 ok: false,
                 matched: 0,
-                ids: vec![],
+                ids: None,
                 error: Some(e.to_string()),
             },
         }
