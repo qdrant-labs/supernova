@@ -1,0 +1,41 @@
+# Load-test config for `nova storm` — fire nearest-neighbour queries at a vector
+# store and measure latency/throughput under a controlled load shape.
+#
+#   nova storm configs/storm/example.yaml
+#
+# Distributed: work is REPLICATED, not sharded — every worker runs this same
+# profile, so total offered load ≈ num_jobs × (concurrency or qps).
+#   nova dist storm configs/storm/example.yaml --num-jobs 10
+#
+# Prints a latency summary (requests, errors, throughput, p50/p95/p99, max).
+
+# The cluster under test, dispatched on `type` (qdrant today).
+target:
+  type: qdrant
+  url: ${QDRANT_URL}                # env substitution; ${VAR:-default} also works
+  api_key: ${QDRANT_API_KEY}
+  collection_name: fiqa_bge-m3
+
+# What to search with.
+query:
+  # Named vector to hit. Omit for a single-(unnamed-)vector collection.
+  vector_name: dense
+  top_k: 10                         # neighbours per query (default 10)
+  source:
+    # Query vectors — a parquet file (or dir) at a local path or s3:// URI, read
+    # via DuckDB. Each row's `column` is one query vector.
+    uri: s3://qdrant--vectorforge/fiqa/bge-m3/queries.parquet
+    column: dense_embedding
+    limit: 5000                     # load this many vectors and cycle through them
+
+# Per-worker load shape (replicated across the fleet).
+load:
+  # Closed-loop (default, `qps` unset): hold `concurrency` requests in flight for
+  # `duration_s` and measure the max throughput sustainable at that depth.
+  concurrency: 32
+  duration_s: 60
+
+  # Open-loop paced: uncomment `qps` to launch on a fixed 1/qps schedule instead,
+  # with `concurrency` as the in-flight ceiling. Use this to measure latency at a
+  # KNOWN offered rate (avoids coordinated omission); raise qps to find the knee.
+  # qps: 500
