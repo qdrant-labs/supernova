@@ -25,8 +25,18 @@ pub mod qdrant;
 pub struct QueryOutcome {
     pub latency: Duration,
     pub ok: bool,
-    /// Number of points the query returned (sanity / future recall checks).
+    /// Number of points the query returned (sanity check). NOT guaranteed to
+    /// equal `ids.len()`: `ids` is left empty whenever the target has no
+    /// reason to populate it (no query in the run has `ground_truth_column`
+    /// configured — the common case, since recall tracking is opt-in — see
+    /// `QdrantTarget::collect_ids`), and even when populated, a point lacking
+    /// a resolvable id is dropped from `ids` but still counted here. Use
+    /// `matched` for a raw result-count sanity check; use `ids` for recall.
     pub matched: usize,
+    /// The point ids actually returned, best-first. Populated only when this
+    /// run tracks recall — see `matched`'s doc for why it can be empty (or
+    /// shorter than `matched`) even on a successful query. Empty on error.
+    pub ids: Vec<String>,
     pub error: Option<String>,
 }
 
