@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from nova_bf.config import BruteForceConfig
 from nova_bf.io import Store
-from nova_bf.results import RESERVED, build_result_table, partial_dir, result_name
+from nova_bf.results import RESERVED, build_result_table, partial_dir, result_name, warn_if_short
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ def run_merge(cfg: BruteForceConfig) -> str:
         for c in payload_cols:
             payload[c].append(payloads[qid][c])
 
+    warn_if_short(hit_ids, k, logger)
     table = build_result_table(query_ids, payload, hit_ids, hit_scores)
     path = out.write(result_name(cfg), table)
     logger.info("wrote %s (%d queries)", path, len(query_ids))
