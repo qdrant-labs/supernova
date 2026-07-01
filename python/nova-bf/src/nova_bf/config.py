@@ -106,6 +106,20 @@ class ParamsConfig(BaseModel):
     # top-K and isn't smaller than the always-resident (n_q × k) state — so values
     # under k are raised to k with a warning.
     corpus_batch_size: int | None = None
+    # `merge` reduces the W per-rank partials in row-batches of this many queries,
+    # streaming the result to disk so the full output never sits in RAM (that's what
+    # let the old merge OOM at 1M queries). Peak host memory is ~(this × W × k)
+    # candidate slots. None (default) → auto: sized so the working set stays near
+    # ~20M candidate slots regardless of W and k, floored at 1 and capped at the
+    # query count. Set it explicitly to trade memory for fewer, larger batches.
+    merge_batch_size: int | None = None
+    # `merge`: when the partials live on S3, first bulk-download them to local disk
+    # (io_workers threads, whole-object copies) and merge from there, instead of
+    # streaming each batch over S3 in lockstep. Trades local disk (~sum of partial
+    # sizes) for a one-shot parallel download at full NIC speed + latency-free reads
+    # during the reduce — worth it on a beefy box with fast NVMe. No effect when the
+    # partials are already local. Default off (a laptop controller may lack the disk).
+    merge_prefetch: bool = False
 
 
 # A single scalar payload value, as it would appear in a corpus column.

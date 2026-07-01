@@ -358,7 +358,7 @@ def run_compute(
         # the true final count, so that's the only place worth warning.
     else:
         name = result_name(cfg)
-        warn_if_short(hit_ids, k, logger)
+        warn_if_short(sum(1 for h in hit_ids if len(h) < k), len(hit_ids), k, logger)
     path = out.write(name, table)
     logger.info("wrote %s (%d queries)", path, n_q)
     return path

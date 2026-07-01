@@ -178,12 +178,6 @@ def storm(config, resources, num_jobs, pool_name, dry_run):
     )
 
 
-_AWS_ENV = [
-    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-    "AWS_REGION", "AWS_DEFAULT_REGION",
-]
-
-
 @main.group()
 def bf() -> None:
     """
@@ -200,7 +194,7 @@ def bf_compute(config, resources, num_jobs, pool_name, dry_run):
     _fanout(
         "bf", config, resources, num_jobs, pool_name, dry_run,
         run_cmd="nova-bf compute {cfg} --num-jobs {n} --job-rank $SKYPILOT_JOB_RANK",
-        env_extra=_AWS_ENV + ["HF_TOKEN"],
+        env_extra=["HF_TOKEN"],
     )
     if not dry_run:
         click.echo("\nwhen all workers finish, merge the partials:")
