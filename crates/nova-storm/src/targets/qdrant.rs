@@ -81,14 +81,12 @@ impl QueryTarget for QdrantTarget {
             Ok(resp) => QueryOutcome {
                 latency: started.elapsed(),
                 ok: true,
-                matched: resp.result.len(),
                 ids: self.collect_ids.then(|| resp.result.iter().filter_map(point_id_string).collect()),
                 error: None,
             },
             Err(e) => QueryOutcome {
                 latency: started.elapsed(),
                 ok: false,
-                matched: 0,
                 ids: None,
                 error: Some(e.to_string()),
             },

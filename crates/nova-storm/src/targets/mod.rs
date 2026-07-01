@@ -25,10 +25,6 @@ pub mod qdrant;
 pub struct QueryOutcome {
     pub latency: Duration,
     pub ok: bool,
-    /// Number of points the query returned (sanity check). Independent of
-    /// `ids` — a point lacking a resolvable id is dropped from `ids` but still
-    /// counted here, so don't assume `matched == ids.len()`.
-    pub matched: usize,
     /// The point ids actually returned, best-first — `None` when there's
     /// nothing meaningful to report: recall tracking wasn't on for this run
     /// (`QdrantTarget::collect_ids` is `false`) or the query failed (`!ok`).
