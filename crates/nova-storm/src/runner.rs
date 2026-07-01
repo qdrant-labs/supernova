@@ -327,7 +327,6 @@ mod tests {
                 return QueryOutcome {
                     latency: Duration::from_micros(100),
                     ok: false,
-                    matched: 0,
                     ids: None,
                     error: Some("mock failure".into()),
                 };
@@ -335,7 +334,6 @@ mod tests {
             QueryOutcome {
                 latency: Duration::from_micros(100),
                 ok: true,
-                matched: self.ids.len(),
                 ids: Some(self.ids.clone()),
                 error: None,
             }
@@ -501,7 +499,7 @@ mod tests {
                     1 => vec!["a".to_string()], // 1/2 -> recall 0.5
                     _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
                 };
-                QueryOutcome { latency: Duration::from_micros(100), ok: true, matched: ids.len(), ids: Some(ids), error: None }
+                QueryOutcome { latency: Duration::from_micros(100), ok: true, ids: Some(ids), error: None }
             }
         }
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
