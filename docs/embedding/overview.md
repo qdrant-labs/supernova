@@ -73,46 +73,19 @@ source:
 
 ## Storage backends
 
-### Object store (S3 / GCS / Azure + S3-compatible)
+Where the embedded parquet lands — chosen by `type`:
 
-The `object_store` backend writes to any cloud object store via [`obstore`](https://developmentseed.org/obstore/). The destination is a `path` URI whose scheme selects the provider:
-
-```yaml
-storage:
-  type: object_store
-  path: s3://my-bucket/dataset-name/model-name   # or gs://…, az://container/…
-```
-
-For **S3-compatible** stores (Cloudflare R2, Backblaze B2, MinIO, DigitalOcean Spaces) keep the `s3://` scheme and add an `endpoint` (and `region` if the provider needs one):
+- **`object_store`** (alias `s3`) — any cloud object store via a `path` URI: S3 (`s3://`), GCS (`gs://`), Azure (`az://`), and S3-compatible stores (R2, B2, MinIO, Spaces) with an `endpoint`.
+- **`hf`** — a HuggingFace Storage Bucket.
+- **`local`** — the local filesystem, no upload.
 
 ```yaml
 storage:
   type: object_store
-  path: s3://my-bucket/dataset-name/model-name
-  endpoint: https://<account>.r2.cloudflarestorage.com
-  region: auto
+  path: s3://my-bucket/arxiv/gte-base    # or gs://… , az://container/…
 ```
 
-Credentials come from the standard provider chains — for S3 that's boto3's chain (env vars, `~/.aws`, or instance role), matching the rest of supernova; GCS/Azure use their own env/config. Each chunk produces one parquet file (`batch_00000000.parquet`, …). For real S3 the bucket is auto-created if missing; other providers require it to already exist.
-
-`type: s3` is an alias for `object_store` — same `path` config, friendlier name.
-
-### HuggingFace Hub
-
-```yaml
-storage:
-  type: hf
-  repo_id: your-org/dataset-name--model-name
-  private: true
-```
-
-### Local
-
-```yaml
-storage:
-  type: local
-  output_dir: /tmp/supernova
-```
+See [Storage backends](storage.md) for every provider, examples, credentials, and options.
 
 ## Output format
 
