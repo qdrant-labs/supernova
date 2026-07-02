@@ -61,7 +61,7 @@ vectorstore:
       on_disk: true
       payload_m: 8
     quantization:
-      type: int8
+      type: scalar
       quantile: 0.99
       always_ram: true
     optimizers:

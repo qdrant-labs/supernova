@@ -43,6 +43,8 @@ nova load run      <config>                          # single machine: all phase
 nova load prepare  <config>                          # master: create collection, defer indexing
 nova load load     <config> --num-jobs N --job-rank R  # worker: load this slice (no indexing mgmt)
 nova load finalize <config>                          # master: re-enable + await indexing
+nova load reindex  <config>                          # patch HNSW/quantization/optimizers on an existing collection
+nova load delete   <config>                          # delete the collection if it exists
 nova load inspect  <config> [--num-jobs N --job-rank R]  # dry inspection (config + file slice)
 ```
 
@@ -52,6 +54,14 @@ nova load inspect  <config> [--num-jobs N --job-rank R]  # dry inspection (confi
   stride, so workers need no coordination.
 - `--num-jobs` / `--job-rank` apply to `load` and `inspect` only (the phases that
   operate on a slice).
+- **`reindex`** patches `vectorstore.params.{hnsw,quantization,optimizers}` on an
+  *already-existing* collection in place — no data is touched, and it doesn't
+  create the collection first. Useful for comparing index/quantization variants
+  against data you've already loaded once. See
+  [Collection-wide params](../loading/overview.md#collection-wide-params) for
+  the full knob list, including all quantization methods.
+- **`delete`** drops the collection if it exists (a no-op otherwise) — handy for
+  clearing out a variant between `reindex` sweeps.
 
 Files are partitioned by a deterministic stride, point ids are content-addressed
 (`vf_point_id`), and HNSW indexing is deferred during the bulk load and built
