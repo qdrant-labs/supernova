@@ -34,6 +34,9 @@ impl StormConfig {
         if cfg.query.top_k == 0 {
             return Err(ConfigError::ZeroTopK);
         }
+        if cfg.load.batch_size == 0 {
+            return Err(ConfigError::ZeroBatchSize);
+        }
         Ok(cfg)
     }
 
@@ -90,10 +93,15 @@ pub struct LoadProfile {
     #[serde(default = "default_duration")]
     pub duration_s: f64,
     /// `0` (default) = closed-loop, measuring max throughput at `concurrency`.
-    /// `>0` = open-loop paced at this many queries/sec per worker, with
-    /// `concurrency` as the in-flight cap. The YAML key is `qps`.
-    #[serde(rename = "qps", default)]
-    pub target_qps: f64,
+    /// `>0` = open-loop paced at this many *batch dispatches*/sec per worker,
+    /// with `concurrency` as the in-flight cap. The YAML key is `rps`.
+    #[serde(rename = "rps", default)]
+    pub target_rps: f64,
+    /// How many query vectors go in a single dispatch (`query_batch` RPC).
+    /// `1` (default) is not a special case — every dispatch is a batch, just
+    /// of size 1 by default, so existing configs behave identically.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
 }
 
 impl Default for LoadProfile {
@@ -101,7 +109,8 @@ impl Default for LoadProfile {
         Self {
             concurrency: default_concurrency(),
             duration_s: default_duration(),
-            target_qps: 0.0,
+            target_rps: 0.0,
+            batch_size: default_batch_size(),
         }
     }
 }
@@ -118,6 +127,9 @@ fn default_concurrency() -> usize {
 fn default_duration() -> f64 {
     60.0
 }
+fn default_batch_size() -> usize {
+    1
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -131,6 +143,8 @@ pub enum ConfigError {
     UnterminatedPlaceholder,
     #[error("query.top_k must be greater than 0")]
     ZeroTopK,
+    #[error("load.batch_size must be greater than 0")]
+    ZeroBatchSize,
 }
 
 /// Expand `${VAR}` references in `input` from the process environment.
@@ -187,7 +201,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_storm_config_and_qps_alias() {
+    fn parses_storm_config_and_rps() {
         let yaml = r#"
 target:
   type: qdrant
@@ -203,13 +217,15 @@ query:
 load:
   concurrency: 8
   duration_s: 300
-  qps: 75
+  rps: 75
+  batch_size: 16
 "#;
         let cfg = StormConfig::from_yaml(yaml).expect("should parse");
         assert_eq!(cfg.query.top_k, 10);
         assert_eq!(cfg.query.source.limit, 1000);
         assert_eq!(cfg.load.concurrency, 8);
-        assert_eq!(cfg.load.target_qps, 75.0); // `qps` -> target_qps
+        assert_eq!(cfg.load.target_rps, 75.0); // `rps` -> target_rps
+        assert_eq!(cfg.load.batch_size, 16);
     }
 
     #[test]
@@ -226,7 +242,8 @@ query:
 "#;
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
         assert_eq!(cfg.load.concurrency, 32);
-        assert_eq!(cfg.load.target_qps, 0.0);
+        assert_eq!(cfg.load.target_rps, 0.0);
+        assert_eq!(cfg.load.batch_size, 1);
         assert_eq!(cfg.query.top_k, 10);
         assert_eq!(cfg.query.source.ground_truth_column, None);
     }
@@ -245,6 +262,42 @@ query:
     column: embedding
 "#;
         assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::ZeroTopK));
+    }
+
+    #[test]
+    fn rejects_zero_batch_size() {
+        let yaml = r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+load:
+  batch_size: 0
+"#;
+        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::ZeroBatchSize));
+    }
+
+    #[test]
+    fn qps_key_is_no_longer_accepted() {
+        let yaml = r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+load:
+  qps: 75
+"#;
+        // `qps` was replaced by `rps` with no back-compat alias -- an old config
+        // using it now hits `deny_unknown_fields` like any other typo'd key.
+        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::Yaml(_)));
     }
 
     #[test]

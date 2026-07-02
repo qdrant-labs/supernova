@@ -105,7 +105,8 @@ query:
 load:
   concurrency: 32
   duration_s: 60
-  # qps: 500     # omit for closed-loop (max throughput); set for paced open-loop
+  # batch_size: 8   # queries per query_batch dispatch (1 = one query per round-trip)
+  # rps: 500        # omit for closed-loop (max throughput); set for paced open-loop
 ```
 
 ```bash

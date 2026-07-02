@@ -123,7 +123,7 @@ for config and tuning.
 ### storm
 
 Replicated, **not** partitioned — every worker runs the same profile, so total
-offered load ≈ `num_jobs × (concurrency or qps)`.
+offered load ≈ `num_jobs × (concurrency or rps) × batch_size`.
 
 ```bash
 nova dist storm configs/storm/test.yaml --num-jobs 10

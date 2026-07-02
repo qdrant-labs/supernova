@@ -8,7 +8,7 @@
 /// Backend client errors are boxed: `QdrantError` is large and an unboxed
 /// variant would bloat every `Result`. Note this covers setup/teardown only —
 /// a *query* failure during the load run is recorded as a non-fatal error
-/// sample (see [`QueryOutcome`](crate::targets::QueryOutcome)), not surfaced here.
+/// sample (see [`BatchOutcome`](crate::targets::BatchOutcome)), not surfaced here.
 #[derive(Debug, thiserror::Error)]
 pub enum TargetError {
     #[error(transparent)]

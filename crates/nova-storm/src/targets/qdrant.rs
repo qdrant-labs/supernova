@@ -6,10 +6,10 @@ use std::time::Instant;
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::point_id::PointIdOptions;
-use qdrant_client::qdrant::{QueryPointsBuilder, ScoredPoint};
+use qdrant_client::qdrant::{QueryBatchPointsBuilder, QueryPointsBuilder, ScoredPoint};
 use serde::Deserialize;
 
-use super::{QueryOutcome, QueryTarget};
+use super::{BatchOutcome, QueryTarget};
 use crate::config::QueryConfig;
 use crate::errors::TargetError;
 
@@ -19,10 +19,11 @@ pub struct QdrantTarget {
     collection_name: String,
     vector_name: Option<String>,
     top_k: u64,
-    /// Whether to materialize `QueryOutcome.ids`. Skipped (leaving `ids` empty)
-    /// when the run has no `ground_truth_column` configured — recall is the
-    /// only consumer of `ids`, so collecting it otherwise is a wasted
-    /// allocation (a `String` clone per returned point) on every query.
+    /// Whether to materialize `BatchOutcome.ids`. Skipped (leaving each
+    /// position `None`) when the run has no `ground_truth_column` configured
+    /// — recall is the only consumer of `ids`, so collecting it otherwise is
+    /// a wasted allocation (a `String` clone per returned point) on every
+    /// query.
     collect_ids: bool,
 }
 
@@ -67,27 +68,48 @@ impl fmt::Display for QdrantTarget {
 
 #[async_trait]
 impl QueryTarget for QdrantTarget {
-    async fn query(&self, vector: &[f32]) -> QueryOutcome {
-        let mut builder = QueryPointsBuilder::new(&self.collection_name)
-            .query(vector.to_vec())
-            .limit(self.top_k)
-            .with_payload(false);
-        if let Some(name) = &self.vector_name {
-            builder = builder.using(name.clone());
-        }
+    async fn query_batch(&self, vectors: &[&[f32]]) -> BatchOutcome {
+        let query_points: Vec<_> = vectors
+            .iter()
+            .map(|vector| {
+                let mut builder = QueryPointsBuilder::new(&self.collection_name)
+                    .query(vector.to_vec())
+                    .limit(self.top_k)
+                    .with_payload(false);
+                if let Some(name) = &self.vector_name {
+                    builder = builder.using(name.clone());
+                }
+                builder.build()
+            })
+            .collect();
+        let request = QueryBatchPointsBuilder::new(&self.collection_name, query_points);
 
         let started = Instant::now();
-        match self.client.query(builder).await {
-            Ok(resp) => QueryOutcome {
-                latency: started.elapsed(),
-                ok: true,
-                ids: self.collect_ids.then(|| resp.result.iter().filter_map(point_id_string).collect()),
-                error: None,
-            },
-            Err(e) => QueryOutcome {
+        match self.client.query_batch(request).await {
+            Ok(resp) => {
+                debug_assert_eq!(
+                    resp.result.len(),
+                    vectors.len(),
+                    "query_batch response length must match the submitted batch size"
+                );
+                BatchOutcome {
+                    latency: started.elapsed(),
+                    ok: true,
+                    ids: resp
+                        .result
+                        .into_iter()
+                        .map(|batch_result| {
+                            self.collect_ids
+                                .then(|| batch_result.result.iter().filter_map(point_id_string).collect())
+                        })
+                        .collect(),
+                    error: None,
+                }
+            }
+            Err(e) => BatchOutcome {
                 latency: started.elapsed(),
                 ok: false,
-                ids: None,
+                ids: vec![None; vectors.len()],
                 error: Some(e.to_string()),
             },
         }

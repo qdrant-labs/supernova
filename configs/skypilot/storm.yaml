@@ -5,7 +5,7 @@
 #   nova dist storm configs/storm/test.yaml --resources configs/skypilot/storm.yaml --num-jobs 10
 #
 # storm is REPLICATED, not partitioned: every worker runs the same profile, so
-# total offered load ≈ num_jobs × (concurrency or qps). Workers run
+# total offered load ≈ num_jobs × (concurrency or rps) × batch_size. Workers run
 # `nova-storm <cfg>`.
 
 resources:
