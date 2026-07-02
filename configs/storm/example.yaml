@@ -4,7 +4,7 @@
 #   nova storm configs/storm/example.yaml
 #
 # Distributed: work is REPLICATED, not sharded — every worker runs this same
-# profile, so total offered load ≈ num_jobs × (concurrency or qps).
+# profile, so total offered load ≈ num_jobs × (concurrency or rps) × batch_size.
 #   nova dist storm configs/storm/example.yaml --num-jobs 10
 #
 # Prints a latency summary (requests, errors, throughput, p50/p95/p99, max).
@@ -30,12 +30,21 @@ query:
 
 # Per-worker load shape (replicated across the fleet).
 load:
-  # Closed-loop (default, `qps` unset): hold `concurrency` requests in flight for
+  # Closed-loop (default, `rps` unset): hold `concurrency` requests in flight for
   # `duration_s` and measure the max throughput sustainable at that depth.
   concurrency: 32
   duration_s: 60
 
-  # Open-loop paced: uncomment `qps` to launch on a fixed 1/qps schedule instead,
-  # with `concurrency` as the in-flight ceiling. Use this to measure latency at a
-  # KNOWN offered rate (avoids coordinated omission); raise qps to find the knee.
-  # qps: 500
+  # How many query vectors go in each dispatch (one query_batch RPC per
+  # dispatch). 1 (default) is not a special case — every dispatch is a batch,
+  # just of size 1 by default. Raise this to measure Qdrant's native batched
+  # query throughput instead of one-vector-per-round-trip.
+  # batch_size: 8
+
+  # Open-loop paced: uncomment `rps` to launch a batch dispatch on a fixed
+  # 1/rps schedule instead, with `concurrency` as the in-flight ceiling. Use
+  # this to measure latency at a KNOWN offered rate (avoids coordinated
+  # omission); raise rps to find the knee. Note `rps` paces *dispatches*, not
+  # individual queries — actual query throughput is `rps * batch_size` (see
+  # the `qps` field in the printed summary).
+  # rps: 500

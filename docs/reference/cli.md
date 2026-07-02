@@ -84,7 +84,7 @@ See [Brute-Force overview](../brute-force/overview.md) for the config, output sc
 
 Load-test a vector store (Rust). Work is **replicated**, not partitioned — every
 worker runs the same profile, so total offered load ≈ `num_workers × {concurrency
-or qps}`.
+or rps} × batch_size`.
 
 ```bash
 nova storm <config>
@@ -92,13 +92,19 @@ nova storm <config>
 
 The config's `load` block picks the mode:
 
-- **closed-loop** (default, `qps` unset) — hold `concurrency` requests in flight
+- **closed-loop** (default, `rps` unset) — hold `concurrency` requests in flight
   for `duration_s`; measures max throughput at that depth.
-- **open-loop paced** (`qps > 0`) — launch on a fixed `1/qps` schedule with
-  `concurrency` as an in-flight cap; avoids coordinated omission.
+- **open-loop paced** (`rps > 0`) — launch a batch dispatch on a fixed `1/rps`
+  schedule with `concurrency` as an in-flight cap; avoids coordinated omission.
 
-Prints a latency summary (requests, errors, throughput, p50/p95/p99, max) at the
-end.
+`batch_size` (default `1`) is how many query vectors go in each dispatch (one
+Qdrant `query_batch` RPC per dispatch) — not a special case at `1`, just the
+default. `rps` paces *dispatches*, not individual queries.
+
+Prints a latency summary at the end: requests/errors (dispatch counts),
+`batch_size`, `requests_per_sec` (dispatch rate) and `qps` (actual query
+throughput, `= requests_per_sec × batch_size`), p50/p95/p99/max latency (per
+dispatch), and recall stats (per query) if `ground_truth_column` is configured.
 
 ## Local dev: overriding a tool's location
 

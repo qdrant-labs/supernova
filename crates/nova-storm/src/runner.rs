@@ -1,15 +1,21 @@
 //! The load generator + single-worker result summary.
 //!
-//! Two modes, chosen by [`LoadProfile::target_qps`](crate::config::LoadProfile):
+//! Two modes, chosen by [`LoadProfile::target_rps`](crate::config::LoadProfile):
 //!
 //! * `0` — **closed-loop**: hold `concurrency` requests in flight for the whole
-//!   window, each task firing the next query the instant its previous one
-//!   returns. Measures the max throughput the cluster gives at that depth.
-//! * `>0` — **open-loop paced**: launch one query every `1/target_qps` seconds
-//!   on a fixed virtual schedule, with `concurrency` as an in-flight ceiling.
-//!   The fixed schedule is what avoids coordinated omission — a slow response
-//!   can't delay the next launch and hide latency — and keeps the offered rate
-//!   tracking the target without overshooting it.
+//!   window, each task firing the next batch dispatch the instant its previous
+//!   one returns. Measures the max throughput the cluster gives at that depth.
+//! * `>0` — **open-loop paced**: launch one batch dispatch every `1/target_rps`
+//!   seconds on a fixed virtual schedule, with `concurrency` as an in-flight
+//!   ceiling. The fixed schedule is what avoids coordinated omission — a slow
+//!   response can't delay the next launch and hide latency — and keeps the
+//!   offered rate tracking the target without overshooting it.
+//!
+//! A batch dispatch (one `query_batch` round-trip) is the atomic unit of load
+//! regardless of [`LoadProfile::batch_size`](crate::config::LoadProfile) — a
+//! batch of 1 is not a special case, it's just the default. Latency is one
+//! sample per dispatch; recall stays per-query within it (see [`BatchOutcome`](
+//! crate::targets::BatchOutcome)).
 //!
 //! Aggregating ACROSS workers is a separate step and must merge latency
 //! *distributions*, never average per-worker percentiles.
@@ -31,23 +37,37 @@ use crate::targets::QueryTarget;
 /// can recompute true percentiles/means instead of averaging per-worker stats.
 #[derive(Debug, Clone)]
 pub struct StormResults {
+    /// One entry per batch dispatch (one `query_batch` round-trip), not per
+    /// query — a single gRPC round-trip's timing can't be honestly
+    /// disaggregated into per-query numbers.
     pub latencies_ms: Vec<f64>,
     /// One entry per query that had ground truth (see [`QueryVector::ground_truth`]).
-    /// Shorter than `latencies_ms` whenever some/all queries have none — that's
-    /// expected, not an error.
+    /// Recall stays per-query even though latency doesn't: `QueryBatchResponse`
+    /// gives one distinct result per submitted query, so each query's recall is
+    /// still individually real, not approximated from the batch.
     pub recalls: Vec<f64>,
+    /// Count of batch dispatches, not individual queries.
     pub n_ok: u64,
     pub n_err: u64,
     pub wall_s: f64,
+    /// How many query vectors went in each dispatch — carried alongside the
+    /// raw samples so `summary()` can self-describe regardless of what
+    /// `LoadProfile` is in scope.
+    pub batch_size: usize,
 }
 
 /// Aggregated stats for THIS worker. Fleet-wide stats must merge raw samples
 /// from every worker, not average these.
 #[derive(Debug, Clone)]
 pub struct Summary {
+    /// Batch dispatches (round-trips), not individual queries.
     pub requests: u64,
     pub errors: u64,
-    pub throughput_qps: f64,
+    pub batch_size: usize,
+    /// Batch dispatch rate — round-trips/sec, not query throughput.
+    pub requests_per_sec: f64,
+    /// Actual query throughput: `requests_per_sec * batch_size`.
+    pub qps: f64,
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,
@@ -72,10 +92,13 @@ impl StormResults {
         let mut rc = self.recalls.clone();
         rc.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let total = self.n_ok + self.n_err;
+        let requests_per_sec = if self.wall_s > 0.0 { total as f64 / self.wall_s } else { 0.0 };
         Summary {
             requests: total,
             errors: self.n_err,
-            throughput_qps: if self.wall_s > 0.0 { total as f64 / self.wall_s } else { 0.0 },
+            batch_size: self.batch_size,
+            requests_per_sec,
+            qps: requests_per_sec * self.batch_size as f64,
             p50_ms: percentile(&ms, 50.0),
             p95_ms: percentile(&ms, 95.0),
             p99_ms: percentile(&ms, 99.0),
@@ -92,7 +115,9 @@ impl std::fmt::Display for Summary {
         let mut lines = vec![
             format!("{:>16}: {}", "requests", self.requests),
             format!("{:>16}: {}", "errors", self.errors),
-            format!("{:>16}: {:.1}", "throughput_qps", self.throughput_qps),
+            format!("{:>16}: {}", "batch_size", self.batch_size),
+            format!("{:>16}: {:.1}", "requests_per_sec", self.requests_per_sec),
+            format!("{:>16}: {:.1}", "qps", self.qps),
             format!("{:>16}: {:.2}", "p50_ms", self.p50_ms),
             format!("{:>16}: {:.2}", "p95_ms", self.p95_ms),
             format!("{:>16}: {:.2}", "p99_ms", self.p99_ms),
@@ -135,35 +160,65 @@ fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> f
     hits as f64 / k as f64
 }
 
-/// One query observation forwarded from a worker to the collector.
-struct Sample {
+/// One batch dispatch's observation forwarded from a worker to the collector.
+/// `latency_ms`/`ok` describe the one round-trip; `recalls` holds 0..N values,
+/// one per query in the batch that had both ground truth and returned ids.
+struct DispatchSample {
     latency_ms: f64,
     ok: bool,
-    /// `None` when this query had no ground truth to compare against, OR the
-    /// query itself failed (`!ok`) — a failed request has no "returned ids" to
-    /// score, so it must not count as recall=0. Conflating the two would make
-    /// `mean_recall` crash under load-induced errors even when every
-    /// *successful* query has perfect recall — a different, already-visible
-    /// finding via `errors`/`throughput_qps`, not one recall should also report.
-    recall: Option<f64>,
+    /// A query contributes no entry here (not a `0.0` entry) when it had no
+    /// ground truth to compare against, OR the whole dispatch failed (`!ok`)
+    /// — a failed request has no "returned ids" to score, so it must not
+    /// count as recall=0. Conflating the two would make `mean_recall` crash
+    /// under load-induced errors even when every *successful* query has
+    /// perfect recall — a different, already-visible finding via
+    /// `errors`/`requests_per_sec`, not one recall should also report.
+    recalls: Vec<f64>,
 }
 
-/// Build a [`Sample`] from a completed query, applying the "only score recall
-/// on success" rule above in one place (both load-shape functions call this).
-/// `out.ids` being `None` already covers both "no ground truth was tracked"
-/// and "the query failed" — see `QueryOutcome::ids` — so `zip` alone is the
-/// whole rule; no separate `out.ok` check is needed here anymore.
-fn sample_from(out: &crate::targets::QueryOutcome, ground_truth: Option<&HashSet<String>>, top_k: u64) -> Sample {
-    let recall = out.ids.as_ref().zip(ground_truth).map(|(ids, gt)| recall_at_k(ids, gt, top_k));
-    Sample { latency_ms: out.latency.as_secs_f64() * 1000.0, ok: out.ok, recall }
+/// Build a [`DispatchSample`] from a completed batch dispatch, applying the
+/// "only score recall on success" rule above per-query within the batch.
+/// `idxs[i]` is the vectors-index the i-th slot in `out.ids` corresponds to.
+/// `out.ids[i]` being `None` already covers both "no ground truth was
+/// tracked" and "the dispatch failed" — see `BatchOutcome::ids` — so `zip`
+/// alone is the whole rule; no separate `out.ok` check is needed here.
+fn dispatch_sample(
+    out: &crate::targets::BatchOutcome,
+    idxs: &[usize],
+    vectors: &[QueryVector],
+    top_k: u64,
+) -> DispatchSample {
+    let recalls = idxs
+        .iter()
+        .zip(out.ids.iter())
+        .filter_map(|(&i, ids)| {
+            ids.as_ref().zip(vectors[i].ground_truth.as_ref()).map(|(ids, gt)| recall_at_k(ids, gt, top_k))
+        })
+        .collect();
+    DispatchSample { latency_ms: out.latency.as_secs_f64() * 1000.0, ok: out.ok, recalls }
+}
+
+/// The batch-of-`batch_size` indices into a round-robin `vectors` set of
+/// length `n`, starting at `start` and wrapping around. Pulled out on its own
+/// so the wraparound math is unit-testable without a mock run.
+///
+/// Precondition: `n > 0` — callers must not invoke this against an empty
+/// vector set (`% 0` panics). Every current caller is already guarded by
+/// `lib.rs::run()` rejecting an empty query-vector set before `run_storm` is
+/// reachable; the assertion exists so a future caller added inside this
+/// module fails loudly instead of hitting a raw divide-by-zero.
+fn batch_indices(start: usize, batch_size: usize, n: usize) -> Vec<usize> {
+    debug_assert!(n > 0, "batch_indices requires a non-empty vector set");
+    (0..batch_size).map(|offset| (start + offset) % n).collect()
 }
 
 /// Drive one worker's load profile against `target` and collect latencies
 /// (and recall, for queries carrying ground truth).
 ///
-/// `vectors` is the query set to cycle through (round-robin). A query failure is
-/// recorded as an error sample, not a hard error — see [`QueryOutcome`]. `top_k`
-/// is the denominator for recall — see [`recall_at_k`].
+/// `vectors` is the query set to cycle through (round-robin). A dispatch failure
+/// is recorded as an error sample, not a hard error — see [`BatchOutcome`](
+/// crate::targets::BatchOutcome). `top_k` is the denominator for recall — see
+/// [`recall_at_k`].
 pub async fn run_storm(
     target: Arc<dyn QueryTarget>,
     vectors: Vec<QueryVector>,
@@ -171,7 +226,7 @@ pub async fn run_storm(
     top_k: u64,
 ) -> StormResults {
     let vectors = Arc::new(vectors);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Sample>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<DispatchSample>();
 
     // Collector: drain samples into the raw distributions + counts. Owning the
     // accumulation in one task keeps the workers lock-free on the hot path.
@@ -182,9 +237,7 @@ pub async fn run_storm(
         let mut n_err = 0u64;
         while let Some(s) = rx.recv().await {
             latencies.push(s.latency_ms);
-            if let Some(r) = s.recall {
-                recalls.push(r);
-            }
+            recalls.extend(s.recalls);
             if s.ok {
                 n_ok += 1;
             } else {
@@ -196,8 +249,9 @@ pub async fn run_storm(
 
     let started = Instant::now();
     let stop_at = started + Duration::from_secs_f64(profile.duration_s);
+    let batch_size = profile.batch_size.max(1);
 
-    if profile.target_qps > 0.0 {
+    if profile.target_rps > 0.0 {
         run_paced(&target, &vectors, profile, stop_at, top_k, &tx).await;
     } else {
         run_closed_loop(&target, &vectors, profile, stop_at, top_k, &tx).await;
@@ -210,7 +264,7 @@ pub async fn run_storm(
     let (latencies_ms, recalls, n_ok, n_err) = collector.await.unwrap_or_default();
     let _ = target.close().await;
 
-    StormResults { latencies_ms, recalls, n_ok, n_err, wall_s }
+    StormResults { latencies_ms, recalls, n_ok, n_err, wall_s, batch_size }
 }
 
 /// Hold `concurrency` requests in flight until the window closes; each task
@@ -221,9 +275,10 @@ async fn run_closed_loop(
     profile: &LoadProfile,
     stop_at: Instant,
     top_k: u64,
-    tx: &mpsc::UnboundedSender<Sample>,
+    tx: &mpsc::UnboundedSender<DispatchSample>,
 ) {
     let n = vectors.len();
+    let batch_size = profile.batch_size.max(1);
     let cursor = Arc::new(AtomicUsize::new(0));
     let mut workers = JoinSet::new();
 
@@ -235,10 +290,11 @@ async fn run_closed_loop(
         workers.spawn(async move {
             while Instant::now() < stop_at {
                 // fetch_add wraps far below usize::MAX over any real run.
-                let i = cursor.fetch_add(1, Ordering::Relaxed) % n;
-                let qv = &vectors[i];
-                let out = target.query(&qv.vector).await;
-                let _ = tx.send(sample_from(&out, qv.ground_truth.as_ref(), top_k));
+                let start = cursor.fetch_add(batch_size, Ordering::Relaxed) % n;
+                let idxs = batch_indices(start, batch_size, n);
+                let vecs: Vec<&[f32]> = idxs.iter().map(|&i| vectors[i].vector.as_slice()).collect();
+                let out = target.query_batch(&vecs).await;
+                let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k));
             }
         });
     }
@@ -246,21 +302,22 @@ async fn run_closed_loop(
     while workers.join_next().await.is_some() {}
 }
 
-/// Open-loop: launch a query on a fixed `1/target_qps` schedule regardless of
-/// whether prior ones have returned. `concurrency` caps in-flight requests as a
-/// safety valve — when the cluster can't keep up the cap fills, `acquire` stalls
-/// the dispatcher, and the achieved QPS sags below target (which is the finding,
-/// not an error).
+/// Open-loop: launch a batch dispatch on a fixed `1/target_rps` schedule
+/// regardless of whether prior ones have returned. `concurrency` caps in-flight
+/// requests as a safety valve — when the cluster can't keep up the cap fills,
+/// `acquire` stalls the dispatcher, and the achieved rate sags below target
+/// (which is the finding, not an error).
 async fn run_paced(
     target: &Arc<dyn QueryTarget>,
     vectors: &Arc<Vec<QueryVector>>,
     profile: &LoadProfile,
     stop_at: Instant,
     top_k: u64,
-    tx: &mpsc::UnboundedSender<Sample>,
+    tx: &mpsc::UnboundedSender<DispatchSample>,
 ) {
     let n = vectors.len();
-    let interval = Duration::from_secs_f64(1.0 / profile.target_qps);
+    let batch_size = profile.batch_size.max(1);
+    let interval = Duration::from_secs_f64(1.0 / profile.target_rps);
     let sem = Arc::new(Semaphore::new(profile.concurrency.max(1)));
     let mut inflight = JoinSet::new();
     let mut idx = 0usize;
@@ -275,15 +332,16 @@ async fn run_paced(
         if Instant::now() >= stop_at {
             break;
         }
-        let i = idx % n;
-        idx += 1;
+        let start = idx % n;
+        idx += batch_size;
+        let idxs = batch_indices(start, batch_size, n);
         let target = target.clone();
         let vectors = vectors.clone();
         let tx = tx.clone();
         inflight.spawn(async move {
-            let qv = &vectors[i];
-            let out = target.query(&qv.vector).await;
-            let _ = tx.send(sample_from(&out, qv.ground_truth.as_ref(), top_k));
+            let vecs: Vec<&[f32]> = idxs.iter().map(|&i| vectors[i].vector.as_slice()).collect();
+            let out = target.query_batch(&vecs).await;
+            let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k));
             drop(permit); // release the in-flight slot
         });
 
@@ -297,7 +355,7 @@ async fn run_paced(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::targets::QueryOutcome;
+    use crate::targets::BatchOutcome;
     use async_trait::async_trait;
 
     /// A target that "answers" instantly with a fixed set of ids (or a hard
@@ -322,19 +380,19 @@ mod tests {
 
     #[async_trait]
     impl QueryTarget for MockTarget {
-        async fn query(&self, _vector: &[f32]) -> QueryOutcome {
+        async fn query_batch(&self, vectors: &[&[f32]]) -> BatchOutcome {
             if self.fail {
-                return QueryOutcome {
+                return BatchOutcome {
                     latency: Duration::from_micros(100),
                     ok: false,
-                    ids: None,
+                    ids: vec![None; vectors.len()],
                     error: Some("mock failure".into()),
                 };
             }
-            QueryOutcome {
+            BatchOutcome {
                 latency: Duration::from_micros(100),
                 ok: true,
-                ids: Some(self.ids.clone()),
+                ids: vec![Some(self.ids.clone()); vectors.len()],
                 error: None,
             }
         }
@@ -346,7 +404,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_loop_fires_many_and_records_each() {
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_qps: 0.0 };
+        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results = run_storm(target, vectors(), &profile, 10).await;
         let summary = results.summary();
@@ -355,24 +413,26 @@ mod tests {
         assert_eq!(summary.errors, 0);
         // every request contributes exactly one latency sample
         assert_eq!(results.latencies_ms.len() as u64, summary.requests);
-        assert!(summary.throughput_qps > 0.0);
+        assert!(summary.requests_per_sec > 0.0);
+        // batch_size 1 -> requests_per_sec and qps (actual query throughput) coincide
+        assert!((summary.qps - summary.requests_per_sec).abs() < 1e-9);
         // no query in `vectors()` carries ground truth -> recall untouched, not zero
         assert!(results.recalls.is_empty());
         assert_eq!(summary.mean_recall, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn paced_does_not_overshoot_target_qps() {
-        let target_qps = 200.0;
+    async fn paced_does_not_overshoot_target_rps() {
+        let target_rps = 200.0;
         let duration_s = 0.5;
-        let profile = LoadProfile { concurrency: 16, duration_s, target_qps };
+        let profile = LoadProfile { concurrency: 16, duration_s, target_rps, batch_size: 1 };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results = run_storm(target, vectors(), &profile, 10).await;
         let summary = results.summary();
 
         // The whole point: pacing holds the offered rate at/under target. Allow a
         // small ceiling slack for scheduling, but it must not run open-throttle.
-        let ceiling = (target_qps * duration_s) as u64 + profile.concurrency as u64;
+        let ceiling = (target_rps * duration_s) as u64 + profile.concurrency as u64;
         assert!(summary.requests > 0);
         assert!(
             summary.requests <= ceiling,
@@ -399,7 +459,7 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_qps: 0.0 };
+        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
         let results = run_storm(target, vectors, &profile, 4).await;
         let summary = results.summary();
 
@@ -417,7 +477,7 @@ mod tests {
         // A live-Qdrant smoke test caught this: a target that fails every query
         // (e.g. wrong vector_name, transient overload) must not report
         // mean_recall=0.0 -- that would read as "search is bad" when the real
-        // finding is "every request errored," which `errors`/`throughput_qps`
+        // finding is "every request errored," which `errors`/`requests_per_sec`
         // already surface distinctly.
         let target = Arc::new(MockTarget { ids: vec![], fail: true });
         let vectors: Vec<QueryVector> = (0..8)
@@ -427,7 +487,7 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_qps: 0.0 };
+        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
         let results = run_storm(target, vectors, &profile, 1).await;
         let summary = results.summary();
 
@@ -461,7 +521,9 @@ mod tests {
         let base = Summary {
             requests: 10,
             errors: 0,
-            throughput_qps: 5.0,
+            batch_size: 1,
+            requests_per_sec: 5.0,
+            qps: 5.0,
             p50_ms: 1.0,
             p95_ms: 2.0,
             p99_ms: 3.0,
@@ -492,14 +554,19 @@ mod tests {
         }
         #[async_trait]
         impl QueryTarget for PerQueryTarget {
-            async fn query(&self, vector: &[f32]) -> QueryOutcome {
+            async fn query_batch(&self, vectors: &[&[f32]]) -> BatchOutcome {
                 // vector[0] selects which of the 3 fixed ids come back.
-                let ids = match vector[0] as i64 {
-                    0 => vec![], // 0/2 in ground truth -> recall 0.0
-                    1 => vec!["a".to_string()], // 1/2 -> recall 0.5
-                    _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
-                };
-                QueryOutcome { latency: Duration::from_micros(100), ok: true, ids: Some(ids), error: None }
+                let ids = vectors
+                    .iter()
+                    .map(|v| {
+                        Some(match v[0] as i64 {
+                            0 => vec![], // 0/2 in ground truth -> recall 0.0
+                            1 => vec!["a".to_string()], // 1/2 -> recall 0.5
+                            _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
+                        })
+                    })
+                    .collect();
+                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None }
             }
         }
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
@@ -509,7 +576,7 @@ mod tests {
             QueryVector { vector: vec![2.0], ground_truth: gt },
         ];
         // duration long enough to cycle through all 3 at concurrency=1 several times
-        let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_qps: 0.0 };
+        let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1 };
         let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2).await;
 
         // Only asserts the pipeline actually produced all 3 distinct values --
@@ -534,6 +601,7 @@ mod tests {
             n_ok: 3,
             n_err: 0,
             wall_s: 1.0,
+            batch_size: 1,
         };
         let summary = results.summary();
 
@@ -543,5 +611,65 @@ mod tests {
         // mean and median coincide here (symmetric distribution) -- min is the
         // one that actually differs from both, proving it's not just an alias.
         assert_ne!(summary.min_recall, summary.mean_recall);
+    }
+
+    #[test]
+    fn batch_indices_wrap_around() {
+        assert_eq!(batch_indices(6, 5, 8), vec![6, 7, 0, 1, 2]);
+        assert_eq!(batch_indices(0, 3, 8), vec![0, 1, 2]);
+        assert_eq!(batch_indices(0, 1, 8), vec![0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batches_group_multiple_queries_per_dispatch_and_score_each() {
+        // Records the length of every query_batch call, and returns ids chosen
+        // by position-within-the-batch so each slot scores a distinct, known
+        // recall -- proving query_batch is actually called with `batch_size`
+        // vectors together (not looped internally), and each query in the
+        // batch gets its own correct recall score.
+        struct BatchCapturingTarget {
+            call_lens: std::sync::Mutex<Vec<usize>>,
+        }
+        impl std::fmt::Display for BatchCapturingTarget {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "batch-capturing-mock")
+            }
+        }
+        #[async_trait]
+        impl QueryTarget for BatchCapturingTarget {
+            async fn query_batch(&self, vectors: &[&[f32]]) -> BatchOutcome {
+                self.call_lens.lock().unwrap().push(vectors.len());
+                // position 0 -> 0/2 in ground truth -> recall 0.0
+                // position 1 -> 1/2 -> recall 0.5
+                // position 2 -> 2/2 -> recall 1.0
+                let ids = (0..vectors.len())
+                    .map(|pos| {
+                        Some(match pos % 3 {
+                            0 => vec![],
+                            1 => vec!["a".to_string()],
+                            _ => vec!["a".to_string(), "b".to_string()],
+                        })
+                    })
+                    .collect();
+                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None }
+            }
+        }
+
+        let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
+        let vectors: Vec<QueryVector> =
+            (0..9).map(|i| QueryVector { vector: vec![i as f32], ground_truth: gt.clone() }).collect();
+        let batch_size = 3;
+        let profile = LoadProfile { concurrency: 1, duration_s: 0.15, target_rps: 0.0, batch_size };
+        let target = Arc::new(BatchCapturingTarget { call_lens: std::sync::Mutex::new(Vec::new()) });
+        let results = run_storm(target.clone(), vectors, &profile, 2).await;
+
+        let call_lens = target.call_lens.lock().unwrap();
+        assert!(!call_lens.is_empty());
+        assert!(call_lens.iter().all(|&len| len == batch_size), "{call_lens:?}");
+
+        assert!(results.recalls.iter().any(|&r| (r - 0.0).abs() < 1e-9));
+        assert!(results.recalls.iter().any(|&r| (r - 0.5).abs() < 1e-9));
+        assert!(results.recalls.iter().any(|&r| (r - 1.0).abs() < 1e-9));
+        assert_eq!(results.summary().batch_size, batch_size);
     }
 }

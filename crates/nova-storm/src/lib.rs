@@ -3,12 +3,13 @@
 //! A *storm* fires nearest-neighbour queries at a target cluster and records
 //! the latency distribution. Work is **replicated, not partitioned**: every
 //! worker runs the same [`LoadProfile`](config::LoadProfile), so total offered
-//! load is roughly `num_workers × {concurrency or qps}`.
+//! load is roughly `num_workers × {concurrency or rps} × batch_size`.
 //!
 //! The split mirrors `nova-load`: a backend ([`QueryTarget`](targets::QueryTarget))
-//! is a thin "fire one query, report its latency" adapter, and the runner owns
-//! the load *shape* (how many in flight, for how long, at what rate). The same
-//! [`run_storm`](runner::run_storm) drives any backend.
+//! is a thin "fire one batch dispatch, report its latency" adapter, and the
+//! runner owns the load *shape* (how many in flight, for how long, at what
+//! rate, how many queries per dispatch). The same [`run_storm`](runner::run_storm)
+//! drives any backend.
 
 pub mod config;
 pub mod errors;
@@ -40,17 +41,38 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
     }
     let with_ground_truth = vectors.iter().filter(|v| v.ground_truth.is_some()).count();
 
+    // `batch_size` is only checked for `> 0` at config-load time (it has no
+    // visibility into how many rows `query.source` will actually yield) — a
+    // `batch_size` bigger than the loaded set is harmless (each repeated
+    // position still scores independently and correctly, see `batch_indices`)
+    // but silently sends duplicate vectors within a single dispatch and does
+    // more work than the operator likely intended. Warn up front, the same
+    // way a too-short ground-truth list is warned about below.
+    if load.batch_size > vectors.len() {
+        tracing::warn!(
+            "load.batch_size={} exceeds the {} loaded query vectors — each batch dispatch will \
+             contain duplicate vectors (harmless, but likely not intended; raise query.source.limit \
+             or lower batch_size)",
+            load.batch_size,
+            vectors.len(),
+        );
+    }
+
     let target = target.into_target(&query)?;
 
-    let mode = if load.target_qps > 0.0 {
-        format!("paced {:.0} qps/worker (cap {} in-flight)", load.target_qps, load.concurrency)
+    let mode = if load.target_rps > 0.0 {
+        format!(
+            "paced {:.0} rps/worker (batch_size={}, cap {} in-flight)",
+            load.target_rps, load.batch_size, load.concurrency
+        )
     } else {
-        format!("closed-loop concurrency={}", load.concurrency)
+        format!("closed-loop concurrency={} batch_size={}", load.concurrency, load.batch_size)
     };
     tracing::info!(
         target = %target,
         query_vectors = vectors.len(),
         duration_s = load.duration_s,
+        batch_size = load.batch_size,
         "storm: {mode}"
     );
     if query.source.ground_truth_column.is_some() {
