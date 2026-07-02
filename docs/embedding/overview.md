@@ -29,10 +29,9 @@ pipeline:
   flush_threshold: 100000          # records before writing parquet
 
 storage:
-  type: s3                         # s3, hf, or local
-  bucket: my-bucket
-  prefix: arxiv-papers/gte-multilingual-base
-  output_dir: /tmp/supernova
+  type: object_store               # object_store (s3/gcs/azure), hf, or local
+  path: s3://my-bucket/arxiv-papers/gte-multilingual-base
+  output_dir: /tmp/supernova       # local staging dir before upload
 ```
 
 You must specify at least one of `dense_embedder` or `sparse_embedder`. See [Dense Embedders](dense-embedders.md) and [Sparse Embedders](sparse-embedders.md) for details.
@@ -74,16 +73,29 @@ source:
 
 ## Storage backends
 
-### S3
+### Object store (S3 / GCS / Azure + S3-compatible)
+
+The `object_store` backend writes to any cloud object store via [`obstore`](https://developmentseed.org/obstore/). The destination is a `path` URI whose scheme selects the provider:
 
 ```yaml
 storage:
-  type: s3
-  bucket: my-bucket
-  prefix: dataset-name/model-name
+  type: object_store
+  path: s3://my-bucket/dataset-name/model-name   # or gs://…, az://container/…
 ```
 
-Each chunk produces one parquet file, uploaded as `batch_00000000.parquet`, `batch_00000001.parquet`, etc. Auto-creates the bucket if it doesn't exist.
+For **S3-compatible** stores (Cloudflare R2, Backblaze B2, MinIO, DigitalOcean Spaces) keep the `s3://` scheme and add an `endpoint` (and `region` if the provider needs one):
+
+```yaml
+storage:
+  type: object_store
+  path: s3://my-bucket/dataset-name/model-name
+  endpoint: https://<account>.r2.cloudflarestorage.com
+  region: auto
+```
+
+Credentials come from the standard provider chains — for S3 that's boto3's chain (env vars, `~/.aws`, or instance role), matching the rest of supernova; GCS/Azure use their own env/config. Each chunk produces one parquet file (`batch_00000000.parquet`, …). For real S3 the bucket is auto-created if missing; other providers require it to already exist.
+
+`type: s3` is an alias for `object_store` — same `path` config, friendlier name.
 
 ### HuggingFace Hub
 
