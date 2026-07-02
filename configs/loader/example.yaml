@@ -8,8 +8,7 @@
 
 # datasource:
 #   type: s3
-#   bucket: qdrant--vectorforge
-#   prefix: mteb_tweets/all-MiniLM-L6-v2
+#   path: s3://qdrant--vectorforge/mteb_tweets/all-MiniLM-L6-v2
 #   id_expression: "vf_point_id(filename, file_row_number)"
 #   payload_fields:
 #     text: text

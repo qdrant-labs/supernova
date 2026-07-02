@@ -20,9 +20,9 @@ dependencies = [
 [project.optional-dependencies]
 # The actual embedding workers. `nova embed` won't run without these.
 embed = [
-    # See upstream notes: aiobotocore/aiohttp pinned around a put_object hang.
-    "aiobotocore<3.5",
-    "aiohttp<3.13.5",
+    # Generic object-store writer (S3/GCS/Azure + S3-compatible) — Rust-backed,
+    # async, multipart. Its boto3 credential provider reuses the base `boto3` dep.
+    "obstore>=0.11",
     "tiktoken>=0.12.0",
     "openai",
     "sentence-transformers",
@@ -50,3 +50,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nova_embed"]
+
+[tool.pytest.ini_options]
+# src-layout: make `nova_embed` importable in tests without an editable install.
+pythonpath = ["src"]
+testpaths = ["tests"]

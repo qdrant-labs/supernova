@@ -79,9 +79,12 @@ if session_token:
 
 So as long as you `eval "$(aws configure export-credentials --profile sandbox --format env)"` before running `nova load`, DuckDB picks everything up.
 
-### aiobotocore (S3 storage backend)
+### object store (S3 storage backend)
 
-aiobotocore — used by the embed pipeline's `S3Backend` and by `cli/run_push_hf.py` — automatically reads `AWS_SESSION_TOKEN` from the environment via boto3's standard credential chain. No special handling needed.
+The embed pipeline's `object_store` backend writes S3 via `obstore`, using
+`obstore`'s boto3 credential provider — so it reads `AWS_SESSION_TOKEN` (and the
+rest) from the environment through boto3's standard credential chain, same as
+`cli/run_push_hf.py`. No special handling needed.
 
 ### SkyPilot dispatch
 

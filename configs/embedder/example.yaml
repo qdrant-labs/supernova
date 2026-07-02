@@ -31,10 +31,11 @@ sparse_embedder:
 #   # strategy: semantic     # not implemented yet (issue #13)
 
 # storage:
-#   type: s3
-#   bucket: qdrant--vectorforge
-#   prefix: mteb_tweets/all-MiniLM-L6-v2
-#   output_dir: /tmp/supernova
+#   type: object_store                 # s3 / gcs / azure + s3-compatible, via a URI
+#   path: s3://qdrant--vectorforge/mteb_tweets/all-MiniLM-L6-v2  # or gs://… , az://…
+#   # endpoint: https://<acct>.r2.cloudflarestorage.com   # for R2/B2/MinIO/Spaces
+#   # region: auto
+#   # legacy s3 shape (still supported): type: s3 + bucket + prefix
 
 storage:
   type: local

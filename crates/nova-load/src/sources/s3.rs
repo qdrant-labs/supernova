@@ -10,11 +10,10 @@ use crate::sources::{DataSource, FileRef, LocalFile, Location, ReaderOptions, Re
 
 #[derive(Debug, Deserialize)]
 pub struct S3Config {
-    pub bucket: String,
-    /// Restrict listing to keys under this prefix.
-    #[serde(default)]
-    pub prefix: Option<String>,
-    /// Explicit keys (relative to `prefix`) instead of listing the prefix.
+    /// Full `s3://bucket/prefix` URI. The bucket names the store; the rest
+    /// restricts listing to keys under that prefix (prefix optional).
+    pub path: String,
+    /// Explicit keys (relative to the prefix) instead of listing the prefix.
     #[serde(default)]
     pub file_list: Option<Vec<String>>,
     #[serde(flatten)]
@@ -22,14 +21,33 @@ pub struct S3Config {
 }
 
 impl S3Config {
+    /// Split `path` (`s3://bucket/prefix`) into `(bucket, Option<prefix>)`.
+    fn bucket_prefix(&self) -> Result<(&str, Option<&str>)> {
+        let rest = self.path.strip_prefix("s3://").ok_or_else(|| {
+            SourceError::List(format!("datasource path `{}` must be an s3:// URI", self.path))
+        })?;
+        let (bucket, prefix) = match rest.split_once('/') {
+            Some((b, p)) => (b, Some(p.trim_end_matches('/')).filter(|p| !p.is_empty())),
+            None => (rest, None),
+        };
+        if bucket.is_empty() {
+            return Err(SourceError::List(format!(
+                "datasource path `{}` has no bucket (expected s3://bucket/prefix)",
+                self.path
+            )));
+        }
+        Ok((bucket, prefix))
+    }
+
     /// Build a client using the standard AWS credential chain (env vars, shared
     /// config/profile, or instance role). A fresh client per call keeps this
     /// simple; listing/fetching are infrequent enough that it doesn't matter.
     fn store(&self) -> Result<impl ObjectStore> {
+        let (bucket, _) = self.bucket_prefix()?;
         AmazonS3Builder::from_env()
-            .with_bucket_name(&self.bucket)
+            .with_bucket_name(bucket)
             .build()
-            .map_err(|e| SourceError::List(format!("build S3 client for `{}`: {e}", self.bucket)))
+            .map_err(|e| SourceError::List(format!("build S3 client for `{bucket}`: {e}")))
     }
 }
 
@@ -37,13 +55,14 @@ impl S3Config {
 impl DataSource for S3Config {
     async fn list_files(&self) -> Result<Vec<FileRef>> {
         let store = self.store()?;
+        let (_, prefix) = self.bucket_prefix()?;
 
         let mut files = match &self.file_list {
             // Explicit keys: HEAD each so we still record sizes.
             Some(list) => {
                 let mut out = Vec::with_capacity(list.len());
                 for name in list {
-                    let key = join(self.prefix.as_deref(), name);
+                    let key = join(prefix, name);
                     let meta = store
                         .head(&ObjPath::from(key.clone()))
                         .await
@@ -53,7 +72,7 @@ impl DataSource for S3Config {
                 out
             }
             None => {
-                let prefix = self.prefix.as_deref().map(ObjPath::from);
+                let prefix = prefix.map(ObjPath::from);
                 let mut stream = store.list(prefix.as_ref());
                 let mut out = Vec::new();
                 while let Some(meta) = stream.next().await {
@@ -76,10 +95,11 @@ impl DataSource for S3Config {
     /// `list` stream is lazy/paginated, so this returns after the first page.
     async fn first_file(&self) -> Result<Option<FileRef>> {
         let store = self.store()?;
+        let (_, prefix) = self.bucket_prefix()?;
         if let Some(list) = &self.file_list {
             return match list.first() {
                 Some(name) => {
-                    let key = join(self.prefix.as_deref(), name);
+                    let key = join(prefix, name);
                     let meta = store
                         .head(&ObjPath::from(key.clone()))
                         .await
@@ -89,7 +109,7 @@ impl DataSource for S3Config {
                 None => Ok(None),
             };
         }
-        let prefix = self.prefix.as_deref().map(ObjPath::from);
+        let prefix = prefix.map(ObjPath::from);
         let mut stream = store.list(prefix.as_ref());
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| SourceError::List(e.to_string()))?;
@@ -143,5 +163,44 @@ fn join(prefix: Option<&str>, name: &str) -> String {
     match prefix {
         Some(p) if !p.is_empty() => format!("{}/{}", p.trim_end_matches('/'), name),
         _ => name.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(path: &str) -> S3Config {
+        S3Config {
+            path: path.to_string(),
+            file_list: None,
+            reader: serde_yaml::from_str("id_expression: row_id").unwrap(),
+        }
+    }
+
+    #[test]
+    fn parses_bucket_and_prefix() {
+        assert_eq!(cfg("s3://b/p/q").bucket_prefix().unwrap(), ("b", Some("p/q")));
+        assert_eq!(cfg("s3://b/p/q/").bucket_prefix().unwrap(), ("b", Some("p/q")));
+        assert_eq!(cfg("s3://b").bucket_prefix().unwrap(), ("b", None));
+        assert_eq!(cfg("s3://b/").bucket_prefix().unwrap(), ("b", None));
+    }
+
+    #[test]
+    fn rejects_non_s3_or_empty_bucket() {
+        assert!(cfg("/local/path").bucket_prefix().is_err());
+        assert!(cfg("s3:///p").bucket_prefix().is_err());
+    }
+
+    #[test]
+    fn deserializes_s3_datasource_with_path() {
+        let cfg: crate::sources::DataSourceConfig =
+            serde_yaml::from_str("type: s3\npath: s3://b/p/q\nid_expression: row_id\n").unwrap();
+        match cfg {
+            crate::sources::DataSourceConfig::S3(s) => {
+                assert_eq!(s.bucket_prefix().unwrap(), ("b", Some("p/q")));
+            }
+            _ => panic!("expected s3 datasource"),
+        }
     }
 }
