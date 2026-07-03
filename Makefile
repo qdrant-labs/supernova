@@ -1,6 +1,6 @@
 # supernova — install the polyglot CLI and its sub-tools.
 #
-#   make all      install the `nova` dispatcher + every sub-tool (embed, load, storm, inspect)
+#   make all      install the `nova` dispatcher + every sub-tool (embed, load, storm, inspect, bf, dist, sweep)
 #   make cli      just the `nova` dispatcher (zero deps, instant)
 #   make embed    the `nova embed` Python tool (heavy: torch, sentence-transformers)
 #   make load     the `nova load` Rust binary
@@ -8,6 +8,7 @@
 #   make inspect  the `nova inspect` Rust binary (count vectors + parquet schema)
 #   make bf       the `nova bf` Python tool (brute-force ground truth; torch)
 #   make dist     the `nova dist` orchestrator (SkyPilot; controller-side only)
+#   make sweep    the `nova sweep` parameter-sweep orchestrator (controller-side only)
 #   make docs     serve the docs locally (zensical)
 #   make test     run Rust + Python tests
 #
@@ -46,7 +47,8 @@ bf:
 	uv pip install -e 'python/nova-bf[compute]'
 
 # `nova dist` — SkyPilot orchestrator. Controller-side only (your laptop / a
-# dispatch box); workers never need it. Not part of `make all`.
+# dispatch box); workers never need it. Still part of `make all` (pulls in
+# skypilot[aws], the heaviest dep in the whole install).
 dist:
 	uv pip install -e python/nova-dist
 
@@ -59,7 +61,8 @@ docs-build:
 
 test:
 	cargo test
-	uv run --extra dev pytest python/nova-embed -q || true
+	uv run --directory python/nova-embed --extra dev pytest -q || true
+	uv run --directory python/nova-bf --extra dev pytest -q || true
 
 clean:
 	cargo clean
