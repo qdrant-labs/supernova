@@ -178,6 +178,27 @@ def storm(config, resources, num_jobs, pool_name, dry_run):
     )
 
 
+@main.command()
+@click.argument("config")
+def sweep(config) -> None:
+    """
+    Fan a `nova sweep` out across a SkyPilot fleet — not implemented yet.
+
+    Multi-target distribution (bin-packing slices across N SkyPilot-launched
+    Qdrant instances, and `nova-sweep --num-jobs`/`--job-rank` to pick which
+    target's slices a process owns) hasn't been built — see the `nova sweep`
+    plan's "Explicitly deferred" section. This stub exists so `nova dist
+    sweep <config>` fails loudly and specifically instead of the dispatcher's
+    generic "unknown command", or the subcommand being silently absent.
+    """
+    click.echo(
+        "error: nova dist sweep is not implemented yet — run nova-sweep directly "
+        "by hand in the meantime",
+        err=True,
+    )
+    raise SystemExit(1)
+
+
 @main.group()
 def bf() -> None:
     """

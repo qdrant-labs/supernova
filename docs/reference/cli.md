@@ -148,6 +148,40 @@ Use this to measure the recall/latency tradeoff of a quantized collection
 [Collection-wide params](../loading/overview.md#collection-wide-params)) under
 different query-time settings without reloading data.
 
+## nova sweep
+
+Orchestrate `nova-load` + `nova-storm` across a matrix of collection/index/search
+configs (Python), producing one combined recall/latency/throughput report.
+Ground truth is out of scope — point `queries:` at a parquet already produced
+by `nova bf` (or equivalent); `nova sweep` never invokes `nova bf` itself.
+
+```bash
+nova sweep <config.yaml> [--skip-insert] [--cleanup] [--dry-run]
+```
+
+- The config declares three cartesian-grid axes — `data_layouts` (structural,
+  forces a fresh `nova-load run`), `index_variants` (patched in place via
+  `nova-load reindex`, no reload), `searches` (storm-only, no Qdrant-side
+  change) — expanded and swept as **one collection per `data_layouts` entry,
+  reused across every `index_variant`**, never a new collection per variant.
+- `index_variants` are walked in an order chosen to minimize rebuild cost
+  (HNSW changes grouped together, quantization changes absorb the frequent
+  transitions — small-scale empirical testing showed quantization changes
+  reindex meaningfully faster), not declaration order.
+- If a sweep's target collection already exists, the run **errors and exits
+  immediately** rather than guessing what to do with it — pass `--skip-insert`
+  to reuse it as-is (skips that data_layout's insert phase entirely), or set
+  `target.recreate: always` in the config to force a fresh reload every time.
+- `--cleanup` deletes only the collections *this run* inserted into — never
+  one reused via `--skip-insert`.
+- `--dry-run` prints the expanded slice/point counts and which data_layouts
+  would need `--skip-insert`, without executing anything.
+- Single machine, sequential — no `--num-jobs`/`--job-rank` yet (a single
+  target has nothing to shard across; see the [Sweep overview](../sweep/overview.md#distribution)).
+
+See the [Sweep overview](../sweep/overview.md) for the full config schema and
+worked examples.
+
 ## Local dev: overriding a tool's location
 
 `nova` resolves `nova-<cmd>` on `PATH`. For local iteration, build a tool and put

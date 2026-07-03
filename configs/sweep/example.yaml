@@ -1,0 +1,71 @@
+# Parameter sweep config for `nova sweep` — orchestrates `nova-load` + `nova-storm`
+# across a matrix of collection/index/search settings, producing one combined report.
+#
+#   nova sweep configs/sweep/example.yaml
+#   nova sweep configs/sweep/example.yaml --dry-run       # preview the expanded matrix, no execution
+#   nova sweep configs/sweep/example.yaml --skip-insert   # reuse existing collections instead of erroring
+#   nova sweep configs/sweep/example.yaml --cleanup       # delete collections this run inserted, when done
+#
+# Ground truth is OUT OF SCOPE here — compute it once, separately, with
+# `nova bf compute` (+ `nova bf merge` if sharded). This file just points at
+# the resulting parquet (`queries:` below), the exact shape `nova-storm`
+# itself expects (`uri`/`column`/`ground_truth_column`/`limit`).
+#
+# Single machine, sequential today (no --num-jobs/--job-rank) — see the CLI
+# reference for why that's not a gap, just not built yet.
+
+corpus:
+  path: s3://qdrant--vectorforge/fiqa/bge-m3          # nova-load's datasource.path
+  dense_column: dense_embedding
+
+queries:
+  uri: s3://qdrant--vectorforge/fiqa/bge-m3/queries.parquet
+  column: dense_embedding
+  ground_truth_column: hit_ids                        # e.g. nova-bf's own output column
+  limit: 1000
+
+target:
+  # Backend dispatch, same idea as nova-load's vectorstore.type / nova-storm's
+  # target.type. Optional: defaults to qdrant (the only backend implemented
+  # today) when omitted, so configs written before this field existed still
+  # work unchanged. See docs/sweep/overview.md#target-backends.
+  type: qdrant
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  # never (default): a pre-existing same-named collection is a hard error
+  # unless --skip-insert is passed. always: unconditionally delete + reload
+  # every run, regardless of --skip-insert.
+  recreate: never
+
+# Everything below is a cartesian grid: a flat dotted-path-key -> list-of-values
+# map. nova-sweep expands the full cross-product of each axis and auto-names
+# every combination (e.g. `hnsw.m: 8, hnsw.ef_construct: 100` -> `m8_ef_construct100`).
+
+# Structural params — changing any of these forces a fresh `nova-load run`
+# (distance/datatype/size/shard_number are fixed at collection creation).
+# One Qdrant collection per expanded combination, named `<sweep-name>_<name>`
+# (sweep-name = this file's stem, so `example_datatypefloat32` here).
+data_layouts:
+  vectors.dense.distance: [cosine]
+  vectors.dense.datatype: [float32, uint8]
+
+# Patchable in place via `nova-load reindex` — no reload between variants,
+# ever (same collection, patched repeatedly). Applied in an order chosen to
+# minimize rebuild cost, not declaration order: HNSW changes are assumed
+# expensive (full graph rebuild) and vary least often; quantization changes
+# are assumed cheap and absorb the frequent changes.
+index_variants:
+  quantization.type: [none, scalar]   # none | scalar | product | binary | turbo
+  hnsw.m: [8, 16, 32]
+  hnsw.ef_construct: [64, 128]
+
+# Storm-only — no Qdrant-side change at all, just query-time tuning.
+searches:
+  top_k: [10]
+  hnsw_ef: [64, 128]           # -> query.search_params.hnsw_ef
+  # exact: [false]             # -> query.search_params.exact
+  batch_size: [1, 8]           # -> load.batch_size (anything not a query/search_params
+  duration_s: [30]             #    field routes to nova-storm's `load:` block)
+
+output:
+  path: s3://qdrant--vectorforge/sweeps/fiqa-bge-m3/   # or a local dir
