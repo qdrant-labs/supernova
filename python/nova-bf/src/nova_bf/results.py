@@ -41,17 +41,20 @@ def build_result_table(
     return pa.table(data)
 
 
-def warn_if_short(hit_ids: list[list[str]], k: int, logger: logging.Logger) -> None:
+def warn_if_short(short_count: int, total: int, k: int, logger: logging.Logger) -> None:
     """Log if any query's FINAL top-K came out shorter than k. Not an error —
     hit_ids/hit_scores are already correctly truncated (see the `-inf` sentinel
     handling in compute.py) — just a signal that the corpus, or `filter` if one
     is configured, didn't have k matches for some queries, so this ground truth
     is smaller than requested rather than wrong.
+
+    Takes pre-aggregated counts, not the raw `hit_ids` lists, so `merge`'s
+    streaming batches (never all in memory at once — see `ParamsConfig.merge_batch_size`)
+    can call this exactly like `compute`'s single in-memory list can.
     """
-    short = sum(1 for h in hit_ids if len(h) < k)
-    if short:
+    if short_count:
         logger.warning(
             "%d/%d quer%s returned fewer than k=%d hits — the corpus (after "
             "any `filter`) didn't have enough matches for them",
-            short, len(hit_ids), "y" if short == 1 else "ies", k,
+            short_count, total, "y" if short_count == 1 else "ies", k,
         )
