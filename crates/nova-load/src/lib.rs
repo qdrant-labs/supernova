@@ -112,8 +112,11 @@ pub async fn finalize(config: LoadConfig) -> Result<(), LoadError> {
 /// `vectorstore.params.{hnsw,quantization,optimizers}` matters).
 pub async fn reindex(config: LoadConfig) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
+    let started = Instant::now();
     store.reindex().await?;
-    store.wait_for_indexing().await?;
+    let converged_at = store.wait_for_indexing().await?;
+    let effective_elapsed = converged_at.duration_since(started);
+    tracing::info!("reindex timing: effective_seconds={:.3}", effective_elapsed.as_secs_f64());
     tracing::info!("reindexed {store}");
     Ok(())
 }

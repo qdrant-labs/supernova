@@ -587,7 +587,7 @@ impl VectorStore for QdrantStore {
         Ok(())
     }
 
-    async fn wait_for_indexing(&self) -> Result<(), StoreError> {
+    async fn wait_for_indexing(&self) -> Result<Instant, StoreError> {
         // Poll until the collection reports green (optimizers idle) *and
         // stays there* for GREEN_HOLD straight — a single Green sample isn't
         // enough of a guarantee: right after a config patch or bulk upsert,
@@ -617,7 +617,7 @@ impl VectorStore for QdrantStore {
             if is_green {
                 let since = *green_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= GREEN_HOLD {
-                    return Ok(());
+                    return Ok(since);
                 }
             } else {
                 green_since = None;

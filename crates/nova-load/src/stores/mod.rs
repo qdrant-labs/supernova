@@ -115,8 +115,11 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
     }
 
     /// Block until indexing is complete. Called after enable_indexing().
-    async fn wait_for_indexing(&self) -> Result<(), StoreError> {
-        Ok(())
+    ///
+    /// Returns the instant when the backend first entered the green state that
+    /// ultimately held long enough to be accepted as converged.
+    async fn wait_for_indexing(&self) -> Result<std::time::Instant, StoreError> {
+        Ok(std::time::Instant::now())
     }
 
     /// Patch index-affecting collection settings (HNSW/quantization/optimizer
