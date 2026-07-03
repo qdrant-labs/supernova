@@ -97,7 +97,7 @@ worker runs the same profile, so total offered load ≈ `num_workers × {concurr
 or rps} × batch_size`.
 
 ```bash
-nova storm <config>
+nova storm <config> [--json]
 ```
 
 The config's `load` block picks the mode:
@@ -115,6 +115,38 @@ Prints a latency summary at the end: requests/errors (dispatch counts),
 `batch_size`, `requests_per_sec` (dispatch rate) and `qps` (actual query
 throughput, `= requests_per_sec × batch_size`), p50/p95/p99/max latency (per
 dispatch), and recall stats (per query) if `ground_truth_column` is configured.
+`--json` prints that same summary as a single JSON line instead of the table —
+for a caller (e.g. a future `nova sweep`) that parses the result rather than
+scraping formatted text. All logging goes to stderr, so stdout is exactly one
+line with `--json` (safe to pipe straight into `jq` or a script).
+
+### Search-time tuning (`query.search_params`)
+
+Optional, server-side (Qdrant `SearchParams`) — distinct from the `load` block's
+client-side pacing knobs. Every field is optional; unset ones keep the
+collection's own defaults.
+
+```yaml
+query:
+  vector_name: dense
+  top_k: 10
+  source:
+    uri: s3://my-bucket/queries.parquet
+    column: query_embedding
+    ground_truth_column: hit_ids
+  search_params:
+    hnsw_ef: 128          # beam width at query time; higher = more accurate, slower
+    exact: false           # true = brute-force (bypasses HNSW *and* quantization)
+    quantization:
+      ignore: false        # true = search with full-precision vectors, skip the quantized index
+      rescore: true         # re-score quantized top-k candidates against full-precision vectors
+      oversampling: 2.0      # preselect oversampling × top_k candidates via the quantized index before rescoring
+```
+
+Use this to measure the recall/latency tradeoff of a quantized collection
+(loaded via `nova load`'s `vectorstore.params.quantization` — see
+[Collection-wide params](../loading/overview.md#collection-wide-params)) under
+different query-time settings without reloading data.
 
 ## Local dev: overriding a tool's location
 
