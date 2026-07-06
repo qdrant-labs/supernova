@@ -10,9 +10,6 @@ from __future__ import annotations
 from nova_sweep.backends.base import SweepBackend, TargetConfigBase
 from nova_sweep.backends.qdrant import QdrantBackend, QdrantTargetConfig
 
-# Qdrant is the default so pre-`target.type` configs keep working unchanged.
-DEFAULT_TARGET_TYPE = "qdrant"
-
 _REGISTRY: dict[str, tuple[type[TargetConfigBase], SweepBackend]] = {
     "qdrant": (QdrantTargetConfig, QdrantBackend()),
 }
@@ -29,8 +26,8 @@ def _lookup(backend_type: str) -> tuple[type[TargetConfigBase], SweepBackend]:
 
 def parse_target(raw: object) -> TargetConfigBase:
     """Dispatch a raw `target:` mapping to its backend's config model, on
-    `type:` — defaulting to `qdrant` when omitted *or* explicitly `null`
-    (old configs), since YAML happily produces either for a missing value."""
+    `type:` — required; omitting it (or setting it to YAML `null`) is an
+    error rather than an implicit default."""
     if not isinstance(raw, dict):
         raise ValueError(
             f"`target:` must be a mapping (e.g. `target: {{url: ...}}`), got {raw!r}"
@@ -38,7 +35,7 @@ def parse_target(raw: object) -> TargetConfigBase:
     data = dict(raw)
     backend_type = data.get("type")
     if backend_type is None:
-        backend_type = DEFAULT_TARGET_TYPE
+        raise ValueError(f"`target.type` is required; available: {sorted(_REGISTRY)}")
     if not isinstance(backend_type, str):
         raise ValueError(f"`target.type` must be a string, got {backend_type!r}")
     data["type"] = backend_type
@@ -51,4 +48,4 @@ def get_backend(backend_type: str) -> SweepBackend:
     return backend
 
 
-__all__ = ["TargetConfigBase", "SweepBackend", "parse_target", "get_backend", "DEFAULT_TARGET_TYPE"]
+__all__ = ["TargetConfigBase", "SweepBackend", "parse_target", "get_backend"]

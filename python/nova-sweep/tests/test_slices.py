@@ -10,7 +10,7 @@ def _cfg(**axes) -> SweepConfig:
     return SweepConfig(
         corpus=CorpusConfig(path="/tmp/corpus"),
         queries=QueriesConfig(uri="/tmp/q.parquet", column="dense_embedding"),
-        target={"url": "http://localhost:6334"},
+        target={"type": "qdrant", "url": "http://localhost:6334"},
         output=OutputConfig(path="/tmp/out"),
         **axes,
     )

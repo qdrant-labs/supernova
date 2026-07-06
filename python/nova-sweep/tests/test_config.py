@@ -1,7 +1,6 @@
-"""Unit tests for `nova_sweep.config`'s `target.type` dispatch: old configs
-that omit `type` must keep resolving to the Qdrant backend (backward
-compatibility), and an unknown `type` must fail loudly rather than silently
-falling back.
+"""Unit tests for `nova_sweep.config`'s `target.type` dispatch: `type` is
+required, so an omitted or `null` `type` must fail loudly, as must an unknown
+`type`.
 """
 
 from __future__ import annotations
@@ -21,11 +20,9 @@ def _cfg(target: object) -> SweepConfig:
     )
 
 
-def test_target_without_type_defaults_to_qdrant():
-    cfg = _cfg({"url": "http://localhost:6334"})
-    assert isinstance(cfg.target, QdrantTargetConfig)
-    assert cfg.target.type == "qdrant"
-    assert cfg.target.url == "http://localhost:6334"
+def test_target_without_type_raises():
+    with pytest.raises(ValueError, match="`target.type` is required"):
+        _cfg({"url": "http://localhost:6334"})
 
 
 def test_target_with_explicit_qdrant_type():
@@ -46,13 +43,12 @@ def test_target_that_is_not_a_mapping_raises_a_clear_error():
         _cfg("qdrant")
 
 
-def test_target_with_explicit_null_type_defaults_to_qdrant():
+def test_target_with_explicit_null_type_raises():
     """YAML's `type:` (no value) and an omitted `type:` key both parse to
-    `None`/absent respectively — both must default to qdrant, not just the
+    `None`/absent respectively — both must raise, not just the
     omitted-key case."""
-    cfg = _cfg({"type": None, "url": "http://localhost:6334"})
-    assert isinstance(cfg.target, QdrantTargetConfig)
-    assert cfg.target.type == "qdrant"
+    with pytest.raises(ValueError, match="`target.type` is required"):
+        _cfg({"type": None, "url": "http://localhost:6334"})
 
 
 def test_target_with_non_string_type_raises_a_clear_error():

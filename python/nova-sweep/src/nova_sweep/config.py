@@ -9,9 +9,8 @@ need a literal-`$` escape, so `$$` isn't implemented here).
                       separately (e.g. `nova bf compute`)
     target:          the instance under test, dispatched on `type` (see
                       `nova_sweep.backends`) plus how to handle a pre-existing
-                      same-named collection. `type` defaults to `qdrant` — the
-                      only backend implemented — so configs written before
-                      this field existed still parse.
+                      same-named collection. `type` is required — no implicit
+                      default backend.
     data_layouts:    axis of structural nova-load params forcing a fresh load
     index_variants:  axis of nova-load `reindex`-patchable params (HNSW,
                       quantization, optimizers)
@@ -98,8 +97,8 @@ class SweepConfig(BaseModel):
     @field_validator("target", mode="before")
     @classmethod
     def _dispatch_target(cls, value: object) -> TargetConfigBase:
-        """Resolve `target.type` to its backend's own config model (default:
-        `qdrant`, for configs predating this field) — see `nova_sweep.backends`."""
+        """Resolve `target.type` to its backend's own config model — see
+        `nova_sweep.backends`. `type` is required."""
         if isinstance(value, TargetConfigBase):
             return value
         return parse_target(value)
