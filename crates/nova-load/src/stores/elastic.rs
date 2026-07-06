@@ -12,7 +12,8 @@ use std::fmt;
 
 use async_trait::async_trait;
 use elasticsearch::auth::Credentials;
-use elasticsearch::http::transport::{SingleNodeConnectionPool, Transport, TransportBuilder};
+use elasticsearch::cert::CertificateValidation;
+use elasticsearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use elasticsearch::indices::{IndicesCreateParts, IndicesDeleteParts, IndicesExistsParts};
 use elasticsearch::{BulkOperation, BulkParts, Elasticsearch};
 use serde::Deserialize;
@@ -40,6 +41,10 @@ pub struct ElasticConfig {
     /// Target index. Defaults to `default`.
     #[serde(default = "default_index")]
     pub index_name: String,
+    /// Skip TLS certificate validation. Needed for a default ES 8 dev node, which
+    /// serves HTTPS with a self-signed cert. DEV ONLY — don't use in production.
+    #[serde(default)]
+    pub tls_insecure: bool,
     /// Drop + recreate the index if it already exists (instead of reusing it).
     #[serde(default)]
     pub recreate: bool,
@@ -58,6 +63,7 @@ impl fmt::Debug for ElasticConfig {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("index_name", &self.index_name)
+            .field("tls_insecure", &self.tls_insecure)
             .field("recreate", &self.recreate)
             .finish()
     }
@@ -79,22 +85,38 @@ impl ElasticConfig {
             None
         };
 
-        let client = match creds {
-            None => Elasticsearch::new(Transport::single_node(&self.url).map_err(to_other)?),
-            Some(creds) => {
-                let pool = SingleNodeConnectionPool::new(Url::parse(&self.url).map_err(to_other)?);
-                let transport =
-                    TransportBuilder::new(pool).auth(creds).build().map_err(to_other)?;
-                Elasticsearch::new(transport)
-            }
-        };
+        // Always go through TransportBuilder so auth + TLS validation are
+        // configurable (Transport::single_node can do neither).
+        let pool = SingleNodeConnectionPool::new(Url::parse(&self.url).map_err(to_other)?);
+        let mut builder = TransportBuilder::new(pool);
+        if let Some(creds) = creds {
+            builder = builder.auth(creds);
+        }
+        if self.tls_insecure {
+            builder = builder.cert_validation(CertificateValidation::None);
+        }
+        let transport = builder.build().map_err(to_other)?;
 
-        Ok(ElasticStore { client, index_name: self.index_name, recreate: self.recreate })
+        Ok(ElasticStore {
+            client: Elasticsearch::new(transport),
+            index_name: self.index_name,
+            recreate: self.recreate,
+        })
     }
 }
 
-fn to_other<E: std::fmt::Display>(e: E) -> StoreError {
-    StoreError::Other(e.to_string())
+/// Flatten an error and its `source()` chain into one message — the top-level
+/// elasticsearch/reqwest message is often just "error sending request for url
+/// (...)", with the real cause (connection refused, invalid certificate, TLS
+/// handshake) one or two links down.
+fn to_other<E: std::error::Error>(e: E) -> StoreError {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        msg.push_str(&format!(": {s}"));
+        src = s.source();
+    }
+    StoreError::Other(msg)
 }
 
 /// Qdrant-style distance name → ES `dense_vector` similarity.
