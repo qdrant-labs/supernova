@@ -30,8 +30,13 @@ embed:
 	uv pip install -e 'python/nova-embed[embed]'
 
 # `nova load` — Rust binary, into ~/.cargo/bin.
+# Extra backends (elastic, milvus) are OFF by default so the common qdrant-only
+# install stays fast (they pull the elasticsearch + milvus/gRPC dep trees). Opt in:
+#   make load LOAD_FEATURES=elastic,milvus     (needs `protoc` for milvus)
+# The released fleet binary (rust-binaries.yml) always ships them.
+LOAD_FEATURES ?=
 load:
-	cargo install --path crates/nova-load
+	cargo install --path crates/nova-load $(if $(LOAD_FEATURES),--features $(LOAD_FEATURES))
 
 # `nova storm` — Rust binary, into ~/.cargo/bin.
 storm:

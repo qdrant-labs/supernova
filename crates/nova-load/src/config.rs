@@ -130,8 +130,39 @@ fn expand_env_with(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<String, ConfigError> {
     let mut out = String::with_capacity(input.len());
-    let mut rest = input;
+    // Expand per line, skipping YAML comments: a commented-out block like
+    // `#   url: ${QDRANT_URL}` must NOT trigger a missing-var error just because
+    // the expander runs on raw text before parsing. Everything from an
+    // (unquoted) comment `#` to end of line is copied verbatim.
+    for line in input.split_inclusive('\n') {
+        let split = comment_start(line).unwrap_or(line.len());
+        let (code, comment) = line.split_at(split);
+        expand_segment(code, &lookup, &mut out)?;
+        out.push_str(comment);
+    }
+    Ok(out)
+}
 
+/// Byte index where a YAML comment begins on `line`, if any. Per YAML, a `#`
+/// starts a comment only at line start or when preceded by whitespace (so
+/// `http://a#b` is not a comment). Does not account for `#` inside a quoted
+/// string on the same line — a rare case, and only matters if a `${VAR}` follows
+/// it on that line.
+fn comment_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    bytes.iter().enumerate().position(|(i, &b)| {
+        b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+    })
+}
+
+/// Expand `${VAR}` / `${VAR:-default}` / `$$` in one non-comment segment,
+/// appending to `out`.
+fn expand_segment(
+    segment: &str,
+    lookup: &impl Fn(&str) -> Option<String>,
+    out: &mut String,
+) -> Result<(), ConfigError> {
+    let mut rest = segment;
     while let Some(pos) = rest.find('$') {
         out.push_str(&rest[..pos]);
         let after = &rest[pos + 1..];
@@ -159,7 +190,7 @@ fn expand_env_with(
         }
     }
     out.push_str(rest);
-    Ok(out)
+    Ok(())
 }
 
 /// One named vector's spec. The scalar knobs (distance, datatype, comparator,
@@ -325,6 +356,21 @@ mod tests {
     fn missing_var_without_default_errors() {
         let err = expand("x: ${NOPE}", &[]).unwrap_err();
         assert!(matches!(err, ConfigError::MissingEnvVar(v) if v == "NOPE"));
+    }
+
+    #[test]
+    fn commented_out_refs_are_not_expanded() {
+        // A commented-out block referencing an unset var must not error, and its
+        // `${...}` must be left verbatim. The active line still expands.
+        let yaml = "#   url: ${QDRANT_URL}\nurl: ${SET}\n  key: v # ${ALSO_UNSET}\n";
+        let out = expand(yaml, &[("SET", "real")]).unwrap();
+        assert_eq!(out, "#   url: ${QDRANT_URL}\nurl: real\n  key: v # ${ALSO_UNSET}\n");
+    }
+
+    #[test]
+    fn hash_without_leading_whitespace_is_not_a_comment() {
+        // `#` mid-token (no preceding space) isn't a comment, so expansion applies.
+        assert_eq!(expand("u: http://h#${P}", &[("P", "x")]).unwrap(), "u: http://h#x");
     }
 
     #[test]

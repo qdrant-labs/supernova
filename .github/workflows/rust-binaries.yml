@@ -43,11 +43,18 @@ jobs:
 
       # duckdb's `bundled` feature compiles a large C++ amalgamation; the runners
       # have a C++ toolchain, but cmake/build-essential makes it reliable.
+      # protobuf-compiler: the milvus backend's SDK generates gRPC stubs from
+      # .proto at build time (tonic-build), which needs `protoc` on PATH.
       - name: Build deps
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake protobuf-compiler
 
+      # nova-load ships with all load backends so the fleet binary can target any
+      # of them (qdrant/elastic/milvus); the features are off by default in local
+      # dev builds. nova-storm has no extra features.
       - name: Build (release)
-        run: cargo build --release -p nova-load -p nova-storm
+        run: |
+          cargo build --release -p nova-storm
+          cargo build --release -p nova-load --features elastic,milvus
 
       - name: Stage assets as <bin>-<target>
         run: |
