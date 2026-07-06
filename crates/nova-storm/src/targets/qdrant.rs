@@ -6,11 +6,13 @@ use std::time::Instant;
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::point_id::PointIdOptions;
-use qdrant_client::qdrant::{QueryBatchPointsBuilder, QueryPointsBuilder, ScoredPoint};
+use qdrant_client::qdrant::{
+    QuantizationSearchParams, QueryBatchPointsBuilder, QueryPointsBuilder, ScoredPoint, SearchParams,
+};
 use serde::Deserialize;
 
 use super::{BatchOutcome, QueryTarget};
-use crate::config::QueryConfig;
+use crate::config::{QuantizationSearchParamsConfig, QueryConfig, SearchParamsConfig};
 use crate::errors::TargetError;
 
 /// Fires nearest-neighbour queries at a Qdrant collection over gRPC.
@@ -19,12 +21,36 @@ pub struct QdrantTarget {
     collection_name: String,
     vector_name: Option<String>,
     top_k: u64,
+    /// Server-side search-time tuning, converted once at construction and
+    /// applied unchanged to every query — same "bake in the knobs once"
+    /// pattern as `top_k`/`vector_name`. `None` when unconfigured, so the
+    /// query builder skips `.params(...)` entirely and the server's own
+    /// defaults apply.
+    search_params: Option<SearchParams>,
     /// Whether to materialize `BatchOutcome.ids`. Skipped (leaving each
     /// position `None`) when the run has no `ground_truth_column` configured
     /// — recall is the only consumer of `ids`, so collecting it otherwise is
     /// a wasted allocation (a `String` clone per returned point) on every
     /// query.
     collect_ids: bool,
+}
+
+impl From<&QuantizationSearchParamsConfig> for QuantizationSearchParams {
+    fn from(q: &QuantizationSearchParamsConfig) -> Self {
+        QuantizationSearchParams { ignore: q.ignore, rescore: q.rescore, oversampling: q.oversampling }
+    }
+}
+
+impl From<&SearchParamsConfig> for SearchParams {
+    fn from(p: &SearchParamsConfig) -> Self {
+        SearchParams {
+            hnsw_ef: p.hnsw_ef,
+            exact: p.exact,
+            quantization: p.quantization.as_ref().map(QuantizationSearchParams::from),
+            indexed_only: None,
+            acorn: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +81,7 @@ impl QdrantConfig {
             collection_name: self.collection_name,
             vector_name: query.vector_name.clone(),
             top_k: query.top_k,
+            search_params: query.search_params.as_ref().map(SearchParams::from),
             collect_ids: query.source.ground_truth_column.is_some(),
         })
     }
@@ -78,6 +105,9 @@ impl QueryTarget for QdrantTarget {
                     .with_payload(false);
                 if let Some(name) = &self.vector_name {
                     builder = builder.using(name.clone());
+                }
+                if let Some(params) = self.search_params {
+                    builder = builder.params(params);
                 }
                 builder.build()
             })
@@ -172,6 +202,29 @@ mod tests {
         let cfg = cfg();
         let target = cfg.target.into_target(&cfg.query).expect("builds");
         assert_eq!(target.to_string(), "qdrant(c)");
+    }
+
+    #[test]
+    fn search_params_absent_by_default() {
+        let cfg = cfg(); // no search_params block
+        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        assert!(target.search_params.is_none());
+    }
+
+    #[test]
+    fn search_params_parse_and_convert() {
+        let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
+                    query:\n  vector_name: dense\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n\
+                    \x20 search_params:\n    hnsw_ef: 128\n    exact: false\n    quantization:\n      ignore: false\n      rescore: true\n      oversampling: 2.5\n";
+        let cfg = StormConfig::from_yaml(yaml).expect("parses");
+        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let params = target.search_params.expect("search_params should be Some");
+        assert_eq!(params.hnsw_ef, Some(128));
+        assert_eq!(params.exact, Some(false));
+        let quant = params.quantization.expect("quantization should be Some");
+        assert_eq!(quant.ignore, Some(false));
+        assert_eq!(quant.rescore, Some(true));
+        assert_eq!(quant.oversampling, Some(2.5));
     }
 
     fn qdrant_config(target: crate::targets::TargetConfig) -> QdrantConfig {

@@ -220,15 +220,42 @@ pub struct HnswConfig {
     pub payload_m: Option<u64>,
 }
 
-/// Scalar quantization parameters.
+/// Quantization parameters — one collection-wide method, mirroring Qdrant's
+/// own `scalar`/`product`/`binary`/`turbo` split, plus `none`. Fields not
+/// relevant to the chosen `type` are simply ignored (not rejected), so
+/// switching `type` doesn't require deleting the other methods' fields first.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuantizationConfig {
-    /// Quantization type; currently only `int8` is supported. Defaults to `int8`.
+    /// Quantization method: `scalar` (the default when unset), `product`,
+    /// `binary`, `turbo`, or `none`. `none` means "no quantization" — a no-op
+    /// at collection creation (same as omitting `quantization:` entirely),
+    /// but on `nova load reindex` it's the way to explicitly *clear*
+    /// quantization off a collection that already has it (omitting
+    /// `quantization:` on a reindex leaves the server's current setting
+    /// untouched, since reindex only patches knobs it's told about).
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
+    /// Scalar only: fraction of the range to keep, e.g. `0.99` clips the
+    /// top/bottom 1% of outliers before mapping to int8.
     #[serde(default)]
     pub quantile: Option<f32>,
+    /// Product only: compression ratio (`x4`, `x8`, `x16`, `x32`, `x64`) —
+    /// higher shrinks the index further at the cost of recall. Defaults to
+    /// `x16` (Qdrant's own default) when unset.
+    #[serde(default)]
+    pub compression: Option<String>,
+    /// Binary only: bit encoding (`one_bit`, the default; `two_bits` and
+    /// `one_and_half_bits` trade back some of binary's compression for
+    /// accuracy).
+    #[serde(default)]
+    pub encoding: Option<String>,
+    /// Turbo only: bits per dimension — one of `1`, `1.5`, `2`, `4`. Leave
+    /// unset for the server's own default.
+    #[serde(default)]
+    pub bits: Option<f32>,
+    /// All methods: keep quantized vectors in RAM regardless of the main
+    /// storage config.
     #[serde(default)]
     pub always_ram: Option<bool>,
 }

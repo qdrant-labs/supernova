@@ -36,6 +36,7 @@ vectorstore:
   collection_name: my-collection
   url: ${QDRANT_URL}                # env var substitution with ${VAR}
   api_key: ${QDRANT_API_KEY}
+  # params:                         # collection-wide HNSW/quantization/optimizers — see below
 
 loader:
   batch_size: 1000                  # points per upsert call
@@ -103,6 +104,84 @@ The top-level `vectors:` block declares one or more named vectors. Each key beco
 | `multivector` | same as dense | `comparator: max_sim` (default) |
 
 A collection with multiple named vectors lets you do hybrid retrieval (e.g. dense + sparse + late-interaction multivector).
+
+## Collection-wide params
+
+Everything under `vectorstore.params` is optional collection-wide config — as
+opposed to the per-vector `distance`/`datatype`/`on_disk` knobs in `vectors:`
+above. Qdrant's own defaults apply to anything left unset.
+
+```yaml
+vectorstore:
+  type: qdrant
+  collection_name: my-collection
+  url: ${QDRANT_URL}
+  params:
+    shard_number: 6
+    replication_factor: 2
+    write_consistency_factor: 1
+    on_disk_payload: true
+    recreate: false            # drop + recreate if an existing collection's structural params conflict
+    hnsw:
+      m: 16
+      ef_construct: 100
+      full_scan_threshold: 10000
+      max_indexing_threads: 4
+      on_disk: true
+      payload_m: 8
+    quantization:
+      type: scalar             # scalar (default), product, binary, turbo, none
+      quantile: 0.99
+      always_ram: true
+    optimizers:
+      default_segment_number: 4
+      max_segment_size_kb: 200000   # `_kb` alias for max_segment_size (both accepted)
+      memmap_threshold: 50000
+      indexing_threshold: 20000
+      flush_interval_sec: 5
+```
+
+- `recreate: true` drops and recreates the collection if it already exists with
+  conflicting structural params (shard count, per-vector size/distance, etc.).
+  It's consumed by the loader itself, not part of the request sent to Qdrant.
+  Default `false`: an existing collection is left as-is (its schema isn't
+  diffed against your config).
+- `hnsw` / `optimizers` map straight onto Qdrant's `HnswConfigDiff` /
+  `OptimizersConfigDiff` — every field is optional and independently overrides
+  just that one server default.
+- `quantization` picks **one** collection-wide method via `type:`:
+
+| `type` | Extra fields | Notes |
+|--------|--------------|-------|
+| `scalar` (default) | `quantile`, `always_ram` | int8 scalar quantization. A bare `quantization: {}` block means this. |
+| `product` | `compression` (`x4`/`x8`/`x16`/`x32`/`x64`, default `x16`), `always_ram` | Smaller index the higher the ratio, at the cost of recall. |
+| `binary` | `encoding` (`one_bit` default, `two_bits`, `one_and_half_bits`), `always_ram` | Most aggressive compression; `two_bits`/`one_and_half_bits` trade some of it back for accuracy. |
+| `turbo` | `bits` (`1`, `1.5`, `2`, `4`), `always_ram` | Qdrant's bit-packed quantization method. |
+| `none` | -- | No quantization. A no-op at creation (same as omitting `quantization:` entirely) — see [Reindexing an existing collection](#reindexing-an-existing-collection) for what it does on `reindex`. |
+
+## Reindexing an existing collection
+
+`nova load reindex <config>` patches `hnsw`/`quantization`/`optimizers` on a
+collection that **already has data loaded**, without touching the data itself
+— useful for comparing index or quantization variants without re-loading the
+whole corpus each time. It waits for the collection to finish rebuilding
+before returning (polls until Qdrant reports the collection `green` and holds
+there, and fails fast if Qdrant's optimizer itself reports an error).
+
+Two things are specific to `reindex`, as opposed to `run`/`prepare` which
+create the collection:
+
+- Structural params (`shard_number`, `replication_factor`, per-vector
+  `distance`/`datatype`/`size`) aren't patchable on an existing collection and
+  are ignored by `reindex` — only `hnsw`/`quantization`/`optimizers` apply.
+- `quantization: { type: none }` is how you explicitly **clear** quantization
+  off a collection that already has it. This is different from omitting the
+  `quantization:` block entirely: omitting it leaves whatever's currently
+  configured untouched, while `type: none` actively turns it off.
+
+`nova load delete <config>` drops the collection outright (a no-op if it
+doesn't exist already) — handy between `reindex` sweeps if you'd rather start
+from a clean collection.
 
 ## Payload composition
 

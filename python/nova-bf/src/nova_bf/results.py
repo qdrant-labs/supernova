@@ -41,13 +41,18 @@ def build_result_table(
     return pa.table(data)
 
 
+<<<<<<< HEAD
 def warn_if_short(short: int, total: int, k: int, logger: logging.Logger) -> None:
+=======
+def warn_if_short(short_count: int, total: int, k: int, logger: logging.Logger) -> None:
+>>>>>>> refs/remotes/origin/master
     """Log if any query's FINAL top-K came out shorter than k. Not an error —
     hit_ids/hit_scores are already correctly truncated (see the `-inf` sentinel
     handling in compute.py) — just a signal that the corpus, or `filter` if one
     is configured, didn't have k matches for some queries, so this ground truth
     is smaller than requested rather than wrong.
 
+<<<<<<< HEAD
     Takes pre-computed counts (not a hit_ids list) so the streaming `merge`, which
     never materializes a full hit_ids list, can tally `short` per batch and still
     share this one warning.
@@ -57,4 +62,15 @@ def warn_if_short(short: int, total: int, k: int, logger: logging.Logger) -> Non
             "%d/%d quer%s returned fewer than k=%d hits — the corpus (after "
             "any `filter`) didn't have enough matches for them",
             short, total, "y" if short == 1 else "ies", k,
+=======
+    Takes pre-aggregated counts, not the raw `hit_ids` lists, so `merge`'s
+    streaming batches (never all in memory at once — see `ParamsConfig.merge_batch_size`)
+    can call this exactly like `compute`'s single in-memory list can.
+    """
+    if short_count:
+        logger.warning(
+            "%d/%d quer%s returned fewer than k=%d hits — the corpus (after "
+            "any `filter`) didn't have enough matches for them",
+            short_count, total, "y" if short_count == 1 else "ies", k,
+>>>>>>> refs/remotes/origin/master
         )

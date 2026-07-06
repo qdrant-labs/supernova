@@ -58,7 +58,7 @@ pub struct StormResults {
 
 /// Aggregated stats for THIS worker. Fleet-wide stats must merge raw samples
 /// from every worker, not average these.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Summary {
     /// Batch dispatches (round-trips), not individual queries.
     pub requests: u64,
@@ -538,6 +538,30 @@ mod tests {
         assert!(with_recall.to_string().contains("mean_recall"));
         assert!(!with_recall.to_string().contains("median_recall")); // still None -> still absent
         assert!(with_recall.to_string().ends_with("0.8700"));
+    }
+
+    #[test]
+    fn summary_serializes_to_json_for_a_calling_tool_to_parse() {
+        let summary = Summary {
+            requests: 10,
+            errors: 1,
+            batch_size: 4,
+            requests_per_sec: 5.0,
+            qps: 20.0,
+            p50_ms: 1.0,
+            p95_ms: 2.0,
+            p99_ms: 3.0,
+            max_ms: 4.0,
+            mean_recall: Some(0.87),
+            median_recall: Some(0.9),
+            min_recall: Some(0.5),
+        };
+        let json = serde_json::to_string(&summary).expect("serializes");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["requests"], 10);
+        assert_eq!(parsed["batch_size"], 4);
+        assert_eq!(parsed["qps"], 20.0);
+        assert_eq!(parsed["mean_recall"], 0.87);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

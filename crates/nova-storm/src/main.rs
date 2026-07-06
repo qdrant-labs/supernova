@@ -11,6 +11,11 @@ use nova_storm::config::StormConfig;
 struct Cli {
     /// Path to the storm config YAML.
     config: PathBuf,
+    /// Print the summary as a single JSON line instead of the human-readable
+    /// table — for a caller (e.g. `nova sweep`) that needs to parse the result
+    /// programmatically rather than scrape formatted text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -20,6 +25,11 @@ async fn main() -> ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "nova_storm=info".into()),
         )
+        // Logs go to stderr so stdout carries only the run's actual output
+        // (the human-readable table, or with `--json`, exactly one JSON
+        // line) — otherwise a caller like `nova sweep` parsing stdout as
+        // JSON gets log lines corrupting it.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -34,9 +44,19 @@ async fn main() -> ExitCode {
 
     match nova_storm::run(config).await {
         Ok(summary) => {
-            println!("{}", "=".repeat(50));
-            println!("{summary}");
-            println!("{}", "=".repeat(50));
+            if cli.json {
+                match serde_json::to_string(&summary) {
+                    Ok(json) => println!("{json}"),
+                    Err(err) => {
+                        eprintln!("error: failed to serialize summary as JSON: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                println!("{}", "=".repeat(50));
+                println!("{summary}");
+                println!("{}", "=".repeat(50));
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {

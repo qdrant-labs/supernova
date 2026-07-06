@@ -60,6 +60,47 @@ pub struct QueryConfig {
     #[serde(default = "default_top_k")]
     pub top_k: u64,
     pub source: QuerySource,
+    /// Server-side search-time tuning (Qdrant's `SearchParams`) — distinct from
+    /// `load`'s client-side knobs (concurrency/batch_size/rps). `None` (default)
+    /// leaves every one of these at the collection's own defaults.
+    #[serde(default)]
+    pub search_params: Option<SearchParamsConfig>,
+}
+
+/// Server-side search-time tuning, passed straight through to Qdrant's
+/// `SearchParams` on every query. All fields optional; the server applies its
+/// own defaults for any left unset — same convention as `HnswConfig`/
+/// `QuantizationConfig` in `nova-load`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchParamsConfig {
+    /// HNSW beam-search width at query time. Higher = more accurate, slower.
+    #[serde(default)]
+    pub hnsw_ef: Option<u64>,
+    /// Search without approximation (brute-force exact search for this query).
+    #[serde(default)]
+    pub exact: Option<bool>,
+    #[serde(default)]
+    pub quantization: Option<QuantizationSearchParamsConfig>,
+}
+
+/// Quantization behavior at query time (distinct from `nova-load`'s
+/// `QuantizationConfig`, which controls how vectors are quantized at index
+/// time — this controls how a query uses that quantized index).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuantizationSearchParamsConfig {
+    /// Skip the quantized index entirely for this query.
+    #[serde(default)]
+    pub ignore: Option<bool>,
+    /// Re-score quantized top-k candidates against the original vectors.
+    #[serde(default)]
+    pub rescore: Option<bool>,
+    /// How many extra candidates to preselect via the quantized index before
+    /// rescoring (e.g. `2.4` with `top_k: 100` preselects 240, then rescores
+    /// down to 100).
+    #[serde(default)]
+    pub oversampling: Option<f64>,
 }
 
 /// Where the query vectors come from — a parquet at a local path or `s3://`

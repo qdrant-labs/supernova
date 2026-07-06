@@ -26,6 +26,11 @@ enum Command {
     /// Master step: re-enable indexing and wait for it to settle. Run once,
     /// after every worker's `load` has finished.
     Finalize(RunArgs),
+    /// Patch HNSW/quantization/optimizer settings on an already-existing
+    /// collection in place and wait for it to complete optimization. Does not touch data.
+    Reindex(RunArgs),
+    /// Delete the collection if it exists.
+    Delete(RunArgs),
     /// Inspect the config and the file list without connecting or loading.
     Inspect(LoadArgs),
 }
@@ -85,6 +90,8 @@ async fn run(command: Command) -> Result<(), ExitCode> {
         Command::Run(a) => nova_load::run(load_config(&a.config)?).await,
         Command::Prepare(a) => nova_load::prepare(load_config(&a.config)?).await,
         Command::Finalize(a) => nova_load::finalize(load_config(&a.config)?).await,
+        Command::Reindex(a) => nova_load::reindex(load_config(&a.config)?).await,
+        Command::Delete(a) => nova_load::delete(load_config(&a.config)?).await,
         Command::Load(a) => {
             let partition = a.partition().map_err(|e| {
                 eprintln!("error: {e}");

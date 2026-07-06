@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
 
 use qdrant_client::qdrant::{
-    CollectionStatus, CreateCollectionBuilder, Datatype, Distance, HnswConfigDiff, Modifier,
+    BinaryQuantization, BinaryQuantizationEncoding, CollectionStatus, CompressionRatio,
+    CreateCollectionBuilder, Datatype, Disabled, Distance, HnswConfigDiff, Modifier,
     MultiVectorComparator, MultiVectorConfigBuilder, OptimizersConfigDiff,
-    OptimizersConfigDiffBuilder, PointStruct, QuantizationType, ScalarQuantization,
-    SparseIndexConfigBuilder, SparseVectorConfig, SparseVectorParams, SparseVectorParamsBuilder,
-    UpdateCollectionBuilder, UpsertPointsBuilder, Vector, VectorParams, VectorParamsBuilder,
-    VectorParamsMap, VectorsConfig, vectors_config,
+    OptimizersConfigDiffBuilder, PointStruct, ProductQuantization, QuantizationType,
+    ScalarQuantization, SparseIndexConfigBuilder, SparseVectorConfig, SparseVectorParams,
+    SparseVectorParamsBuilder, TurboQuantBitSize, TurboQuantization, UpdateCollectionBuilder,
+    UpsertPointsBuilder, Vector, VectorParams, VectorParamsBuilder, VectorParamsMap, VectorsConfig,
+    quantization_config, quantization_config_diff, vectors_config,
 };
 use qdrant_client::{Payload, Qdrant};
 
@@ -106,8 +108,16 @@ pub enum QdrantConfigError {
     UnknownComparator { name: String, value: String },
     #[error("vector `{name}`: unknown sparse modifier `{value}` (expected one of: none, idf)")]
     UnknownModifier { name: String, value: String },
-    #[error("unknown quantization type `{0}` (expected: int8)")]
+    #[error("unknown quantization type `{0}` (expected one of: scalar, product, binary, turbo, none)")]
     UnknownQuantizationType(String),
+    #[error("unknown quantization compression `{0}` (expected one of: x4, x8, x16, x32, x64)")]
+    UnknownCompressionRatio(String),
+    #[error(
+        "unknown quantization encoding `{0}` (expected one of: one_bit, two_bits, one_and_half_bits)"
+    )]
+    UnknownQuantizationEncoding(String),
+    #[error("unknown quantization `bits` `{0}` (expected one of: 1, 1.5, 2, 4)")]
+    UnknownTurboBits(f32),
 }
 
 /// Build a `CreateCollection` request by gathering fields from three sources:
@@ -170,13 +180,46 @@ pub fn build_create_collection(
     if let Some(h) = &params.hnsw {
         builder = builder.hnsw_config(hnsw_diff(h));
     }
-    if let Some(q) = &params.quantization {
-        builder = builder.quantization_config(scalar_quant(q)?);
+    if let Some(q) = &params.quantization
+        && let Some(quant) = quantization_for_create(q)?
+    {
+        builder = builder.quantization_config(quant);
     }
     if let Some(o) = &params.optimizers {
         builder = builder.optimizers_config(optimizers_diff(o));
     }
 
+    Ok(builder)
+}
+
+/// Build an `UpdateCollection` request that patches index-affecting settings
+/// (HNSW/quantization/optimizers) on an *already-existing* collection, from
+/// the same [`QdrantParams`] shape [`build_create_collection`] reads at
+/// creation time — reusing the identical `hnsw_diff`/`optimizers_diff`/
+/// `parse_quantization` helpers, just fed into `UpdateCollectionBuilder`
+/// instead of `CreateCollectionBuilder` (and, for quantization, through
+/// [`quantization_for_update`] instead of [`quantization_for_create`], since
+/// `type: none` clears quantization here rather than being a no-op). Only
+/// patches knobs that are actually `Some`; anything unset in `params` is left
+/// alone server-side, not reset to a default. Structural params
+/// (`shard_number`, `replication_factor`, per-vector `distance`/`datatype`/
+/// `size`) aren't patchable on an existing collection and are deliberately
+/// not read here — see `nova sweep`'s `data_layouts`/`index_variants` split
+/// for why.
+pub fn build_update_collection(
+    collection_name: &str,
+    params: &QdrantParams,
+) -> Result<UpdateCollectionBuilder, QdrantConfigError> {
+    let mut builder = UpdateCollectionBuilder::new(collection_name);
+    if let Some(h) = &params.hnsw {
+        builder = builder.hnsw_config(hnsw_diff(h));
+    }
+    if let Some(q) = &params.quantization {
+        builder = builder.quantization_config(quantization_for_update(q)?);
+    }
+    if let Some(o) = &params.optimizers {
+        builder = builder.optimizers_config(optimizers_diff(o));
+    }
     Ok(builder)
 }
 
@@ -248,20 +291,113 @@ fn optimizers_diff(o: &OptimizersConfig) -> OptimizersConfigDiff {
     }
 }
 
-fn scalar_quant(q: &QuantizationConfig) -> Result<ScalarQuantization, QdrantConfigError> {
-    // Only scalar int8 is supported today; default to it when unspecified.
-    let kind = match q.kind.as_deref().map(str::to_ascii_lowercase).as_deref() {
-        None | Some("int8") => QuantizationType::Int8,
-        Some(other) => {
-            return Err(QdrantConfigError::UnknownQuantizationType(
-                other.to_string(),
-            ));
-        }
-    };
-    Ok(ScalarQuantization {
-        r#type: kind as i32,
-        quantile: q.quantile,
-        always_ram: q.always_ram,
+/// One fully-parsed quantization method, before it's converted into whichever
+/// protobuf shape the caller needs ([`quantization_config::Quantization`] for
+/// `CreateCollection`, [`quantization_config_diff::Quantization`] for
+/// `UpdateCollection`). `None` (no quantization) only has a diff
+/// representation — see [`quantization_for_create`].
+enum ParsedQuantization {
+    None,
+    Scalar(ScalarQuantization),
+    Product(ProductQuantization),
+    Binary(BinaryQuantization),
+    Turbo(TurboQuantization),
+}
+
+fn parse_quantization(q: &QuantizationConfig) -> Result<ParsedQuantization, QdrantConfigError> {
+    match q.kind.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        // A bare `quantization: {}` block means scalar (int8) quantization.
+        None | Some("scalar") => Ok(ParsedQuantization::Scalar(ScalarQuantization {
+            r#type: QuantizationType::Int8 as i32,
+            quantile: q.quantile,
+            always_ram: q.always_ram,
+        })),
+        Some("product") => Ok(ParsedQuantization::Product(ProductQuantization {
+            compression: parse_compression(q.compression.as_deref())? as i32,
+            always_ram: q.always_ram,
+        })),
+        Some("binary") => Ok(ParsedQuantization::Binary(BinaryQuantization {
+            always_ram: q.always_ram,
+            encoding: parse_quantization_encoding(q.encoding.as_deref())?.map(|e| e as i32),
+            query_encoding: None,
+        })),
+        Some("turbo") => Ok(ParsedQuantization::Turbo(TurboQuantization {
+            always_ram: q.always_ram,
+            bits: parse_turbo_bits(q.bits)?.map(|b| b as i32),
+        })),
+        Some("none") => Ok(ParsedQuantization::None),
+        Some(other) => Err(QdrantConfigError::UnknownQuantizationType(other.to_string())),
+    }
+}
+
+fn parse_compression(value: Option<&str>) -> Result<CompressionRatio, QdrantConfigError> {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        // x16 is Qdrant's own server-side default.
+        None | Some("x16") => Ok(CompressionRatio::X16),
+        Some("x4") => Ok(CompressionRatio::X4),
+        Some("x8") => Ok(CompressionRatio::X8),
+        Some("x32") => Ok(CompressionRatio::X32),
+        Some("x64") => Ok(CompressionRatio::X64),
+        Some(other) => Err(QdrantConfigError::UnknownCompressionRatio(other.to_string())),
+    }
+}
+
+fn parse_quantization_encoding(
+    value: Option<&str>,
+) -> Result<Option<BinaryQuantizationEncoding>, QdrantConfigError> {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        // one_bit is the server default; leave unset rather than round-trip it.
+        None | Some("one_bit") => Ok(None),
+        Some("two_bits") => Ok(Some(BinaryQuantizationEncoding::TwoBits)),
+        Some("one_and_half_bits") => Ok(Some(BinaryQuantizationEncoding::OneAndHalfBits)),
+        Some(other) => Err(QdrantConfigError::UnknownQuantizationEncoding(
+            other.to_string(),
+        )),
+    }
+}
+
+fn parse_turbo_bits(value: Option<f32>) -> Result<Option<TurboQuantBitSize>, QdrantConfigError> {
+    match value {
+        // Leave unset rather than round-trip the server's own default.
+        None => Ok(None),
+        Some(1.0) => Ok(Some(TurboQuantBitSize::Bits1)),
+        Some(1.5) => Ok(Some(TurboQuantBitSize::Bits15)),
+        Some(2.0) => Ok(Some(TurboQuantBitSize::Bits2)),
+        Some(4.0) => Ok(Some(TurboQuantBitSize::Bits4)),
+        Some(other) => Err(QdrantConfigError::UnknownTurboBits(other)),
+    }
+}
+
+/// Quantization config for `CreateCollection` — `None` (no quantization) is
+/// a no-op here (`quantization_config::Quantization` has no "disabled"
+/// variant; there's nothing to turn off on a collection that doesn't exist
+/// yet), so the caller just skips setting `.quantization_config(...)`.
+fn quantization_for_create(
+    q: &QuantizationConfig,
+) -> Result<Option<quantization_config::Quantization>, QdrantConfigError> {
+    Ok(match parse_quantization(q)? {
+        ParsedQuantization::None => None,
+        ParsedQuantization::Scalar(s) => Some(s.into()),
+        ParsedQuantization::Product(p) => Some(p.into()),
+        ParsedQuantization::Binary(b) => Some(b.into()),
+        ParsedQuantization::Turbo(t) => Some(t.into()),
+    })
+}
+
+/// Quantization diff for `UpdateCollection` — unlike `create`, `None` is
+/// meaningful here: it's how `nova load reindex` explicitly clears
+/// quantization off a collection that already has it (omitting
+/// `quantization:` from the config instead would leave the server's current
+/// setting untouched), so it maps to Qdrant's `Disabled` diff variant.
+fn quantization_for_update(
+    q: &QuantizationConfig,
+) -> Result<quantization_config_diff::Quantization, QdrantConfigError> {
+    Ok(match parse_quantization(q)? {
+        ParsedQuantization::None => Disabled {}.into(),
+        ParsedQuantization::Scalar(s) => s.into(),
+        ParsedQuantization::Product(p) => p.into(),
+        ParsedQuantization::Binary(b) => b.into(),
+        ParsedQuantization::Turbo(t) => t.into(),
     })
 }
 
@@ -451,17 +587,58 @@ impl VectorStore for QdrantStore {
         Ok(())
     }
 
-    async fn wait_for_indexing(&self) -> Result<(), StoreError> {
-        // Poll until the collection reports green (optimizers idle).
-        // TODO: add a timeout/backoff so a stuck optimizer can't loop forever.
+    async fn wait_for_indexing(&self) -> Result<Instant, StoreError> {
+        // Poll until the collection reports green (optimizers idle) *and
+        // stays there* for GREEN_HOLD straight — a single Green sample isn't
+        // enough of a guarantee: right after a config patch or bulk upsert,
+        // the optimizer is scheduled asynchronously, so an immediate poll
+        // can still observe stale Green left over from before the change
+        // even started. Also fail fast (instead of looping forever) the
+        // moment the optimizer itself reports broken, surfacing its error.
+        const POLL_INTERVAL: Duration = Duration::from_secs(1);
+        const GREEN_HOLD: Duration = Duration::from_secs(5);
+
+        let mut green_since: Option<Instant> = None;
+        // TODO: add an overall timeout so a stuck (non-erroring) optimizer can't loop forever.
         loop {
             let resp = self.client.collection_info(self.collection_name.as_str()).await?;
-            let status = resp.result.map(|r| r.status).unwrap_or_default();
-            if status == CollectionStatus::Green as i32 {
-                return Ok(());
+            let result = resp.result;
+
+            if let Some(status) = result.as_ref().and_then(|r| r.optimizer_status.as_ref())
+                && !status.ok
+            {
+                return Err(StoreError::Other(format!(
+                    "qdrant optimizer error on {self}: {}",
+                    status.error
+                )));
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            let is_green = result.is_some_and(|r| r.status == CollectionStatus::Green as i32);
+            if is_green {
+                let since = *green_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= GREEN_HOLD {
+                    return Ok(since);
+                }
+            } else {
+                green_since = None;
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
+    }
+
+    async fn reindex(&self) -> Result<(), StoreError> {
+        let builder = build_update_collection(&self.collection_name, &self.params)
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        self.client.update_collection(builder).await?;
+        Ok(())
+    }
+
+    async fn delete_collection(&self) -> Result<(), StoreError> {
+        if self.client.collection_exists(self.collection_name.as_str()).await? {
+            self.client.delete_collection(self.collection_name.as_str()).await?;
+        }
+        Ok(())
     }
 }
 
@@ -471,7 +648,7 @@ mod tests {
 
     use rstest::rstest;
 
-    use qdrant_client::qdrant::quantization_config;
+    use qdrant_client::qdrant::{quantization_config, quantization_config_diff};
 
     use crate::config::LoadConfig;
     use crate::stores::VectorStoreConfig;
@@ -617,6 +794,62 @@ mod tests {
         assert_eq!(s.modifier, Some(Modifier::Idf as i32));
     }
 
+    /// `build_update_collection` must patch exactly the knobs present in
+    /// `params` — proves `reindex` would send the right diff without needing a
+    /// live collection to reindex against.
+    #[test]
+    fn update_collection_carries_hnsw_quantization_and_optimizers() {
+        let params = QdrantParams {
+            hnsw: Some(HnswConfig { m: Some(32), ef_construct: Some(200), ..Default::default() }),
+            quantization: Some(QuantizationConfig { kind: Some("scalar".into()), ..Default::default() }),
+            optimizers: Some(OptimizersConfig { default_segment_number: Some(4), ..Default::default() }),
+            ..Default::default()
+        };
+        let uc = build_update_collection("c", &params).expect("builds").build();
+
+        assert_eq!(uc.collection_name, "c");
+        let hnsw = uc.hnsw_config.expect("hnsw_config present");
+        assert_eq!(hnsw.m, Some(32));
+        assert_eq!(hnsw.ef_construct, Some(200));
+
+        let quant = match uc.quantization_config.expect("quantization_config present").quantization {
+            Some(quantization_config_diff::Quantization::Scalar(s)) => s,
+            other => panic!("expected scalar quantization, got {other:?}"),
+        };
+        assert_eq!(quant.r#type, QuantizationType::Int8 as i32);
+
+        let opt = uc.optimizers_config.expect("optimizers_config present");
+        assert_eq!(opt.default_segment_number, Some(4));
+    }
+
+    /// Structural fields (shard_number, recreate, etc.) aren't part of an
+    /// update — `build_update_collection` only ever reads hnsw/quantization/
+    /// optimizers, so an all-unset `QdrantParams` produces an update request
+    /// with nothing set (a legal, if pointless, no-op patch).
+    #[test]
+    fn update_collection_omits_unset_knobs() {
+        let uc = build_update_collection("c", &QdrantParams::default()).expect("builds").build();
+        assert!(uc.hnsw_config.is_none());
+        assert!(uc.quantization_config.is_none());
+        assert!(uc.optimizers_config.is_none());
+    }
+
+    /// End-to-end version of `none_quantization_is_a_create_noop_but_clears_on_update`
+    /// through the actual `reindex` request path: a `nova load reindex` with
+    /// `type: none` must patch quantization off.
+    #[test]
+    fn update_collection_can_disable_quantization() {
+        let params = QdrantParams {
+            quantization: Some(QuantizationConfig { kind: Some("none".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        let uc = build_update_collection("c", &params).expect("builds").build();
+        assert!(matches!(
+            uc.quantization_config.expect("quantization_config present").quantization,
+            Some(quantization_config_diff::Quantization::Disabled(_))
+        ));
+    }
+
     /// Dense size is required: absent from both the spec and the inferred dims,
     /// the build must fail loudly rather than silently produce a 0-dim vector.
     #[test]
@@ -677,12 +910,110 @@ mod tests {
     }
 
     #[test]
-    fn quantization_defaults_to_int8() {
+    fn quantization_defaults_to_scalar_int8() {
         let q = QuantizationConfig::default();
-        assert_eq!(
-            scalar_quant(&q).unwrap().r#type,
-            QuantizationType::Int8 as i32
-        );
+        let quant = quantization_for_create(&q).unwrap();
+        match quant {
+            Some(quantization_config::Quantization::Scalar(s)) => {
+                assert_eq!(s.r#type, QuantizationType::Int8 as i32);
+            }
+            other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case(None, CompressionRatio::X16)]
+    #[case(Some("x4"), CompressionRatio::X4)]
+    #[case(Some("x8"), CompressionRatio::X8)]
+    #[case(Some("X16"), CompressionRatio::X16)]
+    #[case(Some("x32"), CompressionRatio::X32)]
+    #[case(Some("x64"), CompressionRatio::X64)]
+    fn product_quantization_parses(
+        #[case] compression: Option<&str>,
+        #[case] expected: CompressionRatio,
+    ) {
+        let q = QuantizationConfig {
+            kind: Some("product".into()),
+            compression: compression.map(String::from),
+            ..Default::default()
+        };
+        match quantization_for_create(&q).unwrap() {
+            Some(quantization_config::Quantization::Product(p)) => {
+                assert_eq!(p.compression, expected as i32);
+            }
+            other => panic!("expected product, got {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some("one_bit"), None)]
+    #[case(Some("two_bits"), Some(BinaryQuantizationEncoding::TwoBits))]
+    #[case(
+        Some("one_and_half_bits"),
+        Some(BinaryQuantizationEncoding::OneAndHalfBits)
+    )]
+    fn binary_quantization_parses(
+        #[case] encoding: Option<&str>,
+        #[case] expected: Option<BinaryQuantizationEncoding>,
+    ) {
+        let q = QuantizationConfig {
+            kind: Some("binary".into()),
+            encoding: encoding.map(String::from),
+            always_ram: Some(true),
+            ..Default::default()
+        };
+        match quantization_for_create(&q).unwrap() {
+            Some(quantization_config::Quantization::Binary(b)) => {
+                assert_eq!(b.encoding, expected.map(|e| e as i32));
+                assert_eq!(b.always_ram, Some(true));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some(1.0), Some(TurboQuantBitSize::Bits1))]
+    #[case(Some(1.5), Some(TurboQuantBitSize::Bits15))]
+    #[case(Some(2.0), Some(TurboQuantBitSize::Bits2))]
+    #[case(Some(4.0), Some(TurboQuantBitSize::Bits4))]
+    fn turbo_quantization_parses(
+        #[case] bits: Option<f32>,
+        #[case] expected: Option<TurboQuantBitSize>,
+    ) {
+        let q = QuantizationConfig { kind: Some("turbo".into()), bits, ..Default::default() };
+        match quantization_for_create(&q).unwrap() {
+            Some(quantization_config::Quantization::Turboquant(t)) => {
+                assert_eq!(t.bits, expected.map(|b| b as i32));
+            }
+            other => panic!("expected turbo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turbo_quantization_rejects_unknown_bits() {
+        assert!(matches!(
+            quantization_for_create(&QuantizationConfig {
+                kind: Some("turbo".into()),
+                bits: Some(3.0),
+                ..Default::default()
+            }),
+            Err(QdrantConfigError::UnknownTurboBits(v)) if v == 3.0
+        ));
+    }
+
+    /// `none` is a no-op at creation (nothing to turn off yet — same effect
+    /// as omitting `quantization:`), but on an update it's the only way to
+    /// explicitly clear quantization off a collection that already has it.
+    #[test]
+    fn none_quantization_is_a_create_noop_but_clears_on_update() {
+        let q = QuantizationConfig { kind: Some("none".into()), ..Default::default() };
+        assert_eq!(quantization_for_create(&q).unwrap(), None);
+        assert!(matches!(
+            quantization_for_update(&q),
+            Ok(quantization_config_diff::Quantization::Disabled(_))
+        ));
     }
 
     #[test]
@@ -704,11 +1035,27 @@ mod tests {
             Err(QdrantConfigError::UnknownModifier { .. })
         ));
         assert!(matches!(
-            scalar_quant(&QuantizationConfig {
+            quantization_for_create(&QuantizationConfig {
                 kind: Some("fp4".into()),
                 ..Default::default()
             }),
             Err(QdrantConfigError::UnknownQuantizationType(_))
+        ));
+        assert!(matches!(
+            quantization_for_create(&QuantizationConfig {
+                kind: Some("product".into()),
+                compression: Some("x2".into()),
+                ..Default::default()
+            }),
+            Err(QdrantConfigError::UnknownCompressionRatio(_))
+        ));
+        assert!(matches!(
+            quantization_for_create(&QuantizationConfig {
+                kind: Some("binary".into()),
+                encoding: Some("three_bits".into()),
+                ..Default::default()
+            }),
+            Err(QdrantConfigError::UnknownQuantizationEncoding(_))
         ));
     }
 }

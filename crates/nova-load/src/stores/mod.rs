@@ -115,7 +115,26 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
     }
 
     /// Block until indexing is complete. Called after enable_indexing().
-    async fn wait_for_indexing(&self) -> Result<(), StoreError> {
+    ///
+    /// Returns the instant when the backend first entered the green state that
+    /// ultimately held long enough to be accepted as converged.
+    async fn wait_for_indexing(&self) -> Result<std::time::Instant, StoreError> {
+        Ok(std::time::Instant::now())
+    }
+
+    /// Patch index-affecting collection settings (HNSW/quantization/optimizer
+    /// overrides, from this store's own config) on an *already-existing*
+    /// collection, in place — does not touch data. Callers that need to block
+    /// until the change has reconverged should call [`wait_for_indexing`]
+    /// (`VectorStore::wait_for_indexing`) afterward, same as the existing
+    /// `enable_indexing`/`wait_for_indexing` split. Backends that can't patch
+    /// in place can leave this as a no-op.
+    async fn reindex(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Delete the collection if it exists. A no-op if it doesn't.
+    async fn delete_collection(&self) -> Result<(), StoreError> {
         Ok(())
     }
 }

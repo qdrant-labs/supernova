@@ -105,6 +105,30 @@ pub async fn finalize(config: LoadConfig) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Patch HNSW/quantization/optimizer settings on an *already-existing*
+/// collection in place, then wait for the change to finish optimization — no data is
+/// touched. Uses the same `LoadConfig` shape as every other phase; `datasource`
+/// and `vectors` are required by that shared schema but unused here (only
+/// `vectorstore.params.{hnsw,quantization,optimizers}` matters).
+pub async fn reindex(config: LoadConfig) -> Result<(), LoadError> {
+    let store = config.vectorstore.connect().await?;
+    let started = Instant::now();
+    store.reindex().await?;
+    let converged_at = store.wait_for_indexing().await?;
+    let effective_elapsed = converged_at.duration_since(started);
+    tracing::info!("reindex timing: effective_seconds={:.3}", effective_elapsed.as_secs_f64());
+    tracing::info!("reindexed {store}");
+    Ok(())
+}
+
+/// Delete the collection if it exists. A no-op if it doesn't.
+pub async fn delete(config: LoadConfig) -> Result<(), LoadError> {
+    let store = config.vectorstore.connect().await?;
+    store.delete_collection().await?;
+    tracing::info!("deleted {store}");
+    Ok(())
+}
+
 /// Inspect what a load *would* do without connecting to the store or
 /// downloading anything: dump the resolved config (secrets redacted) and the
 /// file list this worker would handle. Listing does hit the source (an S3
