@@ -7,12 +7,19 @@ members = [
 ]
 version = "0.0.7"
 
+# Shrink debug-build artifacts (the `target/` dir was filling the disk). These are
+# profile keys, so they must live under [profile.*], not [workspace].
+[profile.dev]
+debug = 0                      # no debug symbols — the biggest artifact-size win
+split-debuginfo = "unpacked"   # keep any remaining symbols out of the main binary
+
 [workspace.dependencies]
 async-trait="0.1.89"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 qdrant-client = "1.18.0"
+url = "2"
 tempfile = "3.27.0"
 object_store = { version = "0.11", features = ["aws"] }
 futures = "0.3"
@@ -23,11 +30,15 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.18"
-# metrics sink — sync Postgres client + TLS (Neon requires SSL)
-postgres = { version = "0.19", features = ["with-serde_json-1"] }
-postgres-native-tls = "0.5"
-native-tls = "0.2"
-# nova-metrics = { path = "crates/nova-metrics" }
+
+# Optional load backends (feature-gated in nova-load; off by default). The ES
+# client only ships pre-release builds — pin one that matches your cluster major
+# (8.x here; use a 9.x-alpha for ES 9). `milvus` is the unofficial community SDK.
+elasticsearch = "=8.15.0-alpha.1"
+# The maintained community SDK; its lib name is `milvus`, so `use milvus::…` is
+# unchanged. (The similarly-named `milvus` crate is a different, unbuildable one.)
+milvus = { package = "milvus-sdk-rust", version = "0.1.0" }
+
 
 # dev dependencies for workspace
 [workspace.dev-dependencies]

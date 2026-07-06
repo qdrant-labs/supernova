@@ -1,4 +1,8 @@
 mod qdrant;
+#[cfg(feature = "elastic")]
+mod elastic;
+#[cfg(feature = "milvus")]
+mod milvus_store;
 
 use std::collections::HashMap;
 
@@ -33,7 +37,14 @@ impl From<qdrant_client::QdrantError> for StoreError {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VectorStoreConfig {
-    Qdrant(qdrant::QdrantConfig),
+    // Boxed: QdrantConfig (with its HNSW/quantization/optimizer sub-configs) is far
+    // larger than the other variants, so an unboxed variant sizes the whole enum to
+    // it (clippy::large_enum_variant). This config is built once per load, not hot.
+    Qdrant(Box<qdrant::QdrantConfig>),
+    #[cfg(feature = "elastic")]
+    Elastic(elastic::ElasticConfig),
+    #[cfg(feature = "milvus")]
+    Milvus(milvus_store::MilvusConfig),
 }
 
 impl VectorStoreConfig {
@@ -44,6 +55,10 @@ impl VectorStoreConfig {
     pub async fn connect(self) -> Result<Box<dyn VectorStore>, StoreError> {
         match self {
             VectorStoreConfig::Qdrant(c) => Ok(Box::new(c.connect().await?)),
+            #[cfg(feature = "elastic")]
+            VectorStoreConfig::Elastic(c) => Ok(Box::new(c.connect().await?)),
+            #[cfg(feature = "milvus")]
+            VectorStoreConfig::Milvus(c) => Ok(Box::new(c.connect().await?)),
         }
     }
 }

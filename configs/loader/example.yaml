@@ -57,6 +57,31 @@ vectorstore:
   api_key: ${QDRANT_API_KEY}
   upsert_wait: false
 
+# Other backends are compiled in only with the matching cargo feature:
+#   cargo build -p nova-load --features elastic,milvus
+#
+# Elasticsearch (feature `elastic`) — dense vectors + payload. Sparse/multivector
+# are not supported. Auth: username/password OR a base64 api_key.
+# vectorstore:
+#   type: elastic
+#   url: https://localhost:9200
+#   index_name: mteb_tweets
+#   username: elastic
+#   password: ${ELASTIC_PASSWORD}
+#   # api_key: ${ELASTIC_API_KEY}        # alternative to username/password
+#   recreate: false
+#
+# Milvus (feature `milvus`) — dense vectors + id ONLY (the SDK has no JSON field,
+# so payload is NOT persisted). varchar primary key, so UUID ids work.
+# vectorstore:
+#   type: milvus
+#   url: http://localhost:19530
+#   collection_name: mteb_tweets
+#   # username: root
+#   # password: ${MILVUS_PASSWORD}
+#   # id_max_length: 128                 # bump if your ids exceed this
+#   recreate: false
+
 loader:
   batch_size: 256
   concurrency: 4
