@@ -15,11 +15,11 @@
 # Sub-tools follow the git model: each installs a `nova-<cmd>` on PATH, and the
 # `nova` dispatcher execs it. Install only the ones you need.
 
-.PHONY: all cli embed load storm inspect bf dist docs docs-build test clean
+.PHONY: all cli embed load storm inspect bf dist sweep docs docs-build test clean
 
-all: cli embed load storm inspect bf dist
+all: cli embed load storm inspect bf dist sweep
 	@echo
-	@echo "✓ installed nova + embed/load/storm/inspect/bf/dist. Check with: nova --help"
+	@echo "✓ installed nova + embed/load/storm/inspect/bf/dist/sweep. Check with: nova --help"
 
 # The `nova` dispatcher (root pyproject). Zero deps — installs anywhere instantly.
 cli:
@@ -52,6 +52,12 @@ bf:
 dist:
 	uv pip install -e python/nova-dist
 
+# `nova sweep` — parameter sweep orchestrator (drives nova-load/nova-storm
+# subprocesses). Controller-side only, same precedent as `dist` — but, like
+# `dist`, still part of `make all`.
+sweep:
+	uv pip install -e python/nova-sweep
+
 # Live docs at http://localhost:8000 (no install needed; uvx fetches zensical).
 docs:
 	uvx zensical serve
@@ -63,6 +69,7 @@ test:
 	cargo test
 	uv run --directory python/nova-embed --extra dev pytest -q || true
 	uv run --directory python/nova-bf --extra dev pytest -q || true
+	uv run --directory python/nova-sweep --extra dev pytest -q || true
 
 clean:
 	cargo clean

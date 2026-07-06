@@ -126,20 +126,40 @@ fn float(v: &Value) -> Option<f32> {
     }
 }
 
-/// Coerce a DuckDB `LIST`/`ARRAY` of strings into a `Vec<String>` — the same
+/// Coerce a DuckDB `LIST`/`ARRAY` of ids into a `Vec<String>` — the same
 /// shape as [`float_list`], for a ground-truth `hit_ids` column instead of a
-/// vector column.
+/// vector column. Ids are commonly integers (a corpus row number) rather than
+/// strings, so any integer width is stringified the same way point ids
+/// eventually get compared as strings elsewhere in storm.
 fn string_list(value: Value) -> Result<Vec<String>, QueryLoadError> {
     match value {
         Value::List(xs) | Value::Array(xs) => xs
             .iter()
-            .map(|v| match v {
-                Value::Text(s) => Some(s.clone()),
-                _ => None,
-            })
+            .map(id_string)
             .collect::<Option<_>>()
-            .ok_or_else(|| QueryLoadError::Other("ground_truth column is not a list of strings".into())),
-        _ => Err(QueryLoadError::Other("ground_truth column is not a list of strings".into())),
+            .ok_or_else(|| {
+                QueryLoadError::Other("ground_truth column is not a list of strings or integers".into())
+            }),
+        _ => Err(QueryLoadError::Other("ground_truth column is not a list of strings or integers".into())),
+    }
+}
+
+/// Stringify a single ground-truth id: text passes through, any integer width
+/// (signed or unsigned) is formatted as its decimal string. Anything else
+/// (float, bool, blob, ...) isn't a sensible id and is rejected.
+fn id_string(v: &Value) -> Option<String> {
+    match v {
+        Value::Text(s) => Some(s.clone()),
+        Value::TinyInt(i) => Some(i.to_string()),
+        Value::SmallInt(i) => Some(i.to_string()),
+        Value::Int(i) => Some(i.to_string()),
+        Value::BigInt(i) => Some(i.to_string()),
+        Value::HugeInt(i) => Some(i.to_string()),
+        Value::UTinyInt(i) => Some(i.to_string()),
+        Value::USmallInt(i) => Some(i.to_string()),
+        Value::UInt(i) => Some(i.to_string()),
+        Value::UBigInt(i) => Some(i.to_string()),
+        _ => None,
     }
 }
 
@@ -219,6 +239,31 @@ mod tests {
         assert_eq!(
             vectors[4].ground_truth,
             Some(HashSet::from(["gt-4-a".to_string(), "gt-4-b".to_string()]))
+        );
+    }
+
+    #[test]
+    fn ground_truth_column_accepts_integer_ids() {
+        let dir = std::env::temp_dir().join(format!("nova_storm_qgtint_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("queries.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [i::FLOAT, (i + 1)::FLOAT, (i + 2)::FLOAT] AS embedding, \
+             [i, i + 1]::BIGINT[] AS hit_ids FROM range(3) r(i)) TO '{}' (FORMAT PARQUET)",
+            file.display()
+        ))
+        .unwrap();
+
+        let vectors =
+            load_query_vectors(&source(file.display().to_string(), Some("hit_ids"))).unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(vectors.len(), 3);
+        assert_eq!(
+            vectors[1].ground_truth,
+            Some(HashSet::from(["1".to_string(), "2".to_string()]))
         );
     }
 
