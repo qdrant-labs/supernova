@@ -105,22 +105,19 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
     async fn close(&self) -> Result<(), StoreError>;
 
     /// Disable indexing for fast bulk loading. Called before upserts begin.
-    async fn defer_indexing(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
+    /// Backends that have nothing to disable must still implement this
+    /// explicitly (e.g. with an `Ok(())` body) — there is no default, so
+    /// every backend states its behavior rather than silently inheriting one.
+    async fn defer_indexing(&self) -> Result<(), StoreError>;
 
     /// Re-enable indexing after bulk load. Called after all upserts complete.
-    async fn enable_indexing(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
+    async fn enable_indexing(&self) -> Result<(), StoreError>;
 
     /// Block until indexing is complete. Called after enable_indexing().
     ///
     /// Returns the instant when the backend first entered the green state that
     /// ultimately held long enough to be accepted as converged.
-    async fn wait_for_indexing(&self) -> Result<std::time::Instant, StoreError> {
-        Ok(std::time::Instant::now())
-    }
+    async fn wait_for_indexing(&self) -> Result<std::time::Instant, StoreError>;
 
     /// Patch index-affecting collection settings (HNSW/quantization/optimizer
     /// overrides, from this store's own config) on an *already-existing*
@@ -128,13 +125,9 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
     /// until the change has reconverged should call [`wait_for_indexing`]
     /// (`VectorStore::wait_for_indexing`) afterward, same as the existing
     /// `enable_indexing`/`wait_for_indexing` split. Backends that can't patch
-    /// in place can leave this as a no-op.
-    async fn reindex(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
+    /// in place must still implement this explicitly (e.g. as a no-op).
+    async fn reindex(&self) -> Result<(), StoreError>;
 
     /// Delete the collection if it exists. A no-op if it doesn't.
-    async fn delete_collection(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
+    async fn delete_collection(&self) -> Result<(), StoreError>;
 }
