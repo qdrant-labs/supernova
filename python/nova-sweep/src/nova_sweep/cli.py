@@ -60,8 +60,8 @@ def main(config: str, skip_insert: bool, cleanup: bool, dry_run: bool) -> None:
     """Sweep a matrix of nova-load/nova-storm index and search configs."""
     _setup_logging()
 
-    cfg, sweep_name = load_config(config)
-    slices = build_slices(cfg, sweep_name)
+    cfg = load_config(config)
+    slices = build_slices(cfg)
 
     if dry_run:
         _print_dry_run(cfg, slices, skip_insert)

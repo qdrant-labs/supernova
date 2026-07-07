@@ -23,11 +23,9 @@ from __future__ import annotations
 import os
 import re
 
-from pathlib import Path
-
 import yaml
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from nova_sweep.backends import TargetConfigBase, parse_target
 
@@ -81,6 +79,7 @@ class OutputConfig(BaseModel):
 class SweepConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    collection_name: str = Field(min_length=1)
     corpus: CorpusConfig
     queries: QueriesConfig
     target: TargetConfigBase
@@ -104,13 +103,8 @@ class SweepConfig(BaseModel):
         return parse_target(value)
 
 
-def load_config(path: str) -> tuple[SweepConfig, str]:
-    """Parse a sweep config. Returns `(config, sweep_name)` — `sweep_name`
-    (used as the collection-name prefix, `{sweep_name}_{data_layout_name}`) is
-    the config file's stem, matching `nova-dist`'s own pool-naming convention
-    (`f"nova-{tool}-{Path(config).stem}"`) rather than a separate schema field.
-    """
+def load_config(path: str) -> SweepConfig:
+    """Parse a sweep config."""
     with open(path) as f:
         raw = expand_env(f.read())
-    cfg = SweepConfig.model_validate(yaml.safe_load(raw))
-    return cfg, Path(path).stem
+    return SweepConfig.model_validate(yaml.safe_load(raw))

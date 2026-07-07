@@ -16,6 +16,7 @@ from nova_sweep.slices import build_slices
 
 def _cfg(**axes) -> SweepConfig:
     return SweepConfig(
+        collection_name="mycollection",
         corpus=CorpusConfig(path="/tmp/corpus", dense_column="dense_embedding"),
         queries=QueriesConfig(
             uri="/tmp/q.parquet", column="dense_embedding", ground_truth_column="hit_ids"
@@ -27,7 +28,7 @@ def _cfg(**axes) -> SweepConfig:
 
 
 def _one_slice(cfg: SweepConfig):
-    return build_slices(cfg, "mysweep")[0]
+    return build_slices(cfg)[0]
 
 
 # --- backend dispatch --------------------------------------------------------
