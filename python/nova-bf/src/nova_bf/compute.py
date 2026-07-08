@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 from queue import Empty, Queue
@@ -44,7 +45,7 @@ from tqdm import tqdm
 from nova_bf.config import BruteForceConfig
 from nova_bf.filters import evaluate
 from nova_bf.ids import make_point_id
-from nova_bf.io import Store, dense_to_2d
+from nova_bf.io import ParquetFile, Store, dense_to_2d
 from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,31 @@ PREFETCH_QUEUE_SIZE = 4
 # Per-file id encoding: global_file_idx * MAX_ROWS_PER_FILE + row. Collision-free
 # and reversible as long as no single file has more rows than this.
 MAX_ROWS_PER_FILE = 100_000_000
+
+
+def filter_corpus_files(
+    files: list[ParquetFile], include: str | None, exclude: str | None
+) -> list[ParquetFile]:
+    """Keep only corpus files whose path matches `include` (if set) and does not
+    match `exclude` (if set) — both are `re.search`-ed against the full path.
+    `path` globs recursively, so this is how you skip unintended siblings (a
+    `prepared/` folder, a staging dir) that share the prefix."""
+    kept = files
+    if include is not None:
+        rx = re.compile(include)
+        kept = [f for f in kept if rx.search(f.read_path)]
+    if exclude is not None:
+        rx = re.compile(exclude)
+        kept = [f for f in kept if not rx.search(f.read_path)]
+    dropped = len(files) - len(kept)
+    if dropped:
+        logger.info(
+            "corpus filter: kept %d of %d files (dropped %d via include/exclude)",
+            len(kept), len(files), dropped,
+        )
+    if files and not kept:
+        logger.warning("corpus include/exclude removed ALL %d files — check the patterns", len(files))
+    return kept
 
 
 def _resolve_rank(num_jobs: int | None, job_rank: int | None) -> int | None:
@@ -143,6 +169,10 @@ def run_compute(
     #    slice so its global indices stay stable for id decoding.
     cstore = Store(cfg.corpus.path)
     all_files = cstore.list_parquets()
+    # Restrict the recursive glob to the intended shards (see corpus.include/exclude).
+    # Applied BEFORE striding so the global file index — and thus make_point_id — is
+    # over the filtered set, consistent between compute workers and merge.
+    all_files = filter_corpus_files(all_files, cfg.corpus.include, cfg.corpus.exclude)
     if num_jobs is not None:
         mine = [(i, f) for i, f in enumerate(all_files) if i % num_jobs == job_rank]
     else:

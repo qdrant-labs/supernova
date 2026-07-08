@@ -56,6 +56,15 @@ class CorpusConfig(BaseModel):
     # lives in the data, so it's read alongside the dense column and kept in RAM
     # per file for the worker's slice — budget ~(slice_rows × id_size) of host mem.
     id_column: str | None = None
+    # Restrict which `.parquet` under `path` are searched (both are regexes matched
+    # against each object's full path with `re.search`). `path` globs recursively,
+    # so use these to skip siblings you didn't mean to include — e.g. a `prepared/`
+    # folder someone dropped next to the shards:
+    #   include: '/\d{3}/'      # only shard dirs 000/, 001/, …
+    #   exclude: '/prepared/'   # …or just drop the one you don't want
+    # include is applied first (keep only matches), then exclude (drop matches).
+    include: str | None = None
+    exclude: str | None = None
 
 
 class QueriesConfig(BaseModel):
