@@ -1,8 +1,10 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use futures::StreamExt;
-use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
+use object_store::{ClientOptions, ObjectStore, RetryConfig};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
@@ -16,8 +18,19 @@ pub struct S3Config {
     /// Explicit keys (relative to the prefix) instead of listing the prefix.
     #[serde(default)]
     pub file_list: Option<Vec<String>>,
+    /// Per-file S3 download timeout, in seconds. object_store defaults this to
+    /// 30s covering the WHOLE request (headers + body), which is far too short
+    /// for multi-GB parquet under load contention — the body stream aborts as
+    /// "error decoding response body" and the file is retried into the same wall.
+    /// Default 600s; `0` disables the timeout entirely (rely on retries only).
+    #[serde(default = "default_download_timeout_secs")]
+    pub download_timeout_secs: u64,
     #[serde(flatten)]
     pub reader: ReaderOptions,
+}
+
+fn default_download_timeout_secs() -> u64 {
+    600
 }
 
 impl S3Config {
@@ -44,8 +57,25 @@ impl S3Config {
     /// simple; listing/fetching are infrequent enough that it doesn't matter.
     fn store(&self) -> Result<impl ObjectStore> {
         let (bucket, _) = self.bucket_prefix()?;
+
+        // Raise object_store's 30s default request timeout — it covers the full
+        // body stream, so multi-GB downloads time out. Also lift RetryConfig's
+        // retry_timeout (default 3min) to match, so it can't cap a long download.
+        let mut opts = ClientOptions::new();
+        let mut retry = RetryConfig::default();
+        if self.download_timeout_secs == 0 {
+            opts = opts.with_timeout_disabled();
+            retry.retry_timeout = Duration::from_secs(3600);
+        } else {
+            let d = Duration::from_secs(self.download_timeout_secs);
+            opts = opts.with_timeout(d);
+            retry.retry_timeout = d.max(retry.retry_timeout);
+        }
+
         AmazonS3Builder::from_env()
             .with_bucket_name(bucket)
+            .with_client_options(opts)
+            .with_retry(retry)
             .build()
             .map_err(|e| SourceError::List(format!("build S3 client for `{bucket}`: {e}")))
     }
@@ -174,6 +204,7 @@ mod tests {
         S3Config {
             path: path.to_string(),
             file_list: None,
+            download_timeout_secs: default_download_timeout_secs(),
             reader: serde_yaml::from_str("id_expression: row_id").unwrap(),
         }
     }
