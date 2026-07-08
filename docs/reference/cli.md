@@ -164,6 +164,8 @@ nova sweep <config.yaml> [--skip-insert] [--cleanup] [--dry-run]
   `nova-load reindex`, no reload), `searches` (storm-only, no Qdrant-side
   change) — expanded and swept as **one collection per `data_layouts` entry,
   reused across every `index_variant`**, never a new collection per variant.
+  The base collection name is now required explicitly in the config via
+  `collection_name`; it is no longer inferred from the config filename.
 - `index_variants` are walked in an order chosen to minimize rebuild cost
   (HNSW changes grouped together, quantization changes absorb the frequent
   transitions — small-scale empirical testing showed quantization changes

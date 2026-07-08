@@ -116,26 +116,35 @@ impl QueryTarget for QdrantTarget {
 
         let started = Instant::now();
         match self.client.query_batch(request).await {
-            Ok(resp) => {
-                debug_assert_eq!(
+            // A length mismatch here means the response can no longer be
+            // zipped positionally against the submitted queries without
+            // risking a query's recall being scored against another query's
+            // results — treat it the same as a hard failure (no ids) rather
+            // than silently misaligning them. `debug_assert_eq!` alone isn't
+            // enough: this runs in release builds, the mode real storms use.
+            Ok(resp) if resp.result.len() != vectors.len() => BatchOutcome {
+                latency: started.elapsed(),
+                ok: false,
+                ids: vec![None; vectors.len()],
+                error: Some(format!(
+                    "query_batch returned {} results for {} submitted queries",
                     resp.result.len(),
-                    vectors.len(),
-                    "query_batch response length must match the submitted batch size"
-                );
-                BatchOutcome {
-                    latency: started.elapsed(),
-                    ok: true,
-                    ids: resp
-                        .result
-                        .into_iter()
-                        .map(|batch_result| {
-                            self.collect_ids
-                                .then(|| batch_result.result.iter().filter_map(point_id_string).collect())
-                        })
-                        .collect(),
-                    error: None,
-                }
-            }
+                    vectors.len()
+                )),
+            },
+            Ok(resp) => BatchOutcome {
+                latency: started.elapsed(),
+                ok: true,
+                ids: resp
+                    .result
+                    .into_iter()
+                    .map(|batch_result| {
+                        self.collect_ids
+                            .then(|| batch_result.result.iter().filter_map(point_id_string).collect())
+                    })
+                    .collect(),
+                error: None,
+            },
             Err(e) => BatchOutcome {
                 latency: started.elapsed(),
                 ok: false,

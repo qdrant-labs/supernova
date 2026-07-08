@@ -155,8 +155,17 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
 /// artificially low; `lib.rs` warns at startup if any loaded row is short.
 /// `ground_truth` is already a `HashSet` (built once at load time in
 /// `queries.rs`, not per call) since this runs on every query firing.
+/// `returned` is deduped before counting hits — a target that ever repeated an
+/// id within one query's results must not let that repeat count twice, which
+/// would push recall above the `1.0` ceiling a fraction is supposed to have.
 fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> f64 {
-    let hits = returned.iter().filter(|id| ground_truth.contains(id.as_str())).count();
+    let hits = returned
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|id| ground_truth.contains(*id))
+        .count();
     hits as f64 / k as f64
 }
 
@@ -506,6 +515,16 @@ mod tests {
         assert_eq!(recall_at_k(&returned, &ground_truth, 2), 1.0); // capped by k, not clamped to <=1 elsewhere
         assert_eq!(recall_at_k(&[], &ground_truth, 4), 0.0);
         assert_eq!(recall_at_k(&returned, &HashSet::new(), 4), 0.0);
+    }
+
+    #[test]
+    fn recall_at_k_dedupes_returned_so_a_repeated_id_cannot_exceed_1_0() {
+        // "a" appears 3 times in `returned` -- must still count as a single
+        // hit, not 3, or recall would read 1.5 for k=2 (impossible for a
+        // fraction that's supposed to be capped at 1.0).
+        let returned = vec!["a".to_string(), "a".to_string(), "a".to_string()];
+        let ground_truth = HashSet::from(["a".to_string(), "b".to_string()]);
+        assert_eq!(recall_at_k(&returned, &ground_truth, 2), 0.5);
     }
 
     #[test]

@@ -14,6 +14,8 @@
 # Single machine, sequential today (no --num-jobs/--job-rank) — see the CLI
 # reference for why that's not a gap, just not built yet.
 
+collection_name: fiqa_bge_m3_sweep
+
 corpus:
   path: s3://qdrant--vectorforge/fiqa/bge-m3          # nova-load's datasource.path
   dense_column: dense_embedding
@@ -43,8 +45,9 @@ target:
 
 # Structural params — changing any of these forces a fresh `nova-load run`
 # (distance/datatype/size/shard_number are fixed at collection creation).
-# One Qdrant collection per expanded combination, named `<sweep-name>_<name>`
-# (sweep-name = this file's stem, so `example_datatypefloat32` here).
+# One Qdrant collection per expanded combination, named
+# `<collection_name>_<data_layout_name>` (or just `collection_name` when there
+# is only the implicit default layout).
 data_layouts:
   vectors.dense.distance: [cosine]
   vectors.dense.datatype: [float32, uint8]

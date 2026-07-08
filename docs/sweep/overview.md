@@ -30,6 +30,8 @@ nova bf (ground truth) ───┤        ▲                       │
 Sweep configs live in `configs/sweep/`.
 
 ```yaml
+collection_name: my_model_sweep
+
 corpus:
   path: s3://my-bucket/dataset/model      # nova-load's datasource.path
   dense_column: dense_embedding
@@ -136,6 +138,11 @@ Everything under `index_variants` (HNSW, quantization, optimizers) is
 patchable on an already-loaded collection via Qdrant's `update_collection`,
 and `searches` never touches Qdrant at all.
 
+Collection names are now explicit in the config, not inferred from the file
+name: the config's `collection_name` is used directly when there is only the
+implicit default layout, otherwise each expanded `data_layouts` entry is named
+`<collection_name>_<data_layout_name>`.
+
 ### Rebuild-cost ordering
 
 `index_variants` are walked in an order chosen to minimize rebuild cost, not
@@ -151,8 +158,8 @@ either `hnsw.m: 16` variant, regardless of how the axes were declared. The
 
 ## Collections
 
-If a `data_layouts` entry's target collection (`<sweep-name>_<data_layout
-name>`, where sweep-name is the config file's stem) **already exists** when
+If a `data_layouts` entry's target collection (`<collection_name>_<data_layout
+name>`, or just `collection_name` for the implicit default layout) **already exists** when
 its turn comes up, `nova sweep` does not guess, warn-and-continue, or
 silently delete it — **it errors and exits immediately**, before touching
 anything:

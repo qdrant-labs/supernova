@@ -13,6 +13,7 @@ from nova_sweep.config import CorpusConfig, OutputConfig, QueriesConfig, SweepCo
 
 def _cfg(target: object) -> SweepConfig:
     return SweepConfig(
+        collection_name="mysweep",
         corpus=CorpusConfig(path="/tmp/corpus"),
         queries=QueriesConfig(uri="/tmp/q.parquet", column="dense_embedding"),
         target=target,
@@ -56,3 +57,13 @@ def test_target_with_non_string_type_raises_a_clear_error():
         _cfg({"type": [1, 2], "url": "http://localhost:6334"})
     with pytest.raises(ValueError, match="`target.type` must be a string"):
         _cfg({"type": 5, "url": "http://localhost:6334"})
+
+
+def test_collection_name_is_required():
+    with pytest.raises(ValueError, match="collection_name"):
+        SweepConfig(
+            corpus=CorpusConfig(path="/tmp/corpus"),
+            queries=QueriesConfig(uri="/tmp/q.parquet", column="dense_embedding"),
+            target={"type": "qdrant", "url": "http://localhost:6334"},
+            output=OutputConfig(path="/tmp/out"),
+        )

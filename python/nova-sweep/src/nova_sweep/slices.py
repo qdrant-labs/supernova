@@ -22,7 +22,7 @@ class Slice:
     searches: list[dict]
 
 
-def build_slices(cfg: SweepConfig, sweep_name: str) -> list[Slice]:
+def build_slices(cfg: SweepConfig) -> list[Slice]:
     """Every `data_layouts` entry gets its own `Slice`, but all slices share
     the same `index_variants`/`searches` lists (the full grid applies
     uniformly across every layout) — building these once and referencing them
@@ -35,7 +35,11 @@ def build_slices(cfg: SweepConfig, sweep_name: str) -> list[Slice]:
         Slice(
             data_layout=layout,
             data_layout_name=layout["_name"],
-            collection_name=f"{sweep_name}_{layout['_name']}",
+            collection_name=(
+                cfg.collection_name
+                if layout["_name"] == "default"
+                else f"{cfg.collection_name}_{layout['_name']}"
+            ),
             index_variants=index_variants,
             searches=searches,
         )
