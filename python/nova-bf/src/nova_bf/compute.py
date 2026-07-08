@@ -292,13 +292,16 @@ def run_compute(
                 # resolves correctly regardless of `keep`.
 
             g0 = time.perf_counter()
-            # zero-copy view of the (contiguous float32) array + one H2D copy;
-            # torch.tensor() would add an extra host→host copy first.
-            C = torch.from_numpy(arr).to(device, non_blocking=True)
-            n_rows = C.shape[0]
+            n_rows = arr.shape[0]
             step = corpus_batch or n_rows  # None → whole file in one matmul
             for r0 in range(0, n_rows, step):
-                Cb = C[r0 : r0 + step]
+                # Copy only this batch to the GPU, not the whole file. A big corpus
+                # parquet (~1M rows ≈ 3 GB at 768-dim f32) would otherwise sit
+                # resident on the GPU for the whole file even though scoring is
+                # batched — the real driver of the OOM on large parquets. Per-batch
+                # H2D moves the same total bytes but caps corpus residency at `step`
+                # rows (so GPU memory is bounded by corpus_batch_size, as intended).
+                Cb = torch.from_numpy(arr[r0 : r0 + step]).to(device, non_blocking=True)
                 scores = _scores(Q, Cb, metric)  # (n_q, ≤step)
                 bk = min(k, Cb.shape[0])
                 f_scores, f_local = torch.topk(scores, k=bk, dim=1)
