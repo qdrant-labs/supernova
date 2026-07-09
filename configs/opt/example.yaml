@@ -1,0 +1,100 @@
+# nova opt — cost-aware, recall-constrained BO tuner. Finds the best
+# QPS/latency operating points subject to `recall >= target_recall`, spending
+# the experiment budget where expected Pareto improvement per unit marginal
+# rebuild cost is highest. Run: `nova opt tune configs/opt/example.yaml`
+# (add --dry-run to see the plan, models, and stats without evaluating).
+
+# Recall-classifier training data collected so far (the batch feature
+# pipeline's output schema — see docs). Retrained each run unless
+# `recall_model_dir` already holds a saved model.
+data_csv: data.csv
+recall_model_dir: ./opt_results/recall_model
+
+workload:
+  corpus:
+    path: s3://my-bucket/embeddings/
+    dense_column: dense_embedding
+  queries: # exactly nova-storm's `query.source` shape
+    uri: s3://my-bucket/queries.parquet
+    column: embedding
+    ground_truth_column: hit_ids
+    limit: 1000
+  distance_metric: COSINE # COSINE | L2 | IP
+  duration_s: 10 # nova-storm run length per search measurement
+
+# The live instance under test. Alternatively set `replay:
+# /path/to/sweep_results.parquet` to evaluate offline against a previously
+# measured grid (baseline comparisons) — `target` is ignored then.
+target:
+  type: qdrant
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY:-}
+
+# Hierarchical search space, grouped by artifact level (most expensive
+# first): layout changes force a reinsert, index changes an HNSW rebuild,
+# quantization a quant rebuild; search-level knobs only rerun queries.
+space:
+  # layout
+  segments: [2, 8, 32]
+  dtype: [float32]
+  shard_count: [1]
+  on_disk_payload: [false]
+  # index
+  m: [8, 16, 32, 64]
+  ef_construct: [64, 128, 256]
+  index_on_disk: [false]
+  indexing_threshold: [null]
+  # quantization
+  quant_variant: [none, scalar_default, binary_1bit, binary_2bit]
+  always_ram: [true]
+  # search
+  ef_search: [16, 32, 64, 128, 256]
+  batch_size: [1, 8, 32]
+  top_k: [10]
+  concurrency: [1, 4, 16]
+  rescore: [null, true]
+
+optimizer:
+  target_recall: 0.90 # feasibility constraint, not an objective
+  strategy: full # random | bo | bo_recall | bo_cost | full (the baselines)
+  budget_seconds: 7200 # total measured build+search time
+  max_evaluations: 200
+  gamma: 0.5 # rebuild-cost penalty exponent in EHVI * W_R / cost^gamma
+  beta: 0.1 # exploration bonus where the recall model is uncertain
+  prune_min_probability: 0.3 # bo_recall baseline's hard feasibility cutoff
+  n_candidates: 256 # candidates scored per iteration
+  seed: 0
+  cost_cooling: true # anneal gamma -> 0 as the budget depletes
+  bias_fraction: 0.5 # proposals drawn near already-built artifacts
+  online_prior_strength: 4.0 # how slowly measured recall overrides the classifier
+  recall_gp_min_observations: 5 # measured recalls before the spatial recall GP kicks in
+
+# After an expensive (layout/index/quant) build, amortize it by also
+# measuring these cheap search-level siblings of the chosen point.
+scheduler:
+  ef_search: [16, 32, 64, 128, 256]
+  batch_size: [1, 8, 32, 128]
+  max_children: 8
+
+# Dataset/query statistics extraction (recall-classifier features). Full-pass
+# stats fall back to seeded random samples past `full_pass_row_limit`; the
+# run metadata records which regime each statistic came from.
+stats:
+  sample_size: 1000 # query PCA rows
+  pair_sample_size: 100000 # random pair distances
+  nn_query_sample_size: 256
+  nn_reference_sample_size: 5000
+  knn_k: 100
+  seed: 0
+  full_pass_row_limit: 2000000
+
+# Per-level seconds before anything is measured; refined online by EMA.
+cost_priors:
+  layout_s: 600
+  index_s: 300
+  quant_s: 120
+  search_s: 30
+  ema_alpha: 0.3
+
+output:
+  path: ./opt_results

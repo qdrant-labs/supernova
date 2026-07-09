@@ -47,6 +47,10 @@ class CorpusConfig(BaseModel):
 
     path: str
     dense_column: str = "dense_embedding"
+    # Struct<indices: list<uint32>, values: list<float32>> column, read instead
+    # of dense_column when params.metric's sibling `vector_type` is "sparse" —
+    # same schema nova-embed writes and nova-load reads (see docs/embedding).
+    sparse_column: str = "sparse_embedding"
     # If set, hit_ids are taken verbatim from this already-unique column (e.g.
     # fineweb's `id` = "<urn:uuid:...>") — transparent for public data, and
     # resolvable without reconstructing the loader's hashing. If unset (default),
@@ -72,6 +76,7 @@ class QueriesConfig(BaseModel):
 
     path: str
     dense_column: str = "dense_embedding"
+    sparse_column: str = "sparse_embedding"
     # If set, use this column as the query id verbatim; otherwise derive
     # make_point_id(queries_file_key, row) — same scheme as the corpus.
     id_column: str | None = None
@@ -90,6 +95,10 @@ class ParamsConfig(BaseModel):
 
     k: int = 1000
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
+    # "sparse" reads corpus.sparse_column/queries.sparse_column (a
+    # struct<indices, values> column) instead of the dense_column, and scores
+    # via sparse-corpus × dense-query-vocab matmul instead of a dense matmul.
+    vector_type: Literal["dense", "sparse"] = "dense"
     # Concurrent corpus-file readers (one thread per in-flight file). IMPORTANT:
     # pyarrow reads parquet with pre_buffer=True, which dispatches the actual S3
     # byte-fetches to a SHARED global IO thread pool of size `io_thread_count`
@@ -129,6 +138,15 @@ class ParamsConfig(BaseModel):
     # during the reduce — worth it on a beefy box with fast NVMe. No effect when the
     # partials are already local. Default off (a laptop controller may lack the disk).
     merge_prefetch: bool = False
+
+    @model_validator(mode="after")
+    def _no_sparse_euclidean(self) -> "ParamsConfig":
+        if self.vector_type == "sparse" and self.metric == "euclidean":
+            raise ValueError(
+                "metric='euclidean' is not supported with vector_type='sparse' "
+                "(sparse retrieval only ever uses dot/cosine) — use 'dot' or 'cosine'"
+            )
+        return self
 
 
 # A single scalar payload value, as it would appear in a corpus column.

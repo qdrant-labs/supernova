@@ -45,7 +45,7 @@ from tqdm import tqdm
 from nova_bf.config import BruteForceConfig
 from nova_bf.filters import evaluate
 from nova_bf.ids import make_point_id
-from nova_bf.io import ParquetFile, Store, dense_to_2d
+from nova_bf.io import ParquetFile, Store, dense_to_2d, sparse_to_coo_parts
 from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
 
 logger = logging.getLogger(__name__)
@@ -120,6 +120,196 @@ def load_queries(store: Store, qcfg) -> tuple[np.ndarray, list[str], dict[str, l
     return Q, ids, payload
 
 
+def _build_query_vocab(indices: np.ndarray) -> np.ndarray:
+    """Sorted distinct token ids used by the query set. A corpus token id
+    absent from this vocab can never match any query's nonzero support, so
+    dropping it later (see `_vocab_lookup`) is exact, not lossy.
+
+    Deliberately NOT a dense `remap[token_id] -> compact_col` array: real
+    hashed sparse schemes (e.g. fastembed's BM25) scatter token ids across the
+    full uint32 range, so a dense array sized by `max(token_id)` can demand
+    tens of GB for a handful of distinct tokens. `_vocab_lookup` does the same
+    mapping via `np.searchsorted` against this sorted array instead."""
+    return np.unique(indices)
+
+
+def _vocab_lookup(vocab: np.ndarray, ids: np.ndarray) -> np.ndarray:
+    """`ids` -> compact column position in `vocab`, or -1 if not present."""
+    if len(vocab) == 0:
+        return np.full(len(ids), -1, dtype=np.int64)
+    pos = np.minimum(np.searchsorted(vocab, ids), len(vocab) - 1)
+    return np.where(vocab[pos] == ids, pos, -1).astype(np.int64)
+
+
+def _coalesce_by_row_col(
+    row_ids: np.ndarray, col_ids: np.ndarray, values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge duplicate (row, col) pairs by SUMMING their values, returning
+    arrays sorted by row then col with every (row, col) pair appearing at
+    most once.
+
+    A repeated sparse index within one row (e.g. a hash collision in a real
+    hashed sparse embedder) must contribute the SUM of its values, not just
+    the last one seen — the two properties this guarantees (sorted-by-row,
+    distinct-per-row columns) are also exactly torch's CSR tensor invariants,
+    so this is the one place both the "sum duplicates" correctness and the
+    "valid CSR" requirement are satisfied together, instead of only sorting
+    (which leaves duplicate columns per row — still invalid CSR, since
+    `check_invariants=True` rejects it, and relies on undefined/backend-
+    specific behavior to sum them at matmul time).
+
+    `np.lexsort`'s LAST key is primary: `(col_ids, row_ids)` sorts by row
+    first, then col within each row — the reverse of the argument order.
+    """
+    if len(row_ids) == 0:
+        return row_ids, col_ids, values
+    perm = np.lexsort((col_ids, row_ids))
+    row_ids, col_ids, values = row_ids[perm], col_ids[perm], values[perm]
+    is_new = np.empty(len(row_ids), dtype=bool)
+    is_new[0] = True
+    is_new[1:] = (row_ids[1:] != row_ids[:-1]) | (col_ids[1:] != col_ids[:-1])
+    group = np.cumsum(is_new) - 1
+    merged = np.zeros(int(group[-1]) + 1, dtype=np.float64)
+    np.add.at(merged, group, values.astype(np.float64))
+    return row_ids[is_new], col_ids[is_new], merged.astype(values.dtype)
+
+
+def _sparse_rows_to_dense(row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray, vocab: np.ndarray) -> np.ndarray:
+    """CSR parts (indices already all within `vocab`) -> dense (n_rows, len(vocab)).
+
+    Uses `np.add.at` (accumulate), not a plain fancy-index assignment, so a row
+    with a repeated token id sums its contributions instead of silently
+    keeping only the last one written — matching the corpus side, where the
+    same repeated-index case is summed via `_coalesce_by_row_col`.
+
+    Uses `np.searchsorted` directly rather than `_vocab_lookup`: `vocab` is
+    built from this exact `indices` array (`_build_query_vocab`), so every
+    element is provably present — the -1-for-absent branch can never fire
+    here, only in `_sparse_batch_to_csr`'s corpus-side lookup."""
+    n_rows = len(row_offsets) - 1
+    row_ids = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(row_offsets))
+    cols = np.searchsorted(vocab, indices)
+    Q = np.zeros((n_rows, len(vocab)), dtype=np.float32)
+    np.add.at(Q, (row_ids, cols), values)
+    return Q
+
+
+def load_queries_sparse(store: Store, qcfg) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, list]]:
+    """Sparse analog of `load_queries`: reads the struct<indices,values> column
+    from every query file, then densifies once over the query set's own
+    vocabulary (see `_build_query_vocab`) — queries are few enough that a dense
+    (n_q, vocab_size) matrix is cheap, same as loading Q fully upfront today."""
+    cols = [qcfg.sparse_column]
+    if qcfg.id_column:
+        cols.append(qcfg.id_column)
+    cols += [c for c in qcfg.payload_fields if c not in cols]
+
+    counts_parts: list[np.ndarray] = []
+    indices_parts: list[np.ndarray] = []
+    values_parts: list[np.ndarray] = []
+    ids: list[str] = []
+    payload: dict[str, list] = {c: [] for c in qcfg.payload_fields}
+    for f in store.list_parquets():
+        table = store.read_columns(f.read_path, cols)
+        row_offsets, idx, val = sparse_to_coo_parts(table[qcfg.sparse_column])
+        counts_parts.append(np.diff(row_offsets))
+        indices_parts.append(idx)
+        values_parts.append(val)
+        d = table.to_pydict()
+        n = len(row_offsets) - 1
+        if qcfg.id_column:
+            ids += [str(x) for x in d[qcfg.id_column]]
+        else:
+            ids += [make_point_id(f.key, r) for r in range(n)]
+        for c in qcfg.payload_fields:
+            payload[c] += d[c]
+
+    indices = np.concatenate(indices_parts) if indices_parts else np.zeros(0, np.int64)
+    values = np.concatenate(values_parts) if values_parts else np.zeros(0, np.float32)
+    counts = np.concatenate(counts_parts) if counts_parts else np.zeros(0, np.int64)
+    n_q = len(counts)
+    row_offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+
+    vocab = _build_query_vocab(indices)
+    Q = _sparse_rows_to_dense(row_offsets, indices, values, vocab)
+    return Q, vocab, ids, payload
+
+
+def _compact_sparse_rows(
+    row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray,
+    norms: np.ndarray | None, keep: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+    """Row-level filter compaction for sparse CSR parts — the nnz-granular
+    analog of the dense path's `arr = arr[orig_rows]`. `keep` is a per-row mask
+    (from `filters.evaluate`); dropped rows' nonzeros are dropped too, but
+    surviving rows' TRUE file-row numbers are preserved via `orig_rows`, same
+    invariant the dense path relies on for id resolution."""
+    orig_rows = np.nonzero(keep)[0]
+    nnz_keep = np.repeat(keep, np.diff(row_offsets))
+    new_indices = indices[nnz_keep]
+    new_values = values[nnz_keep]
+    new_row_offsets = np.concatenate(([0], np.cumsum(np.diff(row_offsets)[orig_rows]))).astype(np.int64)
+    new_norms = norms[orig_rows] if norms is not None else None
+    return new_row_offsets, new_indices, new_values, new_norms, orig_rows
+
+
+def _sparse_batch_to_csr(
+    row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray,
+    norms: np.ndarray | None, r0: int, r1: int, vocab: np.ndarray, device: str,
+):
+    """This batch's CSR rows, remapped into the query vocabulary (out-of-vocab
+    entries dropped — see `_build_query_vocab`) and, if `norms` is given
+    (cosine), pre-scaled by each row's TRUE (untruncated) L2 norm before the
+    drop, so truncation never distorts the normalization.
+
+    `check_invariants=False` below skips torch's own validation that each
+    row's column indices are sorted and distinct — a real, enforced CSR
+    invariant (violating it is undefined behavior per torch's own sparse
+    tensor docs, not just a missed optimization). The source parquet's
+    per-row token order isn't guaranteed sorted OR unique (two original
+    token ids can remap to the same vocab column — impossible here since
+    `_vocab_lookup` is injective, but a row can also carry the same raw
+    token id twice, e.g. a hash collision in a real hashed embedder), so
+    `_coalesce_by_row_col` both sorts AND merges duplicate columns before
+    construction, so skipping torch's redundant check stays safe."""
+    import torch
+
+    lo, hi = int(row_offsets[r0]), int(row_offsets[r1])
+    b_idx = indices[lo:hi]
+    b_val = values[lo:hi]
+    counts = np.diff(row_offsets[r0 : r1 + 1])
+    if norms is not None:
+        row_scale = 1.0 / np.maximum(norms[r0:r1], 1e-12)
+        b_val = b_val * np.repeat(row_scale, counts).astype(np.float32)
+
+    row_ids = np.repeat(np.arange(r1 - r0, dtype=np.int64), counts)
+    b_idx = _vocab_lookup(vocab, b_idx)
+    keep_nnz = b_idx >= 0
+    b_idx, b_val, row_ids = b_idx[keep_nnz], b_val[keep_nnz], row_ids[keep_nnz]
+
+    row_ids, b_idx, b_val = _coalesce_by_row_col(row_ids, b_idx, b_val)
+    new_counts = np.bincount(row_ids, minlength=r1 - r0)
+    crow = np.concatenate(([0], np.cumsum(new_counts))).astype(np.int64)
+
+    Cb = torch.sparse_csr_tensor(
+        torch.from_numpy(crow), torch.from_numpy(b_idx), torch.from_numpy(b_val),
+        size=(r1 - r0, len(vocab)), check_invariants=False,
+    )
+    return Cb.to(device, non_blocking=True)
+
+
+def _sparse_scores(Q, Cb):
+    """`Cb` (sparse CSR, batch × vocab) against dense `Q` (n_q × vocab) via the
+    documented, stable `sparse_csr @ dense -> dense` path (cuSPARSE SpMM) —
+    deliberately not sparse-sparse matmul, which torch has no stable binding
+    for. Cosine/dot are both already baked into Q/Cb's values by this point
+    (see `_sparse_batch_to_csr`'s row-norm scaling), so this is metric-agnostic,
+    matching `_scores`'s dense dispatch."""
+    import torch
+
+    return torch.matmul(Cb, Q.T).T
+
+
 def _scores(Q, C, metric: str):
     import torch.nn.functional as F
 
@@ -150,16 +340,33 @@ def run_compute(
     job_rank = _resolve_rank(num_jobs, job_rank)
     k = cfg.params.k
     metric = cfg.params.metric
+    vector_type = cfg.params.vector_type
+    # ParamsConfig rejects this combination at config-load time; re-checked
+    # here (not via `assert`, which `python -O` strips) since
+    # _sparse_batch_to_csr's cosine/dot dispatch is implicit (via whether
+    # `norms` is None) and would otherwise silently score as "dot" under an
+    # unsupported "euclidean" label instead of raising.
+    if vector_type == "sparse" and metric == "euclidean":
+        raise ValueError("sparse + euclidean should have been rejected by ParamsConfig")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         logger.warning("No GPU detected — brute force on CPU will be slow.")
 
     # 1. queries
-    Q_np, query_ids, payload = load_queries(Store(cfg.queries.path), cfg.queries)
+    query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
+    if vector_type == "sparse":
+        Q_np, query_vocab, query_ids, payload = load_queries_sparse(Store(cfg.queries.path), cfg.queries)
+        if len(query_vocab) == 0 and len(query_ids) > 0:
+            logger.warning(
+                "sparse query vocabulary is empty (every query has zero nonzero entries) — "
+                "every corpus row will score 0; check queries.sparse_column is correct."
+            )
+    else:
+        Q_np, query_ids, payload = load_queries(Store(cfg.queries.path), cfg.queries)
     n_q, dim = Q_np.shape
     logger.info(
-        "queries=%d dim=%d metric=%s k=%d device=%s%s",
-        n_q, dim, metric, k, device,
+        "queries=%d %s=%d metric=%s k=%d device=%s%s",
+        n_q, "vocab" if vector_type == "sparse" else "dim", dim, metric, k, device,
         f" rank={job_rank}/{num_jobs}" if num_jobs else "",
     )
     if cfg.filter is not None:
@@ -192,15 +399,15 @@ def run_compute(
     top_scores = torch.full((n_q, k), float("-inf"), device=device)
     top_enc = torch.zeros((n_q, k), dtype=torch.int64, device=device)
 
-    # Prefetch corpus files (dense column only) with a POOL of reader threads so
+    # Prefetch corpus files (vector column only) with a POOL of reader threads so
     # many S3 GETs are in flight at once — otherwise the GPU sits idle behind one
     # file's latency at a time. Order doesn't matter (the top-K merge is
     # commutative). pyarrow releases the GIL during IO, so threads parallelize.
-    dense_col = cfg.corpus.dense_column
+    vec_col = cfg.corpus.sparse_column if vector_type == "sparse" else cfg.corpus.dense_column
     id_col = cfg.corpus.id_column  # None → derive make_point_id(file_key, row) at decode
     filt = cfg.filter  # None → no filtering; else a corpus-side payload predicate
     filter_cols = sorted(filt.fields()) if filt else []
-    read_cols = list(dict.fromkeys([dense_col] + ([id_col] if id_col else []) + filter_cols))
+    read_cols = list(dict.fromkeys([vec_col] + ([id_col] if id_col else []) + filter_cols))
     # Corpus id strings carried through to decode, kept in RAM per file (only when
     # id_column is set). gidx → pyarrow string array aligned with that file's rows.
     corpus_ids: dict[int, object] = {}
@@ -233,7 +440,27 @@ def run_compute(
                 return
             t0 = time.perf_counter()
             table = cstore.read_columns(f.read_path, read_cols)
-            arr = dense_to_2d(table[dense_col])
+            if vector_type == "sparse":
+                sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[vec_col])
+                if metric == "cosine":
+                    # per-row L2 norm over the FULL (untruncated) row, before any
+                    # query-vocab truncation or filtering — see _sparse_batch_to_csr.
+                    # A row's true value at a given token id is the SUM of every
+                    # occurrence of that id (a repeated raw index — e.g. a hash
+                    # collision — isn't two separate dimensions), so duplicates
+                    # must be coalesced before squaring: sum-of-squares-of-parts
+                    # is not the same as square-of-the-summed-value whenever a
+                    # row repeats a token id.
+                    n_file_rows = len(sp_offsets) - 1
+                    row_ids = np.repeat(np.arange(n_file_rows, dtype=np.int64), np.diff(sp_offsets))
+                    m_rows, _, m_vals = _coalesce_by_row_col(row_ids, sp_idx, sp_val)  # sp_idx already int64
+                    sumsq = np.bincount(m_rows, weights=m_vals.astype(np.float64) ** 2, minlength=n_file_rows)
+                    sp_norms = np.sqrt(sumsq).astype(np.float32)
+                else:
+                    sp_norms = None
+                arr = (sp_offsets, sp_idx, sp_val, sp_norms)
+            else:
+                arr = dense_to_2d(table[vec_col])
             # carry the id column (combined to one contiguous array) to decode;
             # None when id_column isn't configured. Same row order as `arr`.
             ids = table[id_col].combine_chunks() if id_col else None
@@ -277,32 +504,56 @@ def run_compute(
             # both make_point_id(file, row) and corpus_ids[gidx][row] need the row
             # the vector actually occupies in the parquet file, not its position
             # in the filtered-down array.
-            if keep is not None:
-                orig_rows = np.nonzero(keep)[0]
-                arr = arr[orig_rows]
+            if vector_type == "sparse":
+                sp_offsets, sp_idx, sp_val, sp_norms = arr
+                if keep is not None:
+                    sp_offsets, sp_idx, sp_val, sp_norms, orig_rows = _compact_sparse_rows(
+                        sp_offsets, sp_idx, sp_val, sp_norms, keep
+                    )
+                else:
+                    orig_rows = None
+                n_rows = len(sp_offsets) - 1
+                if n_rows == 0:
+                    continue
+                rows_seen += n_rows
+                # on-disk width (uint32 index + float32 value per nnz), not
+                # sp_idx's in-memory int64 (torch requires int64 indices) —
+                # keeps this comparable to the dense path's wire-byte estimate.
+                bytes_seen += len(sp_idx) * 8
             else:
-                orig_rows = None
-            if len(arr) == 0:
-                continue
-            rows_seen += len(arr)
-            bytes_seen += int(arr.nbytes)
+                if keep is not None:
+                    orig_rows = np.nonzero(keep)[0]
+                    arr = arr[orig_rows]
+                else:
+                    orig_rows = None
+                if len(arr) == 0:
+                    continue
+                rows_seen += len(arr)
+                bytes_seen += int(arr.nbytes)
+                n_rows = arr.shape[0]
             if id_col:
                 corpus_ids[gidx] = ids  # kept in RAM; indexed by row at decode
                 # unfiltered — always the full per-file array, so `corpus_ids[gidx][row]`
                 # resolves correctly regardless of `keep`.
 
             g0 = time.perf_counter()
-            n_rows = arr.shape[0]
             step = corpus_batch or n_rows  # None → whole file in one matmul
             for r0 in range(0, n_rows, step):
+                r1 = min(r0 + step, n_rows)
                 # Copy only this batch to the GPU, not the whole file. A big corpus
                 # parquet (~1M rows ≈ 3 GB at 768-dim f32) would otherwise sit
                 # resident on the GPU for the whole file even though scoring is
                 # batched — the real driver of the OOM on large parquets. Per-batch
                 # H2D moves the same total bytes but caps corpus residency at `step`
                 # rows (so GPU memory is bounded by corpus_batch_size, as intended).
-                Cb = torch.from_numpy(arr[r0 : r0 + step]).to(device, non_blocking=True)
-                scores = _scores(Q, Cb, metric)  # (n_q, ≤step)
+                if vector_type == "sparse":
+                    Cb = _sparse_batch_to_csr(
+                        sp_offsets, sp_idx, sp_val, sp_norms, r0, r1, query_vocab, device,
+                    )
+                    scores = _sparse_scores(Q, Cb)  # (n_q, ≤step)
+                else:
+                    Cb = torch.from_numpy(arr[r0:r1]).to(device, non_blocking=True)
+                    scores = _scores(Q, Cb, metric)  # (n_q, ≤step)
                 bk = min(k, Cb.shape[0])
                 f_scores, f_local = torch.topk(scores, k=bk, dim=1)
                 # rows are the TRUE file row for each entry of Cb (see orig_rows

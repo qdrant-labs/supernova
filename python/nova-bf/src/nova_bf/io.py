@@ -103,3 +103,23 @@ def dense_to_2d(col: pa.ChunkedArray) -> np.ndarray:
         flat = col.values.to_numpy(zero_copy_only=False)
         dim = len(flat) // n
     return np.ascontiguousarray(flat.reshape(n, dim), dtype=np.float32)
+
+
+def sparse_to_coo_parts(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A `struct<indices: list<uint32>, values: list<float32>>` column → CSR parts.
+
+    Same flatten-the-Arrow-buffer-once approach as `dense_to_2d`: no per-row
+    Python conversion. Returns `(row_offsets, indices, values)` — `row_offsets`
+    is length n+1 (CSR `crow_indices`), `indices`/`values` are the flat,
+    concatenated-across-rows nonzero entries (CSR `col_indices`/`values`).
+    """
+    col = col.combine_chunks()
+    n = len(col)
+    if n == 0:
+        return np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+    idx_list = col.field("indices")
+    val_list = col.field("values")
+    row_offsets = idx_list.offsets.to_numpy(zero_copy_only=False).astype(np.int64)
+    indices = idx_list.values.to_numpy(zero_copy_only=False).astype(np.int64)
+    values = val_list.values.to_numpy(zero_copy_only=False).astype(np.float32)
+    return row_offsets, indices, values
