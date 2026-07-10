@@ -33,7 +33,7 @@ import pyarrow.parquet as pq
 
 from tqdm import tqdm
 
-from nova_bf.config import BruteForceConfig
+from nova_bf.config import BruteForceConfig, SearchSpec
 from nova_bf.io import ParquetFile, Store
 from nova_bf.results import RESERVED, partial_dir, result_name, warn_if_short
 
@@ -163,19 +163,31 @@ def _topk_merge(
     return ids_arr, scores_arr
 
 
-def run_merge(cfg: BruteForceConfig) -> str:
+def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
+    """Merges every search in `cfg.effective_specs()` — each spec's per-rank
+    partials (written under its own `partial_dir`, see `compute.py`) are
+    reduced independently into that spec's own final parquet. Returns
+    `{spec.name: output_path}`; the legacy single-search config (no
+    `searches:`) returns `{"": path}`."""
     out = Store(cfg.output.path)
-    partials = out.list_parquets(subpath=partial_dir(cfg))
+    return {spec.name: _run_merge_one(cfg, spec, out) for spec in cfg.effective_specs()}
+
+
+def _run_merge_one(cfg: BruteForceConfig, spec: SearchSpec, out: Store) -> str:
+    partials = out.list_parquets(subpath=partial_dir(cfg, spec))
     if not partials:
         raise RuntimeError(
-            f"no partial results under {cfg.output.path}/{partial_dir(cfg)}/ — "
-            "run `bf compute --num-jobs N` first"
+            f"no partial results under {cfg.output.path}/{partial_dir(cfg, spec)}/ "
+            f"(search={spec.name or '<default>'}) — run `bf compute --num-jobs N` first"
         )
 
     workers = max(1, cfg.params.io_workers)
     staged_dir: str | None = None
     if cfg.params.merge_prefetch and out.is_s3:
-        logger.info("prefetching %d partials to local disk (%d workers)…", len(partials), workers)
+        logger.info(
+            "search=%r: prefetching %d partials to local disk (%d workers)…",
+            spec.name or "<default>", len(partials), workers,
+        )
         staged_dir, local_paths = _prefetch_local(out, partials, workers)
         gb = sum(os.path.getsize(p) for p in local_paths) / 1e9
         logger.info("staged %.1f GB to %s; merging from local disk", gb, staged_dir)
@@ -186,16 +198,17 @@ def run_merge(cfg: BruteForceConfig) -> str:
         readers = [pq.ParquetFile(f.read_path, filesystem=out.fs) for f in partials]
 
     try:
-        return _reduce(cfg, out, partials, readers)
+        return _reduce(cfg, spec, out, partials, readers)
     finally:
         if staged_dir is not None:
             shutil.rmtree(staged_dir, ignore_errors=True)
 
 
 def _reduce(
-    cfg: BruteForceConfig, out: Store, partials: list[ParquetFile], readers: list[pq.ParquetFile]
+    cfg: BruteForceConfig, spec: SearchSpec, out: Store, partials: list[ParquetFile],
+    readers: list[pq.ParquetFile],
 ) -> str:
-    k = cfg.params.k
+    k = spec.k
     n_rows = readers[0].metadata.num_rows
     for f, r in zip(partials, readers):
         if r.metadata.num_rows != n_rows:
@@ -208,8 +221,8 @@ def _reduce(
     payload_cols = [c for c in readers[0].schema_arrow.names if c not in RESERVED]
     batch_rows = _resolve_batch_rows(cfg.params.merge_batch_size, n_rows, len(partials), k)
     logger.info(
-        "merging %d partials (%d queries, k=%d) in batches of %d",
-        len(partials), n_rows, k, batch_rows,
+        "search=%r: merging %d partials (%d queries, k=%d) in batches of %d",
+        spec.name or "<default>", len(partials), n_rows, k, batch_rows,
     )
 
     # Read query_id + payload only from partial 0; every partial contributes its
@@ -218,7 +231,7 @@ def _reduce(
     hit_cols = ["query_id", "hit_ids", "hit_scores"]
     rest_iters = [r.iter_batches(batch_size=batch_rows, columns=hit_cols) for r in readers[1:]]
 
-    path = f"{out.root.rstrip('/')}/{result_name(cfg)}"
+    path = f"{out.root.rstrip('/')}/{result_name(cfg, spec)}"
     if not out.is_s3:
         os.makedirs(os.path.dirname(path), exist_ok=True)
     sink = out.fs.open_output_stream(path)

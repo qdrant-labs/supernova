@@ -71,7 +71,7 @@ def scenario(tmp_path):
         reference[q] = ([h for _, h in top], [s for s, _ in top])
 
     cfg = _make_cfg(tmp_path)
-    pdir = tmp_path / "out" / partial_dir(cfg)
+    pdir = tmp_path / "out" / partial_dir(cfg, cfg.effective_specs()[0])
     pdir.mkdir(parents=True)
     for p, (p_ids, p_scores) in enumerate(partials):
         payload = {"src": [f"payload-{q}" for q in qids]}  # identical across partials
@@ -84,7 +84,7 @@ def scenario(tmp_path):
 
 
 def _read_result(cfg) -> dict[str, tuple[list[str], list[float], str]]:
-    t = pq.read_table(f"{cfg.output.path}/{result_name(cfg)}").to_pydict()
+    t = pq.read_table(f"{cfg.output.path}/{result_name(cfg, cfg.effective_specs()[0])}").to_pydict()
     return {
         q: (hi, hs, src)
         for q, hi, hs, src in zip(t["query_id"], t["hit_ids"], t["hit_scores"], t["src"])

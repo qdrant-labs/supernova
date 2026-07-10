@@ -108,7 +108,7 @@ def _run(ds, *, batch, id_column, out_name, filt=None):
         params=ParamsConfig(k=K, metric="dot", corpus_batch_size=batch, io_workers=2),
         filter=filt,
     )
-    t = pq.read_table(run_compute(cfg)).to_pydict()
+    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
     return {q: list(zip(hi, hs)) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
 
 

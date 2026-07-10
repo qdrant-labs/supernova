@@ -80,6 +80,44 @@ filter:
 
 A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. The filter applies uniformly to every query in the run: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves.
 
+### Multiple searches in one pass
+
+A single `compute` run can produce several **independent** top-K results — e.g. dense-unfiltered, sparse-unfiltered, and a filtered variant of either — while reading and decoding each corpus file only **once**, shared across every search that needs that vector_type. This is not a fused hybrid score: each search gets its own ranked list, own `k`/`metric`/`filter`, and own output file; they just cost roughly the price of one corpus scan instead of one scan per search (the read+decode path is what dominates, see [Performance & tuning](#performance--tuning)).
+
+Use a top-level `searches:` list instead of the flat `params.k`/`params.metric`/`params.vector_type`/`filter`:
+
+```yaml
+searches:
+  - name: dense_all
+    vector_type: dense
+    metric: cosine
+    k: 1000
+  - name: dense_eng
+    vector_type: dense
+    metric: cosine
+    k: 1000
+    filter:
+      must:
+        - field: language
+          match: eng
+  - name: sparse_all
+    vector_type: sparse
+    metric: dot
+    k: 1000
+  - name: sparse_eng
+    vector_type: sparse
+    metric: dot
+    k: 1000
+    filter:
+      must:
+        - field: language
+          match: eng
+```
+
+Every entry needs a unique `name` — it's spliced into the output filename (`bf_<queries-stem>_<name>_k<K>.parquet`) so the searches never collide. Each entry can also set its own `corpus_batch_size`. `searches` replaces the flat `params.k`/`metric`/`vector_type`/`corpus_batch_size` and the top-level `filter` — leaving any of those set alongside `searches` is a config error (they'd otherwise be silently ignored). `params.io_workers`/`io_thread_count`/`merge_batch_size`/`merge_prefetch` are run-level knobs and still apply to the whole run regardless of how many searches it contains. Omit `searches` entirely for the single-search behavior described above — output filenames are unchanged either way.
+
+One run-level number *does* change meaning once multiple searches (or a single filtered search) share a run: the `timing`/`bf-bench` log lines' `rows`/`gb` are the corpus's raw pre-filter row/byte count for each vector_type actually read — not "rows that survived a filter" — since with several searches there's no longer one single filtered count to report. Don't compare these numbers against a pre-`searches` run's log line expecting the same semantics.
+
 ## Running
 
 ```bash
@@ -115,6 +153,8 @@ and `merge` (or single-GPU `compute`) writes the final result:
 ```
 {output.path}/bf_<queries-stem>_k<K>.parquet
 ```
+
+With a `searches:` list, each search's `name` is spliced in (`_bf_partial_<queries-stem>_<name>_k<K>/…` and `bf_<queries-stem>_<name>_k<K>.parquet`) so every search's partials/result land in its own path — one `compute`/`merge` call still produces all of them.
 
 | Column | Type | |
 |--------|------|--|

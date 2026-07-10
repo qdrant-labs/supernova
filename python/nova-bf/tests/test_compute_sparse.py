@@ -162,7 +162,7 @@ def _run(ds, *, metric, batch, id_column, out_name, filt=None):
         params=ParamsConfig(k=K, metric=metric, vector_type="sparse", corpus_batch_size=batch, io_workers=2),
         filter=filt,
     )
-    t = pq.read_table(run_compute(cfg)).to_pydict()
+    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
     return {q: list(zip(hi, hs)) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
 
 
@@ -303,7 +303,7 @@ def test_duplicate_indices_within_a_row_are_summed(ds):
         output=OutputConfig(path=str(out)),
         params=ParamsConfig(k=1, metric="dot", vector_type="sparse", io_workers=1),
     )
-    t = pq.read_table(run_compute(cfg)).to_pydict()
+    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
     # correct: query{3:2.0, 1:10.0} . corpus{3:7.0, 1:1.0} = 2.0*7.0 + 10.0*1.0 = 24.0
     # if either side silently overwrote instead of summing, this would come out wrong
     assert t["hit_scores"][0][0] == pytest.approx(24.0, abs=1e-4)
@@ -361,7 +361,7 @@ def test_duplicate_indices_cosine_norm_is_correct(ds):
         output=OutputConfig(path=str(out)),
         params=ParamsConfig(k=1, metric="cosine", vector_type="sparse", io_workers=1),
     )
-    t = pq.read_table(run_compute(cfg)).to_pydict()
+    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
     # dot = 1*1(token1) + 1*7(token3) = 8; query norm = sqrt(2); corpus norm = sqrt(50)
     expected = 8.0 / (np.sqrt(2) * np.sqrt(50))
     assert t["hit_scores"][0][0] == pytest.approx(expected, abs=1e-4)
@@ -406,7 +406,7 @@ def test_filter_compaction_with_multibatch_tiling(tmp_path, batch):
         params=ParamsConfig(k=2, metric="dot", vector_type="sparse", corpus_batch_size=batch, io_workers=1),
         filter=Filter(must=[FilterCondition(field="language", match="eng")]),
     )
-    t = pq.read_table(run_compute(cfg)).to_pydict()
+    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
     got_ids = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
     assert got_ids == expected_ids
 
@@ -437,7 +437,7 @@ def test_filter_compaction_preserves_duplicate_index_summing(tmp_path):
         params=ParamsConfig(k=1, metric="dot", vector_type="sparse", io_workers=1),
         filter=Filter(must=[FilterCondition(field="language", match="eng")]),
     )
-    t = pq.read_table(run_compute(cfg)).to_pydict()
+    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
     # query{3:1.0, 1:10.0} . corpus{3:7.0, 1:1.0} = 1.0*7.0 + 10.0*1.0 = 17.0
     assert t["hit_ids"][0] == ["keep0"]
     assert t["hit_scores"][0][0] == pytest.approx(17.0, abs=1e-4)

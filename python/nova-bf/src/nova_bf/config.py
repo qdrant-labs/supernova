@@ -107,7 +107,9 @@ class ParamsConfig(BaseModel):
     # and holds more decoded arrays in RAM (each reader ≈ one file; io_workers ×
     # file_size must fit host memory or the box OOMs — that's what killed the
     # 96/128-worker runs on a 16 GB g5.xlarge). Keep it modest; the real S3
-    # concurrency knob is io_thread_count below.
+    # concurrency knob is io_thread_count below. When `searches` mixes dense AND
+    # sparse specs, each in-flight file's reader decodes BOTH columns at once, so
+    # the per-file RAM budget above is (dense_bytes + sparse_bytes), not just one.
     io_workers: int = 16
     # pyarrow's global IO thread pool size = the TRUE S3 fetch concurrency (see
     # io_workers). 0 → leave pyarrow's default (~8). Raise it (e.g. 32) to test
@@ -213,6 +215,52 @@ class Filter(BaseModel):
         return {c.field for group in (self.must, self.should, self.must_not) for c in group}
 
 
+class SearchSpec(BaseModel):
+    """One independent top-K search to compute in a `nova-bf compute` run —
+    its own vector_type, metric, k, corpus_batch_size and (optional) filter,
+    scored and top-K'd independently of every other spec in
+    `BruteForceConfig.searches` (NOT fused into one hybrid score). Multiple
+    specs sharing a run still share corpus file IO/decode (see compute.py) —
+    that sharing is the whole point of listing several here instead of
+    running `nova-bf compute` once per spec.
+
+    `name` becomes part of the output filename (see `nova_bf.results`), so
+    every spec in a run needs a distinct one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    k: int = 1000
+    metric: Literal["cosine", "dot", "euclidean"] = "cosine"
+    vector_type: Literal["dense", "sparse"] = "dense"
+    corpus_batch_size: int | None = None
+    filter: Filter | None = None
+
+    @model_validator(mode="after")
+    def _no_sparse_euclidean(self) -> "SearchSpec":
+        if self.vector_type == "sparse" and self.metric == "euclidean":
+            raise ValueError(
+                f"search '{self.name}': metric='euclidean' is not supported with "
+                "vector_type='sparse' (sparse retrieval only ever uses dot/cosine) "
+                "— use 'dot' or 'cosine'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _name_is_filename_safe(self) -> "SearchSpec":
+        # "" is reserved for the single implicit spec BruteForceConfig.effective_specs()
+        # synthesizes from the legacy flat params/filter shape — BruteForceConfig's own
+        # validator rejects an empty name inside a user-supplied `searches` list, so a
+        # blank name can only ever reach here via that synthesis, never from parsed YAML.
+        if self.name and not re.fullmatch(r"[A-Za-z0-9_-]+", self.name):
+            raise ValueError(
+                f"search name '{self.name}' must match [A-Za-z0-9_-]+ (it becomes "
+                "part of the output filename)"
+            )
+        return self
+
+
 class BruteForceConfig(BaseModel):
     # allow extra top-level keys (e.g. a `resources:` block for `nova dist`).
     model_config = ConfigDict(extra="allow")
@@ -222,6 +270,76 @@ class BruteForceConfig(BaseModel):
     output: OutputConfig
     params: ParamsConfig = ParamsConfig()
     filter: Filter | None = None
+    # Independent top-K searches to compute in ONE corpus read/decode pass — e.g.
+    # dense-unfiltered AND sparse-filtered against the same corpus in a single
+    # `nova-bf compute` run (see compute.py's per-file vector_type fan-out).
+    # Omit (default) for today's single flat-params/filter behavior; the output
+    # filename is then identical to a run with no `searches` at all.
+    searches: list[SearchSpec] | None = None
+
+    @model_validator(mode="after")
+    def _validate_searches(self) -> "BruteForceConfig":
+        if self.searches is None:
+            return self
+        if not self.searches:
+            raise ValueError(
+                "`searches` must not be empty — omit the key entirely for the "
+                "single-search (`params`/`filter`) default"
+            )
+        names = [s.name for s in self.searches]
+        if any(not n for n in names):
+            raise ValueError("every entry in `searches` must set a non-empty `name`")
+        if len(set(names)) != len(names):
+            raise ValueError(f"`searches` names must be unique, got {names}")
+        if self.filter is not None:
+            raise ValueError(
+                "top-level `filter` is ignored when `searches` is set — put each "
+                "search's filter inside its own `searches[].filter` instead"
+            )
+        # Every field name shared between ParamsConfig and SearchSpec (currently
+        # k/metric/vector_type/corpus_batch_size) has moved from `params` onto
+        # each `searches[]` entry — a leftover non-default value here (e.g. a
+        # config migrated from the legacy single-search shape without deleting
+        # `params.k`) would otherwise be silently ignored: effective_specs()
+        # never reads these fields once `searches` is set, so every entry that
+        # doesn't repeat the value gets SearchSpec's own default instead, with
+        # no error. Derived from the two models' actual field sets (not a
+        # hand-maintained tuple) so a future field added to both under the same
+        # name is caught automatically instead of needing a third place to stay
+        # in sync. Compared against a real `ParamsConfig()` instance rather than
+        # pydantic's `FieldInfo.default` — the latter silently becomes
+        # `PydanticUndefined` (never equal to anything) if a field ever switches
+        # to `default_factory=`, which would wrongly reject every config.
+        default_params = ParamsConfig()
+        shared_fields = sorted(set(ParamsConfig.model_fields) & set(SearchSpec.model_fields))
+        stale_fields = [
+            f for f in shared_fields
+            if getattr(self.params, f) != getattr(default_params, f)
+        ]
+        if stale_fields:
+            raise ValueError(
+                f"`searches` is set, so params.{'/'.join(stale_fields)} "
+                f"{'is' if len(stale_fields) == 1 else 'are'} ignored, not applied as a "
+                "default — remove it from `params` (only io_workers/io_thread_count/"
+                "merge_batch_size/merge_prefetch still apply there) and set it on each "
+                "`searches[]` entry that needs it instead"
+            )
+        return self
+
+    def effective_specs(self) -> list["SearchSpec"]:
+        """The searches this run computes: `searches` if set, else a single
+        spec synthesized from the legacy flat params/filter fields (name=""),
+        so compute.py/merge.py never special-case the single-search path."""
+        if self.searches is not None:
+            return self.searches
+        return [SearchSpec(
+            name="",
+            k=self.params.k,
+            metric=self.params.metric,
+            vector_type=self.params.vector_type,
+            corpus_batch_size=self.params.corpus_batch_size,
+            filter=self.filter,
+        )]
 
 
 def load_config(path: str) -> BruteForceConfig:

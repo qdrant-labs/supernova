@@ -26,6 +26,16 @@ number, since both `make_point_id` and the `id_column` lookup are keyed on it.
 Mask evaluation is timed separately from the read (`filter_secs`, reported
 alongside `read_secs`/`io_wait`/`gpu_secs`) so a slow filter is distinguishable
 from slow IO in the end-of-run timing log.
+
+`run_compute` actually runs `cfg.effective_specs()` — one or more independent
+`SearchSpec`s (own vector_type/metric/k/filter), e.g. dense-unfiltered AND
+sparse-filtered against the same corpus in one invocation. Each corpus file is
+read and decoded ONCE per vector_type any spec needs, not once per spec; each
+spec's filter mask, GPU scoring, and top-K accumulation stay fully
+independent (this fans out the read/decode work, it does not fuse scores
+into a single hybrid ranking). A config with no `searches:` synthesizes a
+single spec from the legacy flat `params`/`filter` fields and behaves exactly
+as before, including output filenames.
 """
 
 from __future__ import annotations
@@ -324,6 +334,22 @@ def _scores(Q, C, metric: str):
     return -torch.cdist(Q, C)
 
 
+def _sparse_file_norms(row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Each row's true (untruncated) L2 norm, over the FULL row before any
+    query-vocab truncation or filtering — see `_sparse_batch_to_csr`. A row's
+    true value at a given token id is the SUM of every occurrence of that id
+    (a repeated raw index — e.g. a hash collision — isn't two separate
+    dimensions), so duplicates must be coalesced before squaring:
+    sum-of-squares-of-parts is not the same as square-of-the-summed-value
+    whenever a row repeats a token id. Only computed when some spec in the
+    run needs cosine similarity for sparse vectors."""
+    n_rows = len(row_offsets) - 1
+    row_ids = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(row_offsets))
+    m_rows, _, m_vals = _coalesce_by_row_col(row_ids, indices, values)  # indices already int64
+    sumsq = np.bincount(m_rows, weights=m_vals.astype(np.float64) ** 2, minlength=n_rows)
+    return np.sqrt(sumsq).astype(np.float32)
+
+
 def run_compute(
     cfg: BruteForceConfig,
     num_jobs: int | None = None,
@@ -331,49 +357,77 @@ def run_compute(
     io_workers: int | None = None,
     io_thread_count: int | None = None,
     max_files: int | None = None,
-) -> str:
+) -> dict[str, str]:
+    """Runs every search in `cfg.effective_specs()` — independent vector_type
+    /metric/k/filter combinations — against the corpus in ONE pass: each file
+    is read and decoded once per vector_type actually needed (not once per
+    spec), and each spec's own filter mask, GPU scoring, and top-K
+    accumulation stay fully independent. Returns `{spec.name: output_path}`;
+    the legacy single-search config (no `searches:`) returns `{"": path}`.
+    """
     try:
         import torch
     except ImportError:
         raise RuntimeError("torch is required for `compute`: install nova-bf[compute]")
 
     job_rank = _resolve_rank(num_jobs, job_rank)
-    k = cfg.params.k
-    metric = cfg.params.metric
-    vector_type = cfg.params.vector_type
-    # ParamsConfig rejects this combination at config-load time; re-checked
-    # here (not via `assert`, which `python -O` strips) since
-    # _sparse_batch_to_csr's cosine/dot dispatch is implicit (via whether
-    # `norms` is None) and would otherwise silently score as "dot" under an
-    # unsupported "euclidean" label instead of raising.
-    if vector_type == "sparse" and metric == "euclidean":
-        raise ValueError("sparse + euclidean should have been rejected by ParamsConfig")
+    specs = cfg.effective_specs()
+    vts_needed = sorted({s.vector_type for s in specs})  # ["dense"] / ["sparse"] / both
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         logger.warning("No GPU detected — brute force on CPU will be slow.")
 
-    # 1. queries
+    # 1. queries — loaded once per DISTINCT vector_type needed across all specs
+    #    (queries files are small, so no need to dedupe further than that).
+    qstore = Store(cfg.queries.path)
+    Q_np_by_vt: dict[str, np.ndarray] = {}
     query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
-    if vector_type == "sparse":
-        Q_np, query_vocab, query_ids, payload = load_queries_sparse(Store(cfg.queries.path), cfg.queries)
-        if len(query_vocab) == 0 and len(query_ids) > 0:
-            logger.warning(
-                "sparse query vocabulary is empty (every query has zero nonzero entries) — "
-                "every corpus row will score 0; check queries.sparse_column is correct."
+    query_ids: list[str] | None = None
+    payload: dict[str, list] | None = None
+    for vt in vts_needed:
+        if vt == "sparse":
+            Q_np, query_vocab, q_ids, q_payload = load_queries_sparse(qstore, cfg.queries)
+            if len(query_vocab) == 0 and len(q_ids) > 0:
+                logger.warning(
+                    "sparse query vocabulary is empty (every query has zero nonzero entries) — "
+                    "every corpus row will score 0; check queries.sparse_column is correct."
+                )
+        else:
+            Q_np, q_ids, q_payload = load_queries(qstore, cfg.queries)
+        Q_np_by_vt[vt] = Q_np
+        if query_ids is None:
+            query_ids, payload = q_ids, q_payload
+        elif q_ids != query_ids:
+            # Both loaders read the same query store via the same deterministic
+            # store.list_parquets() order, so q_ids should be IDENTICAL, not just
+            # equal length — checking exact identity (not just len()) catches a
+            # row-order mismatch too (e.g. a future loader change that filters or
+            # reorders rows differently per column), which a length-only check
+            # would silently let through and misattribute query N's dense vector
+            # to query M's sparse vector (or id/payload) in the output.
+            raise RuntimeError(
+                f"queries.{'sparse_column' if vt == 'sparse' else 'dense_column'} produced "
+                f"query ids that don't match a different vector_type's load for the same "
+                f"query set (first mismatch at row "
+                f"{next((i for i, (a, b) in enumerate(zip(q_ids, query_ids)) if a != b), min(len(q_ids), len(query_ids)))}"
+                f"; {len(q_ids)} vs {len(query_ids)} total rows) — the two columns must "
+                "agree on row count and order"
             )
-    else:
-        Q_np, query_ids, payload = load_queries(Store(cfg.queries.path), cfg.queries)
-    n_q, dim = Q_np.shape
-    logger.info(
-        "queries=%d %s=%d metric=%s k=%d device=%s%s",
-        n_q, "vocab" if vector_type == "sparse" else "dim", dim, metric, k, device,
-        f" rank={job_rank}/{num_jobs}" if num_jobs else "",
-    )
-    if cfg.filter is not None:
-        logger.info("filter: %s", cfg.filter.model_dump(exclude_defaults=True))
+    n_q = len(query_ids)
+    for s in specs:
+        dim = Q_np_by_vt[s.vector_type].shape[1]
+        logger.info(
+            "search=%r queries=%d %s=%d metric=%s k=%d device=%s%s",
+            s.name or "<default>", n_q, "vocab" if s.vector_type == "sparse" else "dim", dim,
+            s.metric, s.k, device,
+            f" rank={job_rank}/{num_jobs}" if num_jobs else "",
+        )
+        if s.filter is not None:
+            logger.info("search=%r filter: %s", s.name or "<default>", s.filter.model_dump(exclude_defaults=True))
 
     # 2. corpus files (global, deterministic order); this worker takes a stride
-    #    slice so its global indices stay stable for id decoding.
+    #    slice so its global indices stay stable for id decoding. Shared across
+    #    every spec — they must all see the identical file set/order/truncation.
     cstore = Store(cfg.corpus.path)
     all_files = cstore.list_parquets()
     # Restrict the recursive glob to the intended shards (see corpus.include/exclude).
@@ -393,34 +447,57 @@ def run_compute(
         )
         mine = mine[:max_files]
 
-    Q = torch.tensor(Q_np, dtype=torch.float32, device=device)
-    if metric == "cosine":
-        Q = torch.nn.functional.normalize(Q, dim=1)
-    top_scores = torch.full((n_q, k), float("-inf"), device=device)
-    top_enc = torch.zeros((n_q, k), dtype=torch.int64, device=device)
+    # 3. per-spec GPU state: each spec gets its own (possibly cosine-normalized)
+    #    query matrix and its own running (top_scores, top_enc) pair — these never
+    #    interact across specs, only the corpus read/decode below is shared.
+    Q_gpu_by_vt = {
+        vt: torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device) for vt in vts_needed
+    }
+    spec_Q, spec_top_scores, spec_top_enc, spec_batch = [], [], [], []
+    for s in specs:
+        Qv = Q_gpu_by_vt[s.vector_type]
+        if s.metric == "cosine":
+            Qv = torch.nn.functional.normalize(Qv, dim=1)
+        spec_Q.append(Qv)
+        spec_top_scores.append(torch.full((n_q, s.k), float("-inf"), device=device))
+        spec_top_enc.append(torch.zeros((n_q, s.k), dtype=torch.int64, device=device))
+        # Score each file in row-batches to bound the (n_q × rows) score matrix; None
+        # = whole file. Below k is pointless (a batch can't fill the top-K and isn't
+        # smaller than the resident n_q × k state), so raise it to k with a warning.
+        cb = s.corpus_batch_size
+        if cb is not None and cb < s.k:
+            logger.warning(
+                "search=%r corpus_batch_size=%d is below k=%d; raising to k (a smaller "
+                "batch can't fill the top-K and gives no memory benefit).",
+                s.name or "<default>", cb, s.k,
+            )
+            cb = s.k
+        spec_batch.append(cb)
 
-    # Prefetch corpus files (vector column only) with a POOL of reader threads so
-    # many S3 GETs are in flight at once — otherwise the GPU sits idle behind one
-    # file's latency at a time. Order doesn't matter (the top-K merge is
-    # commutative). pyarrow releases the GIL during IO, so threads parallelize.
-    vec_col = cfg.corpus.sparse_column if vector_type == "sparse" else cfg.corpus.dense_column
+    # Prefetch corpus files with a POOL of reader threads so many S3 GETs are in
+    # flight at once — otherwise the GPU sits idle behind one file's latency at a
+    # time. Order doesn't matter (the top-K merge is commutative). pyarrow releases
+    # the GIL during IO, so threads parallelize.
+    dense_col, sparse_col = cfg.corpus.dense_column, cfg.corpus.sparse_column
     id_col = cfg.corpus.id_column  # None → derive make_point_id(file_key, row) at decode
-    filt = cfg.filter  # None → no filtering; else a corpus-side payload predicate
-    filter_cols = sorted(filt.fields()) if filt else []
-    read_cols = list(dict.fromkeys([vec_col] + ([id_col] if id_col else []) + filter_cols))
+    # Union of every spec's filter fields — read_cols below stays exactly (and only)
+    # the columns some spec actually references, same guarantee the single-search
+    # path always made.
+    filter_cols = sorted({c for s in specs if s.filter for c in s.filter.fields()})
+    read_cols = list(dict.fromkeys(
+        ([dense_col] if "dense" in vts_needed else [])
+        + ([sparse_col] if "sparse" in vts_needed else [])
+        + ([id_col] if id_col else [])
+        + filter_cols
+    ))
+    need_sparse_norms = any(s.vector_type == "sparse" and s.metric == "cosine" for s in specs)
     # Corpus id strings carried through to decode, kept in RAM per file (only when
     # id_column is set). gidx → pyarrow string array aligned with that file's rows.
+    # Shared by every spec; set below whenever ANY spec could still resolve a hit
+    # from this file (unfiltered, or a filter keeping ≥1 row) — never gated on the
+    # CURRENT spec alone, since a restrictive spec's filter dropping a whole file
+    # must not block a DIFFERENT spec's id resolution for that same file.
     corpus_ids: dict[int, object] = {}
-    # Score each file in row-batches to bound the (n_q × rows) score matrix; None =
-    # whole file. Below k is pointless (a batch can't fill the top-K and isn't
-    # smaller than the resident n_q × k state), so raise it to k with a warning.
-    corpus_batch = cfg.params.corpus_batch_size
-    if corpus_batch is not None and corpus_batch < k:
-        logger.warning(
-            "corpus_batch_size=%d is below k=%d; raising to k (a smaller batch can't "
-            "fill the top-K and gives no memory benefit).", corpus_batch, k,
-        )
-        corpus_batch = k
     io_workers = max(1, io_workers if io_workers is not None else cfg.params.io_workers)
     itc = io_thread_count if io_thread_count is not None else cfg.params.io_thread_count
     if itc and itc > 0:
@@ -440,39 +517,27 @@ def run_compute(
                 return
             t0 = time.perf_counter()
             table = cstore.read_columns(f.read_path, read_cols)
-            if vector_type == "sparse":
-                sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[vec_col])
-                if metric == "cosine":
-                    # per-row L2 norm over the FULL (untruncated) row, before any
-                    # query-vocab truncation or filtering — see _sparse_batch_to_csr.
-                    # A row's true value at a given token id is the SUM of every
-                    # occurrence of that id (a repeated raw index — e.g. a hash
-                    # collision — isn't two separate dimensions), so duplicates
-                    # must be coalesced before squaring: sum-of-squares-of-parts
-                    # is not the same as square-of-the-summed-value whenever a
-                    # row repeats a token id.
-                    n_file_rows = len(sp_offsets) - 1
-                    row_ids = np.repeat(np.arange(n_file_rows, dtype=np.int64), np.diff(sp_offsets))
-                    m_rows, _, m_vals = _coalesce_by_row_col(row_ids, sp_idx, sp_val)  # sp_idx already int64
-                    sumsq = np.bincount(m_rows, weights=m_vals.astype(np.float64) ** 2, minlength=n_file_rows)
-                    sp_norms = np.sqrt(sumsq).astype(np.float32)
-                else:
-                    sp_norms = None
-                arr = (sp_offsets, sp_idx, sp_val, sp_norms)
-            else:
-                arr = dense_to_2d(table[vec_col])
+            # Decode each vector_type at most ONCE per file, regardless of how many
+            # specs need it — every spec sharing that vector_type slices/compacts
+            # this same decoded array independently in the consumer loop below.
+            arrs: dict[str, object] = {}
+            if "dense" in vts_needed:
+                arrs["dense"] = dense_to_2d(table[dense_col])
+            if "sparse" in vts_needed:
+                sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[sparse_col])
+                sp_norms = _sparse_file_norms(sp_offsets, sp_idx, sp_val) if need_sparse_norms else None
+                arrs["sparse"] = (sp_offsets, sp_idx, sp_val, sp_norms)
             # carry the id column (combined to one contiguous array) to decode;
-            # None when id_column isn't configured. Same row order as `arr`.
+            # None when id_column isn't configured. Same row order as `arrs`.
             ids = table[id_col].combine_chunks() if id_col else None
             t1 = time.perf_counter()
-            # None when unfiltered; else a boolean mask over this file's rows,
-            # ORIGINAL row order preserved (no compaction here — see consumer).
-            # Timed separately from the read above: it's CPU-vectorized work over
-            # the whole file, not IO wait, and lumping it into `read_secs` would
-            # make an expensive filter look like slow S3, not slow filtering.
-            keep = evaluate(filt, table) if filt else None
+            # One mask per spec (None where that spec has no filter), evaluated
+            # against the same table — timed separately from the read above (CPU-
+            # vectorized work, not IO wait). Cheap enough that identical filters
+            # across specs aren't worth deduping.
+            keeps = [evaluate(s.filter, table) if s.filter else None for s in specs]
             t2 = time.perf_counter()
-            fq.put((gidx, arr, ids, keep, t1 - t0, t2 - t1))
+            fq.put((gidx, arrs, ids, keeps, t1 - t0, t2 - t1))
 
     for _ in range(io_workers):
         Thread(target=reader, daemon=True).start()
@@ -484,7 +549,9 @@ def run_compute(
     # `read_secs` is summed per-file read latency across the reader threads.
     # `filter_secs` is summed per-file mask-evaluation time (0 when unfiltered),
     # also across the reader threads — kept apart from `read_secs` so a slow
-    # filter doesn't masquerade as slow IO.
+    # filter doesn't masquerade as slow IO. All four are run-wide (summed across
+    # every spec's filter/scoring work on a file), not per spec.
+    any_filter = any(s.filter is not None for s in specs)
     io_wait = gpu_secs = read_secs = filter_secs = 0.0
     rows_seen = 0
     bytes_seen = 0  # decoded float32 bytes consumed (~= wire bytes for snappy-float32)
@@ -493,86 +560,121 @@ def run_compute(
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for _ in range(len(mine)):
             w0 = time.perf_counter()
-            gidx, arr, ids, keep, rsec, fsec = fq.get()
+            gidx, arrs, ids, keeps, rsec, fsec = fq.get()
             io_wait += time.perf_counter() - w0
             read_secs += rsec
             filter_secs += fsec
             bar.update(1)
-            # `orig_rows[i]` is the TRUE file row that arr[i] came from — identity
-            # when unfiltered, else the surviving indices of `keep`. Filtering
-            # compacts `arr` (fewer/smaller matmuls) but must never renumber rows:
-            # both make_point_id(file, row) and corpus_ids[gidx][row] need the row
-            # the vector actually occupies in the parquet file, not its position
-            # in the filtered-down array.
-            if vector_type == "sparse":
-                sp_offsets, sp_idx, sp_val, sp_norms = arr
-                if keep is not None:
-                    sp_offsets, sp_idx, sp_val, sp_norms, orig_rows = _compact_sparse_rows(
-                        sp_offsets, sp_idx, sp_val, sp_norms, keep
-                    )
-                else:
-                    orig_rows = None
-                n_rows = len(sp_offsets) - 1
-                if n_rows == 0:
-                    continue
-                rows_seen += n_rows
-                # on-disk width (uint32 index + float32 value per nnz), not
-                # sp_idx's in-memory int64 (torch requires int64 indices) —
-                # keeps this comparable to the dense path's wire-byte estimate.
-                bytes_seen += len(sp_idx) * 8
-            else:
-                if keep is not None:
-                    orig_rows = np.nonzero(keep)[0]
-                    arr = arr[orig_rows]
-                else:
-                    orig_rows = None
-                if len(arr) == 0:
-                    continue
-                rows_seen += len(arr)
-                bytes_seen += int(arr.nbytes)
-                n_rows = arr.shape[0]
-            if id_col:
-                corpus_ids[gidx] = ids  # kept in RAM; indexed by row at decode
-                # unfiltered — always the full per-file array, so `corpus_ids[gidx][row]`
-                # resolves correctly regardless of `keep`.
 
-            g0 = time.perf_counter()
-            step = corpus_batch or n_rows  # None → whole file in one matmul
-            for r0 in range(0, n_rows, step):
-                r1 = min(r0 + step, n_rows)
-                # Copy only this batch to the GPU, not the whole file. A big corpus
-                # parquet (~1M rows ≈ 3 GB at 768-dim f32) would otherwise sit
-                # resident on the GPU for the whole file even though scoring is
-                # batched — the real driver of the OOM on large parquets. Per-batch
-                # H2D moves the same total bytes but caps corpus residency at `step`
-                # rows (so GPU memory is bounded by corpus_batch_size, as intended).
-                if vector_type == "sparse":
-                    Cb = _sparse_batch_to_csr(
-                        sp_offsets, sp_idx, sp_val, sp_norms, r0, r1, query_vocab, device,
-                    )
-                    scores = _sparse_scores(Q, Cb)  # (n_q, ≤step)
+            # Whole-file bookkeeping, computed BEFORE any spec's per-vector-type
+            # compaction below. rows_seen/bytes_seen are counted once per file per
+            # distinct vector_type present (pre-filter), not per spec — with
+            # multiple specs there's no longer a single "the" filtered row count
+            # to report.
+            #
+            # corpus_ids is kept only for files where SOME spec could still
+            # resolve a hit — i.e. any spec is unfiltered, or has a filter with at
+            # least one surviving row in this file. `keeps[i]` is a mask over this
+            # file's rows independent of vector_type (filters read payload
+            # columns, not the vector columns), so checking it here — before the
+            # per-spec loop's own vector-type-specific compaction — is exact, not
+            # an approximation: a restrictive spec's filter dropping the whole
+            # file must never block a DIFFERENT spec's id resolution for that
+            # same file, but a file every spec's filter drops needs no ids kept
+            # at all (restores the pre-multi-spec memory behavior for that case).
+            if id_col and any(k is None or k.any() for k in keeps):
+                corpus_ids[gidx] = ids
+            for vt in vts_needed:
+                if vt == "dense":
+                    rows_seen += len(arrs["dense"])
+                    bytes_seen += int(arrs["dense"].nbytes)
                 else:
-                    Cb = torch.from_numpy(arr[r0:r1]).to(device, non_blocking=True)
-                    scores = _scores(Q, Cb, metric)  # (n_q, ≤step)
-                bk = min(k, Cb.shape[0])
-                f_scores, f_local = torch.topk(scores, k=bk, dim=1)
-                # rows are the TRUE file row for each entry of Cb (see orig_rows
-                # above), so the encoding stays global_file_idx * MAX_ROWS_PER_FILE
-                # + row regardless of batching or filtering.
-                if orig_rows is not None:
-                    rows = torch.from_numpy(orig_rows[r0 : r0 + Cb.shape[0]]).to(device)
+                    sp_offsets, sp_idx, _, _ = arrs["sparse"]
+                    rows_seen += len(sp_offsets) - 1
+                    # on-disk width (uint32 index + float32 value per nnz), not
+                    # sp_idx's in-memory int64 (torch requires int64 indices) —
+                    # keeps this comparable to the dense path's wire-byte estimate.
+                    bytes_seen += len(sp_idx) * 8
+
+            for i, s in enumerate(specs):
+                keep = keeps[i]
+                # `orig_rows[i]` is the TRUE file row a compacted row came from —
+                # identity when unfiltered, else the surviving indices of `keep`.
+                # Filtering compacts the array (fewer/smaller matmuls) but must
+                # never renumber rows: both make_point_id(file, row) and
+                # corpus_ids[gidx][row] need the row the vector actually occupies
+                # in the parquet file, not its position in the filtered-down array.
+                # `arr[orig_rows]`/`_compact_sparse_rows` both copy, so this never
+                # mutates the shared `arrs[vt]` other specs still need.
+                if s.vector_type == "sparse":
+                    sp_offsets, sp_idx, sp_val, sp_norms = arrs["sparse"]
+                    # `sp_norms` is computed per FILE, gated on whether ANY spec in
+                    # the run needs cosine (`need_sparse_norms`) — not per spec. A
+                    # spec whose own metric is "dot" must never receive it (that
+                    # would silently divide its corpus rows by their norm, i.e.
+                    # score query·(corpus/‖corpus‖) instead of query·corpus — wrong,
+                    # and it collapses same-direction rows of different magnitude to
+                    # the same score), even when a co-scheduled cosine spec forced
+                    # `sp_norms` to be computed for this file.
+                    if s.metric != "cosine":
+                        sp_norms = None
+                    if keep is not None:
+                        sp_offsets, sp_idx, sp_val, sp_norms, orig_rows = _compact_sparse_rows(
+                            sp_offsets, sp_idx, sp_val, sp_norms, keep
+                        )
+                    else:
+                        orig_rows = None
+                    n_rows = len(sp_offsets) - 1
+                    if n_rows == 0:
+                        continue
                 else:
-                    rows = torch.arange(r0, r0 + Cb.shape[0], dtype=torch.int64, device=device)
-                f_enc = (gidx * MAX_ROWS_PER_FILE + rows)[f_local]
-                merged_s = torch.cat([top_scores, f_scores], dim=1)
-                merged_e = torch.cat([top_enc, f_enc], dim=1)
-                top_scores, idx = torch.topk(merged_s, k=k, dim=1)
-                top_enc = merged_e.gather(1, idx)
-            gpu_secs += time.perf_counter() - g0
+                    arr = arrs["dense"]
+                    if keep is not None:
+                        orig_rows = np.nonzero(keep)[0]
+                        arr = arr[orig_rows]
+                    else:
+                        orig_rows = None
+                    if len(arr) == 0:
+                        continue
+                    n_rows = arr.shape[0]
+
+                g0 = time.perf_counter()
+                step = spec_batch[i] or n_rows  # None → whole file in one matmul
+                for r0 in range(0, n_rows, step):
+                    r1 = min(r0 + step, n_rows)
+                    # Copy only this batch to the GPU, not the whole file. A big corpus
+                    # parquet (~1M rows ≈ 3 GB at 768-dim f32) would otherwise sit
+                    # resident on the GPU for the whole file even though scoring is
+                    # batched — the real driver of the OOM on large parquets. Per-batch
+                    # H2D moves the same total bytes but caps corpus residency at `step`
+                    # rows (so GPU memory is bounded by corpus_batch_size, as intended).
+                    if s.vector_type == "sparse":
+                        Cb = _sparse_batch_to_csr(
+                            sp_offsets, sp_idx, sp_val, sp_norms, r0, r1, query_vocab, device,
+                        )
+                        scores = _sparse_scores(spec_Q[i], Cb)  # (n_q, ≤step)
+                    else:
+                        Cb = torch.from_numpy(arr[r0:r1]).to(device, non_blocking=True)
+                        scores = _scores(spec_Q[i], Cb, s.metric)  # (n_q, ≤step)
+                    bk = min(s.k, Cb.shape[0])
+                    f_scores, f_local = torch.topk(scores, k=bk, dim=1)
+                    # rows are the TRUE file row for each entry of Cb (see orig_rows
+                    # above), so the encoding stays global_file_idx * MAX_ROWS_PER_FILE
+                    # + row regardless of batching or filtering.
+                    if orig_rows is not None:
+                        rows = torch.from_numpy(orig_rows[r0 : r0 + Cb.shape[0]]).to(device)
+                    else:
+                        rows = torch.arange(r0, r0 + Cb.shape[0], dtype=torch.int64, device=device)
+                    f_enc = (gidx * MAX_ROWS_PER_FILE + rows)[f_local]
+                    merged_s = torch.cat([spec_top_scores[i], f_scores], dim=1)
+                    merged_e = torch.cat([spec_top_enc[i], f_enc], dim=1)
+                    spec_top_scores[i], idx = torch.topk(merged_s, k=s.k, dim=1)
+                    spec_top_enc[i] = merged_e.gather(1, idx)
+                gpu_secs += time.perf_counter() - g0
 
             if bar.n % 200 == 0:
                 postfix = f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s"
-                if filt:
+                if any_filter:
                     postfix += f" filter={filter_secs:.0f}s"
                 bar.set_postfix_str(postfix, refresh=False)
 
@@ -586,7 +688,7 @@ def run_compute(
         len(mine), rows_seen, gb, wall, io_wait, gpu_secs,
         read_secs / max(1, len(mine)), read_secs, io_workers,
         f" | filter eval avg={filter_secs / max(1, len(mine)):.3f}s/file "
-        f"(summed {filter_secs:.0f}s over {io_workers} threads)" if filt else "",
+        f"(summed {filter_secs:.0f}s over {io_workers} threads)" if any_filter else "",
     )
     # One machine-parseable line per run — for sweeping io_workers and plotting.
     # `wall_mbps` is the effective aggregate download rate; compare it to the
@@ -607,9 +709,11 @@ def run_compute(
             100 * io_wait / max(io_wait + gpu_secs, 1e-9), io_workers,
         )
 
-    # 3. decode the final top-K into hit ids. Either recompute make_point_id from
-    #    (file_key, row) — only K*n_q ids, nothing corpus-wide — or, when an id
-    #    column is configured, read it back from the in-RAM per-file arrays.
+    # 4. decode each spec's final top-K into hit ids and write its own output.
+    #    Either recompute make_point_id from (file_key, row) — only K*n_q ids,
+    #    nothing corpus-wide — or, when an id column is configured, read it back
+    #    from the in-RAM per-file arrays. Shared by every spec: depends only on
+    #    id_col/corpus_ids/all_files, none of which is per-spec.
     if id_col is not None:
         def resolve_id(e: int) -> str:
             gidx = e // MAX_ROWS_PER_FILE
@@ -621,28 +725,31 @@ def run_compute(
                 all_files[e // MAX_ROWS_PER_FILE].key, e % MAX_ROWS_PER_FILE
             )
 
-    enc = top_enc.cpu().numpy()
-    sc = top_scores.cpu().numpy()
-    valid = sc > float("-inf")
-    hit_ids, hit_scores = [], []
-    for q in range(n_q):
-        qe, qs = enc[q][valid[q]], sc[q][valid[q]]
-        hit_ids.append([resolve_id(int(e)) for e in qe])
-        hit_scores.append(qs.tolist())
-
-    table = build_result_table(query_ids, payload, hit_ids, hit_scores)
     out = Store(cfg.output.path)
-    if num_jobs is not None:
-        width = max(3, len(str(num_jobs - 1)))
-        name = f"{partial_dir(cfg)}/rank{job_rank:0{width}d}.parquet"
-        # This worker's slice of the corpus naturally has fewer than k
-        # candidates per query most of the time (stride partitioning spreads
-        # the corpus thin) -- that's expected here, not a signal of anything.
-        # Only `merge` (or this function's own single-node path below) sees
-        # the true final count, so that's the only place worth warning.
-    else:
-        name = result_name(cfg)
-        warn_if_short(sum(1 for h in hit_ids if len(h) < k), len(hit_ids), k, logger)
-    path = out.write(name, table)
-    logger.info("wrote %s (%d queries)", path, n_q)
-    return path
+    results: dict[str, str] = {}
+    for i, s in enumerate(specs):
+        enc = spec_top_enc[i].cpu().numpy()
+        sc = spec_top_scores[i].cpu().numpy()
+        valid = sc > float("-inf")
+        hit_ids, hit_scores = [], []
+        for q in range(n_q):
+            qe, qs = enc[q][valid[q]], sc[q][valid[q]]
+            hit_ids.append([resolve_id(int(e)) for e in qe])
+            hit_scores.append(qs.tolist())
+
+        table = build_result_table(query_ids, payload, hit_ids, hit_scores)
+        if num_jobs is not None:
+            width = max(3, len(str(num_jobs - 1)))
+            name = f"{partial_dir(cfg, s)}/rank{job_rank:0{width}d}.parquet"
+            # This worker's slice of the corpus naturally has fewer than k
+            # candidates per query most of the time (stride partitioning spreads
+            # the corpus thin) -- that's expected here, not a signal of anything.
+            # Only `merge` (or this function's own single-node path below) sees
+            # the true final count, so that's the only place worth warning.
+        else:
+            name = result_name(cfg, s)
+            warn_if_short(sum(1 for h in hit_ids if len(h) < s.k), len(hit_ids), s.k, logger)
+        path = out.write(name, table)
+        logger.info("search=%r wrote %s (%d queries)", s.name or "<default>", path, n_q)
+        results[s.name] = path
+    return results
