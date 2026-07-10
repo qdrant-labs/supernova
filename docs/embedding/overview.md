@@ -65,6 +65,20 @@ Column names must be unique and must not collide with source columns.
 
 `pipeline.on_empty_input` controls what happens when a row's input column is empty (`skip` drops the row, `null` writes a null embedding, `error` aborts). Default is `skip`; skipped rows are counted in the manifest (`rows_skipped_empty_input`) and a skip rate above 1% logs a warning — a high rate usually means a wrong `input_column`.
 
+### Dropping columns from the output
+
+Two knobs, distinguished by *when* they drop:
+
+- **`source.exclude_columns`** — drops columns **before** embedding (they're never even read from the source parquet). Can't be used on an `input_column`.
+- **`pipeline.drop_columns`** — drops columns **after** embedding, before they reach the flush buffer or the output parquet. This is how you embed a column without carrying it through — e.g. a raw-bytes image column that would bloat the output:
+
+```yaml
+pipeline:
+  drop_columns: [image]   # embed it, don't store it
+```
+
+A `drop_columns` name that matches nothing in the rows fails on the first chunk (it's almost certainly a typo); naming an embedding output column fails at config time.
+
 ## Sources
 
 ### HuggingFace

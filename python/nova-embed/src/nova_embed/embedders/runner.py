@@ -36,6 +36,7 @@ async def run_embedder(
     flush_threshold: int = 100_000,
     output_dir: str = "/tmp/nova_embed",
     on_empty_input: str = "skip",
+    drop_columns: list[str] | None = None,
     filename_prefix: str = "",
     expected_total_rows: int | None = None,
     row_group_size: int | None = None,
@@ -129,7 +130,15 @@ async def run_embedder(
         progress.close()
 
     worker_tasks = [
-        asyncio.create_task(worker(i, work_queue, result_queue, engine))
+        asyncio.create_task(
+            worker(
+                i,
+                work_queue,
+                result_queue,
+                engine,
+                drop_columns=frozenset(drop_columns or ()),
+            )
+        )
         for i in range(num_workers)
     ]
 
@@ -173,6 +182,7 @@ async def run_embedder(
         "num_workers": num_workers,
         "flush_threshold": flush_threshold,
         "on_empty_input": on_empty_input,
+        "drop_columns": sorted(drop_columns or []),
         "total_records": total_records,
         "rows_skipped_empty_input": empty_stats.rows_skipped,
         "total_batches": batch_counter,

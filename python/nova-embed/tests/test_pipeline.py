@@ -264,3 +264,52 @@ def test_run_embedder_end_to_end(tmp_path):
     assert names["dense_a"]["kind"] == "dense"
     assert names["dense_a"]["column"] == "dense_a_embedding"
     assert names["sparse_a"]["modality"] == "text"
+
+
+def dense_entry(**overrides):
+    data = {
+        "name": "dense_a",
+        "kind": "dense",
+        "type": "fake",
+        "input_column": "text",
+        "modality": "text",
+    }
+    data.update(overrides)
+    return EmbedderEntry.model_validate(data)
+
+
+def run(tmp_path, rows, entries, **kwargs):
+    engine = build_engine(entries)
+    storage = STORAGE.build({"type": "local", "output_dir": str(tmp_path)})
+    asyncio.run(
+        run_embedder(
+            source=ListSource(rows),
+            engine=engine,
+            storage=storage,
+            chunk_size=2,
+            num_workers=1,
+            flush_threshold=100,
+            output_dir=str(tmp_path),
+            **kwargs,
+        )
+    )
+    return pq.read_table(sorted(tmp_path.glob("batch_*.parquet"))[0])
+
+
+def test_drop_columns_removes_input_column_from_output(tmp_path):
+    table = run(
+        tmp_path,
+        [{"text": "hello", "id": 0}],
+        [dense_entry()],
+        drop_columns=["text"],  # embed it, don't carry it
+    )
+    assert table.column_names == ["id", "dense_a_embedding"]
+    assert table.column("dense_a_embedding").to_pylist() == [[5.0, 5.0]]
+
+    manifest = json.loads((tmp_path / "_manifest.json").read_text())
+    assert manifest["drop_columns"] == ["text"]
+
+
+def test_drop_columns_typo_dies_on_first_chunk(tmp_path):
+    with pytest.raises(ValueError, match="drop_columns \\['imge'\\] not found"):
+        run(tmp_path, [{"text": "hello"}], [dense_entry()], drop_columns=["imge"])

@@ -213,6 +213,7 @@ def embed(config, num_jobs, job_rank, dry_run):
             row_group_size=pipeline.row_group_size,
             output_dir=storage_dict.get("output_dir", "/tmp/nova_embed"),
             on_empty_input=pipeline.on_empty_input,
+            drop_columns=pipeline.drop_columns,
             filename_prefix=filename_prefix,
             expected_total_rows=expected_total_rows,
             chunking_strategy=chunking.strategy,

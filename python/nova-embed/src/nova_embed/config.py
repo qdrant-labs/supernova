@@ -171,6 +171,12 @@ class PipelineConfig(BaseModel):
     # A row where EVERY input is empty has nothing to embed: skipped under both
     # `skip` and `null`, and aborts under `error` like any other empty input.
     on_empty_input: Literal["skip", "null", "error"] = "skip"
+    # Columns to drop from the OUTPUT after embedding (they never reach the
+    # parquet, or the flush buffer's memory). This is how you embed a column
+    # without carrying it through — e.g. a raw-bytes image column that would
+    # bloat the output. Distinct from source.exclude_columns, which drops
+    # columns BEFORE embedding and therefore can't touch an input_column.
+    drop_columns: list[str] = Field(default_factory=list)
     # shard_by_rank=true  -> "rank00/batch_*.parquet" (subdir per rank)
     # shard_by_rank=false -> "rank00_batch_*.parquet" (flat)
     shard_by_rank: bool = False
@@ -231,6 +237,16 @@ class EmbedConfig(BaseModel):
         if conflicts:
             raise ValueError(
                 f"conflicting modalities for the same input column: {conflicts}"
+            )
+
+        # drop_columns operates on SOURCE columns; naming an embedding output
+        # here is a config mistake (you'd configure the entry away instead)
+        dropped_outputs = sorted(set(self.pipeline.drop_columns) & set(columns))
+        if dropped_outputs:
+            raise ValueError(
+                f"pipeline.drop_columns lists embedding output column(s) "
+                f"{dropped_outputs}. Remove the embedder entry (or its pooling) "
+                f"instead of dropping its output."
             )
 
         chunking = self.chunking or ChunkingConfig()

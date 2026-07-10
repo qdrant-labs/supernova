@@ -141,3 +141,21 @@ def test_max_length_only_for_text():
 def test_unknown_pipeline_key_rejected():
     with pytest.raises(ValidationError):
         config(entry(), pipeline={"max_text_length": 100})  # removed knob
+
+
+def test_drop_columns_accepts_source_columns():
+    cfg = config(entry(), pipeline={"drop_columns": ["image", "text"]})
+    assert cfg.pipeline.drop_columns == ["image", "text"]
+
+
+def test_drop_columns_rejects_embedding_outputs():
+    with pytest.raises(ValidationError, match="drop_columns lists embedding output"):
+        config(entry(), pipeline={"drop_columns": ["minilm_embedding"]})
+
+
+def test_drop_columns_rejects_pooled_outputs():
+    with pytest.raises(ValidationError, match="drop_columns lists embedding output"):
+        config(
+            entry(name="mv", kind="multivector", type="bge_m3", pooling={"type": "mean"}),
+            pipeline={"drop_columns": ["mv_pooled"]},
+        )
