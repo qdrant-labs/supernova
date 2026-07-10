@@ -18,10 +18,20 @@ source:
 #   output_column — parquet column for the result (default: "{name}_embedding")
 # Unknown keys (batch_size, dtype, device, …) pass through to the backend.
 embedders:
-  - name: minilm
+  - name: minilm_l6
     kind: dense
     type: sentence_transformer
     model: sentence-transformers/all-MiniLM-L6-v2
+    input_column: text
+    modality: text
+    batch_size: 128
+    dtype: bfloat16
+    # max_length: 8192          # truncate input to N chars before embedding
+  
+  - name: minilm_l12
+    kind: dense
+    type: sentence_transformer
+    model: sentence-transformers/all-MiniLM-L12-v2
     input_column: text
     modality: text
     batch_size: 128
@@ -83,7 +93,6 @@ storage:
   output_dir: /tmp/mteb_tweets_all-MiniLM-L6-v2
 
 pipeline:
-  chunk_size: 1000
   flush_threshold: 10000
   # What to do when a row's input column is empty:
   #   skip (default) — drop the row; counted in the manifest, warned if >1%
