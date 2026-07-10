@@ -42,6 +42,27 @@ params:
 
 `${VAR}` / `${VAR:-default}` references are expanded from the environment, same as every other tool.
 
+### Sparse vectors
+
+Set `params.vector_type: sparse` to search a `struct<indices: list<uint32>, values: list<float32>>` column instead — the same schema `nova embed`'s sparse embedders write and `nova load` reads (default column name `sparse_embedding`, override via `corpus.sparse_column` / `queries.sparse_column`). Only `metric: dot` and `metric: cosine` are supported (`euclidean` has no real use case for sparse retrieval and is rejected at config load).
+
+```yaml
+corpus:
+  path: s3://my-bucket/dataset/model
+  sparse_column: sparse_embedding
+
+queries:
+  path: s3://my-bucket/dataset/model/queries.parquet
+  sparse_column: sparse_embedding
+
+params:
+  k: 1000
+  metric: dot
+  vector_type: sparse
+```
+
+Scoring densifies the query set once over its own token vocabulary (a corpus-only token id can never match any query, so dropping it is exact, not approximate) and keeps each corpus batch genuinely sparse (`torch.sparse_csr_tensor`) on the GPU, scored via `sparse @ dense` matmul — `corpus_batch_size` bounds GPU residency the same way it does for dense.
+
 ### Filtering the corpus
 
 To evaluate recall for a *filtered* search, restrict which corpus rows are eligible neighbors with a top-level `filter`, shaped like a Qdrant filter:
