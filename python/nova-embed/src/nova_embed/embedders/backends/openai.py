@@ -1,14 +1,16 @@
 import asyncio
 import logging
 
-from nova_embed.embedders.dense.base import DenseEmbedder
-from nova_embed.registry import DENSE_EMBEDDERS
+from nova_embed.embedders.base import Embedder, OutputKind
+from nova_embed.registry import EMBEDDERS
 
 logger = logging.getLogger(__name__)
 
 
-@DENSE_EMBEDDERS.register("openai")
-class OpenAIEmbedder(DenseEmbedder):
+@EMBEDDERS.register("openai")
+class OpenAIEmbedder(Embedder):
+    output_kind = OutputKind.DENSE
+
     def __init__(
         self,
         model: str = "text-embedding-3-small",

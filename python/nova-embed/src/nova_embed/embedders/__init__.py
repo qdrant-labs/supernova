@@ -1,34 +1,16 @@
-# Import every embedder subpackage so the @*_EMBEDDERS.register decorators run
-# (importing `nova_embed.embedders` populates all three embedder registries).
-from nova_embed.embedders.dense import (
-    DenseEmbedder,
-    OpenAIEmbedder,
-    SentenceTransformerDenseEmbedder,
-)
-from nova_embed.embedders.sparse import (
-    FastEmbedSparseEmbedder,
-    SparseEmbedder,
-    SentenceTransformerSparseEmbedder,
-)
-from nova_embed.embedders.multivector import (
-    BGEM3MultiVectorEmbedder,
-    MultiVectorEmbedder,
-)
-from nova_embed.embedders.engine import EmbeddingEngine, EmbedResult
-from nova_embed.embedders.hybrid import SentenceTransformerHybridEmbedder
+# Import the backends package for its registration side-effects: importing
+# `nova_embed.embedders` populates the EMBEDDERS registry with every backend
+# whose dependencies are installed. Concrete classes are importable from their
+# backend modules (nova_embed.embedders.backends.*) directly.
+import nova_embed.embedders.backends  # noqa: F401
+from nova_embed.embedders.base import Embedder, OutputKind
+from nova_embed.embedders.engine import EmbeddingEngine, build_engine
 from nova_embed.embedders.runner import run_embedder
 
 __all__ = [
-    "DenseEmbedder",
-    "OpenAIEmbedder",
-    "SentenceTransformerDenseEmbedder",
-    "SparseEmbedder",
-    "FastEmbedSparseEmbedder",
-    "SentenceTransformerSparseEmbedder",
-    "MultiVectorEmbedder",
-    "BGEM3MultiVectorEmbedder",
-    "SentenceTransformerHybridEmbedder",
+    "Embedder",
+    "OutputKind",
     "EmbeddingEngine",
-    "EmbedResult",
+    "build_engine",
     "run_embedder",
 ]

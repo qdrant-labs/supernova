@@ -1,0 +1,95 @@
+"""Deterministic in-process embedder backends for tests (no ML deps).
+
+Registered under type "fake" for all three kinds — exercising exactly the
+property that made the registry key on (kind, type).
+"""
+
+from __future__ import annotations
+
+from nova_embed.embedders.base import Embedder
+from nova_embed.media import Modality
+from nova_embed.models import MultiVectorEmbedding, OutputKind, SparseEmbedding
+from nova_embed.registry import EMBEDDERS
+
+# Every FakeDense instantiation lands here so tests can assert instance sharing.
+DENSE_INSTANTIATIONS: list["FakeDenseEmbedder"] = []
+
+
+@EMBEDDERS.register("fake")
+class FakeDenseEmbedder(Embedder):
+    output_kind = OutputKind.DENSE
+
+    def __init__(self, model: str = "fake-dense", dim: int = 2, **_ignored):
+        self._model = model
+        self._dim = dim
+        DENSE_INSTANTIATIONS.append(self)
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @property
+    def dimensions(self) -> int:
+        return self._dim
+
+    @property
+    def max_tokens(self) -> int:
+        return 512
+
+    async def embed(self, batch):
+        # encodes input length -> tests can assert truncation etc.
+        return [[float(len(item))] * self._dim for item in batch]
+
+
+@EMBEDDERS.register("fake")
+class FakeSparseEmbedder(Embedder):
+    output_kind = OutputKind.SPARSE
+
+    def __init__(self, model: str = "fake-sparse", **_ignored):
+        self._model = model
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    async def embed(self, batch):
+        return [
+            SparseEmbedding(indices=[len(item)], values=[1.0]) for item in batch
+        ]
+
+
+@EMBEDDERS.register("fake")
+class FakeMultiVectorEmbedder(Embedder):
+    output_kind = OutputKind.MULTIVECTOR
+
+    def __init__(self, model: str = "fake-mv", **_ignored):
+        self._model = model
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @property
+    def dimensions(self) -> int:
+        return 2
+
+    async def embed(self, batch):
+        return [
+            MultiVectorEmbedding(vectors=[[3.0, 0.0], [0.0, 4.0]]) for _ in batch
+        ]
+
+
+@EMBEDDERS.register("fake_image")
+class FakeImageEmbedder(Embedder):
+    output_kind = OutputKind.DENSE
+    supported_modalities = frozenset({Modality.TEXT, Modality.IMAGE})
+
+    def __init__(self, model: str = "fake-image", **_ignored):
+        self._model = model
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    async def embed(self, batch):
+        return [[1.0, 2.0] for _ in batch]

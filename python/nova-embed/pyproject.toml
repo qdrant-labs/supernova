@@ -37,6 +37,8 @@ embed = [
     "einops>=0.8.2",
     "fastembed",
     "hf_transfer",
+    # Image-modality decoding (nova_embed.media.image → PIL canonical form).
+    "pillow",
 ]
 
 # Exposes `nova-embed` on PATH, so `nova embed ...` dispatches here just like a

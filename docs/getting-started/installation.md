@@ -17,7 +17,7 @@ git clone <repo-url> supernova && cd supernova
 make all
 ```
 
-`make all` installs the `nova` dispatcher plus all three sub-tools. Then put the
+`make all` installs the `nova` dispatcher plus all sub-tools. Then put the
 install dirs on your `PATH` so `nova` can find the sub-tools:
 
 ```bash
@@ -33,8 +33,7 @@ nova --help        # lists every nova-* tool found on PATH
 
 ## Installing piece by piece
 
-Each `make` target maps to one tool. Install only what a given machine needs — a
-loader box doesn't need torch; a docs box needs nothing but the dispatcher.
+Each `make` target maps to one tool. Install only what a given machine needs.
 
 | Target | Installs | Command it provides |
 |--------|----------|---------------------|
@@ -43,23 +42,10 @@ loader box doesn't need torch; a docs box needs nothing but the dispatcher.
 | `make load`  | Rust binary → `~/.cargo/bin` | `nova load` |
 | `make storm` | Rust binary → `~/.cargo/bin` | `nova storm` |
 
-Under the hood:
-
-```bash
-uv pip install -e .                          # nova dispatcher (root pyproject)
-uv pip install -e 'python/nova-embed[embed]' # nova embed (heavy ML extra)
-cargo install --path crates/nova-load        # nova load
-cargo install --path crates/nova-storm       # nova storm
-```
-
-The `embed` extra is where torch/sentence-transformers/FlagEmbedding/fastembed
-live — keeping them out of the dispatcher means `make cli` installs instantly
-anywhere.
-
 ## Environment variables
 
 Set the variables relevant to your workflow. Configs reference them with
-`${VAR}` (or `${VAR:-default}`), expanded at load time.
+`${VAR}` (or `${VAR:-default}`), expanded at load time. Some examples of what each tool might need:
 
 ### Embedding (`nova embed`)
 
