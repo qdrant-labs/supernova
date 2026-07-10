@@ -5,14 +5,8 @@ import os
 
 import click
 
-from nova_embed.config import load_config
-from nova_embed.registry import (
-    DENSE_EMBEDDERS,
-    MULTIVECTOR_EMBEDDERS,
-    SOURCES,
-    SPARSE_EMBEDDERS,
-    STORAGE,
-)
+from nova_embed.config import ChunkingConfig, load_config
+from nova_embed.registry import SOURCES, STORAGE
 from nova_embed.sources.base import files_in_window
 
 # Import the component packages for their registration side-effects: the
@@ -21,94 +15,18 @@ import nova_embed.sources  # noqa: F401
 import nova_embed.embedders  # noqa: F401
 import nova_embed.storage  # noqa: F401
 
-from nova_embed.embedders.engine import EmbeddingEngine
-from nova_embed.embedders.hybrid import SentenceTransformerHybridEmbedder
+from nova_embed.embedders.engine import build_engine
 from nova_embed.embedders.runner import run_embedder
 from nova_embed.chunkers import build_chunker
 
 
-def _can_hybrid(dense_cfg: dict, sparse_cfg: dict) -> bool:
-    """
-    Check if dense and sparse configs point to the same sentence_transformer model.
-    """
-    return dense_cfg.get("type") == sparse_cfg.get(
-        "type"
-    ) == "sentence_transformer" and dense_cfg.get("model") == sparse_cfg.get("model")
-
-
-def build_engine(config: dict) -> EmbeddingEngine:
-    """
-    Build an EmbeddingEngine from config.
-
-    Supports any combination of:
-      - dense_embedder
-      - sparse_embedder
-      - multivector_embedder
-      - pooling (derive a dense column from the multivector output)
-
-    dense + sparse with the same sentence_transformer model are auto-combined
-    into a single hybrid forward pass. Multivector is always built separately.
-    """
-    dense_cfg = dict(config.get("dense_embedder") or {})
-    sparse_cfg = dict(config.get("sparse_embedder") or {})
-    multivector_cfg = dict(config.get("multivector_embedder") or {})
-
-    if not dense_cfg and not sparse_cfg and not multivector_cfg:
-        raise ValueError(
-            "Config must specify at least one of: dense_embedder, sparse_embedder, multivector_embedder"
-        )
-
-    # pooling lives inside multivector_embedder (it only applies in that context).
-    # pop it off so it isn't passed to the embedder constructor as an unknown kwarg.
-    pooling_cfg = dict(multivector_cfg.pop("pooling", None) or {})
-    if config.get("pooling"):
-        import warnings
-
-        warnings.warn(
-            "Top-level 'pooling:' key is ignored. Nest it under 'multivector_embedder:' instead.",
-            stacklevel=2,
-        )
-
-    multivector = (
-        MULTIVECTOR_EMBEDDERS.build(multivector_cfg) if multivector_cfg else None
-    )
-
-    pooling_type = pooling_cfg.get("type") if pooling_cfg else None
-    pooling_normalize = pooling_cfg.get("normalize", True) if pooling_cfg else True
-
-    # detect hybrid case: same model for both --> optimize for a single forward pass
-    if dense_cfg and sparse_cfg and _can_hybrid(dense_cfg, sparse_cfg):
-        hybrid_cfg = dict(dense_cfg)
-        hybrid_cfg.pop("type")  # remove the type
-        hybrid = SentenceTransformerHybridEmbedder(**hybrid_cfg)
-        return EmbeddingEngine(
-            hybrid=hybrid,
-            multivector=multivector,
-            multivector_pooling=pooling_type,
-            multivector_pooling_normalize=pooling_normalize,
-        )
-
-    # build separately (two distinct models, no optimization is possible)
-    dense = DENSE_EMBEDDERS.build(dense_cfg) if dense_cfg else None
-    sparse = SPARSE_EMBEDDERS.build(sparse_cfg) if sparse_cfg else None
-    return EmbeddingEngine(
-        dense=dense,
-        sparse=sparse,
-        multivector=multivector,
-        multivector_pooling=pooling_type,
-        multivector_pooling_normalize=pooling_normalize,
-    )
-
-
 def _configured_embedders(cfg) -> list[str]:
-    """`kind=model` for each embedder set in the config (no models loaded)."""
-    out = []
-    for kind in ("dense", "sparse", "multivector"):
-        section = getattr(cfg, f"{kind}_embedder", None)
-        if section:
-            d = section.build_dict()
-            out.append(f"{kind}={d.get('model') or d.get('type') or '?'}")
-    return out
+    """One line per embedder entry (no models loaded)."""
+    return [
+        f"{e.name}: kind={e.kind.value} type={e.type} model={e.model or '?'} "
+        f"{e.input_column}[{e.modality.value}] -> {e.column}"
+        for e in cfg.embedders
+    ]
 
 
 def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | None) -> None:
@@ -122,8 +40,9 @@ def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | Non
     click.echo("=" * 70)
     click.echo(f"config:    {config_path}")
     click.echo(f"source:    {cfg.source.type}")
-    click.echo(f"embedders: {', '.join(_configured_embedders(cfg)) or '(none configured!)'}")
-    click.echo(f"chunking:  {cfg.chunking.type if cfg.chunking else 'passthrough'}")
+    for line in _configured_embedders(cfg):
+        click.echo(f"embedder:  {line}")
+    click.echo(f"chunking:  {cfg.chunking.strategy if cfg.chunking else 'passthrough'}")
     click.echo(f"storage:   {cfg.storage.type}")
 
     source = SOURCES.build(dict(source_dict))
@@ -201,6 +120,7 @@ def embed(config, num_jobs, job_rank, dry_run):
 
     cfg = load_config(config_path)
     pipeline = cfg.pipeline
+    chunking = cfg.chunking or ChunkingConfig()
 
     source_dict = cfg.source.build_dict()
     if "offset" in source_dict or "limit" in source_dict:
@@ -256,35 +176,26 @@ def embed(config, num_jobs, job_rank, dry_run):
     if pipeline.include_source_provenance:
         source_dict["include_provenance"] = True
 
+    # The fields being embedded must survive the source's read projection even
+    # if the user's exclude_columns would drop them.
+    source_dict.setdefault("required_columns", sorted(cfg.input_specs))
+
     source = SOURCES.build(dict(source_dict))
 
-    # build_engine still takes a dict keyed by *_embedder; feed it the validated
-    # sections.
-    engine_cfg: dict = {}
-    if cfg.dense_embedder:
-        engine_cfg["dense_embedder"] = cfg.dense_embedder.build_dict()
-    if cfg.sparse_embedder:
-        engine_cfg["sparse_embedder"] = cfg.sparse_embedder.build_dict()
-    if cfg.multivector_embedder:
-        engine_cfg["multivector_embedder"] = cfg.multivector_embedder.build_dict()
-    engine = build_engine(engine_cfg)
+    engine = build_engine(cfg.embedders)
 
-    chunker = build_chunker(cfg.chunking.build_dict() if cfg.chunking else None)
+    # A splitting chunker operates on THE input column (config validation
+    # guarantees there is exactly one when strategy != passthrough). Passthrough
+    # needs no chunker at all: one row in, one row out.
+    if chunking.splits:
+        chunker = build_chunker(chunking.build_dict())
+        split_column = next(iter(cfg.input_specs))
+    else:
+        chunker = None
+        split_column = None
 
     storage_dict = cfg.storage.build_dict()
     storage = STORAGE.build(dict(storage_dict))
-
-    dense_column = pipeline.dense_embedding_column if engine.has_dense else None
-    sparse_column = pipeline.sparse_embedding_column if engine.has_sparse else None
-    multivector_column = (
-        pipeline.multivector_embedding_column if engine.has_multivector else None
-    )
-
-    # pooling (nested under multivector_embedder) can override the dense column name
-    mv_dict = cfg.multivector_embedder.build_dict() if cfg.multivector_embedder else {}
-    pooling_cfg = mv_dict.get("pooling") or {}
-    if pooling_cfg.get("pooled_column_name"):
-        dense_column = pooling_cfg["pooled_column_name"]
 
     # prefer the per-job limit (set by --num-jobs slicing); else there's no cap
     expected_total_rows = source_dict.get("limit")
@@ -295,18 +206,16 @@ def embed(config, num_jobs, job_rank, dry_run):
             engine=engine,
             storage=storage,
             chunker=chunker,
+            split_column=split_column,
             chunk_size=pipeline.chunk_size,
             num_workers=pipeline.num_workers,
             flush_threshold=pipeline.flush_threshold,
             row_group_size=pipeline.row_group_size,
             output_dir=storage_dict.get("output_dir", "/tmp/nova_embed"),
-            max_text_length=pipeline.max_text_length,
-            dense_column=dense_column,
-            sparse_column=sparse_column,
-            multivector_column=multivector_column,
-            rendered_text_column=pipeline.rendered_text_column,
+            on_empty_input=pipeline.on_empty_input,
             filename_prefix=filename_prefix,
             expected_total_rows=expected_total_rows,
+            chunking_strategy=chunking.strategy,
         )
     )
 

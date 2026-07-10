@@ -1,30 +1,43 @@
 # Quickstart
 
-Embed a dataset, load it into Qdrant, and load-test it.
+Embed a dataset, load it into Qdrant, and load-test it. In this example. We embed the `mteb/tweet_sentiment_extraction` dataset with a sentence-transformer. This is a small dataset, and we want to embed the `text` field. The embedding is stored in parquet files, which are then loaded into a Qdrant collection. Finally, we load-test the collection with queries drawn from the same dataset.
 
 ## 1. Embed a dataset
 
 Create `configs/embedder/my_dataset.yaml`:
 
 ```yaml
+# get data from HuggingFace datasets hub
 source:
   type: huggingface
   dataset_name: mteb/tweet_sentiment_extraction
   split: train
-  text_field: text
 
-dense_embedder:
-  type: sentence_transformer
-  model: sentence-transformers/all-MiniLM-L6-v2
-  batch_size: 128
+# each entry declares WHAT it embeds (input_column + modality) and WHERE the
+# result lands (output_column, default "{name}_embedding")
+embedders:
+  - name: dense
+    kind: dense
+    type: sentence_transformer
+    model: sentence-transformers/all-MiniLM-L6-v2
+    input_column: text
+    modality: text
+    batch_size: 32
+
+  - name: sparse
+    kind: sparse
+    type: fastembed
+    model: Qdrant/bm25
+    input_column: text
+    modality: text
+    batch_size: 256
 
 storage:
   type: local
-  output_dir: /tmp/tweets
+  output_dir: /tmp/mteb_tweets
 
 pipeline:
-  chunk_size: 1000
-  flush_threshold: 2000
+  flush_threshold: 10000
 ```
 
 Run it:
@@ -37,6 +50,12 @@ nova embed configs/embedder/my_dataset.yaml
 big dataset, shard it across machines with `--num-jobs` / `--job-rank` (see
 [Distributed](#distributed)).
 
+Once finished, the parquet files are in `/tmp/mteb_tweets`. Each file has a
+`dense_embedding` column (384 floats) and a `sparse_embedding` column (a
+sparse vector) — one column per embedder entry, named `{name}_embedding` by
+default. The `text` field and every other source column are preserved in the
+parquet files, so we can use them as payload in the vector store.
+
 ## 2. Load into Qdrant
 
 Create `configs/loader/my_dataset.yaml`:
@@ -44,27 +63,31 @@ Create `configs/loader/my_dataset.yaml`:
 ```yaml
 datasource:
   type: local
-  path: /tmp/tweets
-  id_expression: "vf_point_id(filename, file_row_number)"
+  path: /tmp/mteb_tweets
+  id: id
   payload_fields:
     text: text
+    label: label
+    label_text: label_text
 
 vectors:                 # which parquet column feeds each named vector
   dense:
     type: dense
     column: dense_embedding
     distance: cosine
+  sparse:
+    type: sparse
+    column: sparse_embedding
 
 vectorstore:
   type: qdrant
-  collection_name: tweets
-  url: ${QDRANT_URL}
-  api_key: ${QDRANT_API_KEY}
+  collection_name: mteb_tweets
+  url: ${QDRANT_URL:-http://localhost:6334}
+  api_key: ${QDRANT_API_KEY:-}
 
 loader:
   batch_size: 256
-  concurrency: 8
-  file_look_ahead: 2
+  concurrency: 2
 ```
 
 The top-level `vectors:` block tells the loader which parquet column carries each
@@ -92,7 +115,7 @@ target:
   type: qdrant
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
-  collection_name: tweets
+  collection_name: mteb_tweets
 
 query:
   vector_name: dense

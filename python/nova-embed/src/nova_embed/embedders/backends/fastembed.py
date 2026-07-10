@@ -1,24 +1,30 @@
 import asyncio
 import logging
 
-from nova_embed.embedders.sparse.base import SparseEmbedder
+from nova_embed.embedders.base import Embedder, OutputKind
 from nova_embed.models import SparseEmbedding
-from nova_embed.registry import SPARSE_EMBEDDERS
+from nova_embed.registry import EMBEDDERS
 
 logger = logging.getLogger(__name__)
 
 
-@SPARSE_EMBEDDERS.register("fastembed")
-class FastEmbedSparseEmbedder(SparseEmbedder):
+@EMBEDDERS.register("fastembed")
+class FastEmbedSparseEmbedder(Embedder):
     """
     Sparse embedder backed by fastembed's SparseTextEmbedding.
     Supports BM25 and other lexical sparse models from Qdrant/fastembed.
 
-    Example config:
-        sparse_embedder:
-          type: fastembed
-          model: Qdrant/bm25
+    Example config entry:
+        embedders:
+          - name: bm25
+            kind: sparse
+            type: fastembed
+            model: Qdrant/bm25
+            input_column: text
+            modality: text
     """
+
+    output_kind = OutputKind.SPARSE
 
     def __init__(
         self,
@@ -43,7 +49,7 @@ class FastEmbedSparseEmbedder(SparseEmbedder):
     @property
     def max_tokens(self) -> int:
         # BM25 is lexical (word tokens), no hard transformer limit.
-        # Return a large sentinel so the pipeline's max_text_length governs instead.
+        # Return a large sentinel so per-entry max_length governs instead.
         return 100_000
 
     def _encode(self, texts: list[str]) -> list[SparseEmbedding]:

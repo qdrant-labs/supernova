@@ -18,19 +18,14 @@ async def worker(
             break
 
         chunk_id, records = item
-        texts = [r.text for r in records]
 
-        result = await engine.embed(texts)
+        # name -> row-aligned [embedding | None] for every configured entry
+        result = await engine.embed([r.row for r in records])
 
         embedded = [
             EmbeddedRecord(
-                text=r.text,
-                dense_embedding=result.dense[i] if result.dense else None,
-                sparse_embedding=result.sparse[i] if result.sparse else None,
-                multivector_embedding=result.multivector[i]
-                if result.multivector
-                else None,
-                columns=r.columns,
+                row=r.row,
+                embeddings={name: outputs[i] for name, outputs in result.items()},
             )
             for i, r in enumerate(records)
         ]
