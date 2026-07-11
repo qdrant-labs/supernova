@@ -26,6 +26,7 @@ from nova_bf.config import (
     OutputConfig,
     ParamsConfig,
     QueriesConfig,
+    SearchSpec,
 )
 from nova_bf.ids import make_point_id
 from nova_bf.io import Store
@@ -159,10 +160,10 @@ def _run(ds, *, metric, batch, id_column, out_name, filt=None):
         corpus=CorpusConfig(path=ds["cdir"], sparse_column="sparse_embedding", id_column=id_column),
         queries=QueriesConfig(path=ds["qpath"], sparse_column="sparse_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(k=K, metric=metric, vector_type="sparse", corpus_batch_size=batch, io_workers=2),
-        filter=filt,
+        params=ParamsConfig(io_workers=2),
+        searches=[SearchSpec(name="test", k=K, metric=metric, vector_type="sparse", corpus_batch_size=batch, filter=filt)],
     )
-    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
+    t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     return {q: list(zip(hi, hs)) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
 
 
@@ -258,7 +259,7 @@ def test_out_of_vocab_corpus_token_is_dropped_not_errored(ds):
 
 def test_sparse_euclidean_rejected():
     with pytest.raises(ValueError, match="euclidean"):
-        ParamsConfig(vector_type="sparse", metric="euclidean")
+        SearchSpec(name="s", vector_type="sparse", metric="euclidean")
 
 
 def test_large_hashed_token_ids_do_not_blow_up_memory():
@@ -301,9 +302,10 @@ def test_duplicate_indices_within_a_row_are_summed(ds):
         corpus=CorpusConfig(path=str(cdir), sparse_column="sparse_embedding", id_column="id"),
         queries=QueriesConfig(path=str(qpath), sparse_column="sparse_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(k=1, metric="dot", vector_type="sparse", io_workers=1),
+        params=ParamsConfig(io_workers=1),
+        searches=[SearchSpec(name="test", k=1, metric="dot", vector_type="sparse")],
     )
-    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
+    t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     # correct: query{3:2.0, 1:10.0} . corpus{3:7.0, 1:1.0} = 2.0*7.0 + 10.0*1.0 = 24.0
     # if either side silently overwrote instead of summing, this would come out wrong
     assert t["hit_scores"][0][0] == pytest.approx(24.0, abs=1e-4)
@@ -359,9 +361,10 @@ def test_duplicate_indices_cosine_norm_is_correct(ds):
         corpus=CorpusConfig(path=str(cdir), sparse_column="sparse_embedding", id_column="id"),
         queries=QueriesConfig(path=str(qpath), sparse_column="sparse_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(k=1, metric="cosine", vector_type="sparse", io_workers=1),
+        params=ParamsConfig(io_workers=1),
+        searches=[SearchSpec(name="test", k=1, metric="cosine", vector_type="sparse")],
     )
-    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
+    t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     # dot = 1*1(token1) + 1*7(token3) = 8; query norm = sqrt(2); corpus norm = sqrt(50)
     expected = 8.0 / (np.sqrt(2) * np.sqrt(50))
     assert t["hit_scores"][0][0] == pytest.approx(expected, abs=1e-4)
@@ -403,10 +406,13 @@ def test_filter_compaction_with_multibatch_tiling(tmp_path, batch):
         corpus=CorpusConfig(path=str(cdir), sparse_column="sparse_embedding", id_column="id"),
         queries=QueriesConfig(path=str(qpath), sparse_column="sparse_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(k=2, metric="dot", vector_type="sparse", corpus_batch_size=batch, io_workers=1),
-        filter=Filter(must=[FilterCondition(field="language", match="eng")]),
+        params=ParamsConfig(io_workers=1),
+        searches=[SearchSpec(
+            name="test", k=2, metric="dot", vector_type="sparse", corpus_batch_size=batch,
+            filter=Filter(must=[FilterCondition(field="language", match="eng")]),
+        )],
     )
-    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
+    t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     got_ids = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
     assert got_ids == expected_ids
 
@@ -434,10 +440,13 @@ def test_filter_compaction_preserves_duplicate_index_summing(tmp_path):
         corpus=CorpusConfig(path=str(cdir), sparse_column="sparse_embedding", id_column="id"),
         queries=QueriesConfig(path=str(qpath), sparse_column="sparse_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(k=1, metric="dot", vector_type="sparse", io_workers=1),
-        filter=Filter(must=[FilterCondition(field="language", match="eng")]),
+        params=ParamsConfig(io_workers=1),
+        searches=[SearchSpec(
+            name="test", k=1, metric="dot", vector_type="sparse",
+            filter=Filter(must=[FilterCondition(field="language", match="eng")]),
+        )],
     )
-    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
+    t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     # query{3:1.0, 1:10.0} . corpus{3:7.0, 1:1.0} = 1.0*7.0 + 10.0*1.0 = 17.0
     assert t["hit_ids"][0] == ["keep0"]
     assert t["hit_scores"][0][0] == pytest.approx(17.0, abs=1e-4)

@@ -14,6 +14,7 @@ from nova_bf.config import (
     OutputConfig,
     QueriesConfig,
     RangeCondition,
+    SearchSpec,
 )
 from nova_bf.filters import evaluate
 
@@ -95,6 +96,9 @@ def test_config_filter_field_is_the_only_declaration_needed():
         corpus=CorpusConfig(path="/tmp/corpus"),
         queries=QueriesConfig(path="/tmp/q.parquet"),
         output=OutputConfig(path="/tmp/out"),
-        filter=Filter(must=[FilterCondition(field="language", match="eng")]),
+        searches=[SearchSpec(
+            name="test",
+            filter=Filter(must=[FilterCondition(field="language", match="eng")]),
+        )],
     )
-    assert cfg.filter.fields() == {"language"}
+    assert cfg.searches[0].filter.fields() == {"language"}

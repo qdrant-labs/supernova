@@ -14,17 +14,21 @@ parquet (S3/HF/local) ────┤                               │  compare
 
 Brute-force configs live in `configs/brute_force/`. The same file drives a single-GPU run and a distributed fleet (see [Running](#running)).
 
+Every config lists one or more **searches** — there's no implicit default search, so a config always says explicitly what it's computing:
+
 ```yaml
 corpus:
   # The embedded parquets to search over — the same files the loader ingests.
   path: s3://my-bucket/dataset/model
   dense_column: dense_embedding
+  # sparse_column: sparse_embedding  # only read by a search with vector_type: sparse
   # id_column: id            # optional — see "Hit IDs" below
 
 queries:
   # Query embeddings: a single parquet file or a directory of them.
   path: s3://my-bucket/dataset/model/queries.parquet
   dense_column: dense_embedding
+  # sparse_column: sparse_embedding
   # id_column: query_id      # optional — an existing column to use as the query id
   payload_fields:            # columns carried from the queries file into each output row
     - text
@@ -33,58 +37,25 @@ output:
   path: s3://my-bucket/dataset/model/eval
 
 params:
-  k: 1000
-  metric: cosine             # cosine | dot | euclidean
   io_workers: 16             # concurrent corpus-file reader threads
   io_thread_count: 0         # pyarrow IO-pool size (0 = pyarrow's default ~8)
-  # corpus_batch_size: 4096  # bound GPU memory on huge files; omit = whole file at once
+  # merge_batch_size: null   # merge tuning, see Performance & tuning
+  # merge_prefetch: false
+
+searches:
+  - name: dense_all          # required, unique, [A-Za-z0-9_-]+ — goes into the output filename
+    vector_type: dense       # dense | sparse
+    metric: cosine           # cosine | dot | euclidean (euclidean unsupported with vector_type: sparse)
+    k: 1000
+    # corpus_batch_size: 4096  # bound GPU memory on huge files; omit = whole file at once
+    # filter: {...}            # see "Filtering the corpus" below
 ```
 
-`${VAR}` / `${VAR:-default}` references are expanded from the environment, same as every other tool.
+`${VAR}` / `${VAR:-default}` references are expanded from the environment, same as every other tool. `params` holds only run-level IO/merge tuning — every search-specific setting (`k`, `metric`, `vector_type`, `corpus_batch_size`, `filter`) lives on its `searches[]` entry.
 
-### Sparse vectors
+### One search, or several in one pass
 
-Set `params.vector_type: sparse` to search a `struct<indices: list<uint32>, values: list<float32>>` column instead — the same schema `nova embed`'s sparse embedders write and `nova load` reads (default column name `sparse_embedding`, override via `corpus.sparse_column` / `queries.sparse_column`). Only `metric: dot` and `metric: cosine` are supported (`euclidean` has no real use case for sparse retrieval and is rejected at config load).
-
-```yaml
-corpus:
-  path: s3://my-bucket/dataset/model
-  sparse_column: sparse_embedding
-
-queries:
-  path: s3://my-bucket/dataset/model/queries.parquet
-  sparse_column: sparse_embedding
-
-params:
-  k: 1000
-  metric: dot
-  vector_type: sparse
-```
-
-Scoring densifies the query set once over its own token vocabulary (a corpus-only token id can never match any query, so dropping it is exact, not approximate) and keeps each corpus batch genuinely sparse (`torch.sparse_csr_tensor`) on the GPU, scored via `sparse @ dense` matmul — `corpus_batch_size` bounds GPU residency the same way it does for dense.
-
-### Filtering the corpus
-
-To evaluate recall for a *filtered* search, restrict which corpus rows are eligible neighbors with a top-level `filter`, shaped like a Qdrant filter:
-
-```yaml
-filter:
-  must:
-    - field: language
-      match: eng          # scalar → equality; a list matches any of them (MatchAny)
-    - field: cost
-      range: {lt: 10}     # gt / gte / lt / lte — combinable in one condition
-  should: []               # OR-at-least-one
-  must_not: []              # AND-NOT
-```
-
-A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. The filter applies uniformly to every query in the run: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves.
-
-### Multiple searches in one pass
-
-A single `compute` run can produce several **independent** top-K results — e.g. dense-unfiltered, sparse-unfiltered, and a filtered variant of either — while reading and decoding each corpus file only **once**, shared across every search that needs that vector_type. This is not a fused hybrid score: each search gets its own ranked list, own `k`/`metric`/`filter`, and own output file; they just cost roughly the price of one corpus scan instead of one scan per search (the read+decode path is what dominates, see [Performance & tuning](#performance--tuning)).
-
-Use a top-level `searches:` list instead of the flat `params.k`/`params.metric`/`params.vector_type`/`filter`:
+A single `compute` run computes every entry in `searches:` — one is the common case, but you can list several **independent** top-K results (e.g. dense-unfiltered, sparse-unfiltered, and a filtered variant of either) and they'll share corpus file IO/decode: each corpus file is read and decoded only **once per vector_type any search needs**, not once per search. This is not a fused hybrid score — each search gets its own ranked list, own `k`/`metric`/`filter`, and own output file; they just cost roughly the price of one corpus scan instead of one scan per search (the read+decode path is what dominates, see [Performance & tuning](#performance--tuning)).
 
 ```yaml
 searches:
@@ -114,14 +85,40 @@ searches:
           match: eng
 ```
 
-Every entry needs a unique `name` — it's spliced into the output filename (`bf_<queries-stem>_<name>_k<K>.parquet`) so the searches never collide. Each entry can also set its own `corpus_batch_size`. `searches` replaces the flat `params.k`/`metric`/`vector_type`/`corpus_batch_size` and the top-level `filter` — leaving any of those set alongside `searches` is a config error (they'd otherwise be silently ignored). `params.io_workers`/`io_thread_count`/`merge_batch_size`/`merge_prefetch` are run-level knobs and still apply to the whole run regardless of how many searches it contains. Omit `searches` entirely for the single-search behavior described above — output filenames are unchanged either way.
+Every entry needs a unique `name` — it's spliced into the output filename (`bf_<queries-stem>_<name>_k<K>.parquet`) so searches never collide.
 
-One run-level number *does* change meaning once multiple searches (or a single filtered search) share a run: the `timing`/`bf-bench` log lines' `rows`/`gb` are the corpus's raw pre-filter row/byte count for each vector_type actually read — not "rows that survived a filter" — since with several searches there's no longer one single filtered count to report. Don't compare these numbers against a pre-`searches` run's log line expecting the same semantics.
+**Mixing `vector_type: dense` and `vector_type: sparse` in one run doubles the per-file host-RAM budget**: each in-flight file's reader decodes both columns at once, so `io_workers × file_size` (see [Performance & tuning](#performance--tuning)) becomes `io_workers × (dense_bytes + sparse_bytes)`. Lower `io_workers` accordingly on memory-constrained boxes when mixing vector_types.
+
+### Sparse vectors
+
+Set a search's `vector_type: sparse` to score a `struct<indices: list<uint32>, values: list<float32>>` column instead of the dense one — the same schema `nova embed`'s sparse embedders write and `nova load` reads (default column name `sparse_column`, override via `corpus.sparse_column` / `queries.sparse_column`). Only `metric: dot` and `metric: cosine` are supported (`euclidean` has no real use case for sparse retrieval and is rejected at config load).
+
+Scoring densifies the query set once over its own token vocabulary (a corpus-only token id can never match any query, so dropping it is exact, not approximate) and keeps each corpus batch genuinely sparse (`torch.sparse_csr_tensor`) on the GPU, scored via `sparse @ dense` matmul — `corpus_batch_size` bounds GPU residency the same way it does for dense.
+
+### Filtering the corpus
+
+To evaluate recall for a *filtered* search, restrict which corpus rows are eligible neighbors with that search's `filter`, shaped like a Qdrant filter:
+
+```yaml
+searches:
+  - name: dense_eng
+    vector_type: dense
+    filter:
+      must:
+        - field: language
+          match: eng          # scalar → equality; a list matches any of them (MatchAny)
+        - field: cost
+          range: {lt: 10}     # gt / gte / lt / lte — combinable in one condition
+      should: []               # OR-at-least-one
+      must_not: []              # AND-NOT
+```
+
+A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. The filter applies uniformly to every query in that search: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves. Each search has its own independent `filter` (or none).
 
 ## Running
 
 ```bash
-# single GPU — scan the whole corpus, write the final result
+# single GPU — scan the whole corpus, write the final result(s)
 nova bf compute configs/brute_force/my_eval.yaml
 
 # fleet — each rank scans a stride slice of the corpus files…
@@ -130,31 +127,29 @@ nova bf compute configs/brute_force/my_eval.yaml --num-jobs 8 --job-rank $RANK
 nova bf merge   configs/brute_force/my_eval.yaml
 ```
 
-Single-GPU `compute` (no `--num-jobs`) writes the final result directly; no `merge` needed. For a fleet, see [`nova dist bf`](../distributed.md#bf), which provisions the GPU pool and runs the ranked jobs for you. Per-flag detail is in the [CLI reference](../reference/cli.md#nova-bf).
+Single-GPU `compute` (no `--num-jobs`) writes the final result(s) directly; no `merge` needed. For a fleet, see [`nova dist bf`](../distributed.md#bf), which provisions the GPU pool and runs the ranked jobs for you. Per-flag detail is in the [CLI reference](../reference/cli.md#nova-bf).
 
 ## How it works
 
-It's a two-phase intra-then-inter-worker map-reduce:
+It's a two-phase intra-then-inter-worker map-reduce, run independently per search:
 
-1. **`compute` (map)** — each worker loads the query embeddings onto the GPU, takes a deterministic stride slice of the corpus files (`file_index % num_jobs == job_rank`), and for each file scores `queries × corpus_rows`, folding the file's top-K into a running per-query top-K held on the GPU. It writes one partial parquet.
+1. **`compute` (map)** — each worker loads the query embeddings onto the GPU, takes a deterministic stride slice of the corpus files (`file_index % num_jobs == job_rank`), and for each file scores `queries × corpus_rows`, folding the file's top-K into a running per-query top-K held on the GPU. It writes one partial parquet per search.
    - The running top-K stores `(score, encoded_int)` where `encoded = global_file_index × MAX_ROWS_PER_FILE + row` — keeping an integer on the GPU (not id strings) makes the per-file merge a cheap `torch.topk`. Hit ids are materialised only for the final K per query.
-2. **`merge` (reduce)** — slices are disjoint (stride partition → no overlapping hits), so merging is just: concatenate each query's candidates across partials and keep the global top-K. Runs on the controller.
+2. **`merge` (reduce)** — slices are disjoint (stride partition → no overlapping hits), so merging is just: concatenate each query's candidates across partials and keep the global top-K, per search. Runs on the controller.
 
 ## Output
 
-`compute` (fleet) writes per-rank partials under:
+`compute` (fleet) writes per-rank partials under, one directory per search:
 
 ```
-{output.path}/_bf_partial_<queries-stem>_k<K>/rank<NNN>.parquet
+{output.path}/_bf_partial_<queries-stem>_<name>_k<K>/rank<NNN>.parquet
 ```
 
-and `merge` (or single-GPU `compute`) writes the final result:
+and `merge` (or single-GPU `compute`) writes each search's final result:
 
 ```
-{output.path}/bf_<queries-stem>_k<K>.parquet
+{output.path}/bf_<queries-stem>_<name>_k<K>.parquet
 ```
-
-With a `searches:` list, each search's `name` is spliced in (`_bf_partial_<queries-stem>_<name>_k<K>/…` and `bf_<queries-stem>_<name>_k<K>.parquet`) so every search's partials/result land in its own path — one `compute`/`merge` call still produces all of them.
 
 | Column | Type | |
 |--------|------|--|
@@ -170,7 +165,7 @@ With a `searches:` list, each search's `name` is spliced in (`_bf_partial_<queri
 `hit_ids` are how you join ground truth back to a loaded collection, so they must match the point ids the store holds. Two modes:
 
 - **Default — `make_point_id(corpus_file_key, row)`.** A deterministic UUID over `(parquet path, physical row)`, byte-identical to the loader's `vf_point_id` macro. So the brute-force hit ids equal the Qdrant point ids the loader produced, and recall is a straight id-set intersection — no extra columns needed. This is the right choice when the corpus has no natural id.
-- **`corpus.id_column`.** Use an already-unique column verbatim (e.g. fineweb's `id` = `<urn:uuid:...>`). Transparent for public datasets and resolvable without reconstructing the loader's hashing. Such an id isn't recomputable from `(file, row)`, so it's read alongside the dense column and **kept in RAM per file** for the worker's slice — budget roughly `slice_rows × id_size` of host memory.
+- **`corpus.id_column`.** Use an already-unique column verbatim (e.g. fineweb's `id` = `<urn:uuid:...>`). Transparent for public datasets and resolvable without reconstructing the loader's hashing. Such an id isn't recomputable from `(file, row)`, so it's read alongside the vector column(s) and **kept in RAM per file** for the worker's slice — budget roughly `slice_rows × id_size` of host memory.
 
 Whichever you pick, the corpus loaded into the vector store must use the **same** id scheme, or the id sets won't line up and recall reads ~0.
 
@@ -181,11 +176,13 @@ The work splits into three layers: **reading** corpus parquet from S3, **decodin
 | Knob | Default | Guidance |
 |------|---------|----------|
 | `params.io_thread_count` | `0` (≈8) | **The real S3 fetch concurrency.** pyarrow funnels every read through one global IO pool, so this — not `io_workers` — is what raises throughput once decode keeps up. Try `64`–`128` on a fat NIC. |
-| `params.io_workers` | `16` | Concurrent corpus-file reader threads (each holds ~one file in RAM, so `io_workers × file_size` must fit host memory). Useful, but caps at `io_thread_count` — raising it alone won't lift throughput. |
+| `params.io_workers` | `16` | Concurrent corpus-file reader threads (each holds ~one file in RAM, so `io_workers × file_size` must fit host memory — **double that if any run mixes `vector_type: dense` and `vector_type: sparse` searches**, since each in-flight file then decodes both columns at once). Useful, but caps at `io_thread_count` — raising it alone won't lift throughput. |
 | instance vCPUs | — | Parquet decode is CPU-bound and scales ~linearly with cores. The brute-force matmul is light, so **pick the instance for vCPUs, not the GPU** (e.g. a single-GPU, high-core `g5.16xlarge`). |
-| `params.corpus_batch_size` | `None` | The per-file score matrix is `queries × rows`. Big files (or very large query sets) can OOM the GPU; set this to score in row-batches. Values below `k` are raised to `k`. Omit for the whole-file (fastest) path. |
+| a search's `corpus_batch_size` | `None` | The per-file score matrix is `queries × rows`. Big files (or very large query sets) can OOM the GPU; set this to score in row-batches. Values below that search's `k` are raised to `k`. Omit for the whole-file (fastest) path. |
 | region | — | `nova bf` is S3-read-heavy — run workers in the **same region** as the corpus bucket to avoid the cross-region bandwidth cap and egress. |
 
 A good starting point for a large corpus on AWS: a high-vCPU single-GPU instance, `io_thread_count: 128`, `io_workers: 32–64`. Raising query count shifts the balance toward the GPU — at that point batch the matmul (`corpus_batch_size`) and add GPUs/workers.
 
-> **Reading fewer bytes** helps every layer: `compute` already projects only the dense column (plus `id_column`/`filter` fields when configured), so the heavy work is unavoidable corpus data. Storing the dense column as fp16 (half the bytes to transfer *and* decode) is the next lever if the read path is still the bottleneck.
+> **Reading fewer bytes** helps every layer: `compute` projects only the vector column(s) any search needs (plus `id_column`/`filter` fields when configured), so the heavy work is unavoidable corpus data. Storing the dense column as fp16 (half the bytes to transfer *and* decode) is the next lever if the read path is still the bottleneck.
+
+The `timing`/`bf-bench` log lines' `rows`/`gb` are the corpus's raw pre-filter row/byte count for each vector_type actually read, summed across every search sharing the run — not "rows that survived a filter," and not broken out per search, since several searches with different filters no longer have one single count to report.

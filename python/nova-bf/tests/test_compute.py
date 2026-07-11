@@ -30,6 +30,7 @@ from nova_bf.config import (
     ParamsConfig,
     QueriesConfig,
     RangeCondition,
+    SearchSpec,
 )
 from nova_bf.ids import make_point_id
 from nova_bf.io import Store
@@ -105,10 +106,10 @@ def _run(ds, *, batch, id_column, out_name, filt=None):
         corpus=CorpusConfig(path=ds["cdir"], dense_column="dense_embedding", id_column=id_column),
         queries=QueriesConfig(path=ds["qpath"], dense_column="dense_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(k=K, metric="dot", corpus_batch_size=batch, io_workers=2),
-        filter=filt,
+        params=ParamsConfig(io_workers=2),
+        searches=[SearchSpec(name="test", k=K, metric="dot", corpus_batch_size=batch, filter=filt)],
     )
-    t = pq.read_table(run_compute(cfg)[""]).to_pydict()
+    t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     return {q: list(zip(hi, hs)) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
 
 

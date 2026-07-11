@@ -15,11 +15,11 @@ K via `make_point_id`, so the whole corpus's ids never materialize.
 If `corpus.id_column` is set, hit ids come from that pre-existing column instead
 of `make_point_id`. Such an id isn't recomputable from (file, row), so it's read
 alongside the dense column and kept in RAM per file (the worker's slice) to resolve
-the final top-K. Large files can be scored in row-batches (`params.corpus_batch_size`)
+the final top-K. Large files can be scored in row-batches (`SearchSpec.corpus_batch_size`)
 to bound the per-file score matrix `(n_queries × rows)` on the GPU.
 
-If `filter` is set (see `nova_bf.filters`), each file's payload columns are
-read alongside the dense column and evaluated into a keep-mask *before*
+If a search's `filter` is set (see `nova_bf.filters`), each file's payload columns
+are read alongside the vector column and evaluated into a keep-mask *before*
 scoring, so filtered-out rows never reach the GPU. The mask compacts `arr` but
 never renumbers rows — `orig_rows` tracks each surviving row's true file-row
 number, since both `make_point_id` and the `id_column` lookup are keyed on it.
@@ -27,15 +27,13 @@ Mask evaluation is timed separately from the read (`filter_secs`, reported
 alongside `read_secs`/`io_wait`/`gpu_secs`) so a slow filter is distinguishable
 from slow IO in the end-of-run timing log.
 
-`run_compute` actually runs `cfg.effective_specs()` — one or more independent
-`SearchSpec`s (own vector_type/metric/k/filter), e.g. dense-unfiltered AND
-sparse-filtered against the same corpus in one invocation. Each corpus file is
-read and decoded ONCE per vector_type any spec needs, not once per spec; each
-spec's filter mask, GPU scoring, and top-K accumulation stay fully
-independent (this fans out the read/decode work, it does not fuse scores
-into a single hybrid ranking). A config with no `searches:` synthesizes a
-single spec from the legacy flat `params`/`filter` fields and behaves exactly
-as before, including output filenames.
+`run_compute` runs every `SearchSpec` in `cfg.searches` — one or more
+independent searches (own vector_type/metric/k/filter), e.g. dense-unfiltered
+AND sparse-filtered against the same corpus in one invocation. Each corpus
+file is read and decoded ONCE per vector_type any spec needs, not once per
+spec; each spec's filter mask, GPU scoring, and top-K accumulation stay fully
+independent (this fans out the read/decode work, it does not fuse scores into
+a single hybrid ranking).
 """
 
 from __future__ import annotations
@@ -358,12 +356,11 @@ def run_compute(
     io_thread_count: int | None = None,
     max_files: int | None = None,
 ) -> dict[str, str]:
-    """Runs every search in `cfg.effective_specs()` — independent vector_type
-    /metric/k/filter combinations — against the corpus in ONE pass: each file
-    is read and decoded once per vector_type actually needed (not once per
-    spec), and each spec's own filter mask, GPU scoring, and top-K
-    accumulation stay fully independent. Returns `{spec.name: output_path}`;
-    the legacy single-search config (no `searches:`) returns `{"": path}`.
+    """Runs every search in `cfg.searches` — independent vector_type/metric/k/
+    filter combinations — against the corpus in ONE pass: each file is read
+    and decoded once per vector_type actually needed (not once per spec), and
+    each spec's own filter mask, GPU scoring, and top-K accumulation stay
+    fully independent. Returns `{spec.name: output_path}`.
     """
     try:
         import torch
@@ -371,7 +368,7 @@ def run_compute(
         raise RuntimeError("torch is required for `compute`: install nova-bf[compute]")
 
     job_rank = _resolve_rank(num_jobs, job_rank)
-    specs = cfg.effective_specs()
+    specs = cfg.searches
     vts_needed = sorted({s.vector_type for s in specs})  # ["dense"] / ["sparse"] / both
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -418,12 +415,12 @@ def run_compute(
         dim = Q_np_by_vt[s.vector_type].shape[1]
         logger.info(
             "search=%r queries=%d %s=%d metric=%s k=%d device=%s%s",
-            s.name or "<default>", n_q, "vocab" if s.vector_type == "sparse" else "dim", dim,
+            s.name, n_q, "vocab" if s.vector_type == "sparse" else "dim", dim,
             s.metric, s.k, device,
             f" rank={job_rank}/{num_jobs}" if num_jobs else "",
         )
         if s.filter is not None:
-            logger.info("search=%r filter: %s", s.name or "<default>", s.filter.model_dump(exclude_defaults=True))
+            logger.info("search=%r filter: %s", s.name, s.filter.model_dump(exclude_defaults=True))
 
     # 2. corpus files (global, deterministic order); this worker takes a stride
     #    slice so its global indices stay stable for id decoding. Shared across
@@ -469,7 +466,7 @@ def run_compute(
             logger.warning(
                 "search=%r corpus_batch_size=%d is below k=%d; raising to k (a smaller "
                 "batch can't fill the top-K and gives no memory benefit).",
-                s.name or "<default>", cb, s.k,
+                s.name, cb, s.k,
             )
             cb = s.k
         spec_batch.append(cb)
@@ -582,7 +579,7 @@ def run_compute(
             # file must never block a DIFFERENT spec's id resolution for that
             # same file, but a file every spec's filter drops needs no ids kept
             # at all (restores the pre-multi-spec memory behavior for that case).
-            if id_col and any(k is None or k.any() for k in keeps):
+            if id_col and any(mask is None or mask.any() for mask in keeps):
                 corpus_ids[gidx] = ids
             for vt in vts_needed:
                 if vt == "dense":
@@ -748,8 +745,8 @@ def run_compute(
             # the true final count, so that's the only place worth warning.
         else:
             name = result_name(cfg, s)
-            warn_if_short(sum(1 for h in hit_ids if len(h) < s.k), len(hit_ids), s.k, logger)
+            warn_if_short(sum(1 for h in hit_ids if len(h) < s.k), len(hit_ids), s.k, s.name, logger)
         path = out.write(name, table)
-        logger.info("search=%r wrote %s (%d queries)", s.name or "<default>", path, n_q)
+        logger.info("search=%r wrote %s (%d queries)", s.name, path, n_q)
         results[s.name] = path
     return results

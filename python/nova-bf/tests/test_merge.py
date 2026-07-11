@@ -20,8 +20,8 @@ from nova_bf.config import (
     BruteForceConfig,
     CorpusConfig,
     OutputConfig,
-    ParamsConfig,
     QueriesConfig,
+    SearchSpec,
 )
 from nova_bf.merge import run_merge
 from nova_bf.results import build_result_table, partial_dir, result_name
@@ -29,12 +29,12 @@ from nova_bf.results import build_result_table, partial_dir, result_name
 Q, W, K = 5, 3, 4
 
 
-def _make_cfg(tmp, **params) -> BruteForceConfig:
+def _make_cfg(tmp) -> BruteForceConfig:
     return BruteForceConfig(
         corpus=CorpusConfig(path=str(tmp / "corpus")),
         queries=QueriesConfig(path=str(tmp / "queries.parquet")),
         output=OutputConfig(path=str(tmp / "out")),
-        params=ParamsConfig(k=K, **params),
+        searches=[SearchSpec(name="test", k=K)],
     )
 
 
@@ -71,7 +71,7 @@ def scenario(tmp_path):
         reference[q] = ([h for _, h in top], [s for s, _ in top])
 
     cfg = _make_cfg(tmp_path)
-    pdir = tmp_path / "out" / partial_dir(cfg, cfg.effective_specs()[0])
+    pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
     pdir.mkdir(parents=True)
     for p, (p_ids, p_scores) in enumerate(partials):
         payload = {"src": [f"payload-{q}" for q in qids]}  # identical across partials
@@ -84,7 +84,7 @@ def scenario(tmp_path):
 
 
 def _read_result(cfg) -> dict[str, tuple[list[str], list[float], str]]:
-    t = pq.read_table(f"{cfg.output.path}/{result_name(cfg, cfg.effective_specs()[0])}").to_pydict()
+    t = pq.read_table(f"{cfg.output.path}/{result_name(cfg, cfg.searches[0])}").to_pydict()
     return {
         q: (hi, hs, src)
         for q, hi, hs, src in zip(t["query_id"], t["hit_ids"], t["hit_scores"], t["src"])
@@ -122,3 +122,61 @@ def test_explicit_batch_size_is_invariant(scenario):
     for q in qids:
         assert got[q][0] == reference[q][0]
         assert np.allclose(got[q][1], reference[q][1])
+
+
+def test_merge_prefetch_shares_one_pool_across_searches(scenario, monkeypatch, tmp_path):
+    """merge_prefetch's download pool must be created ONCE for the whole
+    `run_merge` call, not once per search — a search whose downloads land
+    early frees its share of that shared pool for a slower search's downloads
+    instead of sitting on a dedicated pool nobody else can reach (see
+    merge.py's `run_merge` docstring). Exercises the real S3-shaped prefetch
+    code path locally by forcing `Store.is_s3 = True` on top of a real local
+    filesystem — `_plan_prefetch`/`_fetch_range` only ever call generic
+    pyarrow FileSystem methods, so this is a faithful exercise of the same
+    code an S3 run would take, not a mock of it."""
+    import nova_bf.merge as merge_mod
+
+    cfg, qids, reference = scenario
+
+    # A second search, reusing the first search's partial bytes verbatim —
+    # this test is about pool sharing/correctness of the merge path, not
+    # distinct per-search ground truth (other tests already cover that).
+    second = SearchSpec(name="test2", k=K)
+    cfg.searches = [*cfg.searches, second]
+    src_dir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
+    dst_dir = tmp_path / "out" / partial_dir(cfg, second)
+    dst_dir.mkdir(parents=True)
+    for f in src_dir.iterdir():
+        (dst_dir / f.name).write_bytes(f.read_bytes())
+
+    cfg.params.merge_prefetch = True
+
+    real_store_cls = merge_mod.Store
+
+    def _forced_s3_store(uri):
+        store = real_store_cls(uri)
+        store.is_s3 = True  # force the prefetch branch over a real local Store
+        return store
+
+    monkeypatch.setattr(merge_mod, "Store", _forced_s3_store)
+
+    pool_sizes: list[int | None] = []
+
+    class _CountingExecutor(merge_mod.ThreadPoolExecutor):
+        def __init__(self, *args, **kwargs):
+            pool_sizes.append(kwargs.get("max_workers"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(merge_mod, "ThreadPoolExecutor", _CountingExecutor)
+
+    run_merge(cfg)
+
+    assert len(pool_sizes) == 1, f"expected exactly ONE shared thread pool, got {len(pool_sizes)}"
+
+    for spec in cfg.searches:
+        t = pq.read_table(f"{cfg.output.path}/{result_name(cfg, spec)}").to_pydict()
+        got = {q: (hi, hs) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
+        for q in qids:
+            ref_ids, ref_scores = reference[q]
+            assert got[q][0] == ref_ids
+            assert np.allclose(got[q][1], ref_scores)

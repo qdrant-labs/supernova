@@ -59,18 +59,20 @@ _DL_CHUNK = 32 * 1024 * 1024  # 32 MiB range GETs
 _DL_MAX_CONCURRENCY = 64      # ~enough connections to fill a 25 Gbps NIC; caps RAM
 
 
-def _prefetch_local(store: Store, partials: list[ParquetFile], workers: int) -> tuple[str, list[str]]:
-    """
-    Bulk-copy S3 partials to a local temp dir via parallel ranged reads, so even a
-    handful of multi-GB partials saturate the NIC (one stream per file does not).
-    Returns (dir, local_paths) index-aligned with `partials`.
+def _plan_prefetch(store: Store, partials: list[ParquetFile]) -> tuple[str, list[str], list[tuple[str, str, int, int]]]:
+    """Plan (but don't run) a prefetch: allocate a temp dir + pre-size each
+    local destination file, and return the flat (src, dst, offset, length)
+    range-GET task list needed to fill them in. Pure bookkeeping, no IO —
+    so several searches' plans can be built and their task lists concatenated
+    before any fetching starts, letting them share ONE download pool (see
+    `run_merge`) instead of one pool per search.
     """
     tmpdir = tempfile.mkdtemp(prefix="bf_merge_")
 
-    # Plan destinations + sizes, then pre-allocate each local file so ranges can be
-    # written to their absolute offset concurrently (os.pwrite is safe for
-    # non-overlapping regions). Index-prefix keeps names unique across ranks.
-    dsts, total_bytes = [], 0
+    # Pre-allocate each local file so ranges can be written to their absolute
+    # offset concurrently (os.pwrite is safe for non-overlapping regions).
+    # Index-prefix keeps names unique across ranks.
+    dsts: list[str] = []
     tasks: list[tuple[str, str, int, int]] = []  # (src, dst, offset, length)
     for idx, pf in enumerate(partials):
         size = store.fs.get_file_info(pf.read_path).size
@@ -78,33 +80,29 @@ def _prefetch_local(store: Store, partials: list[ParquetFile], workers: int) -> 
         with open(dst, "wb") as fh:
             fh.truncate(size)
         dsts.append(dst)
-        total_bytes += size
         for off in range(0, max(size, 1), _DL_CHUNK):
             tasks.append((pf.read_path, dst, off, min(_DL_CHUNK, size - off)))
+    return tmpdir, dsts, tasks
 
-    def fetch(task: tuple[str, str, int, int]) -> int:
-        src, dst, off, length = task
-        if length <= 0:  # empty partial
-            return 0
-        f = store.fs.open_input_file(src)
-        try:
-            buf = f.read_at(length, off)
-        finally:
-            f.close()
-        fd = os.open(dst, os.O_WRONLY)
-        try:
-            os.pwrite(fd, memoryview(buf), off)
-        finally:
-            os.close(fd)
-        return length
 
-    conc = max(1, min(workers, _DL_MAX_CONCURRENCY))
-    with ThreadPoolExecutor(max_workers=conc) as ex, tqdm(
-        total=total_bytes, unit="B", unit_scale=True, desc="prefetch", dynamic_ncols=True
-    ) as bar:
-        for n in ex.map(fetch, tasks):
-            bar.update(n)
-    return tmpdir, dsts
+def _fetch_range(store: Store, task: tuple[str, str, int, int]) -> int:
+    """Worker function for one range-GET task (see `_plan_prefetch`) — a pure
+    function of `(store, task)`, so the SAME thread pool can run tasks planned
+    for any search without needing per-search state."""
+    src, dst, off, length = task
+    if length <= 0:  # empty partial
+        return 0
+    f = store.fs.open_input_file(src)
+    try:
+        buf = f.read_at(length, off)
+    finally:
+        f.close()
+    fd = os.open(dst, os.O_WRONLY)
+    try:
+        os.pwrite(fd, memoryview(buf), off)
+    finally:
+        os.close(fd)
+    return length
 
 
 def _topk_merge(
@@ -164,44 +162,88 @@ def _topk_merge(
 
 
 def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
-    """Merges every search in `cfg.effective_specs()` — each spec's per-rank
-    partials (written under its own `partial_dir`, see `compute.py`) are
-    reduced independently into that spec's own final parquet. Returns
-    `{spec.name: output_path}`; the legacy single-search config (no
-    `searches:`) returns `{"": path}`."""
+    """Merges every search in `cfg.searches` — each spec's per-rank partials
+    (written under its own `partial_dir`, see `compute.py`) are reduced
+    independently into that spec's own final parquet. Returns
+    `{spec.name: output_path}`.
+
+    When `merge_prefetch` is on and the output is S3, every search's partial
+    downloads are planned up front (see `_plan_prefetch`) and run on ONE
+    shared thread pool, not one pool per search and not one search's downloads
+    fully finishing before the next search's even start. A search with fewer
+    or smaller partials frees its share of the pool the moment its own
+    downloads land, instead of sitting on dedicated capacity a slower search
+    could have used — the same reason `compute.py` uses a shared reader-thread
+    pool across corpus files rather than reading them one at a time.
+    """
     out = Store(cfg.output.path)
-    return {spec.name: _run_merge_one(cfg, spec, out) for spec in cfg.effective_specs()}
 
+    partials_by_name: dict[str, list[ParquetFile]] = {}
+    for spec in cfg.searches:
+        partials = out.list_parquets(subpath=partial_dir(cfg, spec))
+        if not partials:
+            raise RuntimeError(
+                f"no partial results under {cfg.output.path}/{partial_dir(cfg, spec)}/ "
+                f"(search={spec.name!r}) — run `bf compute --num-jobs N` first"
+            )
+        partials_by_name[spec.name] = partials
 
-def _run_merge_one(cfg: BruteForceConfig, spec: SearchSpec, out: Store) -> str:
-    partials = out.list_parquets(subpath=partial_dir(cfg, spec))
-    if not partials:
-        raise RuntimeError(
-            f"no partial results under {cfg.output.path}/{partial_dir(cfg, spec)}/ "
-            f"(search={spec.name or '<default>'}) — run `bf compute --num-jobs N` first"
-        )
-
-    workers = max(1, cfg.params.io_workers)
-    staged_dir: str | None = None
-    if cfg.params.merge_prefetch and out.is_s3:
-        logger.info(
-            "search=%r: prefetching %d partials to local disk (%d workers)…",
-            spec.name or "<default>", len(partials), workers,
-        )
-        staged_dir, local_paths = _prefetch_local(out, partials, workers)
-        gb = sum(os.path.getsize(p) for p in local_paths) / 1e9
-        logger.info("staged %.1f GB to %s; merging from local disk", gb, staged_dir)
-        readers = [pq.ParquetFile(p) for p in local_paths]
-    else:
-        if cfg.params.merge_prefetch:
-            logger.info("merge_prefetch set but partials are already local — reading in place")
-        readers = [pq.ParquetFile(f.read_path, filesystem=out.fs) for f in partials]
-
+    staged_dirs: list[str] = []
+    readers_by_name: dict[str, list[pq.ParquetFile]] = {}
     try:
-        return _reduce(cfg, spec, out, partials, readers)
+        if cfg.params.merge_prefetch and out.is_s3:
+            _prefetch_all(cfg, out, partials_by_name, staged_dirs, readers_by_name)
+        else:
+            if cfg.params.merge_prefetch:
+                logger.info("merge_prefetch set but partials are already local — reading in place")
+            for spec in cfg.searches:
+                readers_by_name[spec.name] = [
+                    pq.ParquetFile(f.read_path, filesystem=out.fs) for f in partials_by_name[spec.name]
+                ]
+
+        return {
+            spec.name: _reduce(cfg, spec, out, partials_by_name[spec.name], readers_by_name[spec.name])
+            for spec in cfg.searches
+        }
     finally:
-        if staged_dir is not None:
-            shutil.rmtree(staged_dir, ignore_errors=True)
+        for d in staged_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _prefetch_all(
+    cfg: BruteForceConfig,
+    out: Store,
+    partials_by_name: dict[str, list[ParquetFile]],
+    staged_dirs: list[str],
+    readers_by_name: dict[str, list[pq.ParquetFile]],
+) -> None:
+    """Plan every search's prefetch, then run every search's download tasks
+    on ONE shared pool — see `run_merge`'s docstring for why this beats a
+    separate pool (or a fully sequential loop) per search."""
+    plans: dict[str, tuple[str, list[str]]] = {}
+    all_tasks: list[tuple[str, str, int, int]] = []
+    for name, partials in partials_by_name.items():
+        tmpdir, dsts, tasks = _plan_prefetch(out, partials)
+        plans[name] = (tmpdir, dsts)
+        staged_dirs.append(tmpdir)
+        all_tasks += tasks
+
+    total_bytes = sum(t[3] for t in all_tasks)
+    conc = max(1, min(cfg.params.io_workers, _DL_MAX_CONCURRENCY))
+    logger.info(
+        "prefetching %d partials across %d searches to local disk (%d shared workers)…",
+        sum(len(p) for p in partials_by_name.values()), len(partials_by_name), conc,
+    )
+    with ThreadPoolExecutor(max_workers=conc) as ex, tqdm(
+        total=total_bytes, unit="B", unit_scale=True, desc="prefetch", dynamic_ncols=True
+    ) as bar:
+        for n in ex.map(lambda t: _fetch_range(out, t), all_tasks):
+            bar.update(n)
+
+    for name, (tmpdir, dsts) in plans.items():
+        gb = sum(os.path.getsize(p) for p in dsts) / 1e9
+        logger.info("search=%r: staged %.1f GB to %s; merging from local disk", name, gb, tmpdir)
+        readers_by_name[name] = [pq.ParquetFile(p) for p in dsts]
 
 
 def _reduce(
@@ -222,7 +264,7 @@ def _reduce(
     batch_rows = _resolve_batch_rows(cfg.params.merge_batch_size, n_rows, len(partials), k)
     logger.info(
         "search=%r: merging %d partials (%d queries, k=%d) in batches of %d",
-        spec.name or "<default>", len(partials), n_rows, k, batch_rows,
+        spec.name, len(partials), n_rows, k, batch_rows,
     )
 
     # Read query_id + payload only from partial 0; every partial contributes its
@@ -278,6 +320,6 @@ def _reduce(
             writer.close()
         sink.close()
 
-    warn_if_short(short_count, n_rows, k, logger)
-    logger.info("wrote %s (%d queries)", path, n_rows)
+    warn_if_short(short_count, n_rows, k, spec.name, logger)
+    logger.info("search=%r wrote %s (%d queries)", spec.name, path, n_rows)
     return path
