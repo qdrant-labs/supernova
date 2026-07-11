@@ -1,8 +1,10 @@
 """Correctness tests for `BruteForceConfig.searches` — running several
 independent top-K searches (dense/sparse x filtered/unfiltered) against the
 SAME corpus in one `run_compute`/`run_merge` call, sharing corpus file IO and
-per-vector-type decode across specs while keeping each spec's filter,
-scoring, and top-K fully independent (see compute.py's per-file fan-out).
+per-vector-type decode across specs, with specs sharing the same
+vector_type+filter further sharing filter evaluation, row compaction, and GPU
+transfer/CSR build (see compute.py's `SpecGroup`) — only each search's own
+scoring and top-K stay independent.
 
 Ground truth for each spec is computed independently in plain numpy (not by
 re-deriving nova_bf's own scoring), mirroring test_compute.py/
@@ -153,6 +155,157 @@ def test_multi_spec_matches_independent_ground_truth(ds):
         "dense_eng": ds["ground_truth"]("dense", 2, allowed=eng_globals),
         "sparse_all": ds["ground_truth"]("sparse", 3),
         "sparse_eng": ds["ground_truth"]("sparse", 2, allowed=eng_globals),
+    }
+    for name, expected in expectations.items():
+        t = pq.read_table(paths[name]).to_pydict()
+        got = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
+        for q in ds["qids"]:
+            assert got[q] == expected[q], f"search={name} query={q}"
+
+
+def test_grouped_matches_ungrouped_per_search(ds):
+    """The core regression guard for SpecGroup: running several searches
+    together (several of which share the same vector_type+filter, so they
+    land in the same SpecGroup and share GPU transfer/CSR build) must produce
+    results BIT-IDENTICAL to running each of those same searches alone, one
+    per `run_compute` call. Covers dense+sparse, and — for dense — all three
+    metrics (cosine/dot/euclidean) sharing one group, since dense cosine/dot/
+    euclidean all read the SAME shared, un-normalized `Cb` (see `_scores`)."""
+    eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
+    specs = [
+        # group: (dense, filter=None) — 3 members, all 3 metrics
+        SearchSpec(name="dense_dot", vector_type="dense", metric="dot", k=3),
+        SearchSpec(name="dense_cos", vector_type="dense", metric="cosine", k=2),
+        SearchSpec(name="dense_euclid", vector_type="dense", metric="euclidean", k=2),
+        # group: (dense, eng_filter) — 1 member (distinct group from the above)
+        SearchSpec(name="dense_eng", vector_type="dense", metric="dot", k=2, filter=eng_filter),
+        # group: (sparse, filter=None) — 2 members, mixed metrics (the
+        # restructured path — see test_three_member_group_mixed_metrics for
+        # a 3-member version with independently-verified ground truth)
+        SearchSpec(name="sparse_dot", vector_type="sparse", metric="dot", k=3),
+        SearchSpec(name="sparse_cos", vector_type="sparse", metric="cosine", k=2),
+    ]
+
+    combined_cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "grouped_out")),
+        searches=specs,
+    )
+    combined_paths = run_compute(combined_cfg)
+
+    for spec in specs:
+        solo_cfg = BruteForceConfig(
+            corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+            queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+            output=OutputConfig(path=_out(ds, f"solo_{spec.name}_out")),
+            searches=[spec],
+        )
+        solo_path = run_compute(solo_cfg)[spec.name]
+
+        combined_t = pq.read_table(combined_paths[spec.name]).to_pydict()
+        solo_t = pq.read_table(solo_path).to_pydict()
+        assert combined_t["hit_ids"] == solo_t["hit_ids"], f"search={spec.name}"
+        for combined_scores, solo_scores in zip(combined_t["hit_scores"], solo_t["hit_scores"]):
+            assert np.allclose(combined_scores, solo_scores, atol=1e-5), f"search={spec.name}"
+
+
+def test_three_member_group_mixed_metrics(tmp_path):
+    """One SpecGroup (same vector_type=sparse, both unfiltered) with THREE
+    members: two `cosine`, one `dot` — directly targets the two riskiest new
+    bug classes from grouping sparse searches: double-normalization (a cosine
+    member's score divided by row_norms twice) and cross-member contamination
+    (one member reading another's scores). Verified against independently
+    hand-computed dot products and cosine similarities, not nova_bf's own
+    scoring — c1 and c2 are deliberately given the identical cosine similarity
+    (same angle to the query, different magnitude) so a correct
+    implementation must still recover their very different DOT scores,
+    exactly like the two-spec version of this regression test."""
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    # c0 = {1: 3.0, 2: 4.0}, norm 5.0 | c1 = {1: 1.0}, norm 1.0 | c2 = {2: 2.0}, norm 2.0
+    corpus_rows = [([1, 2], [3.0, 4.0]), ([1], [1.0]), ([2], [2.0])]
+    dummy_dense = np.random.default_rng(4).standard_normal((3, DIM)).astype(np.float32)
+    _write_combined(cdir / "f0.parquet", dummy_dense, corpus_rows, id=["c0", "c1", "c2"])
+
+    # q0 = {1: 1.0, 2: 1.0}, norm sqrt(2)
+    query_rows = [([1, 2], [1.0, 1.0])]
+    qpath = tmp_path / "queries.parquet"
+    _write_combined(qpath, np.random.default_rng(5).standard_normal((1, DIM)).astype(np.float32),
+                     query_rows, qid=["q0"])
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[
+            SearchSpec(name="sparse_cos_a", vector_type="sparse", metric="cosine", k=3),
+            SearchSpec(name="sparse_dot", vector_type="sparse", metric="dot", k=3),
+            SearchSpec(name="sparse_cos_b", vector_type="sparse", metric="cosine", k=3),
+        ],
+    )
+    paths = run_compute(cfg)
+
+    dot = dict(zip(*[pq.read_table(paths["sparse_dot"]).to_pydict()[c][0] for c in ("hit_ids", "hit_scores")]))
+    # dot(q0, c0) = 1*3+1*4 = 7; dot(q0, c1) = 1*1 = 1; dot(q0, c2) = 1*2 = 2
+    assert dot["c0"] == pytest.approx(7.0, abs=1e-4)
+    assert dot["c1"] == pytest.approx(1.0, abs=1e-4)
+    assert dot["c2"] == pytest.approx(2.0, abs=1e-4)
+
+    sqrt2 = np.sqrt(2.0)
+    expected_cos = {"c0": 7.0 / (sqrt2 * 5.0), "c1": 1.0 / (sqrt2 * 1.0), "c2": 2.0 / (sqrt2 * 2.0)}
+    # c1 and c2 share the identical cosine similarity (1/sqrt(2)) despite very
+    # different dot products — proves the dot spec above isn't just silently
+    # reusing (or half-reusing) a cosine member's normalized result.
+    assert expected_cos["c1"] == pytest.approx(expected_cos["c2"], abs=1e-9)
+    for name in ("sparse_cos_a", "sparse_cos_b"):
+        cos = dict(zip(*[pq.read_table(paths[name]).to_pydict()[c][0] for c in ("hit_ids", "hit_scores")]))
+        for cid, expected in expected_cos.items():
+            assert cos[cid] == pytest.approx(expected, abs=1e-4), f"search={name} id={cid}"
+
+
+def test_group_specs_batch_size_floors_at_group_max_k():
+    """Unit test for `_merge_batch_size`/`_group_specs`: a group's resolved
+    batch size must never fall below the largest `k` among its members, even
+    when a different, lower-k member explicitly requests a smaller
+    `corpus_batch_size` — mirrors the existing single-spec floor (a batch
+    smaller than k can't fill the top-K and gives no memory benefit) at group
+    granularity."""
+    specs = [
+        SearchSpec(name="big_k_wholefile", vector_type="dense", metric="dot", k=100),
+        SearchSpec(name="small_k_tiny_batch", vector_type="dense", metric="dot", k=5, corpus_batch_size=10),
+    ]
+    # spec_batch mirrors what run_compute's setup loop resolves per spec BEFORE
+    # grouping (each spec's own corpus_batch_size, already floored to its own
+    # k) — neither is below its OWN k here, so this is each spec's
+    # corpus_batch_size verbatim.
+    spec_batch = [None, 10]
+    groups = compute_mod._group_specs(specs, spec_batch)
+    assert len(groups) == 1  # same vector_type, both unfiltered -> one group
+    assert groups[0].batch_size == 100  # min(10) floored at max(k)=100, NOT 10
+
+
+def test_group_batch_size_floor_end_to_end_still_correct(ds):
+    """End-to-end companion to the unit test above: a member requesting a
+    tiny `corpus_batch_size` sharing a group with a higher-`k` member must
+    still produce correct, ground-truth-matching results for BOTH members —
+    the floor changes only memory/perf, never correctness."""
+    specs = [
+        SearchSpec(name="low_k_tiny_batch", vector_type="dense", metric="dot", k=2, corpus_batch_size=1),
+        SearchSpec(name="high_k", vector_type="dense", metric="dot", k=5),
+    ]
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "batch_floor_out")),
+        searches=specs,
+    )
+    paths = run_compute(cfg)
+    expectations = {
+        "low_k_tiny_batch": ds["ground_truth"]("dense", 2),
+        "high_k": ds["ground_truth"]("dense", 5),
     }
     for name, expected in expectations.items():
         t = pq.read_table(paths[name]).to_pydict()
