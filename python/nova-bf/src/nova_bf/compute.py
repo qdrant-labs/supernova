@@ -444,17 +444,25 @@ def run_compute(
         )
         mine = mine[:max_files]
 
-    # 3. per-spec GPU state: each spec gets its own (possibly cosine-normalized)
-    #    query matrix and its own running (top_scores, top_enc) pair — these never
-    #    interact across specs, only the corpus read/decode below is shared.
+    # 3. per-spec GPU state: each spec gets its own running (top_scores, top_enc)
+    #    pair, but its (possibly cosine-normalized) query matrix is shared across
+    #    every spec with the same vector_type — normalization is deterministic
+    #    given vector_type alone, so re-normalizing per spec would just hold N
+    #    identical n_q x dim/vocab copies resident on the GPU for no reason.
     Q_gpu_by_vt = {
         vt: torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device) for vt in vts_needed
     }
+    normalized_Q_by_vt: dict[str, object] = {}
     spec_Q, spec_top_scores, spec_top_enc, spec_batch = [], [], [], []
     for s in specs:
-        Qv = Q_gpu_by_vt[s.vector_type]
         if s.metric == "cosine":
-            Qv = torch.nn.functional.normalize(Qv, dim=1)
+            if s.vector_type not in normalized_Q_by_vt:
+                normalized_Q_by_vt[s.vector_type] = torch.nn.functional.normalize(
+                    Q_gpu_by_vt[s.vector_type], dim=1
+                )
+            Qv = normalized_Q_by_vt[s.vector_type]
+        else:
+            Qv = Q_gpu_by_vt[s.vector_type]
         spec_Q.append(Qv)
         spec_top_scores.append(torch.full((n_q, s.k), float("-inf"), device=device))
         spec_top_enc.append(torch.zeros((n_q, s.k), dtype=torch.int64, device=device))
