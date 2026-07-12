@@ -39,6 +39,8 @@ embed = [
     "hf_transfer",
     # Image-modality decoding (nova_embed.media.image → PIL canonical form).
     "pillow",
+    # Required by several VL model processors (e.g. Qwen3-VL) even for stills.
+    "torchvision",
 ]
 
 # Exposes `nova-embed` on PATH, so `nova embed ...` dispatches here just like a

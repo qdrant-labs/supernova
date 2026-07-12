@@ -328,26 +328,38 @@ class HuggingFaceSource(DatasetSource):
         return cols
 
     def _emit_file_rows(self, pf, path, intra_offset, want_from_file, start_in_file):
-        """Yield up to ``want_from_file`` rows from ``pf``, starting ``intra_offset`` rows in."""
+        """Yield up to ``want_from_file`` rows from ``pf``, starting ``intra_offset`` rows in.
+
+        Reads per ROW GROUP (a ``Table``), not via ``iter_batches`` (which emits
+        ``RecordBatch``es): a fat binary column — e.g. an image struct — can
+        overflow a single Arrow array and come back chunked, which a Table
+        tolerates but a RecordBatch cannot ("Nested data conversions not
+        implemented for chunked array outputs"). Rows are still converted in
+        ≤10k-row slices to bound the Arrow→Python memory spike.
+        """
         read_cols = self._read_columns(pf.schema_arrow.names)
         taken = 0
-        for batch in pf.iter_batches(batch_size=10_000, columns=read_cols):
-            batch_len = len(batch)
-            if intra_offset >= batch_len:  # batch entirely before our start
-                intra_offset -= batch_len
-                continue
-            slice_len = min(batch_len - intra_offset, want_from_file - taken)
-            rows = batch.slice(intra_offset, slice_len).to_pylist()
-            intra_offset = 0  # we've entered the window
-            if self._include_provenance:
-                base = start_in_file + taken  # file-local index of this slice's first row
-                for j, row in enumerate(rows):
-                    row[SOURCE_FILE_COLUMN] = path
-                    row[SOURCE_ROW_COLUMN] = base + j
-            yield from rows
-            taken += len(rows)
+        for rg_idx in range(pf.num_row_groups):
             if taken >= want_from_file:
                 break
+            rg_rows = pf.metadata.row_group(rg_idx).num_rows
+            if intra_offset >= rg_rows:  # row group entirely before our start
+                intra_offset -= rg_rows
+                continue
+            table = pf.read_row_group(rg_idx, columns=read_cols)
+            pos = intra_offset
+            intra_offset = 0  # we've entered the window
+            while pos < rg_rows and taken < want_from_file:
+                slice_len = min(10_000, rg_rows - pos, want_from_file - taken)
+                rows = table.slice(pos, slice_len).to_pylist()
+                if self._include_provenance:
+                    base = start_in_file + taken  # file-local index of this slice's first row
+                    for j, row in enumerate(rows):
+                        row[SOURCE_FILE_COLUMN] = path
+                        row[SOURCE_ROW_COLUMN] = base + j
+                yield from rows
+                taken += len(rows)
+                pos += slice_len
 
     def _file_providers(self, window):
         """Yield ``(path, num_rows, file_start, ParquetFile, done_fn)`` per window file.
