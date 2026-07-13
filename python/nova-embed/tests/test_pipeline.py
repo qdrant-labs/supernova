@@ -184,6 +184,21 @@ def test_writer_all_kinds_with_nulls(tmp_path):
     assert pa.types.is_list(dense_type) and dense_type.value_type == pa.float32()
 
 
+def test_writer_accepts_ndarray_dense_rows(tmp_path):
+    # ST backends keep dense rows as float32 ndarrays (4B/elem vs ~32B for
+    # Python floats in the flush buffer); the writer must take them as-is.
+    import numpy as np
+
+    records = [
+        EmbeddedRecord(row={"id": 1}, embeddings={"d": np.array([1.0, 2.0], dtype=np.float32)}),
+        EmbeddedRecord(row={"id": 2}, embeddings={"d": None}),
+    ]
+    path = write_batch(
+        records, str(tmp_path), 0, output_specs=[spec("d", "dense_col", OutputKind.DENSE)]
+    )
+    assert pq.read_table(path).column("dense_col").to_pylist() == [[1.0, 2.0], None]
+
+
 def test_writer_schema_stable_when_batch_all_null(tmp_path):
     records = [EmbeddedRecord(row={"text": ""}, embeddings={"d": None})]
     path = write_batch(

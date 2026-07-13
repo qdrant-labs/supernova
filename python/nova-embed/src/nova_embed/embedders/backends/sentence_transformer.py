@@ -102,7 +102,10 @@ class SentenceTransformerDenseEmbedder(Embedder):
                 show_progress_bar=False,
                 convert_to_numpy=True,
             )
-        return embeddings.tolist()
+        # keep rows as float32 ndarray views, NOT .tolist(): a Python float is
+        # ~32B vs 4B — on a 2048-dim model that's 64KB vs 8KB per row sitting
+        # in the flush buffer. pyarrow writes ndarray rows directly.
+        return list(embeddings)
 
     async def embed(self, batch: list[Any]) -> list[list[float]]:
         return await asyncio.to_thread(self._encode, batch)
@@ -226,7 +229,8 @@ class SentenceTransformerHybridEmbedder:
             batch_size=self._batch_size,
             show_progress_bar=False,
         )
-        return dense_np.tolist(), _sparse_rows_to_embeddings(sparse_raw)
+        # float32 ndarray rows, not .tolist() — see the dense embedder note
+        return list(dense_np), _sparse_rows_to_embeddings(sparse_raw)
 
     async def embed(
         self, texts: list[str]
