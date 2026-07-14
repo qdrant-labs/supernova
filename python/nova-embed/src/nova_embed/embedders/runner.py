@@ -4,11 +4,12 @@ import logging
 import os
 import time
 
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from tqdm import tqdm
 
-from nova_embed.sources.base import DatasetSource
+from nova_embed.sources.base import DatasetSource, EmptyInputStats, iter_chunks
 from nova_embed.chunkers import Chunker
 from nova_embed.embedders.engine import EmbeddingEngine
 from nova_embed.embedders.buffer import ResultBuffer
@@ -18,29 +19,33 @@ from nova_embed.storage.writer import write_batch
 
 logger = logging.getLogger(__name__)
 
+# Above this skip rate, "quiet" isn't good enough: a big fraction of empty
+# inputs usually means the WRONG input_column, which is exactly the mistake
+# the launch-time checks exist to surface.
+SKIP_RATE_WARN_THRESHOLD = 0.01
+
 
 async def run_embedder(
     source: DatasetSource,
     engine: EmbeddingEngine,
     storage: StorageBackend,
-    chunker: Chunker,
+    chunker: Chunker | None = None,
+    split_column: str | None = None,
     chunk_size: int = 10_000,
     num_workers: int = 8,
     flush_threshold: int = 100_000,
     output_dir: str = "/tmp/nova_embed",
-    max_text_length: int | None = None,
-    dense_column: str | None = "dense_embedding",
-    sparse_column: str | None = None,
-    multivector_column: str | None = None,
-    rendered_text_column: str = "text",
+    on_empty_input: str = "skip",
+    drop_columns: list[str] | None = None,
     filename_prefix: str = "",
     expected_total_rows: int | None = None,
     row_group_size: int | None = None,
+    chunking_strategy: str = "passthrough",
 ):
     logger.info(
-        "Starting pipeline: source=%s engine=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
+        "Starting pipeline: source=%s outputs=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
         source.source_name,
-        engine.model_name,
+        [f"{s.column}<-{s.model_name}" for s in engine.output_specs],
         storage.destination,
         chunk_size,
         num_workers,
@@ -55,6 +60,7 @@ async def run_embedder(
     result_queue: asyncio.Queue = asyncio.Queue()
 
     batch_counter = 0
+    empty_stats = EmptyInputStats()
 
     async def flush(records):
         nonlocal batch_counter, total_records
@@ -62,10 +68,7 @@ async def run_embedder(
             records,
             output_dir,
             batch_counter,
-            dense_column=dense_column,
-            sparse_column=sparse_column,
-            multivector_column=multivector_column,
-            rendered_text_column=rendered_text_column,
+            output_specs=engine.output_specs,
             filename_prefix=filename_prefix,
             row_group_size=row_group_size,
         )
@@ -87,8 +90,14 @@ async def run_embedder(
     # chunker: feeds work queue, then sends sentinels to shut down workers
     async def run_chunker():
         try:
-            for chunk_id, records in source.get_chunks(
-                chunker, chunk_size, max_text_length
+            for chunk_id, records in iter_chunks(
+                source,
+                input_specs=engine.input_specs,
+                chunk_size=chunk_size,
+                on_empty_input=on_empty_input,
+                chunker=chunker,
+                split_column=split_column,
+                stats=empty_stats,
             ):
                 await work_queue.put((chunk_id, records))
         finally:
@@ -96,12 +105,13 @@ async def run_embedder(
                 await work_queue.put(None)
 
     # drain: pulls from result queue into buffer until all workers are done.
-    # The bar counts *texts* (not chunks), so tqdm shows the embedded count, the
-    # %/ETA against the dataset, and a texts/sec rate. `total` is the per-job row
-    # count (from --num-jobs slicing or source.limit); None → a count-up bar.
+    # The bar counts *records* (not chunks), so tqdm shows the embedded count,
+    # the %/ETA against the dataset, and a records/sec rate. `total` is the
+    # per-job row count (from --num-jobs slicing or source.limit); None → a
+    # count-up bar.
     progress = tqdm(
         total=expected_total_rows,
-        unit=" texts",
+        unit=" records",
         unit_scale=True,
         desc="Embedding",
         smoothing=0.1,  # rate reflects recent throughput, not the whole run
@@ -120,7 +130,15 @@ async def run_embedder(
         progress.close()
 
     worker_tasks = [
-        asyncio.create_task(worker(i, work_queue, result_queue, engine))
+        asyncio.create_task(
+            worker(
+                i,
+                work_queue,
+                result_queue,
+                engine,
+                drop_columns=frozenset(drop_columns or ()),
+            )
+        )
         for i in range(num_workers)
     ]
 
@@ -139,21 +157,34 @@ async def run_embedder(
         total_records / elapsed if elapsed > 0 else 0,
     )
 
+    # Loud, not silent: skipped rows are counted into the manifest below, and a
+    # high rate gets a warning — it usually means a wrong input_column.
+    if empty_stats.rows_skipped:
+        source_rows_seen = total_records + empty_stats.rows_skipped
+        skip_rate = empty_stats.rows_skipped / source_rows_seen
+        log = (
+            logger.warning
+            if skip_rate > SKIP_RATE_WARN_THRESHOLD
+            else logger.info
+        )
+        log(
+            "Skipped %d row(s) with empty input column(s) (%.2f%% of rows seen). "
+            "If this is unexpected, check the configured input_column(s).",
+            empty_stats.rows_skipped,
+            skip_rate * 100,
+        )
+
     manifest = {
         "source": source.source_name,
-        "dense_embedder": engine.dense_model_name,
-        "sparse_embedder": engine.sparse_model_name,
-        "multivector_embedder": engine.multivector_model_name,
-        "dimensions": engine.dimensions,
-        "dense_column": dense_column,
-        "sparse_column": sparse_column,
-        "multivector_column": multivector_column,
+        "embedders": [asdict(spec) for spec in engine.output_specs],
         "chunk_size": chunk_size,
-        "chunking_strategy": chunker.__class__.__name__,
-        "max_tokens": engine.max_tokens,
+        "chunking_strategy": chunking_strategy,
         "num_workers": num_workers,
         "flush_threshold": flush_threshold,
+        "on_empty_input": on_empty_input,
+        "drop_columns": sorted(drop_columns or []),
         "total_records": total_records,
+        "rows_skipped_empty_input": empty_stats.rows_skipped,
         "total_batches": batch_counter,
         "elapsed_seconds": round(elapsed, 2),
         "records_per_second": round(total_records / elapsed, 1) if elapsed > 0 else 0,

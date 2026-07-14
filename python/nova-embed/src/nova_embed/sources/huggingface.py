@@ -27,32 +27,6 @@ SOURCE_FILE_COLUMN = "source_file_name"
 SOURCE_ROW_COLUMN = "source_row_number"
 
 
-def _build_text_extractor(text_field: str | None, text_template: str | None):
-    """
-    Returns a function that extracts text from a row.
-    - text_template: format string like "{title}: {abstract}"
-    - text_field: single field name (fallback)
-    """
-    if text_template:
-
-        def extract(row: dict) -> str:
-            return text_template.format(**row)
-
-        return extract
-
-    if text_field:
-
-        def extract(row: dict) -> str:
-            val = row.get(text_field)
-            if val is None:
-                raise ValueError(f"Row is missing text field '{text_field}'")
-            return val
-
-        return extract
-
-    raise ValueError("Must specify either text_field or text_template")
-
-
 def _filter_paths(paths: list[str], pattern: str | list[str] | None) -> list[str]:
     """
     Apply a path filter to a list of HF parquet paths.
@@ -90,8 +64,8 @@ class HuggingFaceSource(DatasetSource):
         self,
         dataset_name: str,
         split: str = "train",
-        text_field: str | None = "text",
-        text_template: str | None = None,
+        render_columns: dict[str, str] | None = None,
+        required_columns: list[str] | None = None,
         exclude_columns: list[str] | None = None,
         offset: int | None = None,
         limit: int | None = None,
@@ -108,6 +82,15 @@ class HuggingFaceSource(DatasetSource):
             dataset_name: HF Hub repo id, e.g. "HuggingFaceTB/dclm-edu".
             split: HF split name. The path_filter (or default split-name match)
                 determines which files are read.
+            render_columns: derived columns composed from other fields via
+                format templates, e.g. {"combined": "{title}: {abstract}"}.
+                Rendered per row BEFORE exclude_columns filtering, so embedder
+                entries can use them as input_column and they land in the
+                output parquet like any other column.
+            required_columns: columns that must never be dropped by the parquet
+                read projection, whatever exclude_columns says. The CLI injects
+                the configured input columns here so the field being embedded
+                always survives.
             offset / limit: applied as a row-window across all selected files.
             total_rows_override: skip the metadata sweep at construction time by
                 trusting this number; metadata is still read per-file as we go.
@@ -125,8 +108,8 @@ class HuggingFaceSource(DatasetSource):
         """
         self.dataset_name = dataset_name
         self.split = split
-        self.text_field = text_field
-        self.text_template = text_template
+        self.render_columns = dict(render_columns or {})
+        self.required_columns = set(required_columns or [])
         self.exclude_columns = set(exclude_columns or [])
         self._offset = offset or 0
         self._limit = limit
@@ -143,7 +126,6 @@ class HuggingFaceSource(DatasetSource):
         self._prefetch_window = prefetch_window
         self._include_provenance = include_provenance
         self._local_paths: dict[str, str] = {}
-        self._extract_text = _build_text_extractor(text_field, text_template)
 
         from huggingface_hub import HfApi, HfFileSystem
 
@@ -333,38 +315,51 @@ class HuggingFaceSource(DatasetSource):
         Skipping excluded columns at READ time — not just dropping them from the
         output in ``format_record`` — is what keeps a fat column (e.g. ms_marco's
         ``passages``, which dwarfs the ``query`` we embed) off the wire and out of
-        the Arrow→Python conversion. Returns None (read everything) when a
-        ``text_template`` is used, since the template may reference arbitrary fields
-        we can't safely drop.
+        the Arrow→Python conversion. Returns None (read everything) when
+        ``render_columns`` is used, since a template may reference arbitrary
+        fields we can't safely drop.
         """
-        if self.text_template is not None:
+        if self.render_columns:
             return None
         cols = [c for c in schema_names if c not in self.exclude_columns]
-        if self.text_field and self.text_field not in cols and self.text_field in schema_names:
-            cols.append(self.text_field)  # never drop the field we embed
+        for required in self.required_columns:
+            if required not in cols and required in schema_names:
+                cols.append(required)  # never drop a field we embed
         return cols
 
     def _emit_file_rows(self, pf, path, intra_offset, want_from_file, start_in_file):
-        """Yield up to ``want_from_file`` rows from ``pf``, starting ``intra_offset`` rows in."""
+        """Yield up to ``want_from_file`` rows from ``pf``, starting ``intra_offset`` rows in.
+
+        Reads per ROW GROUP (a ``Table``), not via ``iter_batches`` (which emits
+        ``RecordBatch``es): a fat binary column — e.g. an image struct — can
+        overflow a single Arrow array and come back chunked, which a Table
+        tolerates but a RecordBatch cannot ("Nested data conversions not
+        implemented for chunked array outputs"). Rows are still converted in
+        ≤10k-row slices to bound the Arrow→Python memory spike.
+        """
         read_cols = self._read_columns(pf.schema_arrow.names)
         taken = 0
-        for batch in pf.iter_batches(batch_size=10_000, columns=read_cols):
-            batch_len = len(batch)
-            if intra_offset >= batch_len:  # batch entirely before our start
-                intra_offset -= batch_len
-                continue
-            slice_len = min(batch_len - intra_offset, want_from_file - taken)
-            rows = batch.slice(intra_offset, slice_len).to_pylist()
-            intra_offset = 0  # we've entered the window
-            if self._include_provenance:
-                base = start_in_file + taken  # file-local index of this slice's first row
-                for j, row in enumerate(rows):
-                    row[SOURCE_FILE_COLUMN] = path
-                    row[SOURCE_ROW_COLUMN] = base + j
-            yield from rows
-            taken += len(rows)
+        for rg_idx in range(pf.num_row_groups):
             if taken >= want_from_file:
                 break
+            rg_rows = pf.metadata.row_group(rg_idx).num_rows
+            if intra_offset >= rg_rows:  # row group entirely before our start
+                intra_offset -= rg_rows
+                continue
+            table = pf.read_row_group(rg_idx, columns=read_cols)
+            pos = intra_offset
+            intra_offset = 0  # we've entered the window
+            while pos < rg_rows and taken < want_from_file:
+                slice_len = min(10_000, rg_rows - pos, want_from_file - taken)
+                rows = table.slice(pos, slice_len).to_pylist()
+                if self._include_provenance:
+                    base = start_in_file + taken  # file-local index of this slice's first row
+                    for j, row in enumerate(rows):
+                        row[SOURCE_FILE_COLUMN] = path
+                        row[SOURCE_ROW_COLUMN] = base + j
+                yield from rows
+                taken += len(rows)
+                pos += slice_len
 
     def _file_providers(self, window):
         """Yield ``(path, num_rows, file_start, ParquetFile, done_fn)`` per window file.
@@ -465,9 +460,10 @@ class HuggingFaceSource(DatasetSource):
                 rows_yielded += 1
             done()
 
-    def extract_text(self, row: dict) -> str:
-        return self._extract_text(row)
-
     def format_record(self, row: dict) -> Record:
+        # render derived columns from the FULL row, then apply exclusions — a
+        # template may reference a column the user excludes from the output.
+        rendered = {name: tpl.format(**row) for name, tpl in self.render_columns.items()}
         columns = {k: v for k, v in row.items() if k not in self.exclude_columns}
-        return Record(text=self.extract_text(row), columns=columns)
+        columns.update(rendered)
+        return Record(row=columns)

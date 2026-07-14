@@ -9,6 +9,8 @@ points being searched.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -16,11 +18,31 @@ import pyarrow.compute as pc
 from nova_bf.config import Filter, FilterCondition
 
 
+def _match_text_mask(text: str, col: pa.ChunkedArray) -> pa.ChunkedArray:
+    """AND of per-word substring matches — Qdrant's MatchText semantics.
+
+    This is a whitespace+word-boundary-regex approximation of Qdrant's real
+    tokenizer, not a byte-for-byte replica: a hyphenated query word like
+    `high-fat` is matched as one literal token rather than split into
+    `high`/`fat`, and a word ending directly in trailing punctuation (`C++`)
+    can fail to get a `\\b` boundary on that side. Good enough for
+    keyword-style corpus filtering.
+    """
+    mask = None
+    for word in text.split():
+        pattern = rf"\b{re.escape(word)}\b"
+        part = pc.match_substring_regex(col, pattern=pattern, ignore_case=True)
+        mask = part if mask is None else pc.and_(mask, part)
+    return mask
+
+
 def _condition_mask(cond: FilterCondition, table: pa.Table) -> np.ndarray:
     col = table[cond.field]
     if cond.match is not None:
         values = cond.match if isinstance(cond.match, tuple) else [cond.match]
         mask = pc.is_in(col, value_set=pa.array(values))
+    elif cond.match_text is not None:
+        mask = _match_text_mask(cond.match_text, col)
     else:
         r = cond.range
         mask = None

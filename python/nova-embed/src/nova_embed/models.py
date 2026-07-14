@@ -1,4 +1,18 @@
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Union
+
+
+class OutputKind(str, Enum):
+    """What one input becomes: the declared output contract of an embedder.
+
+    Lives here (not in embedders.base) so the light config layer can import it
+    without pulling the heavy ML stack.
+    """
+
+    DENSE = "dense"
+    SPARSE = "sparse"
+    MULTIVECTOR = "multivector"
 
 
 @dataclass
@@ -15,7 +29,7 @@ class SparseEmbedding:
 @dataclass
 class MultiVectorEmbedding:
     """
-    Multi-vector representation: N vectors of D floats per text.
+    Multi-vector representation: N vectors of D floats per input.
     N varies per input (typically one vector per token). Used by ColBERT,
     BAAI/bge-m3 multi-vector mode, etc.
 
@@ -28,31 +42,36 @@ class MultiVectorEmbedding:
     vectors: list[list[float]]
 
 
+# What a single input turns into. Which variant an embedder produces is declared
+# statically via `Embedder.output_kind` — consumers never sniff the shape.
+Embedding = Union[list[float], SparseEmbedding, MultiVectorEmbedding]
+
+
 @dataclass
 class Record:
     """
-    A single record from a dataset source, before embedding.
-    One source row may produce multiple Records if the text is split.
+    A single row from a dataset source, before embedding.
 
-    `columns` carries all original source columns (after exclude_columns filtering).
+    `row` carries every column (after exclude_columns filtering). Embedders pick
+    their input out of it by `input_column`. When a chunker is active, one source
+    row may produce multiple Records, each with the chunked column rewritten to
+    one piece (all other columns replicated).
     """
 
-    text: str
-    columns: dict = field(default_factory=dict)
+    row: dict = field(default_factory=dict)
 
 
 @dataclass
 class EmbeddedRecord:
     """
-    A Record after embedding. Any combination of dense/sparse/multivector
-    may be set depending on which embedders are configured.
+    A Record after embedding.
+
+    `embeddings` maps embedder entry name -> its output for this row. A value is
+    None when the entry's input was empty and on_empty_input="null" kept the row.
     """
 
-    text: str
-    dense_embedding: list[float] | None = None
-    sparse_embedding: SparseEmbedding | None = None
-    multivector_embedding: MultiVectorEmbedding | None = None
-    columns: dict = field(default_factory=dict)
+    row: dict = field(default_factory=dict)
+    embeddings: dict[str, Embedding | None] = field(default_factory=dict)
 
 
 @dataclass

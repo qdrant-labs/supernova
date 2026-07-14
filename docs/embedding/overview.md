@@ -1,6 +1,6 @@
 # Embedding Overview
 
-supernova's embedding pipeline streams data from a source, embeds text with configurable dense and/or sparse models, and writes the results as parquet files to S3 or HuggingFace Hub.
+supernova's embedding pipeline streams data from a source, runs any number of configured embedders over it (dense, sparse, multivector — text or image inputs), and writes the results as parquet files to S3 or HuggingFace Hub.
 
 ![Embedding Pipeline](../fig/embedding_pipeline.svg)
 
@@ -13,15 +13,17 @@ source:
   type: huggingface
   dataset_name: nick007x/arxiv-papers
   split: train
-  text_field: abstract             # single field to embed
-  # text_template: "{title}: {abstract}"  # or a format string
 
-dense_embedder:
-  type: sentence_transformer       # or openai
-  model: Alibaba-NLP/gte-multilingual-base
-  trust_remote_code: true
-  batch_size: 64
-  dtype: bfloat16
+embedders:
+  - name: gte
+    kind: dense                    # dense | sparse | multivector (output shape)
+    type: sentence_transformer     # backend implementation
+    model: Alibaba-NLP/gte-multilingual-base
+    input_column: abstract         # which source column this entry embeds
+    modality: text                 # how to decode it: text | image (required)
+    trust_remote_code: true
+    batch_size: 64
+    dtype: bfloat16
 
 pipeline:
   chunk_size: 100000               # records per batch
@@ -34,21 +36,48 @@ storage:
   output_dir: /tmp/supernova       # local staging dir before upload
 ```
 
-You must specify at least one of `dense_embedder` or `sparse_embedder`. See [Dense Embedders](dense-embedders.md) and [Sparse Embedders](sparse-embedders.md) for details.
+`embedders:` is a list — add more entries to embed the same column with several models (comparison runs), or different columns with different models (e.g. CLIP on an image column next to MiniLM on the caption column). Each entry declares three independent axes:
+
+- **`kind`** — the output shape (dense / sparse / multivector). Drives the parquet column type and the manifest.
+- **`type`** — the backend implementation. The same backend name may exist for several kinds (`sentence_transformer` is both a dense and a sparse backend).
+- **`modality`** — how the input column's values are decoded (`text` | `image`). **Required, no default**: the pipeline refuses to guess, so a wrong-modality run dies at launch instead of after hours of embedding file paths as prose. Transport is handled for you — an image column may hold file paths, raw bytes, or HuggingFace `{bytes, path}` structs.
+
+Unknown entry keys (`batch_size`, `dtype`, `device`, …) pass through to the backend constructor. See [Dense Embedders](dense-embedders.md) and [Sparse Embedders](sparse-embedders.md) for the available backends.
+
+Two automatic optimizations: a dense + sparse entry pair pointing at the same `sentence_transformer` model and input column is fused into a single forward pass, and entries sharing an identical backend config share one loaded model instance.
 
 ### Column naming
 
-The embedding columns default to `dense_embedding`, `sparse_embedding`, and `multivector_embedding`. Override with:
+Each entry writes to its own column, defaulting to `{name}_embedding`:
+
+```yaml
+embedders:
+  - name: minilm                   # → column "minilm_embedding"
+    ...
+  - name: ada
+    output_column: dense_ada       # explicit override
+    ...
+```
+
+Column names must be unique and must not collide with source columns.
+
+### Empty inputs
+
+`pipeline.on_empty_input` controls what happens when a row's input column is empty (`skip` drops the row, `null` writes a null embedding, `error` aborts). Default is `skip`; skipped rows are counted in the manifest (`rows_skipped_empty_input`) and a skip rate above 1% logs a warning — a high rate usually means a wrong `input_column`.
+
+### Dropping columns from the output
+
+Two knobs, distinguished by *when* they drop:
+
+- **`source.exclude_columns`** — drops columns **before** embedding (they're never even read from the source parquet). Can't be used on an `input_column`.
+- **`pipeline.drop_columns`** — drops columns **after** embedding, before they reach the flush buffer or the output parquet. This is how you embed a column without carrying it through — e.g. a raw-bytes image column that would bloat the output:
 
 ```yaml
 pipeline:
-  dense_embedding_column: my_dense              # default: dense_embedding
-  sparse_embedding_column: my_sparse            # default: sparse_embedding
-  multivector_embedding_column: my_multivector  # default: multivector_embedding
-  rendered_text_column: text                    # default: text
+  drop_columns: [image]   # embed it, don't store it
 ```
 
-The `rendered_text_column` setting controls where the **template-rendered** text lands. If your source already has a `text` field it gets shadowed — set `rendered_text_column: rendered_text` to keep both.
+A `drop_columns` name that matches nothing in the rows fails on the first chunk (it's almost certainly a typo); naming an embedding output column fails at config time.
 
 ## Sources
 
@@ -61,15 +90,21 @@ source:
   type: huggingface
   dataset_name: mteb/tweet_sentiment_extraction
   split: train
-  text_field: text
 ```
 
-**Text extraction** -- two options:
+Sources are pure row producers — *what* gets embedded is declared per embedder entry (`input_column`), not on the source.
 
-- `text_field: abstract` -- use a single column
-- `text_template: "{title}: {abstract}"` -- format string combining multiple columns
+**Derived columns** — compose a new column from several fields with a format template; embedder entries can then use it as `input_column`, and it lands in the output parquet like any other column:
 
-**Text splitting** -- if a text exceeds the embedder's max token limit, it's automatically split using the embedder's native tokenizer. Each piece becomes a separate record with an incrementing `chunk_index`.
+```yaml
+source:
+  type: huggingface
+  dataset_name: nick007x/arxiv-papers
+  render_columns:
+    combined: "{title}: {abstract}"
+```
+
+**Text splitting** — opt in via the `chunking:` block (`strategy: fixed_char`, …). The chunker splits the input column's text into pieces before embedding; every entry reading that column receives the same pieces. A splitting strategy requires a single `input_column` across all entries — splitting one column while another entry reads a different one would produce inconsistent row counts, and errors at launch.
 
 ## Storage backends
 
@@ -89,23 +124,19 @@ See [Storage backends](storage.md) for every provider, examples, credentials, an
 
 ## Output format
 
-Every parquet file has a flat schema. Three groups of columns:
+Every parquet file has a flat schema. Two groups of columns:
 
-**Always present:**
+**Pass-through source columns** — every column from the source row (after `source.exclude_columns` filtering, plus any `render_columns`) lands verbatim under its original name; types are inferred by pyarrow. When a chunker is active, the input column holds the *chunk* that was embedded (other columns are replicated across a row's chunks).
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `text` | string | The text that was sent to the embedder (template-rendered). Configurable via `pipeline.rendered_text_column`. |
+**Embedding columns** — one per embedder entry, named `{name}_embedding` unless overridden with `output_column`. The arrow type follows the entry's `kind`:
 
-**Embedding columns** — written only when the corresponding embedder is configured. Names default as below; override via `pipeline.dense_embedding_column` / `pipeline.sparse_embedding_column` / `pipeline.multivector_embedding_column`.
+| Kind | Type |
+|------|------|
+| `dense` | `list<float32>` |
+| `sparse` | `struct{indices: list<uint32>, values: list<float32>}` |
+| `multivector` | `list<list<float32>>` (N vectors per row) |
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `dense_embedding` | `list<float32>` | Dense embedding |
-| `sparse_embedding` | `struct{indices: list<uint32>, values: list<float32>}` | Sparse embedding |
-| `multivector_embedding` | `list<list<float32>>` | Multi-vector embedding (N vectors per row) |
-
-**Pass-through source columns** — every column from the source row (after `source.exclude_columns` filtering) is appended verbatim under its original name. The writer skips any source column whose name collides with the embedding columns or with `rendered_text_column`. Types are inferred from the data by pyarrow.
+Embedding columns are always written with their declared type — under `on_empty_input: null` an empty input becomes a null value, never a schema change.
 
 So if your HuggingFace source has columns `title`, `abstract`, `author`, those land alongside the embedding columns:
 

@@ -1,36 +1,18 @@
 # supernova
 
-supernova is a toolkit for building large-scale vector search benchmarks. It does five things:
+`supernova` is a toolkit for building large-scale vector search benchmarks. It does five things:
 
-1. **Embedding generation** — take a dataset, embed it with any model (dense, sparse, or multivector), produce parquet files
-2. **Vector store loading** — take pre-embedded parquet files, load them into a database
-3. **Ground truth** — brute-force exact nearest neighbours over the corpus, to measure a store's recall
-4. **Load testing** — fire query load at a vector store and measure its latency
+1. **Embedding generation** — take a dataset, embed it with any model (dense, sparse, or multivector), and produce parquet files.
+2. **Vector store loading** — take pre-embedded parquet files and load them into a vector database
+3. **Ground truth computation** — perform brute-force, exact, nearest neighbour search over a corpus, to measure recall@k for a given index/search configuration
+4. **Load testing** — fire a query load at a vector store to measure its latency and recall
 5. **Parameter sweeping** — orchestrate loading + load testing across a matrix of index/search configs, in one combined report
 
-Each is its own tool, and each shards itself for massive parallelization via `--num-jobs` / `--job-rank`. The datasets we work with are often hundreds of millions of rows and hundreds of gigabytes.
+Each is its own, self-contained tool, and each shards itself for massive parallelization via `--num-jobs` / `--job-rank`. The datasets we work with are often hundreds of millions of rows and hundreds of gigabytes.
 
 ## Mental model
 
-The pipelines are independent. You can run them separately, on different machines, at different times. The parquet files are the bridge — each embedding run produces many parquet files under a common URI prefix, which the loader then reads.
-
-```
-Source (HuggingFace) ──▶ nova embed ──▶ parquet (S3/HF/local) ──▶ nova load ──▶ Qdrant ──▶ nova storm
-                                              │
-                                              └──▶ nova bf ──▶ ground-truth top-K  (recall@k)
-```
-
-`nova sweep` sits on top of `nova load` + `nova storm`: instead of running
-that pair once, it drives them across a matrix of index/search settings and
-combines the results into one report — see [Sweep](sweep/overview.md).
-
-Corpora are addressed by URI. Three schemes are supported:
-
-| Scheme | Used for |
-|--------|----------|
-| `s3://bucket/prefix` | S3 buckets (the typical production destination) |
-| `hf://buckets/ns/name[/subdir]` | HuggingFace Storage Buckets (mutable object storage on the Hub) |
-| local path | Local filesystem (handy for tests and single-machine flows) |
+The pipelines are independent and meant to be reproducible. Each tool doesn't know that the others exist. You can run them separately, on different machines, and at different times. The intermediate parquet files connect each step.
 
 ## One CLI, many tools
 
@@ -51,7 +33,7 @@ Distributed runs are just N copies of a tool, each with its own `--job-rank`. Or
 ## Key design principles
 
 - **Streaming** — no pipeline loads the full dataset into memory; data is processed in chunks/batches throughout.
-- **Self-sharding tools** — each tool partitions its own work from `--num-jobs` / `--job-rank` (rank defaults to `$SKYPILOT_JOB_RANK`). No central coordinator.
+- **Self-sharding tools** — each tool is designed to be stateless and partitions its own work from `--num-jobs` / `--job-rank` (rank defaults to `$SKYPILOT_JOB_RANK`). No central coordinator.
 - **YAML-driven** — every run is defined by a YAML config; `${VAR}` / `${VAR:-default}` references are expanded from the environment.
 - **Flat parquet output** — embedding output is flat columnar data (no nested JSON). Payload composition happens at load time.
 

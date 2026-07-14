@@ -1,0 +1,32 @@
+# Image-modality example: embed MNIST digits with CLIP.
+#
+# The source's `image` column holds HuggingFace Image structs ({bytes, path});
+# the pipeline decodes them (path / bytes / struct all work) and hands the
+# model real images — `modality: image` is what switches the decoder.
+source:
+  type: huggingface_parquet
+  dataset_name: ylecun/mnist
+  split: train
+
+embedders:
+  - name: clip
+    kind: dense
+    type: sentence_transformer
+    model: sentence-transformers/clip-ViT-B-32
+    input_column: image
+    modality: image
+    batch_size: 64
+    # → column "clip_embedding" (512 floats)
+
+storage:
+  type: local
+  output_dir: /tmp/mnist_clip
+
+pipeline:
+  chunk_size: 1000
+  flush_threshold: 10000
+  # Embed the image column but don't carry the raw bytes into the output
+  # parquet (or hold them in the flush buffer). This is the write-side
+  # counterpart of source.exclude_columns, which can't touch an input_column
+  # because it drops BEFORE embedding.
+  drop_columns: [image]

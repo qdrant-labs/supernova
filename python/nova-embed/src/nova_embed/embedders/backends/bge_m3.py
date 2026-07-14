@@ -1,38 +1,26 @@
 import asyncio
 import logging
 
-import torch
-
-from nova_embed.embedders.multivector.base import MultiVectorEmbedder
+from nova_embed.embedders.backends.device import detect_device
+from nova_embed.embedders.base import Embedder, OutputKind
 from nova_embed.models import MultiVectorEmbedding
-from nova_embed.registry import MULTIVECTOR_EMBEDDERS
+from nova_embed.registry import EMBEDDERS
 
 logger = logging.getLogger(__name__)
 
 
-def _detect_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-@MULTIVECTOR_EMBEDDERS.register("bge_m3")
-class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
+@EMBEDDERS.register("bge_m3")
+class BGEM3MultiVectorEmbedder(Embedder):
     """
     Multi-vector (ColBERT-style) output from BAAI/bge-m3 via FlagEmbedding.
 
     bge-m3 has three heads -- dense, sparse (lexical), and multi-vector (colbert).
     This class only exposes the multi-vector head. If you want dense + sparse
     from the same model, use the (future) hybrid path; for now they are separate
-    configs.
+    entries.
     """
 
-    DTYPE_MAP = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
+    output_kind = OutputKind.MULTIVECTOR
 
     def __init__(
         self,
@@ -50,9 +38,8 @@ class BGEM3MultiVectorEmbedder(MultiVectorEmbedder):
                 "Install with: uv add FlagEmbedding"
             ) from e
 
-        self._device = device or _detect_device()
-        torch_dtype = self.DTYPE_MAP.get(dtype, torch.float32)
-        use_fp16 = torch_dtype == torch.float16
+        self._device = device or detect_device()
+        use_fp16 = dtype == "float16"
 
         logger.info(
             "Loading %s (multi-vector mode) on %s (dtype=%s)",

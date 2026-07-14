@@ -2,33 +2,84 @@ source:
   type: huggingface_parquet
   dataset_name: mteb/tweet_sentiment_extraction
   split: train
-  text_field: text
+  # Sources are pure row producers — WHAT gets embedded is declared per
+  # embedder entry below (input_column). Derived columns are available via:
+  # render_columns:
+  #   combined: "{title}: {abstract}"
 
-dense_embedder:
-  type: sentence_transformer
-  model: sentence-transformers/all-MiniLM-L6-v2
-  batch_size: 128
-  dtype: bfloat16
+# Each entry declares its own axes:
+#   kind          — output shape: dense | sparse | multivector (drives the
+#                   parquet column type and the manifest)
+#   type          — backend implementation (registry lookup is (kind, type))
+#   modality      — how input_column's values are decoded: text | image.
+#                   REQUIRED, no default: embedding the wrong modality for
+#                   hours costs more than typing `modality: text`.
+#   input_column  — source column this entry embeds
+#   output_column — parquet column for the result (default: "{name}_embedding")
+# Unknown keys (batch_size, dtype, device, …) pass through to the backend.
+embedders:
+  - name: minilm_l6
+    kind: dense
+    type: sentence_transformer
+    model: sentence-transformers/all-MiniLM-L6-v2
+    input_column: text
+    modality: text
+    batch_size: 128
+    dtype: bfloat16
+    # max_length: 8192          # truncate input to N chars before embedding
+  
+  - name: minilm_l12
+    kind: dense
+    type: sentence_transformer
+    model: sentence-transformers/all-MiniLM-L12-v2
+    input_column: text
+    modality: text
+    batch_size: 128
+    dtype: bfloat16
+    # max_length: 8192          # truncate input to N chars before embedding
 
-sparse_embedder:
-  type: fastembed
-  model: Qdrant/bm25
-  batch_size: 256
+  - name: bm25
+    kind: sparse
+    type: fastembed
+    model: Qdrant/bm25
+    input_column: text
+    modality: text
+    batch_size: 256
 
-# multivector_embedder:
-#   type: bge_m3
-#   model: BAAI/bge-m3
-#   batch_size: 8
+  # Same column through several models (comparison runs), or different columns
+  # through different models (e.g. CLIP on an image column), are both just more
+  # entries. A dense + sparse pair on the SAME sentence_transformer model and
+  # input column is automatically fused into one forward pass.
+  #
+  # - name: clip
+  #   kind: dense
+  #   type: sentence_transformer
+  #   model: clip-ViT-B-32
+  #   input_column: image
+  #   modality: image
+  #
+  # - name: colbert
+  #   kind: multivector
+  #   type: bge_m3
+  #   model: BAAI/bge-m3
+  #   input_column: text
+  #   modality: text
+  #   batch_size: 8
+  #   pooling:                  # derive a dense column from the multivector
+  #     type: mean              # mean | max | cls | last
+  #     normalize: true
+  #     # output_column: dense_pooled   (default: "{name}_pooled")
 
-# How each row's text is split into pieces BEFORE embedding. Model-agnostic:
-# every embedder above receives the same pieces. Omit for the default
-# (passthrough = no split; each model truncates overflow at its own token limit).
+# How the input column's text is split into pieces BEFORE embedding.
+# Model-agnostic: every entry reading that column receives the same pieces.
+# Omit for the default (passthrough = no split). A splitting strategy requires
+# a single input_column across all entries — splitting one column while another
+# entry reads a different one produces inconsistent row counts and errors at
+# launch.
 # chunking:
 #   strategy: fixed_char    # split into fixed-size CHARACTER windows
 #   chunk_chars: 1024
 #   overlap: 0
-#   # strategy: passthrough  # no-op (default)
-#   # strategy: semantic     # not implemented yet (issue #13)
 
 # storage:
 #   type: object_store                 # s3 / gcs / azure + s3-compatible, via a URI
@@ -42,5 +93,9 @@ storage:
   output_dir: /tmp/mteb_tweets_all-MiniLM-L6-v2
 
 pipeline:
-  chunk_size: 1000
   flush_threshold: 10000
+  # What to do when a row's input column is empty:
+  #   skip (default) — drop the row; counted in the manifest, warned if >1%
+  #   null           — keep the row, write a null embedding
+  #   error          — abort on the first empty input
+  # on_empty_input: skip
