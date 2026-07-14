@@ -42,6 +42,15 @@ embed = [
     # Required by several VL model processors (e.g. Qwen3-VL) even for stills.
     "torchvision",
 ]
+# The vllm backend (modality: multimodal, or high-throughput text). Its own
+# extra, not part of `embed`: vLLM is Linux+GPU only — the platform marker
+# keeps macOS/other resolution from ever considering it (there are no darwin
+# wheels; without the marker uv's universal resolve digs up a 2023 sdist and
+# tries to compile it against CUDA).
+vllm = [
+    "vllm>=0.11; sys_platform == 'linux'",
+    "pillow",
+]
 
 # Exposes `nova-embed` on PATH, so `nova embed ...` dispatches here just like a
 # Rust `nova-<cmd>` binary would.

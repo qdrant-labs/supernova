@@ -1,4 +1,5 @@
-"""sentence-transformers backends: dense (text + image), sparse, and the
+"""
+sentence-transformers backends: dense (text + image), sparse, and the
 internal hybrid class used when the engine fuses a dense + sparse pair that
 point at the same model.
 """
@@ -6,9 +7,11 @@ point at the same model.
 import asyncio
 import logging
 import threading
+
 from typing import Any
 
 import torch
+
 from sentence_transformers import SentenceTransformer, SparseEncoder
 
 from nova_embed.embedders.backends.device import detect_device
@@ -27,7 +30,9 @@ DTYPE_MAP = {
 
 
 def _sparse_rows_to_embeddings(rows) -> list[SparseEmbedding]:
-    """SparseEncoder returns scipy sparse matrices or dicts depending on version."""
+    """
+    SparseEncoder returns scipy sparse matrices or dicts depending on version.
+    """
     embeddings = []
     for row in rows:
         if hasattr(row, "toarray"):

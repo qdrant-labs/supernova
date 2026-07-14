@@ -4,7 +4,11 @@ Accepted transport forms:
 
 * ``PIL.Image.Image`` — passed through.
 * ``bytes`` — decoded in-memory (png/jpeg/webp/…, whatever PIL reads).
-* ``str`` — treated as a local file path.
+* ``str`` — an ``http(s)://`` URL is fetched; anything else is a local file
+  path. Fetch timeout defaults to 10s, override via ``NOVA_IMAGE_FETCH_TIMEOUT``
+  (seconds). A failed fetch raises — the pipeline's empty-input policy is about
+  MISSING data, not broken transport, and silently dropping rows on a flaky
+  CDN would skew the output.
 * ``dict`` with ``bytes`` and/or ``path`` keys — the HuggingFace ``Image``
   feature's raw form when read straight from parquet; ``bytes`` wins when both
   are present (the path often refers to a file inside the original archive).
@@ -13,7 +17,32 @@ Accepted transport forms:
 from __future__ import annotations
 
 import io
+import os
 from typing import Any
+
+_URL_PREFIXES = ("http://", "https://")
+
+
+def _fetch_url(url: str):
+    import urllib.request
+
+    from PIL import Image
+
+    timeout = float(os.environ.get("NOVA_IMAGE_FETCH_TIMEOUT", "10"))
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = resp.read()
+    except Exception as e:
+        raise ValueError(f"failed to fetch image from {url!r}: {e}") from e
+    return Image.open(io.BytesIO(data))
+
+
+def _open_str(value: str):
+    from PIL import Image
+
+    if value.startswith(_URL_PREFIXES):
+        return _fetch_url(value)
+    return Image.open(value)
 
 
 def decode(value: Any):
@@ -24,18 +53,18 @@ def decode(value: Any):
     if isinstance(value, (bytes, bytearray)):
         return Image.open(io.BytesIO(bytes(value)))
     if isinstance(value, str):
-        return Image.open(value)
+        return _open_str(value)
     if isinstance(value, dict):
         data = value.get("bytes")
         if data:
             return Image.open(io.BytesIO(bytes(data)))
         path = value.get("path")
         if path:
-            return Image.open(path)
+            return _open_str(path)
         raise TypeError("image dict has neither 'bytes' nor 'path' set")
     raise TypeError(
         f"image modality can't decode {type(value).__name__!r}; expected "
-        "PIL.Image, bytes, path str, or {'bytes':…, 'path':…} dict"
+        "PIL.Image, bytes, path/URL str, or {'bytes':…, 'path':…} dict"
     )
 
 

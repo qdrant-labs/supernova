@@ -51,13 +51,13 @@ class ListSource(DatasetSource):
         return len(self._rows)
 
 
-TEXT_SPECS = {"text": Modality.TEXT}
+TEXT_GROUPS = [{"text": Modality.TEXT}]
 
 
-def collect(rows, input_specs=TEXT_SPECS, **kwargs):
+def collect(rows, input_groups=TEXT_GROUPS, **kwargs):
     stats = kwargs.pop("stats", EmptyInputStats())
     chunks = list(
-        iter_chunks(ListSource(rows), input_specs, chunk_size=10, stats=stats, **kwargs)
+        iter_chunks(ListSource(rows), input_groups, chunk_size=10, stats=stats, **kwargs)
     )
     records = [r for _, chunk in chunks for r in chunk]
     return records, stats
@@ -74,10 +74,13 @@ def test_skip_drops_and_counts():
     assert stats.rows_skipped == 2
 
 
+TWO_ENTRY_GROUPS = [{"text": Modality.TEXT}, {"title": Modality.TEXT}]
+
+
 def test_null_keeps_partial_rows():
     records, stats = collect(
         [{"text": "a", "title": ""}, {"text": "", "title": "t"}],
-        input_specs={"text": Modality.TEXT, "title": Modality.TEXT},
+        input_groups=TWO_ENTRY_GROUPS,
         on_empty_input="null",
     )
     assert len(records) == 2
@@ -87,10 +90,59 @@ def test_null_keeps_partial_rows():
 def test_null_still_skips_all_empty_rows():
     records, stats = collect(
         [{"text": "", "title": ""}, {"text": "a", "title": "t"}],
-        input_specs={"text": Modality.TEXT, "title": Modality.TEXT},
+        input_groups=TWO_ENTRY_GROUPS,
         on_empty_input="null",
     )
     assert len(records) == 1
+    assert stats.rows_skipped == 1
+
+
+# ------------------------------------------- multimodal input groups
+
+# One multimodal entry = ONE group spanning both columns: empty only when
+# every part is empty, so partial rows are valid inputs, not policy events.
+MM_GROUP = [{"text": Modality.TEXT, "image": Modality.IMAGE}]
+
+
+def test_multimodal_group_keeps_partial_rows_under_skip():
+    records, stats = collect(
+        [
+            {"text": "a", "image": b"img"},
+            {"text": "b", "image": None},   # text-only: valid
+            {"text": "", "image": b"img"},  # image-only: valid
+            {"text": "", "image": None},    # all parts empty: skipped
+        ],
+        input_groups=MM_GROUP,
+        on_empty_input="skip",
+    )
+    assert [r.row["text"] for r in records] == ["a", "b", ""]
+    assert stats.rows_skipped == 1
+
+
+def test_multimodal_group_error_only_when_all_parts_empty():
+    records, _ = collect(
+        [{"text": "a", "image": None}],
+        input_groups=MM_GROUP,
+        on_empty_input="error",
+    )
+    assert len(records) == 1
+    with pytest.raises(ValueError, match="on_empty_input=error"):
+        collect(
+            [{"text": "", "image": None}],
+            input_groups=MM_GROUP,
+            on_empty_input="error",
+        )
+
+
+def test_multimodal_group_beside_plain_entry():
+    # the plain entry's empty column is still a policy event even though the
+    # multimodal group is satisfied
+    records, stats = collect(
+        [{"text": "a", "image": b"img", "title": ""}],
+        input_groups=MM_GROUP + [{"title": Modality.TEXT}],
+        on_empty_input="skip",
+    )
+    assert records == []
     assert stats.rows_skipped == 1
 
 
@@ -126,7 +178,7 @@ def test_chunker_requires_split_column():
 def test_batching_respects_chunk_size():
     rows = [{"text": f"t{i}"} for i in range(25)]
     chunks = list(
-        iter_chunks(ListSource(rows), TEXT_SPECS, chunk_size=10)
+        iter_chunks(ListSource(rows), TEXT_GROUPS, chunk_size=10)
     )
     assert [len(c) for _, c in chunks] == [10, 10, 5]
     assert [cid for cid, _ in chunks] == [0, 1, 2]
@@ -328,3 +380,45 @@ def test_drop_columns_removes_input_column_from_output(tmp_path):
 def test_drop_columns_typo_dies_on_first_chunk(tmp_path):
     with pytest.raises(ValueError, match="drop_columns \\['imge'\\] not found"):
         run(tmp_path, [{"text": "hello"}], [dense_entry()], drop_columns=["imge"])
+
+
+def test_run_embedder_multimodal_end_to_end(tmp_path):
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    img = Image.new("RGB", (2, 2))
+    rows = [
+        {"text": "hello", "image": img, "id": 0},  # both parts
+        {"text": "hey", "image": None, "id": 1},   # text-only — valid input
+        {"text": "", "image": img, "id": 2},       # image-only — valid input
+        {"text": "", "image": None, "id": 3},      # all parts empty — skipped
+    ]
+    entries = [
+        EmbedderEntry.model_validate(
+            {
+                "name": "mm",
+                "kind": "dense",
+                "type": "fake_mm",
+                "modality": "multimodal",
+                "input_columns": {"text": "text", "image": "image"},
+                "instruction": "Represent the user's input.",
+            }
+        )
+    ]
+    # drop the image column: a PIL object can't be written to parquet anyway
+    table = run(tmp_path, rows, entries, drop_columns=["image"])
+    assert table.column("id").to_pylist() == [0, 1, 2]
+    # fake_mm encodes [len(text), has_image]
+    assert table.column("mm_embedding").to_pylist() == [
+        [5.0, 1.0],
+        [3.0, 0.0],
+        [0.0, 1.0],
+    ]
+
+    manifest = json.loads((tmp_path / "_manifest.json").read_text())
+    assert manifest["rows_skipped_empty_input"] == 1
+    (spec,) = manifest["embedders"]
+    assert spec["modality"] == "multimodal"
+    assert spec["input_column"] == "text=text,image=image"
+    # the instruction is part of the embedding space — the query side needs it
+    assert spec["instruction"] == "Represent the user's input."

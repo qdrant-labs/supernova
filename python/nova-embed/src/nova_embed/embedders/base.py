@@ -35,8 +35,9 @@ class Embedder(ABC):
     # What one input becomes: list[float] / SparseEmbedding / MultiVectorEmbedding.
     output_kind: ClassVar[OutputKind]
     # What this backend can consume. The engine hands embed() *canonical* objects
-    # for the configured modality (str for text, PIL.Image for image) — transport
-    # decoding already happened in nova_embed.media.
+    # for the configured modality (str for text, PIL.Image for image; multimodal
+    # entries get part dicts like {"text": str, "image": PIL.Image} with at least
+    # one key present) — transport decoding already happened in nova_embed.media.
     supported_modalities: ClassVar[frozenset[Modality]] = frozenset({Modality.TEXT})
 
     @abstractmethod
@@ -67,5 +68,16 @@ class Embedder(ABC):
         Max input token length, for text-modality backends. None for backends
         where the concept doesn't apply (e.g. image encoders). Written to the
         manifest; text splitting itself is owned by the chunkers module.
+        """
+        return None
+
+    @property
+    def instruction(self) -> str | None:
+        """
+        Instruction/prompt text baked into every embedding by this backend
+        (e.g. the chat-template system turn of instruction-tuned embedding
+        models). None when the concept doesn't apply. Written to the manifest
+        because it CHANGES the embedding space: query-side embedding at search
+        time must reproduce the exact same instruction, or recall quietly tanks.
         """
         return None

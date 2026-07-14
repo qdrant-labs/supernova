@@ -23,6 +23,7 @@ _BACKEND_MODULES = [
     "openai",
     "fastembed",
     "bge_m3",
+    "vllm",
 ]
 
 for _mod in _BACKEND_MODULES:

@@ -9,10 +9,10 @@ Three kinds of section:
 * **Typed knobs** — `pipeline` (and the structural shape) are fully modelled, so
   defaults live in one place and typos are caught (`extra="forbid"`).
 * **Embedder entries** — `embedders:` is a list; each entry types the fields the
-  pipeline itself consumes (name / kind / type / model / input_column / modality
-  / output_column / max_length / pooling) and passes everything else through to
-  the backend constructor, so adding a backend param never means touching this
-  file.
+  pipeline itself consumes (name / kind / type / model / input_column /
+  input_columns / modality / output_column / max_length / pooling) and passes
+  everything else through to the backend constructor, so adding a backend param
+  never means touching this file.
 * **Flexible sections** — `source` / `storage` / `chunking` each carry a `type`
   (or `strategy`) plus backend-specific kwargs, passed straight to the
   constructor via [`build_dict`][TypedSection.build_dict].
@@ -30,7 +30,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from nova_embed.media import Modality
+from nova_embed.media import PART_MODALITIES, Modality
 from nova_embed.models import OutputKind
 
 _ENV_RE = re.compile(r"\$\{([^}]+)\}")
@@ -101,6 +101,12 @@ class EmbedderEntry(BaseModel):
     `input_column`'s values — it is REQUIRED, no default: embedding the wrong
     modality for hours is far more expensive than typing `modality: text`.
 
+    `modality: multimodal` entries read SEVERAL columns into one embedding
+    (text + image through a backend like vllm): they declare `input_columns`
+    (part modality -> source column) instead of `input_column`. A row is a
+    valid multimodal input when AT LEAST ONE part is present — only a row with
+    every part empty counts as empty for the `on_empty_input` policy.
+
     Unknown keys are backend constructor kwargs (batch_size, dtype, device, …).
     """
 
@@ -110,17 +116,35 @@ class EmbedderEntry(BaseModel):
     kind: OutputKind
     type: str
     model: str | None = None
-    input_column: str
+    # exactly one of the two, keyed on modality: `input_column` for a single
+    # decoded column, `input_columns` (part modality -> column) for multimodal
+    input_column: str | None = None
+    input_columns: dict[Modality, str] | None = None
     modality: Modality
     # parquet column for this entry's output; defaults to "{name}_embedding"
     output_column: str | None = None
-    # truncate this entry's (text) input to N characters before embedding
+    # truncate this entry's text input to N characters before embedding (the
+    # text part, for a multimodal entry)
     max_length: int | None = Field(default=None, gt=0)
     pooling: PoolingConfig | None = None
 
     @property
     def column(self) -> str:
         return self.output_column or f"{self.name}_embedding"
+
+    @property
+    def input_parts(self) -> dict[Modality, str]:
+        """part modality -> source column. Single-input entries have one part."""
+        if self.input_columns is not None:
+            return dict(self.input_columns)
+        return {self.modality: self.input_column}
+
+    @property
+    def input_display(self) -> str:
+        """Human-readable input spec, for CLI/manifest lines."""
+        if self.input_columns is not None:
+            return ",".join(f"{m.value}={c}" for m, c in self.input_columns.items())
+        return f"{self.input_column}[{self.modality.value}]"
 
     @property
     def pooled_column(self) -> str | None:
@@ -137,16 +161,59 @@ class EmbedderEntry(BaseModel):
 
     @model_validator(mode="after")
     def _check_entry(self) -> "EmbedderEntry":
+        if self.modality == Modality.MULTIMODAL:
+            if self.input_column is not None:
+                raise ValueError(
+                    f"embedder {self.name!r}: modality 'multimodal' takes "
+                    f"`input_columns` (part modality -> column), not `input_column`"
+                )
+            if not self.input_columns:
+                raise ValueError(
+                    f"embedder {self.name!r}: modality 'multimodal' requires "
+                    f"`input_columns`, e.g. input_columns: {{text: caption, "
+                    f"image: image}}"
+                )
+            bad = sorted(m.value for m in self.input_columns if m not in PART_MODALITIES)
+            if bad:
+                parts = sorted(m.value for m in PART_MODALITIES)
+                raise ValueError(
+                    f"embedder {self.name!r}: input_columns keys must be part "
+                    f"modalities {parts}, got {bad}"
+                )
+            if len(self.input_columns) < 2:
+                (only,) = self.input_columns
+                raise ValueError(
+                    f"embedder {self.name!r}: multimodal with a single part is "
+                    f"just that part — declare modality: {only.value} with "
+                    f"input_column instead"
+                )
+            cols = list(self.input_columns.values())
+            if len(set(cols)) != len(cols):
+                raise ValueError(
+                    f"embedder {self.name!r}: input_columns maps two parts to "
+                    f"the same source column ({cols})"
+                )
+        else:
+            if self.input_columns is not None:
+                raise ValueError(
+                    f"embedder {self.name!r}: `input_columns` is only valid with "
+                    f"modality: multimodal; use `input_column` for a single input"
+                )
+            if self.input_column is None:
+                raise ValueError(f"embedder {self.name!r}: `input_column` is required")
         if self.pooling is not None and self.kind != OutputKind.MULTIVECTOR:
             raise ValueError(
                 f"embedder {self.name!r}: pooling derives a dense column from "
                 f"multivector output; it is not valid on kind={self.kind.value!r}"
             )
-        if self.max_length is not None and self.modality != Modality.TEXT:
-            raise ValueError(
-                f"embedder {self.name!r}: max_length is character truncation and "
-                f"only applies to modality: text (got {self.modality.value!r})"
-            )
+        if self.max_length is not None:
+            has_text = Modality.TEXT in self.input_parts
+            if not has_text:
+                raise ValueError(
+                    f"embedder {self.name!r}: max_length is character truncation "
+                    f"of the text input and this entry has none "
+                    f"(modality {self.modality.value!r})"
+                )
         return self
 
 
@@ -204,8 +271,25 @@ class EmbedConfig(BaseModel):
 
     @property
     def input_specs(self) -> dict[str, Modality]:
-        """input_column -> modality, across all entries (validated consistent)."""
-        return {e.input_column: e.modality for e in self.embedders}
+        """input column -> modality, across all entries (validated consistent).
+
+        Multimodal entries contribute one spec per PART column, with the part's
+        own modality — this is the decode/read-projection view of the inputs.
+        """
+        return {
+            col: m for e in self.embedders for m, col in e.input_parts.items()
+        }
+
+    @property
+    def input_groups(self) -> list[dict[str, Modality]]:
+        """One column->modality group per entry — the unit of the empty policy.
+
+        A group (= entry) is empty only when ALL of its columns are empty, so a
+        multimodal row with just a text or just an image is a valid input.
+        """
+        return [
+            {col: m for m, col in e.input_parts.items()} for e in self.embedders
+        ]
 
     @model_validator(mode="after")
     def _check_cross_entry(self) -> "EmbedConfig":
@@ -229,10 +313,12 @@ class EmbedConfig(BaseModel):
             )
 
         # one modality per input column — two entries reading the same column
-        # through different decoders is a config mistake, not a feature
+        # through different decoders is a config mistake, not a feature.
+        # Multimodal entries participate per PART column with the part modality.
         by_column: dict[str, set[Modality]] = {}
         for e in self.embedders:
-            by_column.setdefault(e.input_column, set()).add(e.modality)
+            for m, col in e.input_parts.items():
+                by_column.setdefault(col, set()).add(m)
         conflicts = {c: sorted(m.value for m in ms) for c, ms in by_column.items() if len(ms) > 1}
         if conflicts:
             raise ValueError(

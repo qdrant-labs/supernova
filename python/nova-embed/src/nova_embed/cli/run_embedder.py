@@ -24,7 +24,7 @@ def _configured_embedders(cfg) -> list[str]:
     """One line per embedder entry (no models loaded)."""
     return [
         f"{e.name}: kind={e.kind.value} type={e.type} model={e.model or '?'} "
-        f"{e.input_column}[{e.modality.value}] -> {e.column}"
+        f"{e.input_display} -> {e.column}"
         for e in cfg.embedders
     ]
 

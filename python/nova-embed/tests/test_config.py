@@ -138,6 +138,94 @@ def test_max_length_only_for_text():
         config(entry(modality="image", input_column="img", max_length=100))
 
 
+# ------------------------------------------------------- multimodal entries
+
+def mm_entry(**overrides) -> dict:
+    e = {
+        "name": "mm",
+        "kind": "dense",
+        "type": "vllm",
+        "model": "Qwen/Qwen3-VL-Embedding-2B",
+        "modality": "multimodal",
+        "input_columns": {"text": "caption", "image": "img"},
+    }
+    e.update(overrides)
+    return e
+
+
+def test_multimodal_entry_parses():
+    cfg = config(mm_entry())
+    (e,) = cfg.embedders
+    assert {m.value: c for m, c in e.input_parts.items()} == {
+        "text": "caption",
+        "image": "img",
+    }
+    assert e.input_display == "text=caption,image=img"
+    # decode view: one spec per PART column with the part's own modality
+    assert cfg.input_specs == {"caption": "text", "img": "image"}
+    # policy view: both columns in ONE group (empty = all parts empty)
+    assert cfg.input_groups == [{"caption": "text", "img": "image"}]
+
+
+def test_multimodal_requires_input_columns():
+    e = mm_entry()
+    del e["input_columns"]
+    with pytest.raises(ValidationError, match="requires .input_columns."):
+        config(e)
+
+
+def test_multimodal_rejects_input_column():
+    with pytest.raises(ValidationError, match="not .input_column."):
+        config(mm_entry(input_column="text"))
+
+
+def test_input_columns_only_for_multimodal():
+    with pytest.raises(ValidationError, match="only valid with"):
+        config(entry(input_column=None, input_columns={"text": "caption"}))
+
+
+def test_input_column_required_for_single_input():
+    e = entry()
+    del e["input_column"]
+    with pytest.raises(ValidationError, match="input_column. is required"):
+        config(e)
+
+
+def test_multimodal_single_part_rejected():
+    with pytest.raises(ValidationError, match="single part"):
+        config(mm_entry(input_columns={"text": "caption"}))
+
+
+def test_multimodal_rejects_non_part_modality_keys():
+    with pytest.raises(ValidationError, match="part modalities"):
+        config(mm_entry(input_columns={"text": "caption", "multimodal": "x"}))
+
+
+def test_multimodal_rejects_duplicate_part_columns():
+    with pytest.raises(ValidationError, match="same source column"):
+        config(mm_entry(input_columns={"text": "caption", "image": "caption"}))
+
+
+def test_multimodal_max_length_allowed_for_text_part():
+    cfg = config(mm_entry(max_length=512))
+    assert cfg.embedders[0].max_length == 512
+
+
+def test_multimodal_chunking_rejected():
+    with pytest.raises(ValidationError, match="more than one input_column"):
+        config(mm_entry(), chunking={"strategy": "fixed_char", "chunk_chars": 100})
+
+
+def test_multimodal_part_conflicts_with_other_entry_modality():
+    # mm reads column "caption" as text; another entry reads it as image
+    with pytest.raises(ValidationError, match="conflicting modalities"):
+        config(
+            mm_entry(),
+            entry(name="b", modality="image", input_column="caption",
+                  output_column="b_emb"),
+        )
+
+
 def test_unknown_pipeline_key_rejected():
     with pytest.raises(ValidationError):
         config(entry(), pipeline={"max_text_length": 100})  # removed knob

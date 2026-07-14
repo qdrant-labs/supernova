@@ -1,0 +1,62 @@
+# Multimodal example: text + image through ONE model into ONE vector space,
+# via the vllm backend (the only backend that supports modality: multimodal —
+# anything else fails at launch, before weights download).
+#
+# A row is a valid multimodal input when AT LEAST ONE part is present:
+# text-only, image-only, and text+image rows all land in the same embedding
+# column. Only a row with EVERY part empty counts as empty for
+# pipeline.on_empty_input.
+source:
+  type: huggingface_parquet
+  dataset_name: nlphuji/flickr30k
+  split: test
+
+embedders:
+  - name: qwen_multimodal
+    kind: dense
+    type: vllm
+    model: Qwen/Qwen3-VL-Embedding-2B
+    modality: multimodal
+    # part modality -> source column. This replaces input_column (exactly one
+    # of the two): each column is decoded with its own modality, then the
+    # present parts of a row are embedded together.
+    input_columns:
+      text: caption
+      image: image
+    dtype: bfloat16
+    # The chat-template system turn, baked into EVERY embedding. It changes
+    # the embedding space: query-side embedding at search time MUST use the
+    # exact same instruction (it is recorded in the run manifest for this
+    # reason). "Represent the user's input." is Qwen3-VL-Embedding's default.
+    instruction: "Represent the user's input."
+    # max items per llm.embed() call. Omit to hand vLLM the whole chunk and
+    # let continuous batching schedule it; set it only to bound host memory
+    # (decoded PIL images in flight).
+    # batch_size: 512
+    # max_length: 8192           # truncate the TEXT part to N chars
+    # Unknown keys pass through to vllm.LLM:
+    # gpu_memory_utilization: 0.9
+    # max_model_len: 8192
+
+  # vllm is also a plain high-throughput text backend — same entry shape as
+  # any other dense backend. For chat-formatted embedding models set
+  # `instruction:`; plain strings are used when it's unset.
+  #
+  # - name: qwen_text
+  #   kind: dense
+  #   type: vllm
+  #   model: Qwen/Qwen3-Embedding-0.6B
+  #   input_column: caption
+  #   modality: text
+  #   dtype: bfloat16
+
+storage:
+  type: local
+  output_dir: /tmp/flickr30k_qwen3_vl
+
+pipeline:
+  chunk_size: 1000
+  flush_threshold: 10000
+  # Embed the image column without carrying the raw bytes into the output
+  # parquet (see example_mnist.yaml).
+  drop_columns: [image]

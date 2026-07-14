@@ -74,6 +74,38 @@ def test_image_from_path(tmp_path):
     assert isinstance(img, Image.Image)
 
 
+def test_image_from_http_url_is_fetched(monkeypatch):
+    pytest.importorskip("PIL")
+    import urllib.request
+
+    from PIL import Image
+
+    png = _png_bytes()
+    seen = {}
+
+    def fake_urlopen(url, timeout):
+        seen["url"], seen["timeout"] = url, timeout
+        return io.BytesIO(png)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    img = media.decode("https://example.com/cat.png", Modality.IMAGE)
+    assert isinstance(img, Image.Image)
+    assert seen["url"] == "https://example.com/cat.png"
+    assert seen["timeout"] == 10.0  # default; NOVA_IMAGE_FETCH_TIMEOUT overrides
+
+
+def test_image_url_fetch_failure_raises_with_url(monkeypatch):
+    pytest.importorskip("PIL")
+    import urllib.request
+
+    def fake_urlopen(url, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(ValueError, match="failed to fetch image from 'http://x/y'"):
+        media.decode("http://x/y", Modality.IMAGE)
+
+
 def test_image_from_hf_dict_prefers_bytes(tmp_path):
     pytest.importorskip("PIL")
     from PIL import Image

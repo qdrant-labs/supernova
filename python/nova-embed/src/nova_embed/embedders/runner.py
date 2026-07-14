@@ -92,7 +92,7 @@ async def run_embedder(
         try:
             for chunk_id, records in iter_chunks(
                 source,
-                input_specs=engine.input_specs,
+                input_groups=engine.input_groups,
                 chunk_size=chunk_size,
                 on_empty_input=on_empty_input,
                 chunker=chunker,

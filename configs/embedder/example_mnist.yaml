@@ -30,3 +30,10 @@ pipeline:
   # counterpart of source.exclude_columns, which can't touch an input_column
   # because it drops BEFORE embedding.
   drop_columns: [image]
+
+# add vllM as backend for multimodal embedding (i.e. both at the same time)
+# how do we handle the `modality` parameter? do we need to add a new modality for multimodal embedding?
+# 
+# stick with **just** multimodal embedding for now...
+# add vllm as backend and its the only backend that supports multimodal embedding
+# using its native `multi_modal_data` format

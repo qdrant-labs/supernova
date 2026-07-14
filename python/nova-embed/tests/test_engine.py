@@ -159,6 +159,68 @@ def test_unknown_type_mentions_other_kinds():
         build_engine([entry(kind="multivector", type="fake_image")])
 
 
+# ------------------------------------------------------- multimodal entries
+
+def mm_entry(**overrides) -> EmbedderEntry:
+    data = {
+        "name": "mm",
+        "kind": "dense",
+        "type": "fake_mm",
+        "modality": "multimodal",
+        "input_columns": {"text": "text", "image": "image"},
+    }
+    data.update(overrides)
+    return EmbedderEntry.model_validate(data)
+
+
+def test_multimodal_partial_rows_embed_present_parts():
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    img = Image.new("RGB", (2, 2))
+    engine = build_engine([mm_entry()])
+    out = embed(
+        engine,
+        [
+            {"text": "abc", "image": img},   # both parts
+            {"text": "hello", "image": None},  # text-only: valid input
+            {"text": "", "image": img},        # image-only: valid input
+            {"text": None, "image": None},     # all parts empty: masked to None
+        ],
+    )
+    # fake_mm encodes [len(text), has_image]
+    assert out["mm"] == [[3.0, 1.0], [5.0, 0.0], [0.0, 1.0], None]
+
+
+def test_multimodal_max_length_truncates_text_part():
+    engine = build_engine([mm_entry(max_length=3)])
+    out = embed(engine, [{"text": "abcdefg", "image": None}])
+    assert out["mm"] == [[3.0, 0.0]]
+
+
+def test_multimodal_gated_to_capable_backends():
+    # the whole point of Modality.MULTIMODAL: a backend that never declared it
+    # dies at build time, before any weights load
+    with pytest.raises(ValueError, match="does not support modality 'multimodal'"):
+        build_engine([mm_entry(type="fake")])
+
+
+def test_multimodal_specs_groups_and_manifest_fields():
+    engine = build_engine(
+        [mm_entry(instruction="Represent the user's input."), entry(name="t")]
+    )
+    assert engine.input_specs == {"text": "text", "image": "image"}
+    assert engine.input_groups == [
+        {"text": "text", "image": "image"},
+        {"text": "text"},
+    ]
+    mm_spec, t_spec = engine.output_specs
+    assert mm_spec.input_column == "text=text,image=image"
+    assert mm_spec.modality == "multimodal"
+    assert mm_spec.instruction == "Represent the user's input."
+    assert t_spec.instruction is None
+
+
 def test_fusion_predicate():
     d = entry(kind="dense", type="sentence_transformer", model="m")
     s = entry(name="s", kind="sparse", type="sentence_transformer", model="m",

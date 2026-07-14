@@ -71,7 +71,7 @@ class EmptyInputStats:
 
 def iter_chunks(
     source: DatasetSource,
-    input_specs: dict[str, Modality],
+    input_groups: list[dict[str, Modality]],
     chunk_size: int,
     on_empty_input: str = "skip",
     chunker: "Chunker | None" = None,
@@ -81,15 +81,25 @@ def iter_chunks(
     """Assemble embedding batches from a source's rows.
 
     Sits between the source (pure row producer) and the workers: applies the
-    empty-input policy across every input column, optionally splits ONE column
-    via the chunker (config validation guarantees a splitting chunker implies a
-    single input column), and packs Records into batches of ``chunk_size``.
+    empty-input policy per input GROUP (one group = one embedder entry's
+    column->modality inputs), optionally splits ONE column via the chunker
+    (config validation guarantees a splitting chunker implies a single input
+    column), and packs Records into batches of ``chunk_size``.
+
+    A group is empty only when ALL of its columns are empty — a multimodal
+    entry's row with just a text or just an image is a valid input, not a
+    policy event. Single-column entries degenerate to the per-column check.
 
     Note ``chunk_size`` is the embedding *batch* size, distinct from the
     chunker's text splitting.
     """
     if (chunker is None) != (split_column is None):
         raise ValueError("chunker and split_column must be passed together")
+
+    # decode/emptiness view: every distinct input column with its modality
+    input_specs: dict[str, Modality] = {}
+    for group in input_groups:
+        input_specs.update(group)
 
     chunk: list[Record] = []
     chunk_id = 0
@@ -110,23 +120,24 @@ def iter_chunks(
                 )
             checked_columns = True
 
-        empties = {
+        col_empty = {
             col: media.is_empty(row.get(col), modality)
             for col, modality in input_specs.items()
         }
-        if all(empties.values()):
+        empty_groups = [g for g in input_groups if all(col_empty[c] for c in g)]
+        if len(empty_groups) == len(input_groups):
             # nothing to embed for ANY entry — skipping is the only sane move
             if stats is not None:
                 stats.rows_skipped += 1
             if on_empty_input == "error":
                 raise ValueError(
-                    f"empty input for column(s) {sorted(empties)} "
+                    f"empty input for column(s) {sorted(input_specs)} "
                     f"(on_empty_input=error). Row: { _row_summary(row) }"
                 )
             continue
-        if any(empties.values()):
+        if empty_groups:
             if on_empty_input == "error":
-                empty_cols = sorted(c for c, e in empties.items() if e)
+                empty_cols = sorted({c for g in empty_groups for c in g})
                 raise ValueError(
                     f"empty input for column(s) {empty_cols} "
                     f"(on_empty_input=error). Row: { _row_summary(row) }"
@@ -138,7 +149,7 @@ def iter_chunks(
             # "null": keep the row; the engine masks the empty input and the
             # writer stores a null embedding.
 
-        if chunker is not None and not empties.get(split_column, False):
+        if chunker is not None and not col_empty.get(split_column, False):
             pieces = chunker.chunk(row[split_column])
             records = [Record(row={**row, split_column: piece}) for piece in pieces]
         else:

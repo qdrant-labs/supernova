@@ -75,8 +75,12 @@ class OutputSpec:
     model_name: str
     dimensions: int | None
     max_tokens: int | None
+    # multimodal entries: a "modality=column,…" display string, not one column
     input_column: str
     modality: Modality
+    # instruction baked into the embeddings (instruction-tuned backends): the
+    # query side must reproduce it exactly, so the manifest records it
+    instruction: str | None = None
 
 
 @dataclass
@@ -84,16 +88,26 @@ class _Unit:
     """One forward pass: an embedder bound to its input spec and output name(s)."""
 
     embedder: Any  # Embedder, or SentenceTransformerHybridEmbedder for fused units
-    input_column: str
+    input_column: str | None
     modality: Modality
     max_length: int | None
     name: str | None = None  # plain unit: the entry name
+    # multimodal unit: part modality -> column (input_column is None then)
+    parts: dict[Modality, str] | None = None
     dense_name: str | None = None  # fused unit: dense entry name
     sparse_name: str | None = None  # fused unit: sparse entry name
     # pooling (multivector entries only): derived dense output
     pooled_name: str | None = None
     pooling_type: str | None = None
     pooling_normalize: bool = True
+
+    @property
+    def input_cols(self) -> dict[str, Modality]:
+        """column -> DECODE modality for this unit (part modalities, never
+        'multimodal' — that value has no loader)."""
+        if self.parts is not None:
+            return {col: m for m, col in self.parts.items()}
+        return {self.input_column: self.modality}
 
 
 class EmbeddingEngine:
@@ -109,7 +123,16 @@ class EmbeddingEngine:
 
     @property
     def input_specs(self) -> dict[str, Modality]:
-        return {u.input_column: u.modality for u in self._units}
+        specs: dict[str, Modality] = {}
+        for u in self._units:
+            specs.update(u.input_cols)
+        return specs
+
+    @property
+    def input_groups(self) -> list[dict[str, Modality]]:
+        """One column->modality group per unit — the unit of the empty policy
+        (a group is empty only when ALL of its columns are)."""
+        return [u.input_cols for u in self._units]
 
     @property
     def model_name(self) -> str:
@@ -117,20 +140,28 @@ class EmbeddingEngine:
         return self._output_specs[0].model_name
 
     async def embed(self, rows: list[dict]) -> dict[str, list[Embedding | None]]:
-        # Decode each distinct input column once: empties masked out, the rest
-        # turned canonical. Backends never see raw transport forms.
+        # Decode each distinct input column once, ROW-ALIGNED (None at empty
+        # positions): multimodal units zip several columns back together per
+        # row, which compacted lists can't support. Backends never see raw
+        # transport forms.
         decoded: dict[str, tuple[list[Any], list[bool]]] = {}
         for col, modality in self.input_specs.items():
             raw = [row.get(col) for row in rows]
             mask = [media.is_empty(v, modality) for v in raw]
-            values = [
-                media.decode(v, modality) for v, empty in zip(raw, mask) if not empty
+            aligned = [
+                None if empty else media.decode(v, modality)
+                for v, empty in zip(raw, mask)
             ]
-            decoded[col] = (values, mask)
+            decoded[col] = (aligned, mask)
 
         out: dict[str, list[Embedding | None]] = {}
         for unit in self._units:
-            values, mask = decoded[unit.input_column]
+            if unit.parts is not None:
+                out[unit.name] = await self._embed_multimodal(unit, decoded)
+                continue
+
+            aligned, mask = decoded[unit.input_column]
+            values = [v for v, empty in zip(aligned, mask) if not empty]
             if unit.max_length is not None:
                 values = [v[: unit.max_length] for v in values]
 
@@ -154,6 +185,39 @@ class EmbeddingEngine:
                     for mv in out[unit.name]
                 ]
         return out
+
+    async def _embed_multimodal(
+        self, unit: _Unit, decoded: dict[str, tuple[list[Any], list[bool]]]
+    ) -> list[Embedding | None]:
+        """One multimodal unit over the row-aligned decoded columns.
+
+        A row is an input when AT LEAST ONE part is present; the batch item is
+        a dict of the present parts ({"text": str, "image": PIL.Image}). Only
+        all-parts-empty rows are masked to None.
+        """
+        part_masks = {col: decoded[col][1] for col in unit.input_cols}
+        n_rows = len(next(iter(part_masks.values())))
+        combined = [
+            all(mask[i] for mask in part_masks.values()) for i in range(n_rows)
+        ]
+
+        values: list[dict[str, Any]] = []
+        for i in range(n_rows):
+            if combined[i]:
+                continue
+            item: dict[str, Any] = {}
+            for modality, col in unit.parts.items():
+                aligned, mask = decoded[col]
+                if mask[i]:
+                    continue
+                v = aligned[i]
+                if modality == Modality.TEXT and unit.max_length is not None:
+                    v = v[: unit.max_length]
+                item[modality.value] = v
+            values.append(item)
+
+        results = await unit.embedder.embed(values) if values else []
+        return _scatter(results, combined)
 
 
 def _scatter(results: list, mask: list[bool]) -> list:
@@ -276,6 +340,7 @@ def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
                 modality=e.modality,
                 max_length=e.max_length,
                 name=e.name,
+                parts=e.input_columns,
                 pooled_name=e.pooled_column,
                 pooling_type=e.pooling.type if e.pooling else None,
                 pooling_normalize=e.pooling.normalize if e.pooling else True,
@@ -289,8 +354,9 @@ def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
                 model_name=embedder.model_name,
                 dimensions=embedder.dimensions,
                 max_tokens=embedder.max_tokens,
-                input_column=e.input_column,
+                input_column=e.input_column or e.input_display,
                 modality=e.modality,
+                instruction=embedder.instruction,
             )
         )
         if e.pooled_column:
@@ -302,8 +368,9 @@ def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
                     model_name=f"{embedder.model_name} ({e.pooling.type}-pooled)",
                     dimensions=embedder.dimensions,
                     max_tokens=embedder.max_tokens,
-                    input_column=e.input_column,
+                    input_column=e.input_column or e.input_display,
                     modality=e.modality,
+                    instruction=embedder.instruction,
                 )
             )
 
