@@ -537,14 +537,13 @@ class FilterGroup:
     unfiltered, so there's no full-file score matrix to derive from, and this
     group compacts/transfers/scores its own rows once per batch instead —
     its members share the identical filter by construction, hence the
-    identical surviving row set. Carries `filter_idx`, this group's position
-    in `run_compute`'s `distinct_filters`/`keeps` (a plain list, aligned by
-    position) rather than the `Filter` object itself: the per-file loop looks
-    up `keeps[group.filter_idx]` once per file, and an `int` index costs
-    nothing to hash there, unlike re-hashing a `Filter` instance (pydantic's
-    frozen-model hash isn't cached on the instance the way `str`'s is)."""
+    identical surviving row set. Carries the `Filter` itself: the per-file
+    loop looks up `keeps[group.filter]` once per file — `Filter` is frozen
+    and hashable (see `nova_bf.config.Filter`), and a run has at most a
+    handful of distinct filters, so hashing it here costs nothing next to
+    the corpus read/GPU work this whole module exists to overlap."""
 
-    filter_idx: int
+    filter: Filter | None
     member_idxs: list[int]
     batch_size: int | None  # resolved batch size; None = whole (compacted) file
 
@@ -602,16 +601,12 @@ def _path_a_batch_size(configured: int | None, k_floor: int, vt: str) -> int | N
 
 def _build_filter_groups(
     idxs: list[int], specs: list[SearchSpec], spec_filter: list[Filter | None],
-    filter_idx: dict[Filter | None, int], batch_size_cfg: int | None, vt: str,
+    batch_size_cfg: int | None, vt: str,
 ) -> list[FilterGroup]:
     """Group `idxs` (every spec of one vector_type, Path B only — none of
     them unfiltered) by exact filter equality (`Filter`'s own hash/eq), so
     specs sharing an identical filter compact/transfer/score together once
-    instead of each redoing it. This grouping pass — unlike the resulting
-    `FilterGroup.filter_idx` — legitimately does hash every one of `idxs`'
-    filters once each; it runs only once per `run_compute` call, not once per
-    corpus file, so that cost is negligible (see `FilterGroup`'s docstring for
-    why the per-file path avoids it)."""
+    instead of each redoing it."""
     by_filter: dict[Filter | None, list[int]] = {}
     for i in idxs:
         by_filter.setdefault(spec_filter[i], []).append(i)
@@ -619,7 +614,7 @@ def _build_filter_groups(
     for filt, members in by_filter.items():
         k_floor = max(specs[m].k for m in members)
         groups.append(FilterGroup(
-            filter_idx=filter_idx[filt],
+            filter=filt,
             member_idxs=members,
             batch_size=_path_b_group_batch_size(batch_size_cfg, k_floor, vt),
         ))
@@ -705,30 +700,24 @@ def _is_unfiltered(f: Filter | None) -> bool:
 
 
 def _path_a_select(
-    specs: list[SearchSpec], spec_filter_idx: list[int], keeps: list[np.ndarray | None], device: str,
+    specs: list[SearchSpec], keeps: dict[Filter | None, np.ndarray | None], device: str,
 ):
     """Path A's `select` for `_process_batch_group`: an unfiltered member uses
     the shared slice as-is; a filtered member masks it down to its own
     filter's surviving columns, via a `local_idx` cached per filter (in the
     caller-provided per-slice `cache`) so two members sharing an identical
-    filter don't recompute `nonzero` twice. Cached and looked up by
-    `spec_filter_idx[m]` — this spec's position in `run_compute`'s
-    `distinct_filters`/`keeps` — rather than by the `Filter` object itself,
-    so this hot per-slice, per-member loop never re-hashes a `Filter`
-    instance (pydantic's frozen-model hash isn't cached on the instance the
-    way a plain `int`'s or `str`'s is)."""
+    filter don't recompute `nonzero` twice."""
     import torch
 
-    def select(m: int, r0: int, r1: int, rows, cache: dict[int, object]):
+    def select(m: int, r0: int, r1: int, rows, cache: dict[object, object]):
         s = specs[m]
         if _is_unfiltered(s.filter):
             return rows, None
-        idx = spec_filter_idx[m]
-        local_idx = cache.get(idx)
+        local_idx = cache.get(s.filter)
         if local_idx is None:
-            local_np = np.nonzero(keeps[idx][r0:r1])[0]
+            local_np = np.nonzero(keeps[s.filter][r0:r1])[0]
             local_idx = torch.from_numpy(local_np).to(device, non_blocking=True)
-            cache[idx] = local_idx
+            cache[s.filter] = local_idx
         if local_idx.numel() == 0:
             return None, None
         return rows[local_idx], local_idx
@@ -746,7 +735,7 @@ def _path_b_select(m: int, r0: int, r1: int, rows, cache: dict[object, object]):
 
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
-    spec_filter_idx: list[int], keeps: list[np.ndarray | None], batch_size: int | None,
+    keeps: dict[Filter | None, np.ndarray | None], batch_size: int | None,
     gidx: int, device: str,
 ) -> float:
     """Path A: every spec of this vector_type — filtered or not — shares one
@@ -756,7 +745,7 @@ def _process_shared_batch(
     return _process_batch_group(
         batch, member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
         batch_size, gidx, device, orig_rows=None,
-        select=_path_a_select(specs, spec_filter_idx, keeps, device),
+        select=_path_a_select(specs, keeps, device),
     )
 
 
@@ -911,14 +900,6 @@ def run_compute(
     # derive from. See this module's docstring for the full rationale.
     spec_filter = [s.filter for s in specs]
     distinct_filters: list[Filter | None] = list(dict.fromkeys(spec_filter))
-    # Filter -> its position in `distinct_filters`/`keeps` — hashes each
-    # distinct Filter exactly once, here, at run-wide setup. Every per-file,
-    # per-batch-slice lookup below (`keeps[idx]`, `_path_a_select`'s cache)
-    # then indexes by this cheap `int` instead of re-hashing a `Filter`
-    # instance (pydantic's frozen-model hash isn't cached on the instance the
-    # way a plain `int`'s or `str`'s is).
-    filter_idx: dict[Filter | None, int] = {f: i for i, f in enumerate(distinct_filters)}
-    spec_filter_idx: list[int] = [filter_idx[f] for f in spec_filter]
 
     vt_spec_idxs: dict[str, list[int]] = {vt: [] for vt in vts_needed}
     for i, s in enumerate(specs):
@@ -939,7 +920,7 @@ def run_compute(
             )
         else:
             path_b_groups[vt] = _build_filter_groups(
-                idxs, specs, spec_filter, filter_idx, vt_configured_batch[vt], vt,
+                idxs, specs, spec_filter, vt_configured_batch[vt], vt,
             )
             logger.info(
                 "vector_type=%r: no unfiltered search — %d distinct filter group(s), "
@@ -1020,12 +1001,10 @@ def run_compute(
                 t1 = time.perf_counter()
                 # One mask per DISTINCT filter (`None` for the unfiltered entry),
                 # evaluated against the same table — timed separately from the read
-                # above (CPU-vectorized work, not IO wait). A plain list, aligned by
-                # position with `distinct_filters`/`filter_idx` (not a dict keyed by
-                # the `Filter` object itself) so two specs sharing an identical
-                # filter never evaluate it twice, AND this per-file construction
-                # never hashes a `Filter` instance (see `FilterGroup`'s docstring).
-                keeps = [evaluate(f, table) if f is not None else None for f in distinct_filters]
+                # above (CPU-vectorized work, not IO wait). Keyed by the `Filter`
+                # object itself (frozen, hashable — see `nova_bf.config.Filter`)
+                # so two specs sharing an identical filter never evaluate it twice.
+                keeps = {f: (evaluate(f, table) if f is not None else None) for f in distinct_filters}
                 t2 = time.perf_counter()
                 fq.put((gidx, arrs, ids, keeps, t1 - t0, t2 - t1))
             except Exception as exc:
@@ -1102,7 +1081,7 @@ def run_compute(
             # file must never block a DIFFERENT spec's id resolution for that
             # same file, but a file every spec's filter drops needs no ids
             # kept at all.
-            if id_col and any(mask is None or mask.any() for mask in keeps):
+            if id_col and any(mask is None or mask.any() for mask in keeps.values()):
                 corpus_ids[gidx] = ids
             for vt in vts_needed:
                 rows_seen += batches[vt].n_rows
@@ -1113,11 +1092,11 @@ def run_compute(
                 if has_baseline[vt]:
                     gpu_secs += _process_shared_batch(
                         b, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
-                        spec_filter_idx, keeps, path_a_batch_size[vt], gidx, device,
+                        keeps, path_a_batch_size[vt], gidx, device,
                     )
                 else:
                     for group in path_b_groups[vt]:
-                        keep = keeps[group.filter_idx]
+                        keep = keeps[group.filter]
                         gpu_secs += _process_filter_group(
                             b, group, specs, spec_Q, spec_top_scores, spec_top_enc, keep, gidx, device,
                         )
