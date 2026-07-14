@@ -41,6 +41,7 @@ from nova_bf.config import (
     OutputConfig,
     ParamsConfig,
     QueriesConfig,
+    RangeFromQuery,
     SearchSpec,
 )
 from nova_bf.io import Store
@@ -768,10 +769,10 @@ def test_mismatched_dense_and_sparse_query_loads_are_rejected(ds, monkeypatch):
     load's ids/payload to the other's vectors."""
     orig_load_sparse = compute_mod.load_queries_sparse
 
-    def reordered_load_queries_sparse(store, qcfg):
-        Q_np, vocab, q_ids, payload = orig_load_sparse(store, qcfg)
+    def reordered_load_queries_sparse(store, qcfg, filter_cols=()):
+        Q_np, vocab, q_ids, payload, filter_vals = orig_load_sparse(store, qcfg, filter_cols)
         assert len(q_ids) > 1  # sanity: reordering must actually change something
-        return Q_np, vocab, list(reversed(q_ids)), payload
+        return Q_np, vocab, list(reversed(q_ids)), payload, filter_vals
 
     monkeypatch.setattr(compute_mod, "load_queries_sparse", reordered_load_queries_sparse)
 
@@ -917,3 +918,302 @@ def test_sharded_compute_and_merge_multi_spec(ds):
         got = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
         for q in ds["qids"]:
             assert got[q] == expected[q], f"search={name} query={q}"
+
+
+# --- per-query filters (match_from_query / range_from_query / match_text_from_query) ---
+
+
+def _tenant_dataset(tmp_path, corpus_tenants, query_tenants, dim=DIM, seed=10):
+    """A small dense-only corpus/query set with a `tenant_id` payload column
+    on the corpus side and a matching column on the queries side, for
+    per-query filter tests. Returns (cfg kwargs pieces, dense arrays) so
+    callers can compute independent ground truth."""
+    rng = np.random.default_rng(seed)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    n = len(corpus_tenants)
+    dense = rng.standard_normal((n, dim)).astype(np.float32)
+    ids = [f"c{i}" for i in range(n)]
+    sparse_rows = [_random_sparse_row(rng) for _ in range(n)]
+    _write_combined(cdir / "f0.parquet", dense, sparse_rows, id=ids, tenant_id=list(corpus_tenants))
+
+    n_q = len(query_tenants)
+    qdense = rng.standard_normal((n_q, dim)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    qpath = tmp_path / "queries.parquet"
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, tenant_id=list(query_tenants))
+
+    return {
+        "cdir": str(cdir), "qpath": str(qpath), "ids": ids, "qids": qids,
+        "dense": dense, "qdense": qdense,
+    }
+
+
+def test_per_query_match_from_query_matches_independent_ground_truth(tmp_path):
+    ds = _tenant_dataset(
+        tmp_path,
+        corpus_tenants=["A", "B", "A", "C", "B", "A"],
+        query_tenants=["A", "B", "C"],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="per_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+        )],
+    )
+    paths = run_compute(cfg)
+    t = pq.read_table(paths["per_tenant"]).to_pydict()
+
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    query_tenants = ["A", "B", "C"]
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(len(ds["ids"])) if corpus_tenants[i] == query_tenants[qi]]
+        scores = ds["qdense"][qi] @ ds["dense"][allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ds["ids"][allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_range_from_query_matches_independent_ground_truth(tmp_path):
+    rng = np.random.default_rng(11)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    n = 12
+    dense = rng.standard_normal((n, DIM)).astype(np.float32)
+    cost = rng.uniform(1, 30, n).astype(np.float32)
+    ids = [f"c{i}" for i in range(n)]
+    sparse_rows = [_random_sparse_row(rng) for _ in range(n)]
+    _write_combined(cdir / "f0.parquet", dense, sparse_rows, id=ids, cost=cost.tolist())
+
+    n_q = 3
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    budgets = [8.0, 15.0, 30.0]
+    qpath = tmp_path / "queries.parquet"
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, max_budget=budgets)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="budget_capped", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(
+                field="cost", range_from_query=RangeFromQuery(lt="max_budget"),
+            )]),
+        )],
+    )
+    paths = run_compute(cfg)
+    t = pq.read_table(paths["budget_capped"]).to_pydict()
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(n) if cost[i] < budgets[qi]]
+        scores = qdense[qi] @ dense[allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ids[allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_match_text_from_query_matches_independent_ground_truth(tmp_path):
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    titles = [
+        "wireless mouse", "gaming keyboard", "wireless keyboard combo",
+        "mouse pad xl", "bluetooth mouse", "mechanical keyboard",
+    ]
+    n = len(titles)
+    rng = np.random.default_rng(12)
+    dense = rng.standard_normal((n, DIM)).astype(np.float32)
+    ids = [f"c{i}" for i in range(n)]
+    sparse_rows = [_random_sparse_row(rng) for _ in range(n)]
+    _write_combined(cdir / "f0.parquet", dense, sparse_rows, id=ids, title=titles)
+
+    n_q = 3
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    phrases = ["wireless mouse", "keyboard", "wireless mouse"]  # q0/q2 share a phrase
+    qpath = tmp_path / "queries.parquet"
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, phrase=phrases)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="by_phrase", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")]),
+        )],
+    )
+    paths = run_compute(cfg)
+    t = pq.read_table(paths["by_phrase"]).to_pydict()
+
+    import re
+
+    def word_match(phrase, title):
+        return all(re.search(rf"\b{re.escape(w)}\b", title, re.IGNORECASE) for w in phrase.split())
+
+    hits = dict(zip(t["query_id"], t["hit_ids"]))
+    for qi, phrase in enumerate(phrases):
+        qid = f"q{qi}"
+        allowed = [i for i in range(n) if word_match(phrase, titles[i])]
+        scores = qdense[qi] @ dense[allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ids[allowed[j]] for j in order]
+        assert hits[qid] == expected, f"query={qid}"
+    # q0 and q2 share an identical phrase -> identical candidate set
+    assert set(hits["q0"]) == set(hits["q2"]) or hits["q0"] == hits["q2"]
+
+
+def test_per_query_filter_sharing_vt_with_unfiltered_baseline(tmp_path):
+    """A per-query-filtered spec riding the whole-file batch alongside an
+    unfiltered sibling (has_baseline True because of the unfiltered spec)
+    must still produce correct, independently-verifiable results."""
+    ds = _tenant_dataset(tmp_path, corpus_tenants=["A", "B", "A", "C"], query_tenants=["A", "C"])
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[
+            SearchSpec(name="dense_all", vector_type="dense", metric="dot", k=10),
+            SearchSpec(
+                name="per_tenant", vector_type="dense", metric="dot", k=10,
+                filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+            ),
+        ],
+    )
+    paths = run_compute(cfg)
+
+    corpus_tenants = ["A", "B", "A", "C"]
+    query_tenants = ["A", "C"]
+    t_all = pq.read_table(paths["dense_all"]).to_pydict()
+    for qi, hit_ids in enumerate(t_all["hit_ids"]):
+        scores = ds["qdense"][qi] @ ds["dense"].T
+        order = np.argsort(-scores)[:10]
+        assert hit_ids == [ds["ids"][j] for j in order]
+
+    t_pt = pq.read_table(paths["per_tenant"]).to_pydict()
+    for qid, hit_ids in zip(t_pt["query_id"], t_pt["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(4) if corpus_tenants[i] == query_tenants[qi]]
+        scores = ds["qdense"][qi] @ ds["dense"][allowed].T
+        order = np.argsort(-scores)[:10]
+        assert hit_ids == [ds["ids"][allowed[j]] for j in order]
+
+
+def test_per_query_filter_sharing_vt_with_uniform_filter_no_baseline(tmp_path, caplog):
+    """The trickiest routing interaction: a per-query-filtered spec and a
+    UNIFORM-filtered spec share a vector_type with NO unfiltered spec at
+    all. `has_baseline` must still become True (forced by the per-query
+    spec alone) — confirmed via the log line — and BOTH specs must still
+    produce correct results, the uniform one riding the whole-file base
+    instead of getting its own union-compaction."""
+    ds = _tenant_dataset(tmp_path, corpus_tenants=["A", "B", "A", "C"], query_tenants=["A", "C"])
+    out = tmp_path / "out"
+    out.mkdir()
+    eng_like_filter = Filter(must=[FilterCondition(field="tenant_id", match=["A", "B"])])
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[
+            SearchSpec(
+                name="uniform_ab", vector_type="dense", metric="dot", k=10, filter=eng_like_filter,
+            ),
+            SearchSpec(
+                name="per_tenant", vector_type="dense", metric="dot", k=10,
+                filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+            ),
+        ],
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        paths = run_compute(cfg)
+    assert any("share one full-file batch pass" in r.message for r in caplog.records), \
+        "a per-query filter alone must force has_baseline, even with no unfiltered sibling"
+    assert not any("union of" in r.message for r in caplog.records)
+
+    corpus_tenants = ["A", "B", "A", "C"]
+    query_tenants = ["A", "C"]
+    t_uniform = pq.read_table(paths["uniform_ab"]).to_pydict()
+    ab_rows = [i for i in range(4) if corpus_tenants[i] in ("A", "B")]
+    for qi, hit_ids in enumerate(t_uniform["hit_ids"]):
+        scores = ds["qdense"][qi] @ ds["dense"][ab_rows].T
+        order = np.argsort(-scores)[:10]
+        assert hit_ids == [ds["ids"][ab_rows[j]] for j in order]
+
+    t_pt = pq.read_table(paths["per_tenant"]).to_pydict()
+    for qid, hit_ids in zip(t_pt["query_id"], t_pt["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(4) if corpus_tenants[i] == query_tenants[qi]]
+        scores = ds["qdense"][qi] @ ds["dense"][allowed].T
+        order = np.argsort(-scores)[:10]
+        assert hit_ids == [ds["ids"][allowed[j]] for j in order]
+
+
+def test_per_query_filter_sharded_compute_and_merge(tmp_path):
+    ds = _tenant_dataset(
+        tmp_path, corpus_tenants=["A", "B", "A", "C", "B", "A", "C", "B"], query_tenants=["A", "B", "C"],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="per_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+        )],
+    )
+    single_paths = run_compute(cfg, num_jobs=None)
+    single_t = pq.read_table(single_paths["per_tenant"]).to_pydict()
+
+    shard_out = tmp_path / "shard_out"
+    shard_out.mkdir()
+    shard_cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(shard_out)),
+        searches=cfg.searches,
+    )
+    num_jobs = 2
+    for rank in range(num_jobs):
+        run_compute(shard_cfg, num_jobs=num_jobs, job_rank=rank)
+    merged = run_merge(shard_cfg)
+    merged_t = pq.read_table(merged["per_tenant"]).to_pydict()
+
+    assert merged_t["query_id"] == single_t["query_id"]
+    assert merged_t["hit_ids"] == single_t["hit_ids"]
+    for a, b in zip(merged_t["hit_scores"], single_t["hit_scores"]):
+        assert np.allclose(a, b, atol=1e-5)
+
+
+def test_per_query_filter_missing_queries_column_raises_clear_error(tmp_path):
+    ds = _tenant_dataset(tmp_path, corpus_tenants=["A", "B"], query_tenants=["A"])
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="bad", vector_type="dense", metric="dot", k=5,
+            filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="nonexistent_col")]),
+        )],
+    )
+    with pytest.raises(ValueError, match="nonexistent_col"):
+        run_compute(cfg)

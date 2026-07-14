@@ -123,9 +123,33 @@ searches:
       must_not: []              # AND-NOT
 ```
 
-A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. The filter applies uniformly to every query in that search: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves. Each search has its own independent `filter` (or none).
+A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. By default a filter applies uniformly to every query in that search: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves. Each search has its own independent `filter` (or none). For a filter that varies PER QUERY instead, see [Per-query filters](#per-query-filters) below.
 
 `match_text` requires every whitespace-separated word in the string to appear somewhere in the field, case-insensitively and in any order (an AND of words, not a phrase match) — the same semantics as Qdrant's own full-text-index `MatchText` condition, so ground truth built with it is directly comparable to a real Qdrant filtered search. It's a word-boundary-regex approximation of Qdrant's real tokenizer, not a byte-for-byte replica: a hyphenated query word like `high-fat` is matched as one literal token rather than split into `high`/`fat`, and a word ending directly in trailing punctuation (`C++`) can fail to get a boundary on that side. Good enough for keyword-style corpus filtering.
+
+### Per-query filters
+
+Every condition kind above has a per-query variant — `match_from_query`, `range_from_query`, `match_text_from_query` — that pulls its comparison value(s) from a column in the **queries** file instead of a literal in this config, so two different queries in the same search can each be restricted to a different corpus subset (tenant/user scoping, a per-query budget, a per-query search phrase):
+
+```yaml
+searches:
+  - name: per_tenant_search
+    vector_type: dense
+    filter:
+      must:
+        - field: tenant_id             # corpus column
+          match_from_query: tenant_id  # queries column — each query's own value
+        - field: cost
+          range_from_query: {lt: max_budget}   # queries column per bound
+        - field: title
+          match_text_from_query: search_phrase # queries column — each query's own phrase
+```
+
+A per-query and a static condition can appear together, in any of `must`/`should`/`must_not` — `should: [{field: is_public, match: true}, {field: tenant_id, match_from_query: tenant_id}]` means "public OR this query's own tenant." `match_from_query`'s queries column can hold either a scalar (equality) or a list per row (per-query MatchAny, matching Qdrant's `match` list semantics). `range_from_query` doesn't mix a literal bound with a per-query one in the same condition — express "cost > 0 for everyone AND cost < my own budget" as two separate conditions instead (a static `range: {gt: 0}` plus a `range_from_query: {lt: max_budget}`), which combine the same way any two `must` conditions do. A null/missing value on either side (corpus or queries column) never matches, same convention as a static filter's null handling.
+
+**Cost**: `match_from_query` and `range_from_query` are broadcast comparisons — no more expensive than an unfiltered search sharing the same batch. `match_text_from_query` is different: it dedupes queries by *distinct phrase* and evaluates each phrase once (cheap if many queries share a phrase), but for genuinely per-query search text — the realistic case for real query logs, as opposed to a benchmark with repeated queries — cost approaches one regex pass per query, additional CPU-side work that (unlike IO) doesn't overlap with GPU scoring. Reach for `match_text_from_query` deliberately, not as a default.
+
+A search with ANY per-query condition can't be compacted to a shared row-subset the way a uniform filter can (different queries need different corpus rows), so it always rides the whole-file batch grid (see [One search, or several in one pass](#one-search-or-several-in-one-pass)) — masked per query afterward rather than compacted beforehand. Other searches sharing that vector_type still ride the same shared batch either way.
 
 ## Running
 

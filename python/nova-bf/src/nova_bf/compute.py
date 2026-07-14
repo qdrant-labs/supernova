@@ -49,30 +49,43 @@ What rows make up that shared grid depends on whether any search of the
 vector_type is unfiltered:
 
 - If ANY search is unfiltered (or has an explicit-but-empty filter — see
-  `_is_unfiltered`), the shared grid is the WHOLE file, uncompacted: that
-  search needs every row anyway, so every OTHER (filtered) search of the
-  vector_type just rides along for free, masking down to its own rows
-  afterward.
-- Otherwise (every search of the vector_type has an active filter), the
-  shared grid is the UNION of every DISTINCT active filter's surviving rows
-  (`_union_keep`), compacted/transferred/scored ONCE, with each search then
-  masking down further to its own filter's subset of that union. This never
-  does MORE row-scoring than treating each distinct filter independently
-  would — in the worst case (fully disjoint filters) it's exactly the same
-  total rows, just one transfer/launch instead of several — and strictly
-  less whenever two filters' surviving rows overlap. The tradeoff: unlike
-  treating each filter independently (which bounds each one's own transfer
-  to its own, typically smaller, surviving-row count), the union's peak
-  transfer size is bounded by `params.dense_batch_size`/`sparse_batch_size`
-  alone when left at their None default — several large, mostly-disjoint
-  filters can produce a union nearly the size of the whole file. Set that
-  batch size explicitly if you have many such filters (see `ParamsConfig`).
+  `_is_unfiltered`) OR PER-QUERY-filtered (see `_is_per_query` below), the
+  shared grid is the WHOLE file, uncompacted: an unfiltered search needs
+  every row anyway, and a per-query one has no SINGLE row-subset to offer
+  (different queries need different rows from the same batch) — either way,
+  every OTHER (uniformly filtered) search of the vector_type still rides
+  along for free, masking down to its own rows afterward.
+- Otherwise (every search of the vector_type has a UNIFORM active filter —
+  none unfiltered, none per-query), the shared grid is the UNION of every
+  DISTINCT active filter's surviving rows (`_union_keep`), compacted/
+  transferred/scored ONCE, with each search then masking down further to its
+  own filter's subset of that union. This never does MORE row-scoring than
+  treating each distinct filter independently would — in the worst case
+  (fully disjoint filters) it's exactly the same total rows, just one
+  transfer/launch instead of several — and strictly less whenever two
+  filters' surviving rows overlap. The tradeoff: unlike treating each filter
+  independently (which bounds each one's own transfer to its own, typically
+  smaller, surviving-row count), the union's peak transfer size is bounded
+  by `params.dense_batch_size`/`sparse_batch_size` alone when left at their
+  None default — several large, mostly-disjoint filters can produce a union
+  nearly the size of the whole file. Set that batch size explicitly if you
+  have many such filters (see `ParamsConfig`).
 
 Either way, `_process_shared_batch` does the per-search masking: an
-unfiltered search uses the shared grid as-is; a filtered one narrows it
-further to its own filter's rows, with two searches sharing an identical
-filter memoizing that lookup once (keyed by the `Filter` object itself,
-frozen+hashable) rather than repeating it.
+unfiltered search uses the shared grid as-is; a UNIFORMLY filtered one
+narrows it to its own filter's surviving COLUMNS (a gather), with two
+searches sharing an identical filter memoizing that lookup once (keyed by
+the `Filter` object itself, frozen+hashable) rather than repeating it. A
+PER-QUERY filter (`match_from_query`/`range_from_query`/
+`match_text_from_query` — see `nova_bf.filters`) can't be expressed as a
+column gather, since different queries keep different rows from the SAME
+columns: instead every column stays, and individual `(query, row)` cells get
+invalidated to `-inf` via `masked_fill` before the per-query `torch.topk` —
+needing no changes to the id-encoding scheme, since no column is ever
+dropped. `nova_bf.filters.evaluate()`'s result is `(rows,)` for a uniform
+filter (unchanged cost/shape from before per-query filters existed) or
+`(n_queries, rows)` the instant any condition, in any of `must`/`should`/
+`must_not`, is per-query.
 """
 
 from __future__ import annotations
@@ -165,15 +178,35 @@ def _resolve_rank(num_jobs: int | None, job_rank: int | None) -> int | None:
     return job_rank
 
 
-def load_queries(store: Store, qcfg) -> tuple[np.ndarray, list[str], dict[str, list]]:
+def _to_query_array(values: list) -> np.ndarray:
+    """A per-query filter column's values -> a numpy array. Plain scalars
+    (equality/range/text values) get numpy's own dtype inference (float64
+    for numbers, object/unicode for strings) so `filters.py`'s broadcast
+    comparisons work natively. A per-query MatchAny column (each row a
+    list of acceptable values) instead gets an explicit `dtype=object`
+    array with each list assigned as one element — `np.array([[...], [...]])`
+    would otherwise try to interpret same-length inner lists as a 2D array,
+    which is never what a per-query list-of-alternatives means."""
+    if values and isinstance(values[0], (list, tuple)):
+        arr = np.empty(len(values), dtype=object)
+        arr[:] = values
+        return arr
+    return np.array(values)
+
+
+def load_queries(
+    store: Store, qcfg, filter_cols: list[str] = (),
+) -> tuple[np.ndarray, list[str], dict[str, list], dict[str, np.ndarray]]:
     cols = [qcfg.dense_column]
     if qcfg.id_column:
         cols.append(qcfg.id_column)
     cols += [c for c in qcfg.payload_fields if c not in cols]
+    cols += [c for c in filter_cols if c not in cols]
 
     embs: list[np.ndarray] = []
     ids: list[str] = []
     payload: dict[str, list] = {c: [] for c in qcfg.payload_fields}
+    filter_vals: dict[str, list] = {c: [] for c in filter_cols}
     for f in store.list_parquets():
         table = store.read_columns(f.read_path, cols)
         embs.append(dense_to_2d(table[qcfg.dense_column]))
@@ -185,8 +218,10 @@ def load_queries(store: Store, qcfg) -> tuple[np.ndarray, list[str], dict[str, l
             ids += [make_point_id(f.key, r) for r in range(n)]
         for c in qcfg.payload_fields:
             payload[c] += d[c]
+        for c in filter_cols:
+            filter_vals[c] += d[c]
     Q = np.concatenate(embs, axis=0) if embs else np.zeros((0, 0), np.float32)
-    return Q, ids, payload
+    return Q, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
 
 
 def _build_query_vocab(indices: np.ndarray) -> np.ndarray:
@@ -263,7 +298,9 @@ def _sparse_rows_to_dense(row_offsets: np.ndarray, indices: np.ndarray, values: 
     return Q
 
 
-def load_queries_sparse(store: Store, qcfg) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, list]]:
+def load_queries_sparse(
+    store: Store, qcfg, filter_cols: list[str] = (),
+) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, list], dict[str, np.ndarray]]:
     """Sparse analog of `load_queries`: reads the struct<indices,values> column
     from every query file, then densifies once over the query set's own
     vocabulary (see `_build_query_vocab`) — queries are few enough that a dense
@@ -272,12 +309,14 @@ def load_queries_sparse(store: Store, qcfg) -> tuple[np.ndarray, np.ndarray, lis
     if qcfg.id_column:
         cols.append(qcfg.id_column)
     cols += [c for c in qcfg.payload_fields if c not in cols]
+    cols += [c for c in filter_cols if c not in cols]
 
     counts_parts: list[np.ndarray] = []
     indices_parts: list[np.ndarray] = []
     values_parts: list[np.ndarray] = []
     ids: list[str] = []
     payload: dict[str, list] = {c: [] for c in qcfg.payload_fields}
+    filter_vals: dict[str, list] = {c: [] for c in filter_cols}
     for f in store.list_parquets():
         table = store.read_columns(f.read_path, cols)
         row_offsets, idx, val = sparse_to_coo_parts(table[qcfg.sparse_column])
@@ -292,6 +331,8 @@ def load_queries_sparse(store: Store, qcfg) -> tuple[np.ndarray, np.ndarray, lis
             ids += [make_point_id(f.key, r) for r in range(n)]
         for c in qcfg.payload_fields:
             payload[c] += d[c]
+        for c in filter_cols:
+            filter_vals[c] += d[c]
 
     indices = np.concatenate(indices_parts) if indices_parts else np.zeros(0, np.int64)
     values = np.concatenate(values_parts) if values_parts else np.zeros(0, np.float32)
@@ -301,7 +342,7 @@ def load_queries_sparse(store: Store, qcfg) -> tuple[np.ndarray, np.ndarray, lis
 
     vocab = _build_query_vocab(indices)
     Q = _sparse_rows_to_dense(row_offsets, indices, values, vocab)
-    return Q, vocab, ids, payload
+    return Q, vocab, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
 
 
 def _compact_sparse_rows(
@@ -608,19 +649,25 @@ def _process_batch_group(
     and `_union_keep`) and this maps back to true rows for `_merge_topk`'s
     encoding.
 
-    `select(m, rows, true_rows, cache) -> (sel_rows, sel_cols)` is the
-    per-member filtering strategy (see `_process_shared_batch`): `sel_rows
-    is None` skips the merge entirely for this member/slice (e.g. a filter
-    keeping zero rows here); otherwise `sel_cols` is either `None` (member is
-    unfiltered, use the slice's rows unchanged) or a column-index tensor used
-    to mask both the score matrix and `rows` down to that member's own
-    filter's surviving columns. `true_rows` indexes a filter's keep-mask
-    (sized to the whole file, not to this possibly-already-compacted batch):
-    a plain `slice(r0, r1)` when `orig_rows is None` (position IS the true
-    row — a cheap view, no copy), or `orig_rows`'s corresponding array slice
-    otherwise. `cache` is a fresh dict per r0-slice for `select` to memoize
-    per-filter lookups shared across members — it does not persist across
-    slices, since the mask is slice-relative.
+    `select(m, rows, true_rows, cache) -> (sel_rows, sel_cols, cell_mask)` is
+    the per-member filtering strategy (see `_process_shared_batch`):
+    `sel_rows is None` skips the merge entirely for this member/slice (e.g.
+    a filter keeping zero rows here); `sel_cols` is either `None` (member is
+    unfiltered or per-query-filtered — use the slice's rows unchanged) or a
+    column-index tensor used to mask both the score matrix and `rows` down
+    to that member's own (uniform) filter's surviving columns; `cell_mask`
+    is either `None` (no per-(query,row) masking needed) or a `(n_queries,
+    len(rows))` boolean tensor applied via `masked_fill` — a per-query
+    filter's own rows vary BY QUERY, so unlike a uniform filter it can't be
+    expressed as one shared column selection; every column stays, and
+    individual (query, row) cells get invalidated instead. `true_rows`
+    indexes a filter's keep-mask (sized to the whole file, not to this
+    possibly-already-compacted batch): a plain `slice(r0, r1)` when
+    `orig_rows is None` (position IS the true row — a cheap view, no copy),
+    or `orig_rows`'s corresponding array slice otherwise. `cache` is a fresh
+    dict per r0-slice for `select` to memoize per-filter lookups shared
+    across members — it does not persist across slices, since the mask is
+    slice-relative.
 
     Returns elapsed wall-clock seconds spent in this loop (folded into the
     caller's `gpu_secs`). A caller that pre-compacts `batch` must do so
@@ -656,10 +703,12 @@ def _process_batch_group(
                 score_cache[s.metric] = sl.score(spec_Q[m], s.metric)
             scores = score_cache[s.metric]
 
-            sel_rows, sel_cols = select(m, rows, true_rows, cache)
+            sel_rows, sel_cols, cell_mask = select(m, rows, true_rows, cache)
             if sel_rows is None:
                 continue
             sel_scores = scores if sel_cols is None else scores[:, sel_cols]
+            if cell_mask is not None:
+                sel_scores = sel_scores.masked_fill(~cell_mask, float("-inf"))
 
             spec_top_scores[m], spec_top_enc[m] = _merge_topk(
                 spec_top_scores[m], spec_top_enc[m], sel_scores, sel_rows, gidx, s.k
@@ -678,42 +727,98 @@ def _is_unfiltered(f: Filter | None) -> bool:
     return f is None or not f.fields()
 
 
+def _is_per_query(f: Filter | None) -> bool:
+    """Does `f` have any per-query condition (`match_from_query`/
+    `range_from_query`/`match_text_from_query`) anywhere? A per-query
+    filter can never be compacted to one shared row-subset (different
+    queries need different corpus rows from the same batch), so
+    `run_compute` routes it the same way as an unfiltered spec — see
+    `has_baseline` — and `_process_shared_batch`'s `select` masks it via
+    `cell_mask` (a full `(n_queries, rows)` invalidation) rather than a
+    column gather."""
+    return f is not None and f.is_per_query()
+
+
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
-    keeps: dict[Filter | None, np.ndarray | None], batch_size: int | None,
-    gidx: int, device: str, orig_rows: np.ndarray | None,
+    keeps: dict[Filter | None, np.ndarray | None], filter_is_per_query: dict[Filter | None, bool],
+    batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
 ) -> float:
     """Every search of this vector_type shares one batch grid: `orig_rows`
-    is `None` when some search is unfiltered (`batch` is the raw, whole
-    file — see `run_compute`'s `has_baseline`), or the true-row map produced
-    by compacting `batch` to the union of every active filter otherwise (see
-    `_union_keep`). Either way, a filtered search masks the shared columns
-    down to its own filter's surviving rows, via a `local_idx` cached per
-    filter (in `_process_batch_group`'s per-slice `cache`) so two members
-    sharing an identical filter don't recompute `nonzero` twice — indexing
-    `keeps[s.filter]` by `true_rows` (each slice position's TRUE file row),
-    not by position, since the shared batch may already be a compacted
-    subset of the file. See `_process_batch_group` for the shared loop
-    body."""
+    is `None` when some search is unfiltered OR per-query-filtered (`batch`
+    is the raw, whole file — see `run_compute`'s `has_baseline`), or the
+    true-row map produced by compacting `batch` to the union of every
+    active UNIFORM filter otherwise (see `_union_keep` — a per-query filter
+    never contributes to that union, since it has no single row-subset to
+    offer). Three cases per member, decided by `filter_is_per_query[s.filter]`:
+
+    - Unfiltered: use the shared slice as-is.
+    - Uniform filter: mask down to its own filter's surviving COLUMNS, via a
+      `local_idx` cached per filter (in `_process_batch_group`'s per-slice
+      `cache`) so two members sharing an identical filter don't recompute
+      `nonzero` twice — indexing `keeps[s.filter]` by `true_rows` (each
+      slice position's TRUE file row), not by position, since the shared
+      batch may already be a compacted subset of the file.
+    - Per-query filter: `keeps[s.filter]` is `(n_queries, rows)` — every
+      query needs a potentially different row-subset, so there's no shared
+      column selection to make; instead every column stays, and a `cell_mask`
+      (this member's own `(n_queries, batch_rows)` slice, also cached per
+      filter) gets applied via `masked_fill` in `_process_batch_group`.
+
+    See `_process_batch_group` for the shared loop body."""
     import torch
 
     def select(m: int, rows, true_rows, cache: dict[object, object]):
         s = specs[m]
         if _is_unfiltered(s.filter):
-            return rows, None
+            return rows, None, None
+        if filter_is_per_query[s.filter]:
+            cell_mask = cache.get(s.filter)
+            if cell_mask is None:
+                cell_np = keeps[s.filter][:, true_rows]
+                cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
+                cache[s.filter] = cell_mask
+            if not cell_mask.any():
+                return None, None, None
+            return rows, None, cell_mask
         local_idx = cache.get(s.filter)
         if local_idx is None:
             local_np = np.nonzero(keeps[s.filter][true_rows])[0]
             local_idx = torch.from_numpy(local_np).to(device, non_blocking=True)
             cache[s.filter] = local_idx
         if local_idx.numel() == 0:
-            return None, None
-        return rows[local_idx], local_idx
+            return None, None, None
+        return rows[local_idx], local_idx, None
 
     return _process_batch_group(
         batch, member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
         batch_size, gidx, device, orig_rows=orig_rows, select=select,
     )
+
+
+def _validate_query_filter_cols(qstore: Store, filter_cols: list[str]) -> None:
+    """Fail fast with a clear message if a per-query filter condition
+    (`match_from_query`/`range_from_query`/`match_text_from_query`) names a
+    queries column that doesn't exist — rather than letting a typo surface
+    deep inside `load_queries`/`load_queries_sparse` as a generic pyarrow
+    `ArrowInvalid` about a missing `FieldRef`. Peeks at the FIRST queries
+    file's schema only (metadata read, no row data) since every queries
+    file in a run is assumed to share one schema."""
+    if not filter_cols:
+        return
+    files = qstore.list_parquets()
+    if not files:
+        return  # let the empty-queries-store case surface downstream as usual
+    import pyarrow.parquet as pq
+
+    schema_names = set(pq.ParquetFile(files[0].read_path, filesystem=qstore.fs).schema_arrow.names)
+    missing = sorted(c for c in filter_cols if c not in schema_names)
+    if missing:
+        raise ValueError(
+            f"queries file is missing column(s) referenced by a per-query filter "
+            f"(match_from_query/range_from_query/match_text_from_query): {missing} "
+            f"— available columns: {sorted(schema_names)}"
+        )
 
 
 def run_compute(
@@ -750,23 +855,31 @@ def run_compute(
     # 1. queries — loaded once per DISTINCT vector_type needed across all specs
     #    (queries files are small, so no need to dedupe further than that).
     qstore = Store(cfg.queries.path)
+    # Union of every spec's per-query filter columns — same "read exactly (and
+    # only) what's referenced" guarantee corpus-side filter_cols already makes,
+    # extended to the query side (see Filter.query_fields()).
+    query_filter_cols = sorted({c for s in specs if s.filter for c in s.filter.query_fields()})
+    _validate_query_filter_cols(qstore, query_filter_cols)
     Q_np_by_vt: dict[str, np.ndarray] = {}
     query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
     query_ids: list[str] | None = None
     payload: dict[str, list] | None = None
+    query_filter_vals: dict[str, np.ndarray] | None = None
     for vt in vts_needed:
         if vt == "sparse":
-            Q_np, query_vocab, q_ids, q_payload = load_queries_sparse(qstore, cfg.queries)
+            Q_np, query_vocab, q_ids, q_payload, q_filter_vals = load_queries_sparse(
+                qstore, cfg.queries, query_filter_cols
+            )
             if len(query_vocab) == 0 and len(q_ids) > 0:
                 logger.warning(
                     "sparse query vocabulary is empty (every query has zero nonzero entries) — "
                     "every corpus row will score 0; check queries.sparse_column is correct."
                 )
         else:
-            Q_np, q_ids, q_payload = load_queries(qstore, cfg.queries)
+            Q_np, q_ids, q_payload, q_filter_vals = load_queries(qstore, cfg.queries, query_filter_cols)
         Q_np_by_vt[vt] = Q_np
         if query_ids is None:
-            query_ids, payload = q_ids, q_payload
+            query_ids, payload, query_filter_vals = q_ids, q_payload, q_filter_vals
         elif q_ids != query_ids:
             # Both loaders read the same query store via the same deterministic
             # store.list_parquets() order, so q_ids should be IDENTICAL, not just
@@ -841,13 +954,19 @@ def run_compute(
         spec_top_enc.append(torch.zeros((n_q, s.k), dtype=torch.int64, device=device))
 
     # Per vector_type: does any spec have no filter (or an explicit-but-empty
-    # one — see `_is_unfiltered`)? If so every spec of that vector_type shares
-    # the whole file, uncompacted (`has_baseline`); otherwise every spec has
-    # an active filter, so the shared grid is instead the UNION of those
+    # one — see `_is_unfiltered`) OR a per-query filter (see `_is_per_query` —
+    # it has no single row-subset to offer, since different queries need
+    # different rows)? If so every spec of that vector_type shares the whole
+    # file, uncompacted (`has_baseline`); otherwise every spec has a uniform
+    # active filter, so the shared grid is instead the UNION of those
     # filters' surviving rows (`_union_keep`, computed fresh per file below).
     # See this module's docstring for the full rationale.
     spec_filter = [s.filter for s in specs]
     distinct_filters: list[Filter | None] = list(dict.fromkeys(spec_filter))
+    # Computed once per distinct filter (not per file/slice) — the hot
+    # per-member `select` closure below does a cheap dict lookup instead of
+    # recomputing `Filter.is_per_query()` (a must/should/must_not walk).
+    filter_is_per_query: dict[Filter | None, bool] = {f: _is_per_query(f) for f in distinct_filters}
 
     vt_spec_idxs: dict[str, list[int]] = {vt: [] for vt in vts_needed}
     for i, s in enumerate(specs):
@@ -858,7 +977,9 @@ def run_compute(
     vt_batch_size: dict[str, int | None] = {}
     vt_union_filters: dict[str, list[Filter]] = {}
     for vt, idxs in vt_spec_idxs.items():
-        has_baseline[vt] = any(_is_unfiltered(specs[i].filter) for i in idxs)
+        has_baseline[vt] = any(
+            _is_unfiltered(specs[i].filter) or _is_per_query(specs[i].filter) for i in idxs
+        )
         # Every search of this vector_type shares one batch grid regardless of
         # which branch below applies, so k_floor spans ALL of them, not just a
         # same-filter subset — see _resolve_vt_batch_size's docstring.
@@ -953,7 +1074,13 @@ def run_compute(
                 # above (CPU-vectorized work, not IO wait). Keyed by the `Filter`
                 # object itself (frozen, hashable — see `nova_bf.config.Filter`)
                 # so two specs sharing an identical filter never evaluate it twice.
-                keeps = {f: (evaluate(f, table) if f is not None else None) for f in distinct_filters}
+                # `query_filter_vals` feeds any per-query condition; `evaluate()`
+                # returns `(rows,)` for a purely-uniform filter (unchanged cost),
+                # or `(n_queries, rows)` the moment any condition is per-query.
+                keeps = {
+                    f: (evaluate(f, table, query_filter_vals) if f is not None else None)
+                    for f in distinct_filters
+                }
                 t2 = time.perf_counter()
                 fq.put((gidx, arrs, ids, keeps, t1 - t0, t2 - t1))
             except Exception as exc:
@@ -1050,7 +1177,7 @@ def run_compute(
                     batch, orig_rows = b.compact(_union_keep(vt_union_filters[vt], keeps))
                 gpu_secs += _process_shared_batch(
                     batch, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
-                    keeps, vt_batch_size[vt], gidx, device, orig_rows=orig_rows,
+                    keeps, filter_is_per_query, vt_batch_size[vt], gidx, device, orig_rows=orig_rows,
                 )
 
             if bar.n % 200 == 0:
