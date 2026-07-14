@@ -113,6 +113,56 @@ def test_searches_multiple_specs_preserve_order():
     assert [s.name for s in cfg.searches] == ["dense_all", "sparse_all"]
 
 
+def test_search_spec_name_is_optional():
+    """A lone SearchSpec can omit `name` — it's left `None` until
+    BruteForceConfig assigns a default (a single spec can't disambiguate
+    against siblings it can't see)."""
+    assert SearchSpec().name is None
+
+
+def test_search_spec_default_name_derived_from_vector_type_and_metric():
+    cfg = BruteForceConfig(**_base(searches=[SearchSpec()]))
+    assert cfg.searches[0].name == "dense_cosine"
+
+    cfg = BruteForceConfig(**_base(searches=[SearchSpec(vector_type="sparse", metric="dot")]))
+    assert cfg.searches[0].name == "sparse_dot"
+
+
+def test_search_spec_default_name_gets_filtered_suffix():
+    filt = Filter(must=[FilterCondition(field="language", match="eng")])
+    cfg = BruteForceConfig(**_base(searches=[SearchSpec(filter=filt)]))
+    assert cfg.searches[0].name == "dense_cosine_filtered"
+
+    # an explicit-but-empty filter has no active fields, so it's treated the
+    # same as no filter at all — same convention as compute.py's _is_unfiltered.
+    cfg = BruteForceConfig(**_base(searches=[SearchSpec(filter=Filter())]))
+    assert cfg.searches[0].name == "dense_cosine"
+
+
+def test_search_spec_default_names_disambiguate_collisions():
+    cfg = BruteForceConfig(**_base(searches=[
+        SearchSpec(), SearchSpec(), SearchSpec(),
+    ]))
+    assert [s.name for s in cfg.searches] == ["dense_cosine", "dense_cosine_2", "dense_cosine_3"]
+
+
+def test_search_spec_default_name_avoids_explicit_name_collision():
+    cfg = BruteForceConfig(**_base(searches=[
+        SearchSpec(name="dense_cosine"),
+        SearchSpec(),
+    ]))
+    assert [s.name for s in cfg.searches] == ["dense_cosine", "dense_cosine_2"]
+
+
+def test_search_spec_explicit_name_mixed_with_default_preserves_order():
+    cfg = BruteForceConfig(**_base(searches=[
+        SearchSpec(),
+        SearchSpec(name="my_search", vector_type="sparse", metric="dot"),
+        SearchSpec(vector_type="sparse", metric="dot"),
+    ]))
+    assert [s.name for s in cfg.searches] == ["dense_cosine", "my_search", "sparse_dot"]
+
+
 def test_filter_is_hashable_and_usable_as_a_dict_key():
     """`Filter`/`FilterCondition`/`RangeCondition` are frozen, so pydantic
     auto-generates `__hash__` from their field values — this is what lets

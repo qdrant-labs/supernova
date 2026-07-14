@@ -45,7 +45,7 @@ params:
   # merge_prefetch: false
 
 searches:
-  - name: dense_all          # required, unique, [A-Za-z0-9_-]+ — goes into the output filename
+  - name: dense_all          # optional, unique if set, [A-Za-z0-9_-]+ — goes into the output filename
     vector_type: dense       # dense | sparse
     metric: cosine           # cosine | dot | euclidean (euclidean unsupported with vector_type: sparse)
     k: 1000
@@ -93,7 +93,7 @@ searches:
           match: eng
 ```
 
-Every entry needs a unique `name` — it's spliced into the output filename (`bf_<queries-stem>_<name>_k<K>.parquet`) so searches never collide.
+`name` is optional — it's spliced into the output filename (`bf_<queries-stem>_<name>_k<K>.parquet`), so if you set it, it must be unique. Omit it and one is derived from `vector_type`/`metric` (e.g. `dense_cosine`), with `_filtered` appended when `filter` is set and any collision (with another default, or with an explicit name elsewhere in `searches`) disambiguated by an incrementing suffix (`_2`, `_3`, …) — so the single-search case above needs no `name:` line at all.
 
 **Mixing `vector_type: dense` and `vector_type: sparse` in one run doubles the per-file host-RAM budget**: each in-flight file's reader decodes both columns at once, so `io_workers × file_size` (see [Performance & tuning](#performance--tuning)) becomes `io_workers × (dense_bytes + sparse_bytes)`. Lower `io_workers` accordingly on memory-constrained boxes when mixing vector_types.
 
