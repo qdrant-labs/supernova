@@ -528,37 +528,37 @@ class FilterGroup:
     batch_size: int | None  # resolved batch size; None = whole (compacted) file
 
 
-def _path_b_group_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
-    """Path B's floor: `k_floor` is the largest `k` among one `FilterGroup`'s
-    own (related — they share an identical filter by construction) members.
-    Raise `configured` (`params.dense_batch_size`/`sparse_batch_size`) up to
-    `k_floor` when it's below — below that, a search can't fill its own
-    top-K from one batch and needs extra merge rounds to get there instead,
-    which buys nothing here (this group's own memory footprint is the same
-    either way), so there's no reason not to raise it."""
+def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str, raise_to_floor: bool) -> int | None:
+    """Shared floor-check behind `_path_b_group_batch_size`/`_path_a_batch_size`:
+    `configured` (`params.dense_batch_size`/`sparse_batch_size`) is fine as-is
+    whenever it's unset or already at/above `k_floor` — a batch that size can
+    already fill any of these searches' own top-K in one pass. Below that, the
+    two paths diverge on what `k_floor` even means:
+
+    - Path B (`raise_to_floor=True`, via `_path_b_group_batch_size`): `k_floor`
+      is the largest `k` among one `FilterGroup`'s own (related — they share
+      an identical filter by construction) members, so raising `configured`
+      up to it only helps: this group's memory footprint is the same either
+      way, and a smaller batch just can't fill a search's top-K for no
+      benefit.
+    - Path A (`raise_to_floor=False`, via `_path_a_batch_size`): `k_floor` is
+      the largest `k` across EVERY search of the vector_type, related or not,
+      since they all share one full-file grid — raising `configured` here
+      would let one search's large `k` silently blow past a DIFFERENT
+      search's own memory bound, exactly the OOM footgun `dense_batch_size`/
+      `sparse_batch_size` exists to prevent. Warn instead: the larger-`k`
+      search just takes extra merge rounds to fill its own top-K (more of
+      them the further `configured` sits below `k_floor`), at no extra GPU
+      memory cost to anyone."""
     if configured is None or configured >= k_floor:
         return configured
-    logger.warning(
-        "params.%s_batch_size=%d is below k=%d; raising to k (a smaller "
-        "batch can't fill a search's top-K and gives no memory benefit).",
-        vt, configured, k_floor,
-    )
-    return k_floor
-
-
-def _path_a_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
-    """Path A's floor: `k_floor` is the largest `k` across EVERY search of
-    the vector_type, related or not, since they all share one full-file
-    grid. Unlike `_path_b_group_batch_size`, NEVER raise an explicit
-    `configured` value here — doing so would let one search's large `k`
-    silently blow past a DIFFERENT search's own memory bound, exactly the
-    OOM footgun `dense_batch_size`/`sparse_batch_size` exists to prevent.
-    Just warn instead: the larger-`k` search takes extra merge rounds to
-    fill its own top-K (more of them the further `configured` sits below
-    `k_floor` — each round is its own `torch.topk` pass), but at no extra
-    GPU memory cost to anyone."""
-    if configured is None or configured >= k_floor:
-        return configured
+    if raise_to_floor:
+        logger.warning(
+            "params.%s_batch_size=%d is below k=%d; raising to k (a smaller "
+            "batch can't fill a search's top-K and gives no memory benefit).",
+            vt, configured, k_floor,
+        )
+        return k_floor
     logger.warning(
         "params.%s_batch_size=%d is below k=%d, the largest among searches "
         "sharing this vector_type's batch pass — keeping your configured "
@@ -569,6 +569,14 @@ def _path_a_batch_size(configured: int | None, k_floor: int, vt: str) -> int | N
         vt, configured, k_floor, k_floor,
     )
     return configured
+
+
+def _path_b_group_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
+    return _resolve_vt_batch_size(configured, k_floor, vt, raise_to_floor=True)
+
+
+def _path_a_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
+    return _resolve_vt_batch_size(configured, k_floor, vt, raise_to_floor=False)
 
 
 def _build_filter_groups(
