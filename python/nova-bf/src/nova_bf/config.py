@@ -171,10 +171,13 @@ class RangeCondition(BaseModel):
 
 
 class FilterCondition(BaseModel):
-    """One field predicate: keyword-style equality (`match`) or numeric bounds (`range`).
+    """One field predicate: keyword-style equality (`match`), numeric bounds
+    (`range`), or full-text (`match_text`).
 
     `match` takes a scalar (equality) or a list (matches any of them — Qdrant's
-    MatchAny). Exactly one of `match`/`range` must be set.
+    MatchAny). `match_text` requires every whitespace-separated word in the
+    string to appear somewhere in the field (case-insensitive, order-independent).
+    Exactly one of `match`/`range`/`match_text` must be set.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -185,12 +188,23 @@ class FilterCondition(BaseModel):
     field: str
     match: MatchValue | list[MatchValue] | None = None
     range: RangeCondition | None = None
+    match_text: str | None = None
 
     @model_validator(mode="after")
     def _exactly_one(self) -> "FilterCondition":
-        if (self.match is None) == (self.range is None):
+        if sum(v is not None for v in (self.match, self.range, self.match_text)) != 1:
             raise ValueError(
-                f"filter condition on `{self.field}` must set exactly one of `match` or `range`"
+                f"filter condition on `{self.field}` must set exactly one of "
+                "`match`, `range`, or `match_text`"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _match_text_not_blank(self) -> "FilterCondition":
+        if self.match_text is not None and not self.match_text.strip():
+            raise ValueError(
+                f"filter condition on `{self.field}` has a blank `match_text` "
+                "— it needs at least one word"
             )
         return self
 

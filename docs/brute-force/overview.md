@@ -74,11 +74,15 @@ filter:
       match: eng          # scalar → equality; a list matches any of them (MatchAny)
     - field: cost
       range: {lt: 10}     # gt / gte / lt / lte — combinable in one condition
+    - field: text
+      match_text: chronic fatigue syndrome  # every word must appear (Qdrant's MatchText)
   should: []               # OR-at-least-one
   must_not: []              # AND-NOT
 ```
 
 A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. The filter applies uniformly to every query in the run: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves.
+
+`match_text` requires every whitespace-separated word in the string to appear somewhere in the field, case-insensitively and in any order (an AND of words, not a phrase match) — the same semantics as Qdrant's own full-text-index `MatchText` condition, so ground truth built with it is directly comparable to a real Qdrant filtered search. It's a word-boundary-regex approximation of Qdrant's real tokenizer, not a byte-for-byte replica: a hyphenated query word like `high-fat` is matched as one literal token rather than split into `high`/`fat`, and a word ending directly in trailing punctuation (`C++`) can fail to get a boundary on that side. Good enough for keyword-style corpus filtering.
 
 ## Running
 
