@@ -592,58 +592,119 @@ def _build_filter_groups(
     return groups
 
 
-def _process_shared_batch(
+def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
-    keeps: dict[str, np.ndarray | None], spec_filter_key: list[str], batch_size: int | None,
-    gidx: int, device: str,
+    batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
 ) -> float:
-    """Path A: every spec of this vector_type — filtered or not — shares one
-    full-file batch grid. Built once per batch: the GPU transfer/CSR
-    (`batch.transfer`) and each DISTINCT metric's score matrix (`score_cache`,
-    keyed by metric — every spec needing that metric reads the same tensor,
-    filtered or not). Every member then merges its own top-k from those
-    shared columns: an unfiltered spec reads them directly; a filtered spec
-    masks them down to its own filter's surviving rows first (`local_idx`,
-    cached per filter so two specs sharing an identical filter don't
-    recompute `nonzero` twice). Returns elapsed wall-clock seconds (folded
-    into the caller's `gpu_secs`) — Path A never compacts, so the whole body
-    is GPU transfer/score/merge work."""
+    """Shared Path A / Path B primitive: iterate `batch` in `batch_size`-row
+    slices, transfer each slice once (`batch.transfer`), score it once per
+    DISTINCT metric among `member_idxs` (`score_cache` — every member needing
+    that metric reads the same tensor), and merge each member's own top-k
+    from those shared columns via `_merge_topk`.
+
+    `orig_rows` maps a slice position to its TRUE file-row number: `None`
+    means position IS the true row (Path A, `_process_shared_batch` below —
+    it never compacts, so `batch` is the raw, whole file); an array means
+    `batch` was already compacted by the caller (Path B,
+    `_process_filter_group` below) and this maps back to true rows for
+    `_merge_topk`'s encoding.
+
+    `select(m, r0, r1, rows, cache) -> (sel_rows, sel_cols)` is the per-member
+    filtering strategy: `sel_rows is None` skips the merge entirely for this
+    member/slice (e.g. a filter keeping zero rows here); otherwise `sel_cols`
+    is either `None` (use the slice's columns/rows unchanged — Path B, whose
+    members already share one filter via compaction) or a column-index tensor
+    used to mask both the score matrix and `rows` down to a per-member
+    filter's surviving columns (Path A). `cache` is a fresh dict per r0-slice
+    for `select` to memoize per-filter lookups shared across members (see
+    `_path_a_select`) — it does not persist across slices, since the mask is
+    slice-relative.
+
+    Returns elapsed wall-clock seconds spent in this loop (folded into the
+    caller's `gpu_secs`). Callers that pre-compact (Path B) must compact
+    BEFORE calling this function — its own timer starts only once this loop
+    begins, so CPU-side compaction time never counts as GPU time (see the
+    `io_wait`/`gpu_secs` split docs at the top of this module)."""
     import torch
 
-    t0 = time.perf_counter()
     n_rows = batch.n_rows
     if n_rows == 0:
-        return time.perf_counter() - t0
+        return 0.0
+    t0 = time.perf_counter()
     step = batch_size or n_rows
     for r0 in range(0, n_rows, step):
         r1 = min(r0 + step, n_rows)
         sl = batch.transfer(r0, r1, device)
-        rows = torch.arange(r0, r0 + sl.n_rows, dtype=torch.int64, device=device)
+        if orig_rows is None:
+            rows = torch.arange(r0, r0 + sl.n_rows, dtype=torch.int64, device=device)
+        else:
+            rows = torch.from_numpy(orig_rows[r0 : r0 + sl.n_rows]).to(device, non_blocking=True)
 
         score_cache: dict[str, object] = {}
-        local_idx_cache: dict[str, object] = {}
+        cache: dict[str, object] = {}
         for m in member_idxs:
             s = specs[m]
             if s.metric not in score_cache:
                 score_cache[s.metric] = sl.score(spec_Q[m], s.metric)
             scores = score_cache[s.metric]
 
-            if s.filter is None:
-                sel_scores, sel_rows = scores, rows
-            else:
-                fk = spec_filter_key[m]
-                if fk not in local_idx_cache:
-                    local_np = np.nonzero(keeps[fk][r0:r1])[0]
-                    local_idx_cache[fk] = torch.from_numpy(local_np).to(device, non_blocking=True)
-                local_idx = local_idx_cache[fk]
-                if local_idx.numel() == 0:
-                    continue
-                sel_scores, sel_rows = scores[:, local_idx], rows[local_idx]
+            sel_rows, sel_cols = select(m, r0, r1, rows, cache)
+            if sel_rows is None:
+                continue
+            sel_scores = scores if sel_cols is None else scores[:, sel_cols]
 
             spec_top_scores[m], spec_top_enc[m] = _merge_topk(
                 spec_top_scores[m], spec_top_enc[m], sel_scores, sel_rows, gidx, s.k
             )
     return time.perf_counter() - t0
+
+
+def _path_a_select(specs: list[SearchSpec], spec_filter_key: list[str], keeps: dict[str, np.ndarray | None], device: str):
+    """Path A's `select` for `_process_batch_group`: an unfiltered member uses
+    the shared slice as-is; a filtered member masks it down to its own
+    filter's surviving columns, via a `local_idx` cached per filter key (in
+    the caller-provided per-slice `cache`) so two members sharing an
+    identical filter don't recompute `nonzero` twice."""
+    import torch
+
+    def select(m: int, r0: int, r1: int, rows, cache: dict[str, object]):
+        s = specs[m]
+        if s.filter is None:
+            return rows, None
+        fk = spec_filter_key[m]
+        if fk not in cache:
+            local_np = np.nonzero(keeps[fk][r0:r1])[0]
+            cache[fk] = torch.from_numpy(local_np).to(device, non_blocking=True)
+        local_idx = cache[fk]
+        if local_idx.numel() == 0:
+            return None, None
+        return rows[local_idx], local_idx
+
+    return select
+
+
+def _path_b_select(m: int, r0: int, r1: int, rows, cache: dict[str, object]):
+    """Path B's `select` for `_process_batch_group`: every member of a
+    `FilterGroup` shares one identical filter, already applied via
+    `batch.compact()` before this loop runs — no further per-member masking
+    needed, so this is a no-op that always merges the slice unchanged."""
+    return rows, None
+
+
+def _process_shared_batch(
+    batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
+    keeps: dict[str, np.ndarray | None], spec_filter_key: list[str], batch_size: int | None,
+    gidx: int, device: str,
+) -> float:
+    """Path A: every spec of this vector_type — filtered or not — shares one
+    full-file batch grid; a filtered spec masks the shared columns down to
+    its own filter's surviving rows (`_path_a_select`). See
+    `_process_batch_group` for the shared loop body."""
+    return _process_batch_group(
+        batch, member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
+        batch_size, gidx, device, orig_rows=None,
+        select=_path_a_select(specs, spec_filter_key, keeps, device),
+    )
 
 
 def _process_filter_group(
@@ -652,36 +713,18 @@ def _process_filter_group(
 ) -> float:
     """Path B: no spec of this vector_type is unfiltered, so there's no
     full-file score matrix to derive from — this group's rows are compacted
-    once, then transferred/scored/batched independently, same as a single
-    spec running alone would. Returns elapsed wall-clock seconds spent on the
-    GPU transfer/score/merge loop (folded into the caller's `gpu_secs`) —
-    deliberately excludes `batch.compact()` above, a real CPU-side cost (row
-    filtering, array copies) that scales with corpus size, not GPU work; it's
-    real time, just not GPU time, so it shouldn't count toward the signal
-    `gpu_secs` exists to give (see the `io_wait`/`gpu_secs` split docs at the
-    top of this module)."""
-    import torch
-
+    once (`batch.compact`), then run through the shared loop
+    (`_process_batch_group`) unmasked (`_path_b_select`), same as a single
+    spec running alone would. `batch.compact()` runs OUTSIDE (before)
+    `_process_batch_group`'s own timer, so its real but CPU-side cost (row
+    filtering, array copies — scales with corpus size, not GPU work) never
+    counts toward the `gpu_secs` signal (see the `io_wait`/`gpu_secs` split
+    docs at the top of this module)."""
     compacted, orig_rows = batch.compact(keep)
-    n_rows = compacted.n_rows
-    if n_rows == 0:
-        return 0.0
-    t0 = time.perf_counter()
-    step = group.batch_size or n_rows
-    for r0 in range(0, n_rows, step):
-        r1 = min(r0 + step, n_rows)
-        sl = compacted.transfer(r0, r1, device)
-        rows = torch.from_numpy(orig_rows[r0 : r0 + sl.n_rows]).to(device)
-
-        score_cache: dict[str, object] = {}
-        for m in group.member_idxs:
-            s = specs[m]
-            if s.metric not in score_cache:
-                score_cache[s.metric] = sl.score(spec_Q[m], s.metric)
-            spec_top_scores[m], spec_top_enc[m] = _merge_topk(
-                spec_top_scores[m], spec_top_enc[m], score_cache[s.metric], rows, gidx, s.k
-            )
-    return time.perf_counter() - t0
+    return _process_batch_group(
+        compacted, group.member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
+        group.batch_size, gidx, device, orig_rows=orig_rows, select=_path_b_select,
+    )
 
 
 def run_compute(
