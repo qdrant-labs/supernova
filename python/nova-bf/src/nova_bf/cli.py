@@ -55,7 +55,7 @@ def compute(
 @main.command()
 @click.argument("config")
 def merge(config: str) -> None:
-    """Merge per-rank partial results into a single top-K parquet."""
+    """Merge per-rank partial results into each search's own top-K parquet."""
     _setup_logging()
     from nova_bf.merge import run_merge
 
