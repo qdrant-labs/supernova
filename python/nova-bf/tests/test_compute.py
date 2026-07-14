@@ -220,3 +220,15 @@ def test_filter_timing_is_reported_only_when_filtering(ds, caplog):
         _run(ds, batch=None, id_column="id", out_name="filter_timing_off")
     assert not any("filter eval" in r.message for r in caplog.records)
     assert any("filter_s=0.0" in r.message for r in caplog.records)  # stable bf-bench schema
+
+
+def test_bad_filter_field_raises_instead_of_hanging(ds):
+    """A filter referencing a column absent from the corpus schema makes
+    `evaluate()` raise inside a reader thread — this must surface as a clear
+    exception in the main thread, not hang forever (an uncaught exception in
+    a daemon thread silently kills it, and the consumer's fixed-count
+    `fq.get()` loop would otherwise block waiting for an item that never
+    arrives)."""
+    filt = Filter(must=[FilterCondition(field="no_such_column", match="eng")])
+    with pytest.raises(RuntimeError, match="reader thread failed"):
+        _run(ds, batch=None, id_column="id", out_name="filter_bad_field", filt=filt)

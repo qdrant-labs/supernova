@@ -928,31 +928,43 @@ def run_compute(
                 gidx, f = work.get_nowait()
             except Empty:
                 return
-            t0 = time.perf_counter()
-            table = cstore.read_columns(f.read_path, read_cols)
-            # Decode each vector_type at most ONCE per file, regardless of how many
-            # specs need it — wrapped in the batch abstraction (`DenseCorpusBatch`/
-            # `SparseCorpusBatch`) in the consumer loop below, where every spec (Path
-            # A) or filter group (Path B) of that vector_type shares it.
-            arrs: dict[str, object] = {}
-            if "dense" in vts_needed:
-                arrs["dense"] = dense_to_2d(table[dense_col])
-            if "sparse" in vts_needed:
-                sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[sparse_col])
-                sp_norms = _sparse_file_norms(sp_offsets, sp_idx, sp_val) if need_sparse_norms else None
-                arrs["sparse"] = (sp_offsets, sp_idx, sp_val, sp_norms)
-            # carry the id column (combined to one contiguous array) to decode;
-            # None when id_column isn't configured. Same row order as `arrs`.
-            ids = table[id_col].combine_chunks() if id_col else None
-            t1 = time.perf_counter()
-            # One mask per DISTINCT filter (`None` for the unfiltered entry),
-            # evaluated against the same table — timed separately from the read
-            # above (CPU-vectorized work, not IO wait). Keyed by the `Filter`
-            # object itself (hashable — see its docstring) so two specs
-            # sharing an identical filter never evaluate it twice.
-            keeps = {f: evaluate(f, table) if f is not None else None for f in distinct_filters}
-            t2 = time.perf_counter()
-            fq.put((gidx, arrs, ids, keeps, t1 - t0, t2 - t1))
+            # Wrapped in try/except so a bad read/decode/filter (e.g. a filter
+            # field missing from this file's schema, or a type pyarrow can't
+            # compare) fails the run loudly instead of silently killing this
+            # thread — an uncaught exception here would otherwise just print a
+            # traceback to stderr and die, leaving the consumer's fixed-count
+            # `fq.get()` loop blocked forever waiting for an item that will
+            # never arrive. Putting the exception itself on the queue lets the
+            # consumer re-raise it in the main thread with a clear message.
+            try:
+                t0 = time.perf_counter()
+                table = cstore.read_columns(f.read_path, read_cols)
+                # Decode each vector_type at most ONCE per file, regardless of how many
+                # specs need it — wrapped in the batch abstraction (`DenseCorpusBatch`/
+                # `SparseCorpusBatch`) in the consumer loop below, where every spec (Path
+                # A) or filter group (Path B) of that vector_type shares it.
+                arrs: dict[str, object] = {}
+                if "dense" in vts_needed:
+                    arrs["dense"] = dense_to_2d(table[dense_col])
+                if "sparse" in vts_needed:
+                    sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[sparse_col])
+                    sp_norms = _sparse_file_norms(sp_offsets, sp_idx, sp_val) if need_sparse_norms else None
+                    arrs["sparse"] = (sp_offsets, sp_idx, sp_val, sp_norms)
+                # carry the id column (combined to one contiguous array) to decode;
+                # None when id_column isn't configured. Same row order as `arrs`.
+                ids = table[id_col].combine_chunks() if id_col else None
+                t1 = time.perf_counter()
+                # One mask per DISTINCT filter (`None` for the unfiltered entry),
+                # evaluated against the same table — timed separately from the read
+                # above (CPU-vectorized work, not IO wait). Keyed by the `Filter`
+                # object itself (hashable — see its docstring) so two specs
+                # sharing an identical filter never evaluate it twice.
+                keeps = {f: evaluate(f, table) if f is not None else None for f in distinct_filters}
+                t2 = time.perf_counter()
+                fq.put((gidx, arrs, ids, keeps, t1 - t0, t2 - t1))
+            except Exception as exc:
+                fq.put(exc)
+                return
 
     for _ in range(io_workers):
         Thread(target=reader, daemon=True).start()
@@ -975,7 +987,12 @@ def run_compute(
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for _ in range(len(mine)):
             w0 = time.perf_counter()
-            gidx, arrs, ids, keeps, rsec, fsec = fq.get()
+            item = fq.get()
+            if isinstance(item, Exception):
+                raise RuntimeError(
+                    "a reader thread failed while reading/decoding/filtering a corpus file"
+                ) from item
+            gidx, arrs, ids, keeps, rsec, fsec = item
             io_wait += time.perf_counter() - w0
             read_secs += rsec
             filter_secs += fsec
