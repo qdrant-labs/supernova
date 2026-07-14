@@ -261,12 +261,16 @@ class SearchSpec(BaseModel):
     run-level knob, not a per-search one — see `ParamsConfig`.
 
     `name` becomes part of the output filename (see `nova_bf.results`), so
-    every spec in a run needs a distinct one.
+    every spec in a run needs a distinct one. Optional: if omitted, `Brute
+    ForceConfig` derives one from `vector_type`/`metric` (plus `_filtered`
+    when a filter is set) and disambiguates collisions automatically — see
+    `_assign_default_names`. A lone `SearchSpec` can't do this itself since
+    disambiguation needs to see every spec in the run's `searches` list.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str
+    name: str | None = None
     k: int = 1000
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
     vector_type: Literal["dense", "sparse"] = "dense"
@@ -276,20 +280,44 @@ class SearchSpec(BaseModel):
     def _no_sparse_euclidean(self) -> "SearchSpec":
         if self.vector_type == "sparse" and self.metric == "euclidean":
             raise ValueError(
-                f"search '{self.name}': metric='euclidean' is not supported with "
-                "vector_type='sparse' (sparse retrieval only ever uses dot/cosine) "
-                "— use 'dot' or 'cosine'"
+                "metric='euclidean' is not supported with vector_type='sparse' "
+                "(sparse retrieval only ever uses dot/cosine) — use 'dot' or 'cosine'"
+                + (f" (search {self.name!r})" if self.name else "")
             )
         return self
 
     @model_validator(mode="after")
     def _name_is_filename_safe(self) -> "SearchSpec":
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.name):
+        # None (not yet assigned — see BruteForceConfig._assign_default_names)
+        # is fine here; an explicitly-set name is validated immediately.
+        if self.name is not None and not re.fullmatch(r"[A-Za-z0-9_-]+", self.name):
             raise ValueError(
                 f"search name '{self.name}' must be non-empty and match "
                 "[A-Za-z0-9_-]+ (it becomes part of the output filename)"
             )
         return self
+
+
+def _assign_default_names(specs: list[SearchSpec]) -> None:
+    """Fill in `.name` for every spec that didn't set one explicitly, deriving
+    a readable default from `vector_type`/`metric` (plus `_filtered` when a
+    filter is set) and disambiguating any collision — with each other, or
+    with an explicit name elsewhere in `specs` — by appending an incrementing
+    numeric suffix. Runs once over the whole list (not as a per-SearchSpec
+    validator): a spec can't see its siblings, and disambiguation needs to."""
+    used = {s.name for s in specs if s.name is not None}
+    for s in specs:
+        if s.name is not None:
+            continue
+        base = f"{s.vector_type}_{s.metric}"
+        if s.filter is not None and s.filter.fields():
+            base += "_filtered"
+        name, n = base, 2
+        while name in used:
+            name = f"{base}_{n}"
+            n += 1
+        used.add(name)
+        s.name = name
 
 
 class BruteForceConfig(BaseModel):
@@ -311,6 +339,7 @@ class BruteForceConfig(BaseModel):
     def _validate_searches(self) -> "BruteForceConfig":
         if not self.searches:
             raise ValueError("`searches` must list at least one SearchSpec")
+        _assign_default_names(self.searches)
         names = [s.name for s in self.searches]
         if len(set(names)) != len(names):
             raise ValueError(f"`searches` names must be unique, got {names}")

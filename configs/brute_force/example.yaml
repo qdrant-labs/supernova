@@ -54,7 +54,10 @@ params:
 # corpus file is read/decoded once per vector_type any search below needs, not
 # once per search — see docs/brute-force/overview.md#one-search-or-several-in-one-pass).
 searches:
-  - name: dense                # required, unique, [A-Za-z0-9_-]+ — goes into the output filename
+  - name: dense                # optional, unique if set, [A-Za-z0-9_-]+ — goes into the output
+                                # filename. Omit it and one is derived from vector_type/metric
+                                # (e.g. "dense_cosine", "_filtered" appended if `filter` is set),
+                                # with collisions disambiguated automatically (_2, _3, …).
     vector_type: dense          # dense | sparse
     metric: cosine               # cosine | dot | euclidean (euclidean unsupported with vector_type: sparse)
     k: 1000
