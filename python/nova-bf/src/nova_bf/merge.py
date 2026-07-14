@@ -188,6 +188,26 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
             )
         partials_by_name[spec.name] = partials
 
+    # Every search in one `compute` run is written by the SAME set of ranks
+    # (each rank writes one partial per search, back to back, in a single
+    # invocation) — so with more than one search, every search must end up
+    # with the identical partial COUNT. A mismatch means some rank died
+    # partway through writing its per-search partials (crash/OOM/preemption
+    # between two of its writes), silently leaving one search's merge short
+    # a rank's worth of candidates with no other signal. Catch it here,
+    # before reducing, rather than let it manifest as a suspiciously-low
+    # top-K for just that search.
+    if len(partials_by_name) > 1:
+        counts = {name: len(partials) for name, partials in partials_by_name.items()}
+        if len(set(counts.values())) > 1:
+            raise RuntimeError(
+                f"searches have mismatched partial counts: {counts} — every search in "
+                "one `compute` run should have the same number of per-rank partials; "
+                "this points to a rank that died partway through writing its per-search "
+                "outputs (crash/OOM/preemption). Re-run the missing rank(s) with "
+                "`bf compute --num-jobs N --job-rank R` before merging."
+            )
+
     staged_dirs: list[str] = []
     readers_by_name: dict[str, list[pq.ParquetFile]] = {}
     try:
