@@ -37,6 +37,16 @@ output:
 params:
   io_workers: 16
   io_thread_count: 0
+  # Score each corpus file against the queries in row-batches of this many rows
+  # instead of all at once, bounding the (n_queries × rows) score matrix on the
+  # GPU. Omit (default) to score the whole file in one matmul — fastest, and fine
+  # until a file is big enough (or the query set large enough) to OOM the GPU.
+  # Values below the largest k among that vector_type's searches are raised to it
+  # (a smaller batch can't fill any search's top-K). One value per vector_type,
+  # run-wide — every search of a vector_type ends up sharing one GPU pass over
+  # the corpus, so this isn't a per-search setting.
+  # dense_batch_size: 4096
+  # sparse_batch_size: 4096
   # merge_batch_size: null
   # merge_prefetch: false
 
@@ -48,12 +58,6 @@ searches:
     vector_type: dense          # dense | sparse
     metric: cosine               # cosine | dot | euclidean (euclidean unsupported with vector_type: sparse)
     k: 1000
-    # Score each corpus file against the queries in row-batches of this many rows
-    # instead of all at once, bounding the (n_queries × rows) score matrix on the
-    # GPU. Omit (default) to score the whole file in one matmul — fastest, and fine
-    # until a file is big enough (or the query set large enough) to OOM the GPU.
-    # Values below k are raised to k (a smaller batch can't fill the top-K).
-    # corpus_batch_size: 4096
     # Restrict eligible neighbors to corpus rows matching this predicate — shaped
     # like a Qdrant filter (must = AND, should = OR-at-least-one, must_not = AND-NOT).
     # A condition's `field` is the only place you name a corpus column to filter on

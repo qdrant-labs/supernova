@@ -160,8 +160,8 @@ def _run(ds, *, metric, batch, id_column, out_name, filt=None):
         corpus=CorpusConfig(path=ds["cdir"], sparse_column="sparse_embedding", id_column=id_column),
         queries=QueriesConfig(path=ds["qpath"], sparse_column="sparse_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(io_workers=2),
-        searches=[SearchSpec(name="test", k=K, metric=metric, vector_type="sparse", corpus_batch_size=batch, filter=filt)],
+        params=ParamsConfig(io_workers=2, sparse_batch_size=batch),
+        searches=[SearchSpec(name="test", k=K, metric=metric, vector_type="sparse", filter=filt)],
     )
     t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     return {q: list(zip(hi, hs)) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
@@ -232,8 +232,8 @@ def test_filter_match_restricts_candidates(ds):
 @pytest.mark.parametrize("batch", [None, K])
 def test_filter_preserves_row_numbers_under_batching(ds, batch):
     """A filter must resolve the same (correct) point ids whether or not
-    corpus_batch_size tiles the file — guards against filtering renumbering
-    rows instead of keeping their true file-row number."""
+    params.sparse_batch_size tiles the file — guards against filtering
+    renumbering rows instead of keeping their true file-row number."""
     filt = Filter(must=[FilterCondition(field="language", match="eng")])
     res = _run(ds, metric="dot", batch=batch, id_column=None, out_name=f"filter_defid_{batch}", filt=filt)
     eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
@@ -373,11 +373,12 @@ def test_duplicate_indices_cosine_norm_is_correct(ds):
 @pytest.mark.parametrize("batch", [None, 2])
 def test_filter_compaction_with_multibatch_tiling(tmp_path, batch):
     """The shared `ds` fixture's per-file row counts are too small for any
-    `corpus_batch_size` tiling to actually span more than one batch AFTER a
-    filter has compacted a file — so this exercises that specific interaction
-    directly: a file where filtering leaves enough rows that batch=2 forces
-    multiple iterations (r0=0, 2, 4) of the post-compaction array, checking
-    the same row-number-preservation invariant `orig_rows` relies on."""
+    `params.sparse_batch_size` tiling to actually span more than one batch
+    AFTER a filter has compacted a file — so this exercises that specific
+    interaction directly: a file where filtering leaves enough rows that
+    batch=2 forces multiple iterations (r0=0, 2, 4) of the post-compaction
+    array, checking the same row-number-preservation invariant `orig_rows`
+    relies on."""
     rng = np.random.default_rng(1)
     vocab, nnz = 10, 6  # 2*nnz > vocab: pigeonhole guarantees overlap, avoids ties
     cdir = tmp_path / "corpus"
@@ -406,9 +407,9 @@ def test_filter_compaction_with_multibatch_tiling(tmp_path, batch):
         corpus=CorpusConfig(path=str(cdir), sparse_column="sparse_embedding", id_column="id"),
         queries=QueriesConfig(path=str(qpath), sparse_column="sparse_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(io_workers=1),
+        params=ParamsConfig(io_workers=1, sparse_batch_size=batch),
         searches=[SearchSpec(
-            name="test", k=2, metric="dot", vector_type="sparse", corpus_batch_size=batch,
+            name="test", k=2, metric="dot", vector_type="sparse",
             filter=Filter(must=[FilterCondition(field="language", match="eng")]),
         )],
     )

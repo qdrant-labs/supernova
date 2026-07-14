@@ -12,13 +12,16 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 
+from fractions import Fraction
 from typing import Literal
 
 import yaml
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import os
 
@@ -116,6 +119,25 @@ class ParamsConfig(BaseModel):
     # pool-bound; if it stays flat you're network-bound. Applied via
     # pa.set_io_thread_count() once at startup.
     io_thread_count: int = 0
+    # Bounds the per-file score matrix (`queries × rows`) for dense/sparse
+    # searches respectively — a big file (or large query set) can otherwise
+    # OOM the GPU; set this to score in row-batches instead of the whole file
+    # at once. None (default) = whole file in one matmul. Lives here (one
+    # value per vector_type, run-wide) rather than per-search: every search of
+    # a given vector_type ends up sharing one GPU pass over the corpus anyway
+    # (see compute.py), so a per-search value would just be resolved down to
+    # this same shared number regardless — this makes that explicit instead of
+    # implicit. Values below a search's own `k` are raised to `k` (a batch
+    # smaller than `k` can't fill that search's top-K and gives no memory
+    # benefit).
+    # `gt=0`: a batch size of 0 or negative isn't just useless, it's actively
+    # wrong — `range(0, n_rows, step)` with a non-positive `step` is EMPTY, so
+    # every file's batch loop would silently skip all rows, no exception, no
+    # partial results, just an empty top-K for every query. Reject it here at
+    # config-load time (the system boundary) rather than let it manifest as a
+    # silent all-empty run downstream.
+    dense_batch_size: int | None = Field(default=None, gt=0)
+    sparse_batch_size: int | None = Field(default=None, gt=0)
     # `merge` reduces the W per-rank partials in row-batches of this many queries,
     # streaming the result to disk so the full output never sits in RAM (that's what
     # let the old merge OOM at 1M queries). Peak host memory is ~(this × W × k)
@@ -193,22 +215,95 @@ class Filter(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # The one place the three condition-group names are listed — `fields()`
+    # and `filter_key()` both walk them via this, not their own hardcoded
+    # tuple, so a future group added here can't update one and silently miss
+    # the other (which would let two filters differing only in that group
+    # collide as "the same" wherever the missed one is used).
+    _CONDITION_GROUPS = ("must", "should", "must_not")
+
     must: list[FilterCondition] = []
     should: list[FilterCondition] = []
     must_not: list[FilterCondition] = []
 
     def fields(self) -> set[str]:
-        return {c.field for group in (self.must, self.should, self.must_not) for c in group}
+        return {
+            c.field for group in self._CONDITION_GROUPS for c in getattr(self, group)
+        }
+
+
+def _canonical_match(value: MatchValue | list[MatchValue]) -> object:
+    """`match` values that Python treats as equal (`5 == 5.0`, which is what
+    `Filter`'s own by-value equality relies on) must produce the same key —
+    plain JSON text doesn't guarantee that on its own (`5` and `5.0` serialize
+    to different text, e.g. from a YAML author writing one search's filter
+    with an int literal and another's with a float literal).
+
+    Deliberately `Fraction`, not `float(value)`: Python's own `int == float`
+    comparison is exact (no precision loss), but `float(value)` on a large
+    int is NOT — `float(2**53) == float(2**53 + 1)` (both round to the same
+    float64), so two DIFFERENT filters would collide onto the same key,
+    silently merging their masks (see the regression this guards against —
+    a filter on a large payload value, e.g. a nanosecond timestamp or a
+    snowflake id, both common in the ~1e18 range where float64 precision
+    runs out). `Fraction` represents any Python `int` or `float` exactly (a
+    float is itself an exact binary fraction — `Fraction(x)` never rounds),
+    so two values compare equal here iff they're actually equal, matching
+    `Filter.__eq__` exactly instead of approximately. `bool`/`str` pass
+    through unchanged (`bool` is technically an `int` subclass, but
+    conflating `match: true` with `match: 1` isn't the case this guards
+    against, so it's left alone).
+
+    `nan`/`inf` are handled separately because `Fraction` can't represent
+    them at all (`Fraction(float("nan"))` raises `ValueError`, `Fraction(float("inf"))`
+    raises `OverflowError` — both are legal YAML/pydantic `match` values, so
+    this must never crash `run_compute` outright, the way it did before this
+    special case existed). `inf`/`-inf` compare equal to themselves under
+    Python's own `==` (what `Filter.__eq__` relies on), so they canonicalize
+    to a stable sentinel by sign. `nan` is the opposite — `nan != nan`, even
+    against itself — so no two `nan` match values are ever "the same filter"
+    either; a fresh sentinel per call guarantees this key never collides
+    with anything, matching that never-equal-to-itself semantics exactly."""
+    if isinstance(value, list):
+        return [_canonical_match(v) for v in value]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float) and math.isnan(value):
+        return f"__nan_{id(value)}__"
+    if isinstance(value, float) and math.isinf(value):
+        return "+inf" if value > 0 else "-inf"
+    if isinstance(value, (int, float)):
+        frac = Fraction(value)
+        return [frac.numerator, frac.denominator]
+    return value
+
+
+def filter_key(f: Filter | None) -> str:
+    """Canonical, hashable key for a filter — `"none"` for no filter, else a
+    JSON dump of its fields (with `match` values canonicalized, see
+    `_canonical_match`). Two specs are considered "the same filter" iff this
+    key matches, which is order-sensitive (a `must` list reordered in YAML is
+    a different key) — same as `Filter`'s own by-value equality, just usable
+    as a real dict key instead of a linear `==` scan."""
+    if f is None:
+        return "none"
+    dumped = f.model_dump()
+    for group in ("must", "should", "must_not"):
+        for cond in dumped[group]:
+            if cond.get("match") is not None:
+                cond["match"] = _canonical_match(cond["match"])
+    return json.dumps(dumped, sort_keys=True)
 
 
 class SearchSpec(BaseModel):
     """One independent top-K search to compute in a `nova-bf compute` run —
-    its own vector_type, metric, k, corpus_batch_size and (optional) filter,
-    scored and top-K'd independently of every other spec in
-    `BruteForceConfig.searches` (NOT fused into one hybrid score). Multiple
-    specs sharing a run still share corpus file IO/decode (see compute.py) —
-    that sharing is the whole point of listing several here instead of
-    running `nova-bf compute` once per spec.
+    its own vector_type, metric, k, and (optional) filter, scored and top-K'd
+    independently of every other spec in `BruteForceConfig.searches` (NOT
+    fused into one hybrid score). Multiple specs sharing a run still share
+    corpus file IO/decode (see compute.py) — that sharing is the whole point
+    of listing several here instead of running `nova-bf compute` once per
+    spec. GPU batching (`params.dense_batch_size`/`sparse_batch_size`) is a
+    run-level knob, not a per-search one — see `ParamsConfig`.
 
     `name` becomes part of the output filename (see `nova_bf.results`), so
     every spec in a run needs a distinct one.
@@ -220,7 +315,6 @@ class SearchSpec(BaseModel):
     k: int = 1000
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
     vector_type: Literal["dense", "sparse"] = "dense"
-    corpus_batch_size: int | None = None
     filter: Filter | None = None
 
     @model_validator(mode="after")
