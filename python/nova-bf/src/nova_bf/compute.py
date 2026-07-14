@@ -35,23 +35,44 @@ spec. This is purely a sharing of REDUNDANT work, never a fusion of scores:
 each search still gets its own independent ranked list, not a blended hybrid
 ranking.
 
-Per vector_type, searches share GPU work one of two ways (see `run_compute`'s
-`has_baseline` / `_process_shared_batch` / `_process_filter_group`):
+Per vector_type, EVERY search sharing that vector_type shares ONE batch grid
+(see `run_compute`'s `has_baseline` and `_process_shared_batch`): the GPU
+transfer/CSR build and each distinct metric's score matrix are computed ONCE
+per batch, and every search merges its own top-K from those same columns,
+masking them down to its own filter's surviving rows first if it has one.
+Masking a raw, per-row-independent score matrix is exact, not an
+approximation, so a filtered search's metric never needs to already be used
+by anyone else — computing one more metric on a batch that's already
+resident on the GPU is cheap, unlike a second transfer.
 
-- If ANY search of that vector_type is unfiltered, EVERY search of that
-  vector_type — filtered or not — shares one full-file batch grid: the GPU
-  transfer/CSR build and each distinct metric's score matrix are computed
-  ONCE per batch, and every search merges its own top-K from those same
-  columns (an unfiltered search reads them directly; a filtered search masks
-  them down to its own filter's surviving rows first). Masking a raw,
-  per-row-independent score matrix is exact, not an approximation, so a
-  filtered search's metric never needs to already be used by anyone else —
-  computing one more metric on a batch that's already resident on the GPU is
-  cheap, unlike a second transfer.
-- Otherwise (no search of that vector_type is unfiltered), there's no
-  full-file computation to derive from: searches are grouped by exact filter
-  equality instead, and each such group compacts its own rows before
-  transfer/scoring, once per group per batch.
+What rows make up that shared grid depends on whether any search of the
+vector_type is unfiltered:
+
+- If ANY search is unfiltered (or has an explicit-but-empty filter — see
+  `_is_unfiltered`), the shared grid is the WHOLE file, uncompacted: that
+  search needs every row anyway, so every OTHER (filtered) search of the
+  vector_type just rides along for free, masking down to its own rows
+  afterward.
+- Otherwise (every search of the vector_type has an active filter), the
+  shared grid is the UNION of every DISTINCT active filter's surviving rows
+  (`_union_keep`), compacted/transferred/scored ONCE, with each search then
+  masking down further to its own filter's subset of that union. This never
+  does MORE row-scoring than treating each distinct filter independently
+  would — in the worst case (fully disjoint filters) it's exactly the same
+  total rows, just one transfer/launch instead of several — and strictly
+  less whenever two filters' surviving rows overlap. The tradeoff: unlike
+  treating each filter independently (which bounds each one's own transfer
+  to its own, typically smaller, surviving-row count), the union's peak
+  transfer size is bounded by `params.dense_batch_size`/`sparse_batch_size`
+  alone when left at their None default — several large, mostly-disjoint
+  filters can produce a union nearly the size of the whole file. Set that
+  batch size explicitly if you have many such filters (see `ParamsConfig`).
+
+Either way, `_process_shared_batch` does the per-search masking: an
+unfiltered search uses the shared grid as-is; a filtered one narrows it
+further to its own filter's rows, with two searches sharing an identical
+filter memoizing that lookup once (keyed by the `Filter` object itself,
+frozen+hashable) rather than repeating it.
 """
 
 from __future__ import annotations
@@ -310,9 +331,8 @@ def _sparse_batch_to_csr(
 
     Deliberately takes no `norms`/metric argument and never scales `b_val` —
     this builder is shared across every search of this vector_type that scores
-    the same rows, whether via `_process_shared_batch` (Path A) or a
-    `FilterGroup` (Path B), including a mix of `cosine` and `dot` searches, so
-    it must stay metric-agnostic BY CONSTRUCTION. Cosine
+    the same rows via `_process_shared_batch`, including a mix of `cosine` and
+    `dot` searches, so it must stay metric-agnostic BY CONSTRUCTION. Cosine
     normalization is applied by the caller as a post-hoc divide on the score
     matrix (`raw / row_norms`, mathematically identical to pre-scaling these
     values by `1/row_norm` before the matmul, since a per-row scalar commutes
@@ -530,55 +550,21 @@ def _merge_topk(top_scores, top_enc, batch_scores, batch_rows, gidx: int, k: int
     return new_top_scores, merged_e.gather(1, idx)
 
 
-@dataclass(frozen=True)
-class FilterGroup:
-    """Specs sharing one vector_type and one exact filter (Path B only — see
-    `run_compute`'s `has_baseline`): no spec of this vector_type is
-    unfiltered, so there's no full-file score matrix to derive from, and this
-    group compacts/transfers/scores its own rows once per batch instead —
-    its members share the identical filter by construction, hence the
-    identical surviving row set. Carries the `Filter` itself: the per-file
-    loop looks up `keeps[group.filter]` once per file — `Filter` is frozen
-    and hashable (see `nova_bf.config.Filter`), and a run has at most a
-    handful of distinct filters, so hashing it here costs nothing next to
-    the corpus read/GPU work this whole module exists to overlap."""
-
-    filter: Filter | None
-    member_idxs: list[int]
-    batch_size: int | None  # resolved batch size; None = whole (compacted) file
-
-
-def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str, raise_to_floor: bool) -> int | None:
-    """Shared floor-check behind `_path_b_group_batch_size`/`_path_a_batch_size`:
-    `configured` (`params.dense_batch_size`/`sparse_batch_size`) is fine as-is
-    whenever it's unset or already at/above `k_floor` — a batch that size can
-    already fill any of these searches' own top-K in one pass. Below that, the
-    two paths diverge on what `k_floor` even means:
-
-    - Path B (`raise_to_floor=True`, via `_path_b_group_batch_size`): `k_floor`
-      is the largest `k` among one `FilterGroup`'s own (related — they share
-      an identical filter by construction) members, so raising `configured`
-      up to it only helps: this group's memory footprint is the same either
-      way, and a smaller batch just can't fill a search's top-K for no
-      benefit.
-    - Path A (`raise_to_floor=False`, via `_path_a_batch_size`): `k_floor` is
-      the largest `k` across EVERY search of the vector_type, related or not,
-      since they all share one full-file grid — raising `configured` here
-      would let one search's large `k` silently blow past a DIFFERENT
-      search's own memory bound, exactly the OOM footgun `dense_batch_size`/
-      `sparse_batch_size` exists to prevent. Warn instead: the larger-`k`
-      search just takes extra merge rounds to fill its own top-K (more of
-      them the further `configured` sits below `k_floor`), at no extra GPU
-      memory cost to anyone."""
+def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
+    """`configured` (`params.dense_batch_size`/`sparse_batch_size`) is fine
+    as-is whenever it's unset or already at/above `k_floor` (the largest `k`
+    among EVERY search of this vector_type) — a batch that size can already
+    fill any of these searches' own top-K in one pass. Below that, never
+    raise it: every search of the vector_type shares one batch grid
+    regardless of filter (see `run_compute`'s `has_baseline` and
+    `_union_keep`), so raising `configured` for one search's large `k` would
+    silently blow past a DIFFERENT, unrelated search's own memory bound —
+    exactly the OOM footgun `dense_batch_size`/`sparse_batch_size` exists to
+    prevent. Warn instead: the larger-`k` search just takes extra merge
+    rounds to fill its own top-K (more of them the further `configured` sits
+    below `k_floor`), at no extra GPU memory cost to anyone."""
     if configured is None or configured >= k_floor:
         return configured
-    if raise_to_floor:
-        logger.warning(
-            "params.%s_batch_size=%d is below k=%d; raising to k (a smaller "
-            "batch can't fill a search's top-K and gives no memory benefit).",
-            vt, configured, k_floor,
-        )
-        return k_floor
     logger.warning(
         "params.%s_batch_size=%d is below k=%d, the largest among searches "
         "sharing this vector_type's batch pass — keeping your configured "
@@ -591,66 +577,53 @@ def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str, raise_
     return configured
 
 
-def _path_b_group_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
-    return _resolve_vt_batch_size(configured, k_floor, vt, raise_to_floor=True)
-
-
-def _path_a_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
-    return _resolve_vt_batch_size(configured, k_floor, vt, raise_to_floor=False)
-
-
-def _build_filter_groups(
-    idxs: list[int], specs: list[SearchSpec], spec_filter: list[Filter | None],
-    batch_size_cfg: int | None, vt: str,
-) -> list[FilterGroup]:
-    """Group `idxs` (every spec of one vector_type, Path B only — none of
-    them unfiltered) by exact filter equality (`Filter`'s own hash/eq), so
-    specs sharing an identical filter compact/transfer/score together once
-    instead of each redoing it."""
-    by_filter: dict[Filter | None, list[int]] = {}
-    for i in idxs:
-        by_filter.setdefault(spec_filter[i], []).append(i)
-    groups = []
-    for filt, members in by_filter.items():
-        k_floor = max(specs[m].k for m in members)
-        groups.append(FilterGroup(
-            filter=filt,
-            member_idxs=members,
-            batch_size=_path_b_group_batch_size(batch_size_cfg, k_floor, vt),
-        ))
-    return groups
+def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | None]) -> np.ndarray:
+    """OR-reduce of every DISTINCT active filter's keep-mask in `filters` —
+    the shared row-set for a vector_type where no search is unfiltered (see
+    `run_compute`). Never called with `None` in `filters` (that's the
+    `has_baseline` case, handled by leaving the whole file uncompacted
+    instead), so every `keeps[f]` here is a real per-row `np.ndarray`, not
+    `None`. `filters` is never empty (a vt only reaches this function once
+    `vt_spec_idxs` has established it has at least one spec, each with a
+    real filter)."""
+    return np.logical_or.reduce([keeps[f] for f in filters])
 
 
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
 ) -> float:
-    """Shared Path A / Path B primitive: iterate `batch` in `batch_size`-row
-    slices, transfer each slice once (`batch.transfer`), score it once per
+    """The shared per-vector_type primitive behind `_process_shared_batch`:
+    iterate `batch` in `batch_size`-row slices, transfer each slice once
+    (`batch.transfer`), score it once per
     DISTINCT metric among `member_idxs` (`score_cache` — every member needing
     that metric reads the same tensor), and merge each member's own top-k
     from those shared columns via `_merge_topk`.
 
     `orig_rows` maps a slice position to its TRUE file-row number: `None`
-    means position IS the true row (Path A, `_process_shared_batch` below —
-    it never compacts, so `batch` is the raw, whole file); an array means
-    `batch` was already compacted by the caller (Path B,
-    `_process_filter_group` below) and this maps back to true rows for
-    `_merge_topk`'s encoding.
+    means position IS the true row — `batch` is the raw, whole file, because
+    some search of this vector_type is unfiltered and needs every row; an
+    array means `batch` was already compacted by the caller (to the union of
+    every active filter's surviving rows — see `run_compute`'s `has_baseline`
+    and `_union_keep`) and this maps back to true rows for `_merge_topk`'s
+    encoding.
 
-    `select(m, r0, r1, rows, cache) -> (sel_rows, sel_cols)` is the per-member
-    filtering strategy: `sel_rows is None` skips the merge entirely for this
-    member/slice (e.g. a filter keeping zero rows here); otherwise `sel_cols`
-    is either `None` (use the slice's columns/rows unchanged — Path B, whose
-    members already share one filter via compaction) or a column-index tensor
-    used to mask both the score matrix and `rows` down to a per-member
-    filter's surviving columns (Path A). `cache` is a fresh dict per r0-slice
-    for `select` to memoize per-filter lookups shared across members (see
-    `_path_a_select`) — it does not persist across slices, since the mask is
-    slice-relative.
+    `select(m, rows, true_rows, cache) -> (sel_rows, sel_cols)` is the
+    per-member filtering strategy (see `_process_shared_batch`): `sel_rows
+    is None` skips the merge entirely for this member/slice (e.g. a filter
+    keeping zero rows here); otherwise `sel_cols` is either `None` (member is
+    unfiltered, use the slice's rows unchanged) or a column-index tensor used
+    to mask both the score matrix and `rows` down to that member's own
+    filter's surviving columns. `true_rows` indexes a filter's keep-mask
+    (sized to the whole file, not to this possibly-already-compacted batch):
+    a plain `slice(r0, r1)` when `orig_rows is None` (position IS the true
+    row — a cheap view, no copy), or `orig_rows`'s corresponding array slice
+    otherwise. `cache` is a fresh dict per r0-slice for `select` to memoize
+    per-filter lookups shared across members — it does not persist across
+    slices, since the mask is slice-relative.
 
     Returns elapsed wall-clock seconds spent in this loop (folded into the
-    caller's `gpu_secs`). Callers that pre-compact (Path B) must compact
+    caller's `gpu_secs`). A caller that pre-compacts `batch` must do so
     BEFORE calling this function — its own timer starts only once this loop
     begins, so CPU-side compaction time never counts as GPU time (see the
     `io_wait`/`gpu_secs` split docs at the top of this module)."""
@@ -665,9 +638,15 @@ def _process_batch_group(
         r1 = min(r0 + step, n_rows)
         sl = batch.transfer(r0, r1, device)
         if orig_rows is None:
+            # No CPU round-trip: build the row-index tensor directly on
+            # device, and use a plain slice (a view, not a gather-copy) to
+            # index a filter's keep-mask below — position already IS the
+            # true row here, so there's nothing to remap.
             rows = torch.arange(r0, r0 + sl.n_rows, dtype=torch.int64, device=device)
+            true_rows = slice(r0, r0 + sl.n_rows)
         else:
-            rows = torch.from_numpy(orig_rows[r0 : r0 + sl.n_rows]).to(device, non_blocking=True)
+            true_rows = orig_rows[r0 : r0 + sl.n_rows]
+            rows = torch.from_numpy(true_rows).to(device, non_blocking=True)
 
         score_cache: dict[str, object] = {}
         cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
@@ -677,7 +656,7 @@ def _process_batch_group(
                 score_cache[s.metric] = sl.score(spec_Q[m], s.metric)
             scores = score_cache[s.metric]
 
-            sel_rows, sel_cols = select(m, r0, r1, rows, cache)
+            sel_rows, sel_cols = select(m, rows, true_rows, cache)
             if sel_rows is None:
                 continue
             sel_scores = scores if sel_cols is None else scores[:, sel_cols]
@@ -693,79 +672,47 @@ def _is_unfiltered(f: Filter | None) -> bool:
     (`Filter(must=(), should=(), must_not=())`) is semantically the same —
     `evaluate()` keeps every row either way — so both must be treated
     identically wherever "does this spec have an active filter" decides
-    Path A/B GPU-sharing (`has_baseline`) or per-member masking
-    (`_path_a_select`). `f.fields()` is empty iff every condition group is
-    empty, without duplicating that check against `Filter`'s own fields."""
+    `run_compute`'s `has_baseline` or `_process_shared_batch`'s per-member
+    masking. `f.fields()` is empty iff every condition group is empty,
+    without duplicating that check against `Filter`'s own fields."""
     return f is None or not f.fields()
 
 
-def _path_a_select(
-    specs: list[SearchSpec], keeps: dict[Filter | None, np.ndarray | None], device: str,
-):
-    """Path A's `select` for `_process_batch_group`: an unfiltered member uses
-    the shared slice as-is; a filtered member masks it down to its own
-    filter's surviving columns, via a `local_idx` cached per filter (in the
-    caller-provided per-slice `cache`) so two members sharing an identical
-    filter don't recompute `nonzero` twice."""
+def _process_shared_batch(
+    batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
+    keeps: dict[Filter | None, np.ndarray | None], batch_size: int | None,
+    gidx: int, device: str, orig_rows: np.ndarray | None,
+) -> float:
+    """Every search of this vector_type shares one batch grid: `orig_rows`
+    is `None` when some search is unfiltered (`batch` is the raw, whole
+    file — see `run_compute`'s `has_baseline`), or the true-row map produced
+    by compacting `batch` to the union of every active filter otherwise (see
+    `_union_keep`). Either way, a filtered search masks the shared columns
+    down to its own filter's surviving rows, via a `local_idx` cached per
+    filter (in `_process_batch_group`'s per-slice `cache`) so two members
+    sharing an identical filter don't recompute `nonzero` twice — indexing
+    `keeps[s.filter]` by `true_rows` (each slice position's TRUE file row),
+    not by position, since the shared batch may already be a compacted
+    subset of the file. See `_process_batch_group` for the shared loop
+    body."""
     import torch
 
-    def select(m: int, r0: int, r1: int, rows, cache: dict[object, object]):
+    def select(m: int, rows, true_rows, cache: dict[object, object]):
         s = specs[m]
         if _is_unfiltered(s.filter):
             return rows, None
         local_idx = cache.get(s.filter)
         if local_idx is None:
-            local_np = np.nonzero(keeps[s.filter][r0:r1])[0]
+            local_np = np.nonzero(keeps[s.filter][true_rows])[0]
             local_idx = torch.from_numpy(local_np).to(device, non_blocking=True)
             cache[s.filter] = local_idx
         if local_idx.numel() == 0:
             return None, None
         return rows[local_idx], local_idx
 
-    return select
-
-
-def _path_b_select(m: int, r0: int, r1: int, rows, cache: dict[object, object]):
-    """Path B's `select` for `_process_batch_group`: every member of a
-    `FilterGroup` shares one identical filter, already applied via
-    `batch.compact()` before this loop runs — no further per-member masking
-    needed, so this is a no-op that always merges the slice unchanged."""
-    return rows, None
-
-
-def _process_shared_batch(
-    batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
-    keeps: dict[Filter | None, np.ndarray | None], batch_size: int | None,
-    gidx: int, device: str,
-) -> float:
-    """Path A: every spec of this vector_type — filtered or not — shares one
-    full-file batch grid; a filtered spec masks the shared columns down to
-    its own filter's surviving rows (`_path_a_select`). See
-    `_process_batch_group` for the shared loop body."""
     return _process_batch_group(
         batch, member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
-        batch_size, gidx, device, orig_rows=None,
-        select=_path_a_select(specs, keeps, device),
-    )
-
-
-def _process_filter_group(
-    batch, group: FilterGroup, specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
-    keep: np.ndarray, gidx: int, device: str,
-) -> float:
-    """Path B: no spec of this vector_type is unfiltered, so there's no
-    full-file score matrix to derive from — this group's rows are compacted
-    once (`batch.compact`), then run through the shared loop
-    (`_process_batch_group`) unmasked (`_path_b_select`), same as a single
-    spec running alone would. `batch.compact()` runs OUTSIDE (before)
-    `_process_batch_group`'s own timer, so its real but CPU-side cost (row
-    filtering, array copies — scales with corpus size, not GPU work) never
-    counts toward the `gpu_secs` signal (see the `io_wait`/`gpu_secs` split
-    docs at the top of this module)."""
-    compacted, orig_rows = batch.compact(keep)
-    return _process_batch_group(
-        compacted, group.member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
-        group.batch_size, gidx, device, orig_rows=orig_rows, select=_path_b_select,
+        batch_size, gidx, device, orig_rows=orig_rows, select=select,
     )
 
 
@@ -781,11 +728,12 @@ def run_compute(
     filter combinations — against the corpus in ONE pass: each file is read
     and decoded once per vector_type actually needed (not once per spec), and
     every distinct filter is evaluated once per file regardless of how many
-    searches share it. Per vector_type, searches then share GPU work via
-    `_process_shared_batch` (Path A, when some search is unfiltered) or
-    `_process_filter_group` (Path B, otherwise) — see this module's
-    docstring. Only each search's own scoring and top-K accumulation stay
-    independent. Returns `{spec.name: output_path}`.
+    searches share it. Per vector_type, every search then shares one GPU
+    batch grid via `_process_shared_batch` — the whole file when some search
+    is unfiltered, otherwise the union of every active filter's surviving
+    rows (`_union_keep`) — see this module's docstring. Only each search's
+    own scoring and top-K accumulation stay independent. Returns
+    `{spec.name: output_path}`.
     """
     try:
         import torch
@@ -894,10 +842,10 @@ def run_compute(
 
     # Per vector_type: does any spec have no filter (or an explicit-but-empty
     # one — see `_is_unfiltered`)? If so every spec of that vector_type shares
-    # one full-file batch grid (Path A, `_process_shared_batch`); otherwise
-    # specs are grouped by exact filter equality instead (Path B,
-    # `_process_filter_group`) since there's no full-file computation to
-    # derive from. See this module's docstring for the full rationale.
+    # the whole file, uncompacted (`has_baseline`); otherwise every spec has
+    # an active filter, so the shared grid is instead the UNION of those
+    # filters' surviving rows (`_union_keep`, computed fresh per file below).
+    # See this module's docstring for the full rationale.
     spec_filter = [s.filter for s in specs]
     distinct_filters: list[Filter | None] = list(dict.fromkeys(spec_filter))
 
@@ -907,25 +855,26 @@ def run_compute(
 
     vt_configured_batch = {"dense": cfg.params.dense_batch_size, "sparse": cfg.params.sparse_batch_size}
     has_baseline: dict[str, bool] = {}
-    path_a_batch_size: dict[str, int | None] = {}
-    path_b_groups: dict[str, list[FilterGroup]] = {}
+    vt_batch_size: dict[str, int | None] = {}
+    vt_union_filters: dict[str, list[Filter]] = {}
     for vt, idxs in vt_spec_idxs.items():
         has_baseline[vt] = any(_is_unfiltered(specs[i].filter) for i in idxs)
+        # Every search of this vector_type shares one batch grid regardless of
+        # which branch below applies, so k_floor spans ALL of them, not just a
+        # same-filter subset — see _resolve_vt_batch_size's docstring.
+        k_floor = max(specs[i].k for i in idxs)
+        vt_batch_size[vt] = _resolve_vt_batch_size(vt_configured_batch[vt], k_floor, vt)
         if has_baseline[vt]:
-            k_floor = max(specs[i].k for i in idxs)
-            path_a_batch_size[vt] = _path_a_batch_size(vt_configured_batch[vt], k_floor, vt)
             logger.info(
                 "vector_type=%r: %d search(es) share one full-file batch pass (batch_size=%s)",
-                vt, len(idxs), path_a_batch_size[vt],
+                vt, len(idxs), vt_batch_size[vt],
             )
         else:
-            path_b_groups[vt] = _build_filter_groups(
-                idxs, specs, spec_filter, vt_configured_batch[vt], vt,
-            )
+            vt_union_filters[vt] = list(dict.fromkeys(spec_filter[i] for i in idxs))
             logger.info(
-                "vector_type=%r: no unfiltered search — %d distinct filter group(s), "
-                "each compacting its own rows independently",
-                vt, len(path_b_groups[vt]),
+                "vector_type=%r: no unfiltered search — %d search(es) share one batch pass "
+                "over the union of %d distinct filter(s) (batch_size=%s)",
+                vt, len(idxs), len(vt_union_filters[vt]), vt_batch_size[vt],
             )
 
     # Prefetch corpus files with a POOL of reader threads so many S3 GETs are in
@@ -986,8 +935,8 @@ def run_compute(
                 table = cstore.read_columns(f.read_path, read_cols)
                 # Decode each vector_type at most ONCE per file, regardless of how many
                 # specs need it — wrapped in the batch abstraction (`DenseCorpusBatch`/
-                # `SparseCorpusBatch`) in the consumer loop below, where every spec (Path
-                # A) or filter group (Path B) of that vector_type shares it.
+                # `SparseCorpusBatch`) in the consumer loop below, where every spec of
+                # that vector_type shares it (see `run_compute`'s `has_baseline`).
                 arrs: dict[str, object] = {}
                 if "dense" in vts_needed:
                     arrs["dense"] = dense_to_2d(table[dense_col])
@@ -1055,9 +1004,9 @@ def run_compute(
             bar.update(1)
 
             # Wrap this file's decoded arrays in the vector_type-agnostic batch
-            # abstraction ONCE — every spec of a vector_type (Path A) or every
-            # filter group of it (Path B) shares the same wrapper below, never
-            # rebuilding or mutating the underlying decoded arrays.
+            # abstraction ONCE — every spec of a vector_type shares the same
+            # wrapper below, never rebuilding or mutating the underlying
+            # decoded arrays.
             batches: dict[str, object] = {}
             if "dense" in vts_needed:
                 batches["dense"] = DenseCorpusBatch(arrs["dense"])
@@ -1090,16 +1039,19 @@ def run_compute(
             for vt in vts_needed:
                 b = batches[vt]
                 if has_baseline[vt]:
-                    gpu_secs += _process_shared_batch(
-                        b, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
-                        keeps, path_a_batch_size[vt], gidx, device,
-                    )
+                    batch, orig_rows = b, None
                 else:
-                    for group in path_b_groups[vt]:
-                        keep = keeps[group.filter]
-                        gpu_secs += _process_filter_group(
-                            b, group, specs, spec_Q, spec_top_scores, spec_top_enc, keep, gidx, device,
-                        )
+                    # Compact to the union OUTSIDE _process_shared_batch's own
+                    # timer, same as the old per-filter-group compaction did —
+                    # this CPU-side cost (row filtering, array copies — scales
+                    # with corpus size, not GPU work) never counts toward the
+                    # gpu_secs signal (see the io_wait/gpu_secs split docs at
+                    # the top of this module).
+                    batch, orig_rows = b.compact(_union_keep(vt_union_filters[vt], keeps))
+                gpu_secs += _process_shared_batch(
+                    batch, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
+                    keeps, vt_batch_size[vt], gidx, device, orig_rows=orig_rows,
+                )
 
             if bar.n % 200 == 0:
                 postfix = f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s"

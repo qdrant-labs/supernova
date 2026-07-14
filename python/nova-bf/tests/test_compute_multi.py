@@ -1,16 +1,17 @@
 """Correctness tests for `BruteForceConfig.searches` — running several
 independent top-K searches (dense/sparse x filtered/unfiltered) against the
 SAME corpus in one `run_compute`/`run_merge` call, sharing corpus file IO and
-per-vector-type decode across specs. Per vector_type, searches additionally
-share GPU work one of two ways (see compute.py's module docstring):
+per-vector-type decode across specs. Per vector_type, every search sharing
+that vector_type shares ONE GPU batch grid via `_process_shared_batch` (see
+compute.py's module docstring):
 
-- Path A (`_process_shared_batch`): if ANY search of that vector_type is
-  unfiltered, every search of that vector_type shares one full-file batch
-  pass — a filtered search's own `metric` never needs to match anyone
-  else's, since scoring one more metric on an already-resident batch is
-  cheap.
-- Path B (`_process_filter_group`): otherwise, searches are grouped by exact
-  filter equality and each such group compacts its own rows independently.
+- If ANY search of that vector_type is unfiltered, the shared grid is the
+  whole file, uncompacted — a filtered search's own `metric` never needs to
+  match anyone else's, since scoring one more metric on an already-resident
+  batch is cheap.
+- Otherwise, the shared grid is the UNION of every distinct active filter's
+  surviving rows (`_union_keep`), compacted/transferred/scored once, with
+  each search then masking down further to its own filter's subset.
 
 Only each search's own scoring and top-K stay independent either way.
 
@@ -179,18 +180,19 @@ def test_grouped_matches_ungrouped_per_search(ds):
     searches together must produce results BIT-IDENTICAL to running each of
     those same searches alone, one per `run_compute` call. Covers dense+
     sparse, all three dense metrics (cosine/dot/euclidean) sharing the SAME
-    unfiltered pass (Path A — see `_scores`), and a filtered dense search
-    (`dense_eng`) riding that same pass alongside them."""
+    unfiltered pass (see `_scores`), and a filtered dense search (`dense_eng`)
+    riding that same pass alongside them."""
     eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
     specs = [
-        # dense: 3 unfiltered members (all 3 metrics) -> Path A baseline
+        # dense: 3 unfiltered members (all 3 metrics) -> whole-file baseline
         SearchSpec(name="dense_dot", vector_type="dense", metric="dot", k=3),
         SearchSpec(name="dense_cos", vector_type="dense", metric="cosine", k=2),
         SearchSpec(name="dense_euclid", vector_type="dense", metric="euclidean", k=2),
         # dense: filtered, but an unfiltered dense sibling exists above -> also
-        # rides Path A (masked down to its own filter), not processed alone
+        # rides the shared batch (masked down to its own filter), not
+        # processed alone
         SearchSpec(name="dense_eng", vector_type="dense", metric="dot", k=2, filter=eng_filter),
-        # sparse: 2 unfiltered members, mixed metrics — Path A again (the
+        # sparse: 2 unfiltered members, mixed metrics — shared again (the
         # shared-metric-cache path; see test_three_member_group_mixed_metrics
         # for a 3-member version with independently-verified ground truth)
         SearchSpec(name="sparse_dot", vector_type="sparse", metric="dot", k=3),
@@ -222,7 +224,7 @@ def test_grouped_matches_ungrouped_per_search(ds):
 
 
 def test_three_member_group_mixed_metrics(tmp_path):
-    """One Path A shared batch (vector_type=sparse, all three unfiltered) with
+    """One shared batch (vector_type=sparse, all three unfiltered) with
     THREE members: two `cosine`, one `dot` — directly targets the two riskiest
     bug classes from grouping sparse searches: double-normalization (a cosine
     member's score divided by row_norms twice) and cross-member contamination
@@ -277,35 +279,182 @@ def test_three_member_group_mixed_metrics(tmp_path):
             assert cos[cid] == pytest.approx(expected, abs=1e-4), f"search={name} id={cid}"
 
 
-def test_path_b_group_batch_size_raises_to_k_floor():
-    """Unit test for `_path_b_group_batch_size` — `k_floor` is scoped to one
-    `FilterGroup`'s own (related) members: a configured batch below that
-    floor is raised to it, never left below — the extra merge rounds below
-    `k` buy nothing since the group's own memory footprint is unaffected
-    either way."""
-    assert compute_mod._path_b_group_batch_size(10, k_floor=100, vt="dense") == 100
-    assert compute_mod._path_b_group_batch_size(500, k_floor=100, vt="dense") == 500
-    assert compute_mod._path_b_group_batch_size(None, k_floor=100, vt="dense") is None
+def test_resolve_vt_batch_size_never_raises():
+    """Unit test for `_resolve_vt_batch_size` — `k_floor` spans EVERY search
+    of a vector_type, since they all now share one batch grid regardless of
+    filter (see `_union_keep`). Raising a configured value here would let one
+    search's large `k` silently blow past a DIFFERENT, unrelated search's own
+    memory bound, so it's never overridden — only warned about — even when
+    it's below `k_floor`. (Unlike the old per-identical-filter-group
+    behavior this replaced: that raised freely, since only THAT group's own
+    members shared the grid back then — see
+    test_identical_filter_specs_no_longer_raise_batch_size.)"""
+    assert compute_mod._resolve_vt_batch_size(10, k_floor=100, vt="dense") == 10
+    assert compute_mod._resolve_vt_batch_size(500, k_floor=100, vt="dense") == 500
+    assert compute_mod._resolve_vt_batch_size(None, k_floor=100, vt="dense") is None
 
 
-def test_path_a_batch_size_respects_configured_value():
-    """Unit test for `_path_a_batch_size` — `k_floor` spans EVERY search of a
-    vector_type, related or not. Raising it here would let one search's
-    large `k` silently blow past a DIFFERENT search's own memory bound, so a
-    configured value is never overridden — only warned about — even when
-    it's below `k_floor`."""
-    assert compute_mod._path_a_batch_size(10, k_floor=100, vt="dense") == 10
-    assert compute_mod._path_a_batch_size(500, k_floor=100, vt="dense") == 500
-    assert compute_mod._path_a_batch_size(None, k_floor=100, vt="dense") is None
+def test_union_keep_ors_every_distinct_filter():
+    """Unit test for `_union_keep`: the shared row-set for a vector_type with
+    no unfiltered search is the OR of every distinct filter's own mask, not
+    just one of them — this is what lets fully disjoint filters still share
+    ONE transfer/score pass instead of one each."""
+    keeps = {
+        "a": np.array([True, False, False, True]),
+        "b": np.array([False, True, False, False]),
+    }
+    union = compute_mod._union_keep(["a", "b"], keeps)
+    assert union.tolist() == [True, True, False, True]
+    # a single filter's union is just its own mask, copied (not aliased —
+    # mutating the result must never corrupt `keeps`).
+    solo = compute_mod._union_keep(["a"], keeps)
+    solo[0] = False
+    assert keeps["a"][0]
+
+
+def test_no_baseline_distinct_filters_match_independent_ground_truth(ds):
+    """The core regression guard for the union-of-filters mechanism
+    (`_union_keep`): when NO search of a vector_type is unfiltered, but two
+    searches have genuinely DIFFERENT (here, disjoint — eng vs fra) filters,
+    each must still get its own correct top-K — the shared union batch must
+    never let one search's filter leak into another's results. `lang_by_g`
+    alternates eng/fra across the WHOLE corpus, so the union here covers
+    every row, the same as an unfiltered baseline would — a good edge case
+    for the union path specifically."""
+    eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
+    fra_filter = Filter(must=[FilterCondition(field="language", match="fra")])
+    specs = [
+        SearchSpec(name="dense_eng", vector_type="dense", metric="dot", k=3, filter=eng_filter),
+        SearchSpec(name="dense_fra", vector_type="dense", metric="dot", k=3, filter=fra_filter),
+    ]
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "no_baseline_union_out")),
+        searches=specs,
+    )
+    paths = run_compute(cfg)
+
+    eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
+    fra_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "fra"]
+    expectations = {
+        "dense_eng": ds["ground_truth"]("dense", 3, allowed=eng_globals),
+        "dense_fra": ds["ground_truth"]("dense", 3, allowed=fra_globals),
+    }
+    for name, expected in expectations.items():
+        t = pq.read_table(paths[name]).to_pydict()
+        got = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
+        for q in ds["qids"]:
+            assert got[q] == expected[q], f"search={name} query={q}"
+
+
+def test_no_baseline_distinct_filters_match_solo_runs_bit_identical(ds):
+    """Companion to `test_grouped_matches_ungrouped_per_search`, specifically
+    for the no-baseline union path: two searches with different (eng/fra)
+    filters and no unfiltered sibling must produce results BIT-IDENTICAL to
+    running each alone — each solo run's own union is just its single
+    filter, so this also proves the union path degenerates correctly to the
+    single-filter case."""
+    eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
+    fra_filter = Filter(must=[FilterCondition(field="language", match="fra")])
+    specs = [
+        SearchSpec(name="dense_eng", vector_type="dense", metric="dot", k=3, filter=eng_filter),
+        SearchSpec(name="dense_fra", vector_type="dense", metric="dot", k=3, filter=fra_filter),
+    ]
+    combined_cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "no_baseline_union_combined")),
+        searches=specs,
+    )
+    combined_paths = run_compute(combined_cfg)
+
+    for spec in specs:
+        solo_cfg = BruteForceConfig(
+            corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+            queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+            output=OutputConfig(path=_out(ds, f"no_baseline_union_solo_{spec.name}")),
+            searches=[spec],
+        )
+        solo_path = run_compute(solo_cfg)[spec.name]
+
+        combined_t = pq.read_table(combined_paths[spec.name]).to_pydict()
+        solo_t = pq.read_table(solo_path).to_pydict()
+        assert combined_t["hit_ids"] == solo_t["hit_ids"], f"search={spec.name}"
+        for combined_scores, solo_scores in zip(combined_t["hit_scores"], solo_t["hit_scores"]):
+            assert np.allclose(combined_scores, solo_scores, atol=1e-5), f"search={spec.name}"
+
+
+def test_no_baseline_log_reports_union_of_distinct_filters(ds, caplog):
+    """Regression test for the log wording itself: with no unfiltered search
+    sharing a vector_type, the log must report the union path (distinct
+    filter count), not the old per-group wording."""
+    eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
+    fra_filter = Filter(must=[FilterCondition(field="language", match="fra")])
+    specs = [
+        SearchSpec(name="dense_eng", vector_type="dense", metric="dot", k=3, filter=eng_filter),
+        SearchSpec(name="dense_fra", vector_type="dense", metric="dot", k=3, filter=fra_filter),
+    ]
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "no_baseline_union_log_out")),
+        searches=specs,
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        run_compute(cfg)
+    assert any(
+        "no unfiltered search" in r.message and "union of 2 distinct filter(s)" in r.message
+        for r in caplog.records
+    )
+
+
+def test_identical_filter_specs_no_longer_raise_batch_size(ds, caplog):
+    """Deliberate behavior change from the old per-identical-filter-group
+    path: specs sharing an IDENTICAL filter used to have their batch size
+    raised to their own group's k_floor (safe when only THAT group shared
+    the grid). Now every search of the vector_type shares ONE grid regardless
+    of filter — even when they're all the same filter — so raising is no
+    longer safe in general and `_resolve_vt_batch_size` never does it; a
+    small configured batch just costs the larger-k search extra merge
+    rounds instead of a wrong answer."""
+    eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
+    specs = [
+        SearchSpec(name="eng_smallk", vector_type="dense", metric="dot", k=2, filter=eng_filter),
+        SearchSpec(name="eng_bigk", vector_type="dense", metric="dot", k=1000, filter=eng_filter),
+    ]
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "identical_filter_no_raise_out")),
+        params=ParamsConfig(dense_batch_size=1),
+        searches=specs,
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        paths = run_compute(cfg)
+    assert any("batch_size=1)" in r.message for r in caplog.records), \
+        "batch size must stay at the configured 1, not be raised to k=1000 (old Path B behavior)"
+    assert not any("raising to k" in r.message for r in caplog.records)
+
+    eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
+    expectations = {
+        "eng_smallk": ds["ground_truth"]("dense", 2, allowed=eng_globals),
+        "eng_bigk": ds["ground_truth"]("dense", 1000, allowed=eng_globals),
+    }
+    for name, expected in expectations.items():
+        t = pq.read_table(paths[name]).to_pydict()
+        got = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
+        for q in ds["qids"]:
+            assert got[q] == expected[q], f"search={name} query={q}"
 
 
 def test_batch_size_floor_end_to_end_still_correct(ds):
-    """End-to-end companion to the unit tests above: a tiny `params.
-    dense_batch_size` shared by a low-k and a high-k search (both unfiltered
-    -> Path A, so the configured value is kept rather than raised — see
-    test_path_a_batch_size_respects_configured_value) must still produce
-    correct, ground-truth-matching results for BOTH — an under-filled batch
-    means more merge rounds, never a wrong answer."""
+    """End-to-end companion to the unit test above: a tiny `params.
+    dense_batch_size` shared by a low-k and a high-k search (both unfiltered,
+    so the configured value is kept rather than raised — see
+    test_resolve_vt_batch_size_never_raises) must still produce correct,
+    ground-truth-matching results for BOTH — an under-filled batch means
+    more merge rounds, never a wrong answer."""
     specs = [
         SearchSpec(name="low_k", vector_type="dense", metric="dot", k=2),
         SearchSpec(name="high_k", vector_type="dense", metric="dot", k=5),
@@ -314,7 +463,7 @@ def test_batch_size_floor_end_to_end_still_correct(ds):
         corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
         queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
         output=OutputConfig(path=_out(ds, "batch_floor_out")),
-        params=ParamsConfig(dense_batch_size=1),  # NOT raised to 5 — Path A keeps it at 1
+        params=ParamsConfig(dense_batch_size=1),  # NOT raised to 5 — kept at 1
         searches=specs,
     )
     paths = run_compute(cfg)
@@ -329,13 +478,13 @@ def test_batch_size_floor_end_to_end_still_correct(ds):
             assert got[q] == expected[q], f"search={name} query={q}"
 
 
-def test_unrelated_large_k_filtered_spec_does_not_inflate_shared_path_a_batch(ds, caplog):
-    """Regression test: under Path A, an unfiltered spec's own configured
-    `dense_batch_size` must not be silently widened just because a DIFFERENT,
-    filtered spec sharing the same vector_type has a much larger `k` — that
-    would defeat the memory bound the batch size exists to enforce. Both
-    specs must still produce correct results; only the log should note the
-    larger-k search needs extra merge rounds, not raise the resolved batch."""
+def test_unrelated_large_k_filtered_spec_does_not_inflate_shared_batch(ds, caplog):
+    """Regression test: an unfiltered spec's own configured `dense_batch_size`
+    must not be silently widened just because a DIFFERENT, filtered spec
+    sharing the same vector_type has a much larger `k` — that would defeat
+    the memory bound the batch size exists to enforce. Both specs must still
+    produce correct results; only the log should note the larger-k search
+    needs extra merge rounds, not raise the resolved batch."""
     eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
     specs = [
         SearchSpec(name="dense_all_smallk", vector_type="dense", metric="dot", k=2),
@@ -351,7 +500,7 @@ def test_unrelated_large_k_filtered_spec_does_not_inflate_shared_path_a_batch(ds
     with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
         paths = run_compute(cfg)
     assert any("batch_size=1)" in r.message for r in caplog.records), "batch size must stay at the configured 1, not be raised to k=1000"
-    assert not any("raising to k" in r.message for r in caplog.records), "Path A must never force-raise a configured batch size"
+    assert not any("raising to k" in r.message for r in caplog.records), "the shared batch grid must never be force-raised for one unrelated search's large k"
 
     eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
     expectations = {
@@ -365,13 +514,13 @@ def test_unrelated_large_k_filtered_spec_does_not_inflate_shared_path_a_batch(ds
             assert got[q] == expected[q], f"search={name} query={q}"
 
 
-def test_explicit_empty_filter_still_rides_path_a(ds, caplog):
+def test_explicit_empty_filter_still_shares_full_file_batch(ds, caplog):
     """Regression test: an explicit-but-empty `filter: {}` (`Filter()`) is
     semantically identical to no filter at all — `evaluate()` keeps every
     row either way — so a vector_type where every spec sets one must still
-    take Path A's zero-copy full-file batch grid, not Path B's per-group row
-    compaction (which `has_baseline`'s `is None` check alone would have
-    mistakenly ruled out, since `Filter()` is not `None`)."""
+    take the zero-copy, whole-file shared batch grid, not the union-of-
+    filters compaction path (which `has_baseline`'s `is None` check alone
+    would have mistakenly ruled out, since `Filter()` is not `None`)."""
     specs = [
         SearchSpec(name="dense_a", vector_type="dense", metric="dot", k=3, filter=Filter()),
         SearchSpec(name="dense_b", vector_type="dense", metric="dot", k=3, filter=Filter()),
@@ -385,7 +534,7 @@ def test_explicit_empty_filter_still_rides_path_a(ds, caplog):
     with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
         paths = run_compute(cfg)
     assert any("share one full-file batch pass" in r.message for r in caplog.records), \
-        "an explicit-but-empty filter must still route to Path A, not Path B's row compaction"
+        "an explicit-but-empty filter must still route to the whole-file shared batch, not union compaction"
     assert not any("no unfiltered search" in r.message for r in caplog.records)
 
     expected = ds["ground_truth"]("dense", 3)
@@ -450,7 +599,7 @@ def test_filtered_spec_metric_not_used_by_baseline_still_shares_batch(ds):
     the only unfiltered dense sibling (`dense_all`) is `dot` — under the old
     SpecGroup/borrower model this metric mismatch would have forced
     `dense_eng` into fully independent processing; now it still rides the
-    shared Path A batch (computing one more metric — `cosine` — on the
+    shared batch (computing one more metric — `cosine` — on the
     already-resident batch is cheap), and must produce results BIT-IDENTICAL
     to running it alone."""
     eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
@@ -474,10 +623,11 @@ def test_filtered_spec_metric_not_used_by_baseline_still_shares_batch(ds):
     )
     solo_path = run_compute(solo_cfg)["dense_eng"]
 
-    # Crucially, the solo run here has NO unfiltered dense sibling, so it takes
-    # Path B (independent compaction) — a different code path than the
-    # combined run's Path A. Matching bit-for-bit across both paths is a
-    # stronger proof than comparing either one to itself.
+    # Crucially, the solo run here has NO unfiltered dense sibling, so its
+    # shared batch is the union of its own (single) filter — batch.compact()
+    # runs, unlike the combined run's whole-file pass above. Matching
+    # bit-for-bit across both is a stronger proof than comparing either one
+    # to itself.
     combined_t = pq.read_table(combined_paths["dense_eng"]).to_pydict()
     solo_t = pq.read_table(solo_path).to_pydict()
     assert combined_t["hit_ids"] == solo_t["hit_ids"]
@@ -530,10 +680,10 @@ def test_sparse_cosine_filtered_spec_riding_dot_baseline_not_double_normalized(t
 
 
 def test_multi_batch_filtered_spec_riding_shared_batch_correct(ds):
-    """A filtered dense search sharing Path A's batch grid with an unfiltered
-    sibling must still accumulate the correct top-K across MULTIPLE batch
-    boundaries (`params.dense_batch_size` forces several batches per file) —
-    not just when the whole file fits in one batch."""
+    """A filtered dense search sharing the whole-file batch grid with an
+    unfiltered sibling must still accumulate the correct top-K across
+    MULTIPLE batch boundaries (`params.dense_batch_size` forces several
+    batches per file) — not just when the whole file fits in one batch."""
     eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
     specs = [
         SearchSpec(name="dense_all", vector_type="dense", metric="dot", k=3),
@@ -561,7 +711,7 @@ def test_multi_batch_filtered_spec_riding_shared_batch_correct(ds):
 
 
 def test_filtered_spec_zero_surviving_rows_in_a_middle_batch(tmp_path):
-    """A filtered search riding Path A's shared batch grid must handle a
+    """A filtered search riding the whole-file shared batch grid must handle a
     batch where NONE of its rows survive its filter — not just an all-or-
     nothing whole-file case (see `test_corpus_ids_resolved_even_when_a_
     different_specs_filter_drops_the_file` for the whole-file version). Rows

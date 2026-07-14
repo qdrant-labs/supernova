@@ -119,14 +119,24 @@ class ParamsConfig(BaseModel):
     # Bounds the per-file score matrix (`queries × rows`) for dense/sparse
     # searches respectively — a big file (or large query set) can otherwise
     # OOM the GPU; set this to score in row-batches instead of the whole file
-    # at once. None (default) = whole file in one matmul. Lives here (one
-    # value per vector_type, run-wide) rather than per-search: every search of
-    # a given vector_type ends up sharing one GPU pass over the corpus anyway
+    # at once. None (default) = whole file (or, if every search of that
+    # vector_type has an active filter, the UNION of their surviving rows —
+    # see compute.py's `_union_keep`) in one matmul. Lives here (one value
+    # per vector_type, run-wide) rather than per-search: every search of a
+    # given vector_type ends up sharing one GPU pass over the corpus anyway
     # (see compute.py), so a per-search value would just be resolved down to
-    # this same shared number regardless — this makes that explicit instead of
-    # implicit. Values below a search's own `k` are raised to `k` (a batch
-    # smaller than `k` can't fill that search's top-K and gives no memory
-    # benefit).
+    # this same shared number regardless — this makes that explicit instead
+    # of implicit. A value below some search's own `k` is never raised —
+    # only warned about (that search just needs extra merge rounds to fill
+    # its own top-K, at no extra memory cost to anyone).
+    #
+    # When every search of a vector_type has an active filter, this is now
+    # the ONLY memory bound on that vector_type's shared pass: the union of
+    # several large, mostly-disjoint filters can be nearly as big as the
+    # whole file, transferred/scored in one shot if this is left at its
+    # None default — set it explicitly if you have several such filters and
+    # relied on each one's own (typically much smaller) surviving-row count
+    # bounding memory implicitly.
     # `gt=0`: a batch size of 0 or negative isn't just useless, it's actively
     # wrong — `range(0, n_rows, step)` with a non-positive `step` is EMPTY, so
     # every file's batch loop would silently skip all rows, no exception, no
@@ -236,7 +246,7 @@ class Filter(BaseModel):
 
     Frozen and hashable (see `RangeCondition`'s docstring) — usable directly
     as a dict key wherever specs need grouping/deduping by identical filter
-    (see compute.py's `spec_filter`/`FilterGroup.filter`/`keeps`), via
+    (see compute.py's `spec_filter`/`_union_keep`/`keeps`), via
     pydantic's own `__eq__`/`__hash__`, with no separate canonicalization
     scheme needed: two `Filter`s are "the same" iff Python's own `==` says so,
     which for `int`/`float`/`nan`/`inf` `match` values already has exactly the
