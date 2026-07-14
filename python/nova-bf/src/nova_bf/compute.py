@@ -186,8 +186,15 @@ def _to_query_array(values: list) -> np.ndarray:
     list of acceptable values) instead gets an explicit `dtype=object`
     array with each list assigned as one element — `np.array([[...], [...]])`
     would otherwise try to interpret same-length inner lists as a 2D array,
-    which is never what a per-query list-of-alternatives means."""
-    if values and isinstance(values[0], (list, tuple)):
+    which is never what a per-query list-of-alternatives means.
+
+    Scans every value (not just the first) to decide which encoding applies:
+    a MatchAny column can legitimately have `None` (no restriction) for some
+    query and a real list for another, and checking only `values[0]` would
+    misclassify the whole column whenever THAT one row happens to be null —
+    `np.array([None, [...], [...]])` raises `ValueError` (inhomogeneous
+    shape) rather than producing the object array `filters.py` expects."""
+    if any(isinstance(v, (list, tuple)) for v in values):
         arr = np.empty(len(values), dtype=object)
         arr[:] = values
         return arr

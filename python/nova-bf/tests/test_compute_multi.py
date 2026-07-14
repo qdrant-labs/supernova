@@ -313,6 +313,32 @@ def test_union_keep_ors_every_distinct_filter():
     assert keeps["a"][0]
 
 
+def test_to_query_array_scans_every_value_not_just_the_first():
+    """Regression test: a per-query MatchAny column can legitimately mix
+    `None` (no restriction for that query) with real lists in any order —
+    classifying scalar-vs-list encoding from `values[0]` alone used to
+    crash (`ValueError: inhomogeneous shape`) whenever THAT one value
+    happened to be null while later ones were lists."""
+    arr = compute_mod._to_query_array([None, ["books", "toys"], ["electronics"]])
+    assert arr.dtype == object
+    assert arr.tolist() == [None, ["books", "toys"], ["electronics"]]
+
+    # a plain scalar column (no lists anywhere) is unaffected — still gets
+    # numpy's own dtype inference, not forced to object.
+    arr2 = compute_mod._to_query_array([1.0, 2.0, 3.0])
+    assert arr2.dtype == np.float64
+
+    # a scalar column that happens to have a None value (but no lists) is
+    # NOT misclassified as MatchAny either — `_to_query_array` only forces
+    # object dtype when a LIST/TUPLE is present, not merely a None; numpy's
+    # own object-dtype fallback for a None-containing scalar list still
+    # `.astype(float64)`s cleanly to NaN downstream (see
+    # test_range_from_query_null_query_value_never_matches in test_filters.py).
+    arr3 = compute_mod._to_query_array([1.0, 2.0, None])
+    assert arr3.astype(np.float64).tolist()[:2] == [1.0, 2.0]
+    assert np.isnan(arr3.astype(np.float64)[2])
+
+
 def test_no_baseline_distinct_filters_match_independent_ground_truth(ds):
     """The core regression guard for the union-of-filters mechanism
     (`_union_keep`): when NO search of a vector_type is unfiltered, but two

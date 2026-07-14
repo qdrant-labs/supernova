@@ -67,23 +67,38 @@ def _match_from_query_mask(
     query_vals = query_values[cond.match_from_query]
     not_null = ~_corpus_null_mask(table, cond.field)
 
-    if len(query_vals) and isinstance(query_vals[0], (list, tuple, np.ndarray)):
-        mask = _match_any_from_query_mask(corpus_vals, query_vals)
+    # Scan every value (not just the first) to decide scalar vs. MatchAny-list
+    # encoding: a column can legitimately mix `None`/NaN (no restriction for
+    # that query) with real lists, and checking only index 0 would misclassify
+    # the whole column whenever THAT one value happens to be null.
+    if any(isinstance(v, (list, tuple, np.ndarray)) for v in query_vals):
+        mask = _match_any_from_query_mask(corpus_vals, query_vals, not_null)
     else:
         mask = query_vals[:, None] == corpus_vals[None, :]
     return mask & not_null[None, :]
 
 
-def _match_any_from_query_mask(corpus_vals: np.ndarray, query_lists) -> np.ndarray:
+def _match_any_from_query_mask(
+    corpus_vals: np.ndarray, query_lists, not_null: np.ndarray,
+) -> np.ndarray:
     """`(n_queries, rows)` — per-query MatchAny: query `q` keeps row `r` iff
     `corpus_vals[r]` is a member of `query_lists[q]`. Factorizes `corpus_vals`'
     DISTINCT values in this batch (cheap for the low-to-moderate-cardinality
     categorical fields this is meant for) rather than an O(n_queries * rows)
     membership test — cost tracks distinct-value count and per-query list
-    sizes, not row count."""
-    distinct, corpus_idx = np.unique(corpus_vals, return_inverse=True)
-    corpus_idx = np.asarray(corpus_idx).reshape(-1)
+    sizes, not row count.
+
+    `not_null` (from `_corpus_null_mask`) excludes null corpus rows from the
+    distinct-value factorization BEFORE calling `np.unique` — `np.unique`'s
+    sort can't compare `None` against a string/number, so a null mixed into
+    an otherwise-typed object array raises `TypeError` if included. Null
+    rows are left at `False` for every query (the caller's own `not_null`
+    AND-out would catch this too, but getting it right here avoids a
+    negative gather index accidentally wrapping to the LAST column)."""
+    distinct = np.unique(corpus_vals[not_null]) if not_null.any() else np.empty(0, dtype=corpus_vals.dtype)
     pos = {v: i for i, v in enumerate(distinct)}
+    corpus_idx = np.array([pos.get(v, -1) for v in corpus_vals], dtype=np.int64)
+
     n_q = len(query_lists)
     membership = np.zeros((n_q, len(distinct)), dtype=bool)
     for q, values in enumerate(query_lists):
@@ -92,7 +107,11 @@ def _match_any_from_query_mask(corpus_vals: np.ndarray, query_lists) -> np.ndarr
         idxs = [pos[v] for v in values if v in pos]
         if idxs:
             membership[q, idxs] = True
-    return membership[:, corpus_idx]
+
+    result = np.zeros((n_q, len(corpus_vals)), dtype=bool)
+    valid_cols = corpus_idx >= 0
+    result[:, valid_cols] = membership[:, corpus_idx[valid_cols]]
+    return result
 
 
 def _range_from_query_mask(
@@ -106,7 +125,7 @@ def _range_from_query_mask(
     has. A null per-query bound value never matches for that query (`nan`
     compared to anything is `False`); corpus-side nulls are explicitly
     ANDed out the same way `_match_from_query_mask` does."""
-    corpus_vals = table[cond.field].to_numpy(zero_copy_only=False).astype(np.float64)
+    corpus_vals = table[cond.field].to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
     not_null = ~_corpus_null_mask(table, cond.field)
     r = cond.range_from_query
     mask = None
@@ -116,7 +135,7 @@ def _range_from_query_mask(
     ):
         if colname is None:
             continue
-        qvals = query_values[colname].astype(np.float64)
+        qvals = query_values[colname].astype(np.float64, copy=False)
         # op(corpus, bound) — matching the static path's op(col, bound)
         # (e.g. `lt: X` means "corpus value < X"), not the other way round.
         part = op(corpus_vals[None, :], qvals[:, None])
@@ -144,6 +163,15 @@ def _match_text_from_query_mask(
     by_phrase: dict[str, list[int]] = {}
     for q, phrase in enumerate(phrases):
         if phrase is None or phrase != phrase:  # None, or nan (nan != nan)
+            continue
+        if not phrase.strip():
+            # A blank/whitespace-only phrase never matches, same as null —
+            # the static `match_text` rejects this at config-load time (see
+            # `FilterCondition._match_text_not_blank`), but a per-query
+            # phrase comes from DATA, not a config literal, so it can't be
+            # rejected upfront the same way. Without this check, `_match_
+            # text_mask` would see zero words, never set its `mask`, and
+            # return `None` — crashing the caller's `pc.fill_null(None, ...)`.
             continue
         by_phrase.setdefault(phrase, []).append(q)
 

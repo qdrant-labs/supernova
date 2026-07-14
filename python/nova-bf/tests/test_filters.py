@@ -176,6 +176,20 @@ def test_match_from_query_list_any():
     ]
 
 
+def test_match_from_query_list_any_with_null_corpus_value():
+    """Regression test: a null corpus value mixed into an otherwise
+    list-valued (per-query MatchAny) match_from_query condition used to
+    crash `np.unique` (can't compare `None` to `str` while sorting) before
+    the null-exclusion mask ever got a chance to apply. The null row must
+    just never match, for any query."""
+    t = _table(category=["books", None, "toys"])
+    f = Filter(must=[FilterCondition(field="category", match_from_query="allowed")])
+    qv = {"allowed": np.empty(1, dtype=object)}
+    qv["allowed"][:] = [["books", "toys"]]
+    mask = evaluate(f, t, qv)
+    assert mask.tolist() == [[True, False, True]]
+
+
 def test_match_from_query_null_never_matches_on_either_side():
     t = _table(tenant_id=["A", None, "C"])
     f = Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")])
@@ -268,6 +282,22 @@ def test_match_text_from_query_null_phrase_never_matches():
     mask = evaluate(f, t, qv)
     assert mask[0].tolist() == [True, False]
     assert mask[1].tolist() == [False, False]
+
+
+def test_match_text_from_query_blank_phrase_never_matches():
+    """Regression test: a blank/whitespace-only per-query phrase must never
+    reach `_match_text_mask` (zero words -> `text.split()` never sets its
+    `mask`, so it returns `None` and the caller's `pc.fill_null(None, ...)`
+    crashes) — found live against real query data where every query's
+    `title` column happened to be an empty string."""
+    t = _table(title=["wireless mouse", "gaming keyboard"])
+    f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
+    qv = {"phrase": np.array(["mouse", "", "   "], dtype=object)}
+    mask = evaluate(f, t, qv)
+    assert mask.shape == (3, 2)
+    assert mask[0].tolist() == [True, False]
+    assert mask[1].tolist() == [False, False]
+    assert mask[2].tolist() == [False, False]
 
 
 def test_static_only_filter_stays_one_dimensional():
