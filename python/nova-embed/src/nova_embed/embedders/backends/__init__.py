@@ -35,3 +35,16 @@ for _mod in _BACKEND_MODULES:
             _mod,
             e,
         )
+    except Exception as e:  # noqa: BLE001 — see below
+        # Not-missing-but-BROKEN dependency (e.g. a resolver-backtracked
+        # transitive pin blowing up at import, like ancient datasets vs modern
+        # pyarrow). A backend the run never selects must not kill the launch;
+        # warning (not debug) because this is a broken env worth fixing, not a
+        # deliberately absent extra. Selecting the backend still fails with
+        # the registry's "available backends" message.
+        logger.warning(
+            "embedder backend %r failed to import (%s: %s) — unavailable this run",
+            _mod,
+            type(e).__name__,
+            e,
+        )

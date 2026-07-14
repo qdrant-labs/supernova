@@ -115,7 +115,10 @@ def _python_worker_setup(binary: str, pip_spec: str) -> str:
         "($SUDO apt-get update && $SUDO apt-get install -y curl git)\n"
         "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
         'export PATH="$HOME/.local/bin:$PATH"\n'
-        f"UV_TOOL_BIN_DIR=\"$HOME/.local/bin\" uv tool install '{pip_spec}'\n"
+        # --python pins the tool env: unpinned, uv grabs the newest CPython
+        # (3.14+), where missing wheels/support markers make the resolver
+        # backtrack to prehistoric transitive versions that crash at import.
+        f"UV_TOOL_BIN_DIR=\"$HOME/.local/bin\" uv tool install --python 3.12 '{pip_spec}'\n"
         f'$SUDO ln -sf "$HOME/.local/bin/{binary}" /usr/local/bin/{binary}'
     )
 

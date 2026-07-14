@@ -36,6 +36,12 @@ embed = [
     "FlagEmbedding",
     "einops>=0.8.2",
     "fastembed",
+    # Not imported by nova-embed — a resolver guard. sentence-transformers
+    # pulls `datasets` in transitively, and without a floor uv can backtrack
+    # to prehistoric versions whose IMPORT crashes against modern pyarrow
+    # (pa.PyExtensionType was removed in pyarrow 17; see
+    # huggingface/datasets#7742).
+    "datasets>=2.20.0",
     "hf_transfer",
     # Image-modality decoding (nova_embed.media.image → PIL canonical form).
     "pillow",
