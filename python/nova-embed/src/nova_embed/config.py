@@ -244,9 +244,20 @@ class PipelineConfig(BaseModel):
     # bloat the output. Distinct from source.exclude_columns, which drops
     # columns BEFORE embedding and therefore can't touch an input_column.
     drop_columns: list[str] = Field(default_factory=list)
-    # shard_by_rank=true  -> "rank00/batch_*.parquet" (subdir per rank)
-    # shard_by_rank=false -> "rank00_batch_*.parquet" (flat)
-    shard_by_rank: bool = False
+    # Opt-in output layout knobs (both default off, composable):
+    #
+    # content_addressed_files: name each parquet by a deterministic UUID derived
+    # from its CONTENT (blake2b of the file bytes) instead of rank/batch
+    # counters — "rank00_batch_00000001.parquet" becomes
+    # "8f14e45f-ceea-467f-a12d-4c8f1a2b3c4d.parquet". Same bytes, same name.
+    content_addressed_files: bool = False
+    # shard_output_buckets: distribute output files across N bucket
+    # subdirectories ("000/".."{N-1}/") under the destination prefix. The
+    # bucket is derived from the file's content hash, so the spread is uniform
+    # and needs zero coordination across ranks. Composes with
+    # content_addressed_files ("017/8f14e45f-….parquet") or with the default
+    # counter names ("017/rank00_batch_00000001.parquet").
+    shard_output_buckets: int | None = Field(default=None, ge=1)
     # Stamp each embedded row with where it came from: `source_file_name` (the
     # original parquet path in the source repo) and `source_row_number` (its row
     # index WITHIN that file). Lets you trace any embedding back to its origin —

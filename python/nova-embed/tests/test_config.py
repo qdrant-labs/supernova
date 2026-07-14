@@ -241,6 +241,22 @@ def test_drop_columns_rejects_embedding_outputs():
         config(entry(), pipeline={"drop_columns": ["minilm_embedding"]})
 
 
+def test_output_layout_knobs_parse():
+    cfg = config(
+        entry(),
+        pipeline={"shard_output_buckets": 100, "content_addressed_files": True},
+    )
+    assert cfg.pipeline.shard_output_buckets == 100
+    assert cfg.pipeline.content_addressed_files is True
+
+
+def test_shard_by_rank_removed():
+    # superseded by shard_output_buckets; extra="forbid" makes old configs die
+    # loudly instead of silently flattening their layout
+    with pytest.raises(ValidationError):
+        config(entry(), pipeline={"shard_by_rank": True})
+
+
 def test_drop_columns_rejects_pooled_outputs():
     with pytest.raises(ValidationError, match="drop_columns lists embedding output"):
         config(

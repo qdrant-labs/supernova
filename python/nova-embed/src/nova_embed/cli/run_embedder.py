@@ -165,10 +165,7 @@ def embed(config, num_jobs, job_rank, dry_run):
         source_dict["limit"] = slice_limit
 
         rank_width = max(2, len(str(num_jobs - 1)))
-        # shard_by_rank=true  -> "rank00/batch_*.parquet" (subdir per rank)
-        # shard_by_rank=false -> "rank00_batch_*.parquet" (flat)
-        separator = "/" if pipeline.shard_by_rank else "_"
-        filename_prefix = f"rank{job_rank:0{rank_width}d}{separator}"
+        filename_prefix = f"rank{job_rank:0{rank_width}d}_"
 
     # Carry source provenance (source_file_name + source_row_number) into the
     # output when enabled. Injected only when on, so sources that don't support
@@ -217,6 +214,8 @@ def embed(config, num_jobs, job_rank, dry_run):
             filename_prefix=filename_prefix,
             expected_total_rows=expected_total_rows,
             chunking_strategy=chunking.strategy,
+            content_addressed_files=pipeline.content_addressed_files,
+            shard_output_buckets=pipeline.shard_output_buckets,
         )
     )
 

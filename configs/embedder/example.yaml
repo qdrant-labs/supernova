@@ -99,3 +99,11 @@ pipeline:
   #   null           — keep the row, write a null embedding
   #   error          — abort on the first empty input
   # on_empty_input: skip
+  #
+  # Opt-in output layout (composable; both recorded in the manifest, which
+  # also lists every file a rank wrote under "output_files"):
+  # content_addressed_files: true  # name parquets by a content-derived uuid
+  #                                # instead of rank/batch counters
+  # shard_output_buckets: 256      # spread files across 000/..255/ subdirs,
+  #                                # bucket picked by content hash (uniform,
+  #                                # no cross-rank coordination)

@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
+import uuid
 from typing import Iterator
 
 import pyarrow as pa
@@ -262,6 +265,59 @@ def test_writer_schema_stable_when_batch_all_null(tmp_path):
     assert pa.types.is_list(dense_type) and dense_type.value_type == pa.float32()
 
 
+_UUID_PARQUET = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.parquet"
+)
+
+
+def test_writer_content_addressed_name_is_deterministic(tmp_path):
+    records = [EmbeddedRecord(row={"text": "a"}, embeddings={"d": [1.0, 2.0]})]
+    specs = [spec("d", "dense_col", OutputKind.DENSE)]
+    p1 = write_batch(
+        records, str(tmp_path / "one"), 0, output_specs=specs, content_addressed=True
+    )
+    p2 = write_batch(
+        records,
+        str(tmp_path / "two"),
+        7,  # different batch id and rank prefix: the CONTENT names the file
+        output_specs=specs,
+        filename_prefix="rank03_",
+        content_addressed=True,
+    )
+    assert _UUID_PARQUET.fullmatch(os.path.basename(p1))
+    assert os.path.basename(p1) == os.path.basename(p2)
+
+
+def test_writer_shard_buckets_keep_counter_names(tmp_path):
+    specs = [spec("d", "dense_col", OutputKind.DENSE)]
+    rels = []
+    for i in range(8):
+        records = [
+            EmbeddedRecord(row={"text": f"t{i}"}, embeddings={"d": [float(i)]})
+        ]
+        p = write_batch(records, str(tmp_path), i, output_specs=specs, shard_buckets=4)
+        rels.append(os.path.relpath(p, tmp_path))
+    for rel in rels:
+        bucket, name = rel.split(os.sep)
+        assert re.fullmatch(r"00[0-3]", bucket)
+        assert name.startswith("batch_")  # counters kept without content_addressed
+
+
+def test_writer_shard_bucket_derived_from_content_uuid(tmp_path):
+    records = [EmbeddedRecord(row={"text": "a"}, embeddings={"d": [1.0]})]
+    p = write_batch(
+        records,
+        str(tmp_path),
+        0,
+        output_specs=[spec("d", "dense_col", OutputKind.DENSE)],
+        content_addressed=True,
+        shard_buckets=16,
+    )
+    bucket, name = os.path.relpath(p, tmp_path).split(os.sep)
+    u = uuid.UUID(name.removesuffix(".parquet"))
+    assert int(bucket) == int.from_bytes(u.bytes[:8], "big") % 16
+
+
 def test_writer_rejects_collision_with_source_column(tmp_path):
     records = [EmbeddedRecord(row={"text": "a"}, embeddings={"d": [1.0]})]
     with pytest.raises(ValueError, match="collide with source columns"):
@@ -380,6 +436,43 @@ def test_drop_columns_removes_input_column_from_output(tmp_path):
 def test_drop_columns_typo_dies_on_first_chunk(tmp_path):
     with pytest.raises(ValueError, match="drop_columns \\['imge'\\] not found"):
         run(tmp_path, [{"text": "hello"}], [dense_entry()], drop_columns=["imge"])
+
+
+def test_run_embedder_content_addressed_sharded_output(tmp_path):
+    rows = [{"text": f"text number {i}", "id": i} for i in range(5)]
+    engine = build_engine([dense_entry()])
+    storage = STORAGE.build({"type": "local", "output_dir": str(tmp_path)})
+    asyncio.run(
+        run_embedder(
+            source=ListSource(rows),
+            engine=engine,
+            storage=storage,
+            chunk_size=2,
+            num_workers=1,
+            flush_threshold=2,  # several flushes -> several files
+            output_dir=str(tmp_path),
+            content_addressed_files=True,
+            shard_output_buckets=8,
+        )
+    )
+
+    files = sorted(tmp_path.glob("*/*.parquet"))
+    assert files
+    for f in files:
+        assert re.fullmatch(r"00[0-7]", f.parent.name)
+        assert _UUID_PARQUET.fullmatch(f.name)
+
+    # every row lands exactly once across the sharded files
+    ids = [i for f in files for i in pq.read_table(f).column("id").to_pylist()]
+    assert sorted(ids) == list(range(5))
+
+    manifest = json.loads((tmp_path / "_manifest.json").read_text())
+    assert manifest["content_addressed_files"] is True
+    assert manifest["shard_output_buckets"] == 8
+    # the manifest is the record of which files this rank wrote
+    assert sorted(manifest["output_files"]) == sorted(
+        str(f.relative_to(tmp_path)) for f in files
+    )
 
 
 def test_run_embedder_multimodal_end_to_end(tmp_path):

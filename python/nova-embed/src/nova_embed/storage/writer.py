@@ -1,4 +1,6 @@
+import hashlib
 import os
+import uuid
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -40,6 +42,19 @@ _KIND_TO_ARROW = {
 }
 
 
+def _content_uuid(path: str) -> uuid.UUID:
+    """Deterministic UUID for a file, derived from its bytes (blake2b-128).
+
+    Chunked read: batch files can be hundreds of MB and never need to be in
+    memory at once. blake2b hashes at GB/s — noise next to embedding time.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return uuid.UUID(bytes=h.digest())
+
+
 def write_batch(
     records: list[EmbeddedRecord],
     output_dir: str,
@@ -47,6 +62,8 @@ def write_batch(
     output_specs: list,  # list[OutputSpec] — (name, column, kind) is all we use
     filename_prefix: str = "",
     row_group_size: int | None = None,
+    content_addressed: bool = False,
+    shard_buckets: int | None = None,
 ) -> str:
     """Write one parquet batch: every source row column (chunk-rewritten where a
     chunker was active), then one typed embedding column per output spec.
@@ -54,10 +71,15 @@ def write_batch(
     Embedding columns are ALWAYS written with their declared arrow type, even if
     every value in this batch is null (on_empty_input="null") — the schema must
     be identical across batches or downstream readers choke on the mismatch.
+
+    Output layout (see PipelineConfig): with ``content_addressed`` the file is
+    named by its content hash (rank/batch counters and prefix dropped — the
+    name is globally unique by construction); with ``shard_buckets`` it lands
+    in a hash-derived bucket subdir. Both are applied by renaming AFTER the
+    parquet is fully written, so the hash covers the final bytes.
     """
     filename = f"{filename_prefix}batch_{batch_id:08d}.parquet"
     path = os.path.join(output_dir, filename)
-    # filename_prefix may include '/' (shard_by_rank); ensure the subdir exists.
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     arrays: list[pa.Array] = []
@@ -88,4 +110,19 @@ def write_batch(
 
     table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
     pq.write_table(table, path, compression="snappy", row_group_size=row_group_size)
+
+    if content_addressed or shard_buckets:
+        file_uuid = _content_uuid(path)
+        final_name = f"{file_uuid}.parquet" if content_addressed else filename
+        subdir = ""
+        if shard_buckets:
+            # bucket from the same hash: uniform spread, no rank coordination
+            width = max(3, len(str(shard_buckets - 1)))
+            bucket = int.from_bytes(file_uuid.bytes[:8], "big") % shard_buckets
+            subdir = f"{bucket:0{width}d}"
+        final_path = os.path.join(output_dir, subdir, final_name)
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
+        os.replace(path, final_path)
+        return final_path
+
     return path

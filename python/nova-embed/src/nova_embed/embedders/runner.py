@@ -41,6 +41,8 @@ async def run_embedder(
     expected_total_rows: int | None = None,
     row_group_size: int | None = None,
     chunking_strategy: str = "passthrough",
+    content_addressed_files: bool = False,
+    shard_output_buckets: int | None = None,
 ):
     logger.info(
         "Starting pipeline: source=%s outputs=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
@@ -61,6 +63,9 @@ async def run_embedder(
 
     batch_counter = 0
     empty_stats = EmptyInputStats()
+    # remote subpaths of every file this rank wrote, for the manifest — with
+    # content-addressed names it's the only record of which files are ours.
+    output_files: list[str] = []
 
     async def flush(records):
         nonlocal batch_counter, total_records
@@ -71,15 +76,18 @@ async def run_embedder(
             output_specs=engine.output_specs,
             filename_prefix=filename_prefix,
             row_group_size=row_group_size,
+            content_addressed=content_addressed_files,
+            shard_buckets=shard_output_buckets,
         )
         logger.info(
             "Wrote batch %d (%d records) to %s", batch_counter, len(records), local_path
         )
         batch_counter += 1
         total_records += len(records)
-        # preserve any subdir structure from filename_prefix (e.g. "rank00/") so
+        # preserve any subdir structure from hash-bucket sharding ("017/") so
         # storage backends can replicate the layout remotely.
         remote_subpath = os.path.relpath(local_path, output_dir)
+        output_files.append(remote_subpath)
         # upload_file consumes local_path (cloud backends upload then delete the
         # staging copy; LocalBackend moves it into place / no-ops if it's already
         # there). Deleting it here would nuke LocalBackend's saved file.
@@ -183,9 +191,12 @@ async def run_embedder(
         "flush_threshold": flush_threshold,
         "on_empty_input": on_empty_input,
         "drop_columns": sorted(drop_columns or []),
+        "content_addressed_files": content_addressed_files,
+        "shard_output_buckets": shard_output_buckets,
         "total_records": total_records,
         "rows_skipped_empty_input": empty_stats.rows_skipped,
         "total_batches": batch_counter,
+        "output_files": output_files,
         "elapsed_seconds": round(elapsed, 2),
         "records_per_second": round(total_records / elapsed, 1) if elapsed > 0 else 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
