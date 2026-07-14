@@ -658,6 +658,17 @@ def _process_batch_group(
     return time.perf_counter() - t0
 
 
+def _is_unfiltered(f: Filter | None) -> bool:
+    """`None` is the common no-filter case; an explicit-but-empty `filter: {}`
+    (`Filter(must=(), should=(), must_not=())`) is semantically the same —
+    `evaluate()` keeps every row either way — so both must be treated
+    identically wherever "does this spec have an active filter" decides
+    Path A/B GPU-sharing (`has_baseline`) or per-member masking
+    (`_path_a_select`). `f.fields()` is empty iff every condition group is
+    empty, without duplicating that check against `Filter`'s own fields."""
+    return f is None or not f.fields()
+
+
 def _path_a_select(specs: list[SearchSpec], keeps: dict[Filter | None, np.ndarray | None], device: str):
     """Path A's `select` for `_process_batch_group`: an unfiltered member uses
     the shared slice as-is; a filtered member masks it down to its own
@@ -673,7 +684,7 @@ def _path_a_select(specs: list[SearchSpec], keeps: dict[Filter | None, np.ndarra
     def select(m: int, r0: int, r1: int, rows, cache: dict[object, object]):
         s = specs[m]
         filt = s.filter
-        if filt is None:
+        if _is_unfiltered(filt):
             return rows, None
         local_idx = cache.get(filt)
         if local_idx is None:
@@ -854,11 +865,12 @@ def run_compute(
         spec_top_scores.append(torch.full((n_q, s.k), float("-inf"), device=device))
         spec_top_enc.append(torch.zeros((n_q, s.k), dtype=torch.int64, device=device))
 
-    # Per vector_type: does any spec have no filter? If so every spec of that
-    # vector_type shares one full-file batch grid (Path A, `_process_shared_
-    # batch`); otherwise specs are grouped by exact filter equality instead
-    # (Path B, `_process_filter_group`) since there's no full-file computation
-    # to derive from. See this module's docstring for the full rationale.
+    # Per vector_type: does any spec have no filter (or an explicit-but-empty
+    # one — see `_is_unfiltered`)? If so every spec of that vector_type shares
+    # one full-file batch grid (Path A, `_process_shared_batch`); otherwise
+    # specs are grouped by exact filter equality instead (Path B,
+    # `_process_filter_group`) since there's no full-file computation to
+    # derive from. See this module's docstring for the full rationale.
     spec_filter = [s.filter for s in specs]
     distinct_filters: list[Filter | None] = list(dict.fromkeys(spec_filter))
 
@@ -871,7 +883,7 @@ def run_compute(
     path_a_batch_size: dict[str, int | None] = {}
     path_b_groups: dict[str, list[FilterGroup]] = {}
     for vt, idxs in vt_spec_idxs.items():
-        has_baseline[vt] = any(specs[i].filter is None for i in idxs)
+        has_baseline[vt] = any(_is_unfiltered(specs[i].filter) for i in idxs)
         if has_baseline[vt]:
             k_floor = max(specs[i].k for i in idxs)
             path_a_batch_size[vt] = _path_a_batch_size(vt_configured_batch[vt], k_floor, vt)

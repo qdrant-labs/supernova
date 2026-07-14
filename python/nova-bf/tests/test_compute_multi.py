@@ -365,6 +365,37 @@ def test_unrelated_large_k_filtered_spec_does_not_inflate_shared_path_a_batch(ds
             assert got[q] == expected[q], f"search={name} query={q}"
 
 
+def test_explicit_empty_filter_still_rides_path_a(ds, caplog):
+    """Regression test: an explicit-but-empty `filter: {}` (`Filter()`) is
+    semantically identical to no filter at all — `evaluate()` keeps every
+    row either way — so a vector_type where every spec sets one must still
+    take Path A's zero-copy full-file batch grid, not Path B's per-group row
+    compaction (which `has_baseline`'s `is None` check alone would have
+    mistakenly ruled out, since `Filter()` is not `None`)."""
+    specs = [
+        SearchSpec(name="dense_a", vector_type="dense", metric="dot", k=3, filter=Filter()),
+        SearchSpec(name="dense_b", vector_type="dense", metric="dot", k=3, filter=Filter()),
+    ]
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "empty_filter_out")),
+        searches=specs,
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        paths = run_compute(cfg)
+    assert any("share one full-file batch pass" in r.message for r in caplog.records), \
+        "an explicit-but-empty filter must still route to Path A, not Path B's row compaction"
+    assert not any("no unfiltered search" in r.message for r in caplog.records)
+
+    expected = ds["ground_truth"]("dense", 3)
+    for name in ("dense_a", "dense_b"):
+        t = pq.read_table(paths[name]).to_pydict()
+        got = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
+        for q in ds["qids"]:
+            assert got[q] == expected[q], f"search={name} query={q}"
+
+
 def test_sparse_dot_spec_not_corrupted_by_coscheduled_cosine_spec(tmp_path):
     """Regression test: `need_sparse_norms` (compute.py) gates whether a
     file's sparse rows get their L2 norm computed at all, but that's a
