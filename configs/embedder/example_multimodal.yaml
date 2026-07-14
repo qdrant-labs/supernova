@@ -34,9 +34,14 @@ embedders:
     # (decoded PIL images in flight).
     # batch_size: 512
     # max_length: 8192           # truncate the TEXT part to N chars
-    # Unknown keys pass through to vllm.LLM:
+    # Unknown keys pass through to vllm.LLM. max_model_len matters: vLLM
+    # pre-reserves KV cache for ONE request at the model's full context —
+    # Qwen3-VL-Embedding ships 262144, which is a 28 GiB reservation that no
+    # 24 GB card can make. 16k covers any caption + a high-res image's vision
+    # tokens with room to spare. (Prompts LONGER than this error out, not
+    # truncate — use max_length to bound pathological text.)
+    max_model_len: 16384
     # gpu_memory_utilization: 0.9
-    # max_model_len: 8192
 
   # vllm is also a plain high-throughput text backend — same entry shape as
   # any other dense backend. For chat-formatted embedding models set

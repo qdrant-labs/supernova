@@ -23,7 +23,7 @@ resources:
 setup: |
   set -e
   SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
-  command -v curl >/dev/null && command -v git >/dev/null || ($SUDO apt-get update && $SUDO apt-get install -y curl git)
+  command -v curl >/dev/null && command -v git >/dev/null && command -v ffmpeg >/dev/null || ($SUDO apt-get update && $SUDO apt-get install -y curl git ffmpeg)
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
   UV_TOOL_BIN_DIR="$HOME/.local/bin" uv tool install --python 3.12 'nova-embed[embed,vllm] @ git+https://github.com/qdrant-labs/supernova@master#subdirectory=python/nova-embed'

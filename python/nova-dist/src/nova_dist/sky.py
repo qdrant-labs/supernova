@@ -111,8 +111,11 @@ def _python_worker_setup(binary: str, pip_spec: str) -> str:
     return (
         "set -e\n"
         'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"\n'
-        "command -v curl >/dev/null && command -v git >/dev/null || "
-        "($SUDO apt-get update && $SUDO apt-get install -y curl git)\n"
+        # ffmpeg: newer `datasets` (pulled in by sentence-transformers) imports
+        # torchcodec, which dlopens libavutil/libavcodec at import time — a GPU
+        # AMI without FFmpeg makes the whole ST backend unimportable.
+        "command -v curl >/dev/null && command -v git >/dev/null && command -v ffmpeg >/dev/null || "
+        "($SUDO apt-get update && $SUDO apt-get install -y curl git ffmpeg)\n"
         "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
         'export PATH="$HOME/.local/bin:$PATH"\n'
         # --python pins the tool env: unpinned, uv grabs the newest CPython
