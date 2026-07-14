@@ -640,7 +640,7 @@ def _process_batch_group(
             rows = torch.from_numpy(orig_rows[r0 : r0 + sl.n_rows]).to(device, non_blocking=True)
 
         score_cache: dict[str, object] = {}
-        cache: dict[str, object] = {}
+        cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
         for m in member_idxs:
             s = specs[m]
             if s.metric not in score_cache:
@@ -664,17 +664,22 @@ def _path_a_select(specs: list[SearchSpec], keeps: dict[Filter | None, np.ndarra
     filter's surviving columns, via a `local_idx` cached per `Filter` (in
     the caller-provided per-slice `cache`, keyed by the `Filter` object
     itself — hashable, see its docstring) so two members sharing an
-    identical filter don't recompute `nonzero` twice."""
+    identical filter don't recompute `nonzero` twice. `Filter.__hash__` isn't
+    cached on the instance the way `str.__hash__` is, so each member's
+    `filt` is hashed at most once here (`cache.get`, then one more on a
+    miss to store it) rather than once per dict access."""
     import torch
 
     def select(m: int, r0: int, r1: int, rows, cache: dict[object, object]):
         s = specs[m]
-        if s.filter is None:
+        filt = s.filter
+        if filt is None:
             return rows, None
-        if s.filter not in cache:
-            local_np = np.nonzero(keeps[s.filter][r0:r1])[0]
-            cache[s.filter] = torch.from_numpy(local_np).to(device, non_blocking=True)
-        local_idx = cache[s.filter]
+        local_idx = cache.get(filt)
+        if local_idx is None:
+            local_np = np.nonzero(keeps[filt][r0:r1])[0]
+            local_idx = torch.from_numpy(local_np).to(device, non_blocking=True)
+            cache[filt] = local_idx
         if local_idx.numel() == 0:
             return None, None
         return rows[local_idx], local_idx
@@ -682,7 +687,7 @@ def _path_a_select(specs: list[SearchSpec], keeps: dict[Filter | None, np.ndarra
     return select
 
 
-def _path_b_select(m: int, r0: int, r1: int, rows, cache: dict[str, object]):
+def _path_b_select(m: int, r0: int, r1: int, rows, cache: dict[object, object]):
     """Path B's `select` for `_process_batch_group`: every member of a
     `FilterGroup` shares one identical filter, already applied via
     `batch.compact()` before this loop runs — no further per-member masking
