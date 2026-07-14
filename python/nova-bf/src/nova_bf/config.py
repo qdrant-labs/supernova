@@ -12,11 +12,8 @@
 
 from __future__ import annotations
 
-import json
-import math
 import re
 
-from fractions import Fraction
 from typing import Literal
 
 import yaml
@@ -164,9 +161,16 @@ MatchValue = str | int | float | bool
 
 
 class RangeCondition(BaseModel):
-    """Numeric bounds, combinable like Qdrant's Range (e.g. `gte` + `lt` together)."""
+    """Numeric bounds, combinable like Qdrant's Range (e.g. `gte` + `lt` together).
 
-    model_config = ConfigDict(extra="forbid")
+    Frozen: makes this — and, transitively, `FilterCondition`/`Filter`, which
+    contain it — hashable via pydantic's auto-generated `__hash__` (a tuple of
+    field values), so a `Filter` can be used directly as a dict key wherever
+    specs need grouping/deduping by identical filter (see compute.py). Also
+    enforces the invariant that a `Filter` is never mutated after grouping,
+    previously just assumed."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     gt: float | None = None
     gte: float | None = None
@@ -187,13 +191,17 @@ class FilterCondition(BaseModel):
     MatchAny). Exactly one of `match`/`range` must be set.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     # The corpus column this condition reads and matches against — this is the
     # only place a filtered field is named; nothing else needs to declare it,
     # so `compute` reads exactly (and only) the columns the filter references.
     field: str
-    match: MatchValue | list[MatchValue] | None = None
+    # tuple, not list: lists aren't hashable, and this needs to be for Filter
+    # (which contains this) to be usable as a dict key — see RangeCondition's
+    # docstring. Pydantic coerces a YAML/list literal (`match: [1, 2, 3]`)
+    # into a tuple automatically at validation time.
+    match: MatchValue | tuple[MatchValue, ...] | None = None
     range: RangeCondition | None = None
 
     @model_validator(mode="after")
@@ -211,88 +219,35 @@ class Filter(BaseModel):
     Restricts which corpus points are eligible neighbors for every query in the
     run — it does not touch queries themselves, same as a Qdrant search filter.
     `must` = AND, `should` = OR-at-least-one, `must_not` = AND-NOT.
+
+    Frozen and hashable (see `RangeCondition`'s docstring) — usable directly
+    as a dict key wherever specs need grouping/deduping by identical filter
+    (see compute.py's `spec_filter`/`FilterGroup.filter`/`keeps`), via
+    pydantic's own `__eq__`/`__hash__`, with no separate canonicalization
+    scheme needed: two `Filter`s are "the same" iff Python's own `==` says so,
+    which for `int`/`float`/`nan`/`inf` `match` values already has exactly the
+    right semantics (`5 == 5.0`, no precision loss for large ints, `nan`
+    never equal to itself, `inf`/`-inf` equal to themselves by sign).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     # The one place the three condition-group names are listed — `fields()`
-    # and `filter_key()` both walk them via this, not their own hardcoded
-    # tuple, so a future group added here can't update one and silently miss
-    # the other (which would let two filters differing only in that group
-    # collide as "the same" wherever the missed one is used).
+    # walks them via this, not its own hardcoded tuple, so a future group
+    # added here can't be missed by `fields()`.
     _CONDITION_GROUPS = ("must", "should", "must_not")
 
-    must: list[FilterCondition] = []
-    should: list[FilterCondition] = []
-    must_not: list[FilterCondition] = []
+    # tuple, not list: needed for this model to be hashable (see
+    # RangeCondition's docstring). Pydantic coerces a YAML/list literal
+    # (`must: [...]`) into a tuple automatically at validation time.
+    must: tuple[FilterCondition, ...] = ()
+    should: tuple[FilterCondition, ...] = ()
+    must_not: tuple[FilterCondition, ...] = ()
 
     def fields(self) -> set[str]:
         return {
             c.field for group in self._CONDITION_GROUPS for c in getattr(self, group)
         }
-
-
-def _canonical_match(value: MatchValue | list[MatchValue]) -> object:
-    """`match` values that Python treats as equal (`5 == 5.0`, which is what
-    `Filter`'s own by-value equality relies on) must produce the same key —
-    plain JSON text doesn't guarantee that on its own (`5` and `5.0` serialize
-    to different text, e.g. from a YAML author writing one search's filter
-    with an int literal and another's with a float literal).
-
-    Deliberately `Fraction`, not `float(value)`: Python's own `int == float`
-    comparison is exact (no precision loss), but `float(value)` on a large
-    int is NOT — `float(2**53) == float(2**53 + 1)` (both round to the same
-    float64), so two DIFFERENT filters would collide onto the same key,
-    silently merging their masks (see the regression this guards against —
-    a filter on a large payload value, e.g. a nanosecond timestamp or a
-    snowflake id, both common in the ~1e18 range where float64 precision
-    runs out). `Fraction` represents any Python `int` or `float` exactly (a
-    float is itself an exact binary fraction — `Fraction(x)` never rounds),
-    so two values compare equal here iff they're actually equal, matching
-    `Filter.__eq__` exactly instead of approximately. `bool`/`str` pass
-    through unchanged (`bool` is technically an `int` subclass, but
-    conflating `match: true` with `match: 1` isn't the case this guards
-    against, so it's left alone).
-
-    `nan`/`inf` are handled separately because `Fraction` can't represent
-    them at all (`Fraction(float("nan"))` raises `ValueError`, `Fraction(float("inf"))`
-    raises `OverflowError` — both are legal YAML/pydantic `match` values, so
-    this must never crash `run_compute` outright, the way it did before this
-    special case existed). `inf`/`-inf` compare equal to themselves under
-    Python's own `==` (what `Filter.__eq__` relies on), so they canonicalize
-    to a stable sentinel by sign. `nan` is the opposite — `nan != nan`, even
-    against itself — so no two `nan` match values are ever "the same filter"
-    either; a fresh sentinel per call guarantees this key never collides
-    with anything, matching that never-equal-to-itself semantics exactly."""
-    if isinstance(value, list):
-        return [_canonical_match(v) for v in value]
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, float) and math.isnan(value):
-        return f"__nan_{id(value)}__"
-    if isinstance(value, float) and math.isinf(value):
-        return "+inf" if value > 0 else "-inf"
-    if isinstance(value, (int, float)):
-        frac = Fraction(value)
-        return [frac.numerator, frac.denominator]
-    return value
-
-
-def filter_key(f: Filter | None) -> str:
-    """Canonical, hashable key for a filter — `"none"` for no filter, else a
-    JSON dump of its fields (with `match` values canonicalized, see
-    `_canonical_match`). Two specs are considered "the same filter" iff this
-    key matches, which is order-sensitive (a `must` list reordered in YAML is
-    a different key) — same as `Filter`'s own by-value equality, just usable
-    as a real dict key instead of a linear `==` scan."""
-    if f is None:
-        return "none"
-    dumped = f.model_dump()
-    for group in ("must", "should", "must_not"):
-        for cond in dumped[group]:
-            if cond.get("match") is not None:
-                cond["match"] = _canonical_match(cond["match"])
-    return json.dumps(dumped, sort_keys=True)
 
 
 class SearchSpec(BaseModel):

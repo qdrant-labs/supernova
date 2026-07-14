@@ -69,7 +69,7 @@ import numpy as np
 
 from tqdm import tqdm
 
-from nova_bf.config import BruteForceConfig, Filter, SearchSpec, filter_key
+from nova_bf.config import BruteForceConfig, Filter, SearchSpec
 from nova_bf.filters import evaluate
 from nova_bf.ids import make_point_id
 from nova_bf.io import ParquetFile, Store, dense_to_2d, sparse_to_coo_parts
@@ -516,13 +516,12 @@ class FilterGroup:
     unfiltered, so there's no full-file score matrix to derive from, and this
     group compacts/transfers/scores its own rows once per batch instead —
     its members share the identical filter by construction, hence the
-    identical surviving row set. Doesn't carry the `Filter` object itself —
-    nothing downstream needs it (`run_compute`'s own `distinct_filters[key]`
-    already holds it, if a caller ever does), and keeping only `key` here
-    means there's exactly one place a group's filter identity lives, not two
-    that could in principle drift apart."""
+    identical surviving row set. Carries the `Filter` itself (now hashable —
+    see `nova_bf.config.Filter`'s docstring) since it's this group's only,
+    primary key: the per-file loop looks up `keeps[group.filter]` directly,
+    with no separate string-keyed index to keep in sync."""
 
-    key: str  # this group's filter_key — stored so the per-file loop never re-derives it
+    filter: Filter | None
     member_idxs: list[int]
     batch_size: int | None  # resolved batch size; None = whole (compacted) file
 
@@ -571,21 +570,21 @@ def _path_a_batch_size(configured: int | None, k_floor: int, vt: str) -> int | N
 
 
 def _build_filter_groups(
-    idxs: list[int], specs: list[SearchSpec], spec_filter_key: list[str],
+    idxs: list[int], specs: list[SearchSpec], spec_filter: list[Filter | None],
     batch_size_cfg: int | None, vt: str,
 ) -> list[FilterGroup]:
     """Group `idxs` (every spec of one vector_type, Path B only — none of
-    them unfiltered) by exact filter equality via `filter_key`, so specs
-    sharing an identical filter compact/transfer/score together once instead
-    of each redoing it."""
-    by_key: dict[str, list[int]] = {}
+    them unfiltered) by exact filter equality (`Filter`'s own hash/eq), so
+    specs sharing an identical filter compact/transfer/score together once
+    instead of each redoing it."""
+    by_filter: dict[Filter | None, list[int]] = {}
     for i in idxs:
-        by_key.setdefault(spec_filter_key[i], []).append(i)
+        by_filter.setdefault(spec_filter[i], []).append(i)
     groups = []
-    for key, members in by_key.items():
+    for filt, members in by_filter.items():
         k_floor = max(specs[m].k for m in members)
         groups.append(FilterGroup(
-            key=key,
+            filter=filt,
             member_idxs=members,
             batch_size=_path_b_group_batch_size(batch_size_cfg, k_floor, vt),
         ))
@@ -659,23 +658,23 @@ def _process_batch_group(
     return time.perf_counter() - t0
 
 
-def _path_a_select(specs: list[SearchSpec], spec_filter_key: list[str], keeps: dict[str, np.ndarray | None], device: str):
+def _path_a_select(specs: list[SearchSpec], keeps: dict[Filter | None, np.ndarray | None], device: str):
     """Path A's `select` for `_process_batch_group`: an unfiltered member uses
     the shared slice as-is; a filtered member masks it down to its own
-    filter's surviving columns, via a `local_idx` cached per filter key (in
-    the caller-provided per-slice `cache`) so two members sharing an
+    filter's surviving columns, via a `local_idx` cached per `Filter` (in
+    the caller-provided per-slice `cache`, keyed by the `Filter` object
+    itself — hashable, see its docstring) so two members sharing an
     identical filter don't recompute `nonzero` twice."""
     import torch
 
-    def select(m: int, r0: int, r1: int, rows, cache: dict[str, object]):
+    def select(m: int, r0: int, r1: int, rows, cache: dict[object, object]):
         s = specs[m]
         if s.filter is None:
             return rows, None
-        fk = spec_filter_key[m]
-        if fk not in cache:
-            local_np = np.nonzero(keeps[fk][r0:r1])[0]
-            cache[fk] = torch.from_numpy(local_np).to(device, non_blocking=True)
-        local_idx = cache[fk]
+        if s.filter not in cache:
+            local_np = np.nonzero(keeps[s.filter][r0:r1])[0]
+            cache[s.filter] = torch.from_numpy(local_np).to(device, non_blocking=True)
+        local_idx = cache[s.filter]
         if local_idx.numel() == 0:
             return None, None
         return rows[local_idx], local_idx
@@ -693,7 +692,7 @@ def _path_b_select(m: int, r0: int, r1: int, rows, cache: dict[str, object]):
 
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
-    keeps: dict[str, np.ndarray | None], spec_filter_key: list[str], batch_size: int | None,
+    keeps: dict[Filter | None, np.ndarray | None], batch_size: int | None,
     gidx: int, device: str,
 ) -> float:
     """Path A: every spec of this vector_type — filtered or not — shares one
@@ -703,7 +702,7 @@ def _process_shared_batch(
     return _process_batch_group(
         batch, member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
         batch_size, gidx, device, orig_rows=None,
-        select=_path_a_select(specs, spec_filter_key, keeps, device),
+        select=_path_a_select(specs, keeps, device),
     )
 
 
@@ -855,10 +854,8 @@ def run_compute(
     # batch`); otherwise specs are grouped by exact filter equality instead
     # (Path B, `_process_filter_group`) since there's no full-file computation
     # to derive from. See this module's docstring for the full rationale.
-    spec_filter_key = [filter_key(s.filter) for s in specs]
-    distinct_filters: dict[str, Filter | None] = {}
-    for s, fk in zip(specs, spec_filter_key):
-        distinct_filters.setdefault(fk, s.filter)
+    spec_filter = [s.filter for s in specs]
+    distinct_filters: list[Filter | None] = list(dict.fromkeys(spec_filter))
 
     vt_spec_idxs: dict[str, list[int]] = {vt: [] for vt in vts_needed}
     for i, s in enumerate(specs):
@@ -878,7 +875,7 @@ def run_compute(
                 vt, len(idxs), path_a_batch_size[vt],
             )
         else:
-            path_b_groups[vt] = _build_filter_groups(idxs, specs, spec_filter_key, vt_configured_batch[vt], vt)
+            path_b_groups[vt] = _build_filter_groups(idxs, specs, spec_filter, vt_configured_batch[vt], vt)
             logger.info(
                 "vector_type=%r: no unfiltered search — %d distinct filter group(s), "
                 "each compacting its own rows independently",
@@ -943,11 +940,12 @@ def run_compute(
             # None when id_column isn't configured. Same row order as `arrs`.
             ids = table[id_col].combine_chunks() if id_col else None
             t1 = time.perf_counter()
-            # One mask per DISTINCT filter (`None` for the unfiltered key),
+            # One mask per DISTINCT filter (`None` for the unfiltered entry),
             # evaluated against the same table — timed separately from the read
-            # above (CPU-vectorized work, not IO wait). Keyed by `filter_key` so
-            # two specs sharing an identical filter never evaluate it twice.
-            keeps = {fk: evaluate(f, table) if f is not None else None for fk, f in distinct_filters.items()}
+            # above (CPU-vectorized work, not IO wait). Keyed by the `Filter`
+            # object itself (hashable — see its docstring) so two specs
+            # sharing an identical filter never evaluate it twice.
+            keeps = {f: evaluate(f, table) if f is not None else None for f in distinct_filters}
             t2 = time.perf_counter()
             fq.put((gidx, arrs, ids, keeps, t1 - t0, t2 - t1))
 
@@ -997,7 +995,7 @@ def run_compute(
             #
             # corpus_ids is kept only for files where SOME spec could still
             # resolve a hit — i.e. it's unfiltered, or its filter keeps at least
-            # one row in this file. `keeps[fk]` is a mask over this file's rows
+            # one row in this file. `keeps[f]` is a mask over this file's rows
             # independent of vector_type (filters read payload columns, not the
             # vector columns), so checking it here — before any vector-type-
             # specific compaction below — is exact, not an approximation: a
@@ -1015,11 +1013,11 @@ def run_compute(
                 if has_baseline[vt]:
                     gpu_secs += _process_shared_batch(
                         b, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
-                        keeps, spec_filter_key, path_a_batch_size[vt], gidx, device,
+                        keeps, path_a_batch_size[vt], gidx, device,
                     )
                 else:
                     for group in path_b_groups[vt]:
-                        keep = keeps[group.key]
+                        keep = keeps[group.filter]
                         gpu_secs += _process_filter_group(
                             b, group, specs, spec_Q, spec_top_scores, spec_top_enc, keep, gidx, device,
                         )

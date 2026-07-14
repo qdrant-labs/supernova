@@ -19,7 +19,7 @@ from nova_bf.config import Filter, FilterCondition
 def _condition_mask(cond: FilterCondition, table: pa.Table) -> np.ndarray:
     col = table[cond.field]
     if cond.match is not None:
-        values = cond.match if isinstance(cond.match, list) else [cond.match]
+        values = cond.match if isinstance(cond.match, tuple) else [cond.match]
         mask = pc.is_in(col, value_set=pa.array(values))
     else:
         r = cond.range
