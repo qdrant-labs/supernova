@@ -232,3 +232,33 @@ def test_bad_filter_field_raises_instead_of_hanging(ds):
     filt = Filter(must=[FilterCondition(field="no_such_column", match="eng")])
     with pytest.raises(RuntimeError, match="reader thread failed"):
         _run(ds, batch=None, id_column="id", out_name="filter_bad_field", filt=filt)
+
+
+def test_next_in_order_reorders_scrambled_arrivals():
+    """Regression test: reader threads can finish corpus files in any order,
+    but `_next_in_order` must always hand the consumer files back in a
+    fixed, deterministic order (ascending `gidx`) — otherwise which of
+    several EXACTLY tied candidates wins a spot in the top-K merge varies
+    nondeterministically run to run, even for the identical corpus and
+    queries (see `run_compute`'s consumer loop)."""
+    from nova_bf.compute import _next_in_order
+
+    # Arrives scrambled: 2, 0, 3, 1 — must still be consumable in order 0, 1, 2, 3.
+    arrivals = iter([(2, "b"), (0, "a"), (3, "d"), (1, "c")])
+    pending: dict = {}
+    results = [_next_in_order(g, pending, lambda: next(arrivals)) for g in [0, 1, 2, 3]]
+    assert results == [(0, "a"), (1, "c"), (2, "b"), (3, "d")]
+    assert pending == {}  # every buffered arrival was eventually consumed
+
+
+def test_next_in_order_reraises_from_fetch():
+    """`fetch` raising (e.g. the consumer's `_fetch_or_raise` re-raising a
+    reader thread's forwarded exception) must propagate straight through,
+    not get silently swallowed while waiting for `want_gidx`'s turn."""
+    from nova_bf.compute import _next_in_order
+
+    def fetch():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _next_in_order(0, {}, fetch)

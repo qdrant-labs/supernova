@@ -108,6 +108,27 @@ def filter_corpus_files(
     return kept
 
 
+def _next_in_order(want_gidx: int, pending: dict[int, tuple], fetch) -> tuple:
+    """Returns the `(gidx, ...)` item for `want_gidx`, buffering (in
+    `pending`) any item `fetch()` delivers out of turn until it's needed.
+    `fetch()` returns the next available item in ARRIVAL order, which may
+    not be `want_gidx`'s turn yet — used so items produced by an unordered
+    pool of worker threads can still be consumed in a fixed, deterministic
+    order. `run_compute`'s consumer loop uses this to fold corpus files into
+    the running top-K merge in ascending `gidx` order regardless of which
+    reader thread's file arrives first — the merge is commutative in the
+    SCORES it produces, but not in which of several EXACTLY tied candidates
+    a run picks, so without this, that pick varied nondeterministically run
+    to run for the identical corpus and queries."""
+    if want_gidx in pending:
+        return pending.pop(want_gidx)
+    while True:
+        item = fetch()
+        if item[0] == want_gidx:
+            return item
+        pending[item[0]] = item
+
+
 def _resolve_rank(num_jobs: int | None, job_rank: int | None) -> int | None:
     if num_jobs is None:
         return None
@@ -928,8 +949,12 @@ def run_compute(
 
     # Prefetch corpus files with a POOL of reader threads so many S3 GETs are in
     # flight at once — otherwise the GPU sits idle behind one file's latency at a
-    # time. Order doesn't matter (the top-K merge is commutative). pyarrow releases
-    # the GIL during IO, so threads parallelize.
+    # time. pyarrow releases the GIL during IO, so threads parallelize. Reader
+    # threads may FINISH in any order, but the consumer below folds files into
+    # the running top-K in a FIXED order (ascending `gidx`) regardless of
+    # arrival order — see the comment above the consumer loop for why: the
+    # merge is commutative in the SCORES it produces, but not in which of
+    # several EXACTLY tied candidates a run picks.
     dense_col, sparse_col = cfg.corpus.dense_column, cfg.corpus.sparse_column
     id_col = cfg.corpus.id_column  # None → derive make_point_id(file_key, row) at decode
     # Union of every spec's filter fields — read_cols below stays exactly (and only)
@@ -1025,15 +1050,26 @@ def run_compute(
     bytes_seen = 0  # decoded float32 bytes consumed (~= wire bytes for snappy-float32)
     wall0 = time.perf_counter()
 
+    def _fetch_or_raise() -> tuple:
+        it = fq.get()
+        if isinstance(it, Exception):
+            raise RuntimeError(
+                "a reader thread failed while reading/decoding/filtering a corpus file"
+            ) from it
+        return it
+
+    # `mine` already lists this worker's files in a fixed, deterministic
+    # order (ascending `gidx`); `_next_in_order` reorders reader threads'
+    # arbitrary-arrival-order output back into that order (bounded by
+    # `io_workers`-many buffered items, since `fq`'s own bound already caps
+    # how far readers can race ahead) — see its docstring for why this
+    # matters for reproducibility, not just correctness.
+    pending: dict[int, tuple] = {}
+
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
-        for _ in range(len(mine)):
+        for want_gidx, _f in mine:
             w0 = time.perf_counter()
-            item = fq.get()
-            if isinstance(item, Exception):
-                raise RuntimeError(
-                    "a reader thread failed while reading/decoding/filtering a corpus file"
-                ) from item
-            gidx, arrs, ids, keeps, rsec, fsec = item
+            gidx, arrs, ids, keeps, rsec, fsec = _next_in_order(want_gidx, pending, _fetch_or_raise)
             io_wait += time.perf_counter() - w0
             read_secs += rsec
             filter_secs += fsec
