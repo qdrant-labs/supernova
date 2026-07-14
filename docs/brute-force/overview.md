@@ -39,6 +39,8 @@ output:
 params:
   io_workers: 16             # concurrent corpus-file reader threads
   io_thread_count: 0         # pyarrow IO-pool size (0 = pyarrow's default ~8)
+  # dense_batch_size: 4096   # bound GPU memory on huge files; omit = whole file at once
+  # sparse_batch_size: 4096  # same, for vector_type: sparse searches
   # merge_batch_size: null   # merge tuning, see Performance & tuning
   # merge_prefetch: false
 
@@ -47,19 +49,21 @@ searches:
     vector_type: dense       # dense | sparse
     metric: cosine           # cosine | dot | euclidean (euclidean unsupported with vector_type: sparse)
     k: 1000
-    # corpus_batch_size: 4096  # bound GPU memory on huge files; omit = whole file at once
     # filter: {...}            # see "Filtering the corpus" below
 ```
 
-`${VAR}` / `${VAR:-default}` references are expanded from the environment, same as every other tool. `params` holds only run-level IO/merge tuning — every search-specific setting (`k`, `metric`, `vector_type`, `corpus_batch_size`, `filter`) lives on its `searches[]` entry.
+`${VAR}` / `${VAR:-default}` references are expanded from the environment, same as every other tool. `params` holds run-level IO/merge/GPU-batching tuning; every search-specific setting (`k`, `metric`, `vector_type`, `filter`) lives on its `searches[]` entry. GPU batch size (`dense_batch_size`/`sparse_batch_size`) lives on `params`, not per search — see [One search, or several in one pass](#one-search-or-several-in-one-pass) for why.
 
 ### One search, or several in one pass
 
 A single `compute` run computes every entry in `searches:` — one is the common case, but you can list several **independent** top-K results (e.g. dense-unfiltered, sparse-unfiltered, and a filtered variant of either) and they'll share corpus file IO/decode: each corpus file is read and decoded only **once per vector_type any search needs**, not once per search. This is not a fused hybrid score — each search gets its own ranked list, own `k`/`metric`/`filter`, and own output file; they just cost roughly the price of one corpus scan instead of one scan per search (the read+decode path is what dominates, see [Performance & tuning](#performance--tuning)).
 
-Searches sharing the exact same `vector_type` **and** the exact same `filter` (including two unfiltered searches) share more than just decode: their filter evaluation, row compaction, and GPU transfer / sparse-CSR construction all happen once per shared batch too — only each search's own scoring (by its own `metric`) and top-K accumulation stay independent. So `dense_all` and `dense_eng` above are in different groups (different `filter`), but two searches differing only by `k` or `metric` over the same unfiltered corpus (or the same filter) land in one group and pay for the transfer exactly once between them.
+Per `vector_type`, searches share GPU work one of two ways:
 
-When grouped searches request different `corpus_batch_size` values, the group runs at the **smallest** of the explicit requests (a smaller batch is always safe, just less efficient — never larger than any one member asked for), floored so it never drops below the largest `k` among the group's members (the same "a batch below k gives no memory benefit" rule already applied per search). A group whose resolved batch size differs from what one of its members configured logs an INFO line naming that search and the resolved value, so this is never silent.
+- **If any search of that vector_type is unfiltered**, every search of that vector_type — filtered or not — shares one full-file GPU pass: the transfer/CSR build and each distinct `metric`'s score matrix are computed once per batch, and every search (including filtered ones) reads its top-K straight from those shared columns, masking down to its own filter's surviving rows first if it has one. This is exact, not an approximation — masking a raw score matrix commutes with computing it — so a filtered search's `metric` never needs to match anything else in the run; scoring one more metric on a batch that's already on the GPU is cheap, unlike a second transfer. In the example above, `dense_eng` and `sparse_eng` both ride `dense_all`/`sparse_all`'s pass this way.
+- **Otherwise** (no search of that vector_type is unfiltered), there's no full-file pass to ride, so searches are grouped by exact filter equality instead and each such group compacts its own rows before transfer — same behavior as a single filtered search run alone.
+
+Either way, GPU batch size for a vector_type is one run-level setting (`params.dense_batch_size`/`sparse_batch_size`) — it's not something you tune per search, since every search of a vector_type ends up sharing one GPU pass over the corpus regardless of grouping. What happens when it's set below some search's `k` differs by which of the two cases above applies: in the **shared-pass** case, your configured value is kept as-is (an under-filled batch just costs the larger-`k` search a few extra merge rounds — never a wrong answer, and never a memory bound you didn't ask for, since one unrelated search's large `k` would otherwise silently widen every OTHER search's GPU footprint too); in the **grouped-by-filter** case, each group's own batch size floors at the largest `k` among that GROUP's own (related, identically-filtered) members, same as before — there's no unrelated search sharing the grid to protect against there.
 
 ```yaml
 searches:
@@ -95,9 +99,9 @@ Every entry needs a unique `name` — it's spliced into the output filename (`bf
 
 ### Sparse vectors
 
-Set a search's `vector_type: sparse` to score a `struct<indices: list<uint32>, values: list<float32>>` column instead of the dense one — the same schema `nova embed`'s sparse embedders write and `nova load` reads (default column name `sparse_column`, override via `corpus.sparse_column` / `queries.sparse_column`). Only `metric: dot` and `metric: cosine` are supported (`euclidean` has no real use case for sparse retrieval and is rejected at config load).
+Set a search's `vector_type: sparse` to score a `struct<indices: list<uint32>, values: list<float32>>` column instead of the dense one — the same schema `nova embed`'s sparse embedders write and `nova load` reads (default column name `sparse_embedding`, override via `corpus.sparse_column` / `queries.sparse_column`). Only `metric: dot` and `metric: cosine` are supported (`euclidean` has no real use case for sparse retrieval and is rejected at config load).
 
-Scoring densifies the query set once over its own token vocabulary (a corpus-only token id can never match any query, so dropping it is exact, not approximate) and keeps each corpus batch genuinely sparse (`torch.sparse_csr_tensor`) on the GPU, scored via `sparse @ dense` matmul — `corpus_batch_size` bounds GPU residency the same way it does for dense.
+Scoring densifies the query set once over its own token vocabulary (a corpus-only token id can never match any query, so dropping it is exact, not approximate) and keeps each corpus batch genuinely sparse (`torch.sparse_csr_tensor`) on the GPU, scored via `sparse @ dense` matmul — `params.sparse_batch_size` bounds GPU residency the same way `dense_batch_size` does for dense.
 
 ### Filtering the corpus
 
@@ -182,10 +186,10 @@ The work splits into three layers: **reading** corpus parquet from S3, **decodin
 | `params.io_thread_count` | `0` (≈8) | **The real S3 fetch concurrency.** pyarrow funnels every read through one global IO pool, so this — not `io_workers` — is what raises throughput once decode keeps up. Try `64`–`128` on a fat NIC. |
 | `params.io_workers` | `16` | Concurrent corpus-file reader threads (each holds ~one file in RAM, so `io_workers × file_size` must fit host memory — **double that if any run mixes `vector_type: dense` and `vector_type: sparse` searches**, since each in-flight file then decodes both columns at once). Useful, but caps at `io_thread_count` — raising it alone won't lift throughput. |
 | instance vCPUs | — | Parquet decode is CPU-bound and scales ~linearly with cores. The brute-force matmul is light, so **pick the instance for vCPUs, not the GPU** (e.g. a single-GPU, high-core `g5.16xlarge`). |
-| a search's `corpus_batch_size` | `None` | The per-file score matrix is `queries × rows`. Big files (or very large query sets) can OOM the GPU; set this to score in row-batches. Values below that search's `k` are raised to `k`. Omit for the whole-file (fastest) path. **Searches sharing a `vector_type`+`filter` resolve to one shared batch size** — the smallest explicit request among them, still floored at the largest `k` in the group (see [One search, or several in one pass](#one-search-or-several-in-one-pass)). |
+| `params.dense_batch_size` / `sparse_batch_size` | `None` | The per-file score matrix is `queries × rows`. Big files (or very large query sets) can OOM the GPU; set this to score in row-batches. Omit for the whole-file (fastest) path. One value per vector_type, run-wide — every search of a vector_type ends up sharing one GPU pass over the corpus (see [One search, or several in one pass](#one-search-or-several-in-one-pass)). When some search of that vector_type is unfiltered (the shared-pass case), your configured value is always kept as-is — it's a memory bound, so it's never silently raised, even if some search's `k` exceeds it (that search just takes a few extra merge rounds). Otherwise, each filter group's own batch size floors at the largest `k` among that group's own members. |
 | region | — | `nova bf` is S3-read-heavy — run workers in the **same region** as the corpus bucket to avoid the cross-region bandwidth cap and egress. |
 
-A good starting point for a large corpus on AWS: a high-vCPU single-GPU instance, `io_thread_count: 128`, `io_workers: 32–64`. Raising query count shifts the balance toward the GPU — at that point batch the matmul (`corpus_batch_size`) and add GPUs/workers.
+A good starting point for a large corpus on AWS: a high-vCPU single-GPU instance, `io_thread_count: 128`, `io_workers: 32–64`. Raising query count shifts the balance toward the GPU — at that point batch the matmul (`params.dense_batch_size`/`sparse_batch_size`) and add GPUs/workers.
 
 > **Reading fewer bytes** helps every layer: `compute` projects only the vector column(s) any search needs (plus `id_column`/`filter` fields when configured), so the heavy work is unavoidable corpus data. Storing the dense column as fp16 (half the bytes to transfer *and* decode) is the next lever if the read path is still the bottleneck.
 

@@ -2,9 +2,9 @@
 
 Exercises the GPU topk path on CPU (small synthetic corpus + queries), covering
 the two pieces most prone to silent corruption:
-  - corpus_batch_size tiling: must yield the *same* top-K as scoring the whole
-    file at once (the `gidx * MAX_ROWS_PER_FILE + row` encoding uses file-local
-    row offsets, so an off-by-a-batch bug would scramble hit ids), and
+  - params.dense_batch_size tiling: must yield the *same* top-K as scoring the
+    whole file at once (the `gidx * MAX_ROWS_PER_FILE + row` encoding uses
+    file-local row offsets, so an off-by-a-batch bug would scramble hit ids), and
   - id resolution: hit_ids come from `corpus.id_column` when set (a real,
     pre-existing identifier) and from `make_point_id(file_key, row)` otherwise.
 """
@@ -106,8 +106,8 @@ def _run(ds, *, batch, id_column, out_name, filt=None):
         corpus=CorpusConfig(path=ds["cdir"], dense_column="dense_embedding", id_column=id_column),
         queries=QueriesConfig(path=ds["qpath"], dense_column="dense_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(io_workers=2),
-        searches=[SearchSpec(name="test", k=K, metric="dot", corpus_batch_size=batch, filter=filt)],
+        params=ParamsConfig(io_workers=2, dense_batch_size=batch),
+        searches=[SearchSpec(name="test", k=K, metric="dot", filter=filt)],
     )
     t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     return {q: list(zip(hi, hs)) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
@@ -194,8 +194,8 @@ def test_filter_range_condition(ds):
 @pytest.mark.parametrize("batch", [None, K])
 def test_filter_preserves_row_numbers_under_batching(ds, batch):
     """A filter must resolve the same (correct) point ids whether or not
-    corpus_batch_size tiles the file — the bug this guards against is filtering
-    renumbering rows instead of keeping their true file-row number."""
+    params.dense_batch_size tiles the file — the bug this guards against is
+    filtering renumbering rows instead of keeping their true file-row number."""
     filt = Filter(must=[FilterCondition(field="language", match="eng")])
     res = _run(ds, batch=batch, id_column=None, out_name=f"filter_defid_{batch}", filt=filt)
     eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
@@ -220,3 +220,45 @@ def test_filter_timing_is_reported_only_when_filtering(ds, caplog):
         _run(ds, batch=None, id_column="id", out_name="filter_timing_off")
     assert not any("filter eval" in r.message for r in caplog.records)
     assert any("filter_s=0.0" in r.message for r in caplog.records)  # stable bf-bench schema
+
+
+def test_bad_filter_field_raises_instead_of_hanging(ds):
+    """A filter referencing a column absent from the corpus schema makes
+    `evaluate()` raise inside a reader thread — this must surface as a clear
+    exception in the main thread, not hang forever (an uncaught exception in
+    a daemon thread silently kills it, and the consumer's fixed-count
+    `fq.get()` loop would otherwise block waiting for an item that never
+    arrives)."""
+    filt = Filter(must=[FilterCondition(field="no_such_column", match="eng")])
+    with pytest.raises(RuntimeError, match="reader thread failed"):
+        _run(ds, batch=None, id_column="id", out_name="filter_bad_field", filt=filt)
+
+
+def test_next_in_order_reorders_scrambled_arrivals():
+    """Regression test: reader threads can finish corpus files in any order,
+    but `_next_in_order` must always hand the consumer files back in a
+    fixed, deterministic order (ascending `gidx`) — otherwise which of
+    several EXACTLY tied candidates wins a spot in the top-K merge varies
+    nondeterministically run to run, even for the identical corpus and
+    queries (see `run_compute`'s consumer loop)."""
+    from nova_bf.compute import _next_in_order
+
+    # Arrives scrambled: 2, 0, 3, 1 — must still be consumable in order 0, 1, 2, 3.
+    arrivals = iter([(2, "b"), (0, "a"), (3, "d"), (1, "c")])
+    pending: dict = {}
+    results = [_next_in_order(g, pending, lambda: next(arrivals)) for g in [0, 1, 2, 3]]
+    assert results == [(0, "a"), (1, "c"), (2, "b"), (3, "d")]
+    assert pending == {}  # every buffered arrival was eventually consumed
+
+
+def test_next_in_order_reraises_from_fetch():
+    """`fetch` raising (e.g. the consumer's `_fetch_or_raise` re-raising a
+    reader thread's forwarded exception) must propagate straight through,
+    not get silently swallowed while waiting for `want_gidx`'s turn."""
+    from nova_bf.compute import _next_in_order
+
+    def fetch():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _next_in_order(0, {}, fetch)

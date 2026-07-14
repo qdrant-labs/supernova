@@ -180,3 +180,25 @@ def test_merge_prefetch_shares_one_pool_across_searches(scenario, monkeypatch, t
             ref_ids, ref_scores = reference[q]
             assert got[q][0] == ref_ids
             assert np.allclose(got[q][1], ref_scores)
+
+
+def test_mismatched_partial_counts_across_searches_raises(scenario, tmp_path):
+    """Every search in one `compute` run is written by the same set of ranks,
+    so a mismatched partial count between two searches means some rank died
+    partway through writing its per-search outputs — this must raise loudly
+    at merge time instead of silently merging the short search from fewer
+    ranks than it actually had."""
+    cfg, qids, reference = scenario
+
+    second = SearchSpec(name="test2", k=K)
+    cfg.searches = [*cfg.searches, second]
+    src_dir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
+    dst_dir = tmp_path / "out" / partial_dir(cfg, second)
+    dst_dir.mkdir(parents=True)
+    # Copy only W-1 of the W partials — simulates a rank that wrote the first
+    # search's partial but died before writing this second search's.
+    for f in sorted(src_dir.iterdir())[:-1]:
+        (dst_dir / f.name).write_bytes(f.read_bytes())
+
+    with pytest.raises(RuntimeError, match="mismatched partial counts"):
+        run_merge(cfg)

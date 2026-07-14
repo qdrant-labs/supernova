@@ -18,7 +18,7 @@ from typing import Literal
 
 import yaml
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import os
 
@@ -116,6 +116,25 @@ class ParamsConfig(BaseModel):
     # pool-bound; if it stays flat you're network-bound. Applied via
     # pa.set_io_thread_count() once at startup.
     io_thread_count: int = 0
+    # Bounds the per-file score matrix (`queries × rows`) for dense/sparse
+    # searches respectively — a big file (or large query set) can otherwise
+    # OOM the GPU; set this to score in row-batches instead of the whole file
+    # at once. None (default) = whole file in one matmul. Lives here (one
+    # value per vector_type, run-wide) rather than per-search: every search of
+    # a given vector_type ends up sharing one GPU pass over the corpus anyway
+    # (see compute.py), so a per-search value would just be resolved down to
+    # this same shared number regardless — this makes that explicit instead of
+    # implicit. Values below a search's own `k` are raised to `k` (a batch
+    # smaller than `k` can't fill that search's top-K and gives no memory
+    # benefit).
+    # `gt=0`: a batch size of 0 or negative isn't just useless, it's actively
+    # wrong — `range(0, n_rows, step)` with a non-positive `step` is EMPTY, so
+    # every file's batch loop would silently skip all rows, no exception, no
+    # partial results, just an empty top-K for every query. Reject it here at
+    # config-load time (the system boundary) rather than let it manifest as a
+    # silent all-empty run downstream.
+    dense_batch_size: int | None = Field(default=None, gt=0)
+    sparse_batch_size: int | None = Field(default=None, gt=0)
     # `merge` reduces the W per-rank partials in row-batches of this many queries,
     # streaming the result to disk so the full output never sits in RAM (that's what
     # let the old merge OOM at 1M queries). Peak host memory is ~(this × W × k)
@@ -142,9 +161,16 @@ MatchValue = str | int | float | bool
 
 
 class RangeCondition(BaseModel):
-    """Numeric bounds, combinable like Qdrant's Range (e.g. `gte` + `lt` together)."""
+    """Numeric bounds, combinable like Qdrant's Range (e.g. `gte` + `lt` together).
 
-    model_config = ConfigDict(extra="forbid")
+    Frozen: makes this — and, transitively, `FilterCondition`/`Filter`, which
+    contain it — hashable via pydantic's auto-generated `__hash__` (a tuple of
+    field values), so a `Filter` can be used directly as a dict key wherever
+    specs need grouping/deduping by identical filter (see compute.py). Also
+    enforces the invariant that a `Filter` is never mutated after grouping,
+    previously just assumed."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     gt: float | None = None
     gte: float | None = None
@@ -165,13 +191,17 @@ class FilterCondition(BaseModel):
     MatchAny). Exactly one of `match`/`range` must be set.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     # The corpus column this condition reads and matches against — this is the
     # only place a filtered field is named; nothing else needs to declare it,
     # so `compute` reads exactly (and only) the columns the filter references.
     field: str
-    match: MatchValue | list[MatchValue] | None = None
+    # tuple, not list: lists aren't hashable, and this needs to be for Filter
+    # (which contains this) to be usable as a dict key — see RangeCondition's
+    # docstring. Pydantic coerces a YAML/list literal (`match: [1, 2, 3]`)
+    # into a tuple automatically at validation time.
+    match: MatchValue | tuple[MatchValue, ...] | None = None
     range: RangeCondition | None = None
 
     @model_validator(mode="after")
@@ -189,26 +219,46 @@ class Filter(BaseModel):
     Restricts which corpus points are eligible neighbors for every query in the
     run — it does not touch queries themselves, same as a Qdrant search filter.
     `must` = AND, `should` = OR-at-least-one, `must_not` = AND-NOT.
+
+    Frozen and hashable (see `RangeCondition`'s docstring) — usable directly
+    as a dict key wherever specs need grouping/deduping by identical filter
+    (see compute.py's `spec_filter`/`FilterGroup.filter`/`keeps`), via
+    pydantic's own `__eq__`/`__hash__`, with no separate canonicalization
+    scheme needed: two `Filter`s are "the same" iff Python's own `==` says so,
+    which for `int`/`float`/`nan`/`inf` `match` values already has exactly the
+    right semantics (`5 == 5.0`, no precision loss for large ints, `nan`
+    never equal to itself, `inf`/`-inf` equal to themselves by sign).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    must: list[FilterCondition] = []
-    should: list[FilterCondition] = []
-    must_not: list[FilterCondition] = []
+    # The one place the three condition-group names are listed — `fields()`
+    # walks them via this, not its own hardcoded tuple, so a future group
+    # added here can't be missed by `fields()`.
+    _CONDITION_GROUPS = ("must", "should", "must_not")
+
+    # tuple, not list: needed for this model to be hashable (see
+    # RangeCondition's docstring). Pydantic coerces a YAML/list literal
+    # (`must: [...]`) into a tuple automatically at validation time.
+    must: tuple[FilterCondition, ...] = ()
+    should: tuple[FilterCondition, ...] = ()
+    must_not: tuple[FilterCondition, ...] = ()
 
     def fields(self) -> set[str]:
-        return {c.field for group in (self.must, self.should, self.must_not) for c in group}
+        return {
+            c.field for group in self._CONDITION_GROUPS for c in getattr(self, group)
+        }
 
 
 class SearchSpec(BaseModel):
     """One independent top-K search to compute in a `nova-bf compute` run —
-    its own vector_type, metric, k, corpus_batch_size and (optional) filter,
-    scored and top-K'd independently of every other spec in
-    `BruteForceConfig.searches` (NOT fused into one hybrid score). Multiple
-    specs sharing a run still share corpus file IO/decode (see compute.py) —
-    that sharing is the whole point of listing several here instead of
-    running `nova-bf compute` once per spec.
+    its own vector_type, metric, k, and (optional) filter, scored and top-K'd
+    independently of every other spec in `BruteForceConfig.searches` (NOT
+    fused into one hybrid score). Multiple specs sharing a run still share
+    corpus file IO/decode (see compute.py) — that sharing is the whole point
+    of listing several here instead of running `nova-bf compute` once per
+    spec. GPU batching (`params.dense_batch_size`/`sparse_batch_size`) is a
+    run-level knob, not a per-search one — see `ParamsConfig`.
 
     `name` becomes part of the output filename (see `nova_bf.results`), so
     every spec in a run needs a distinct one.
@@ -220,7 +270,6 @@ class SearchSpec(BaseModel):
     k: int = 1000
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
     vector_type: Literal["dense", "sparse"] = "dense"
-    corpus_batch_size: int | None = None
     filter: Filter | None = None
 
     @model_validator(mode="after")
