@@ -177,6 +177,172 @@ def test_multi_spec_matches_independent_ground_truth(ds):
             assert got[q] == expected[q], f"search={name} query={q}"
 
 
+def test_coalesced_batches_match_independent_ground_truth(ds, monkeypatch):
+    """Idea #2: when `has_baseline` is False and every filter sharing a vt is
+    uniform (no per-query filter), small per-file post-compaction batches get
+    coalesced across files into fewer, larger `_process_shared_batch` calls
+    (see `coalesce_eligible_vts`/`_flush_coalesce_group`) instead of one call
+    per file. `ds`'s 3 corpus files (`SIZES = [5, 7, 4]`) have per-file "eng"
+    counts of [3, 3, 2] (verified directly against the fixture's own
+    generation logic); `dense_batch_size=5` means file0's own 3 eng rows
+    alone don't cross the threshold, but file0+file1 together (3+3=6) do —
+    forcing a flush that genuinely SPANS TWO FILES, not just multiple slices
+    within one file (a batch_size small enough to flush after every single
+    file would exercise `_flush_coalesce_group` but never actually combine
+    more than one file, missing the interesting new case). Both specs share
+    the SAME `Filter` object, so `vt_union_filters["dense"]` has exactly one
+    distinct filter (the simplest coalescing case: every row in a flushed
+    group trivially satisfies it)."""
+    eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
+    specs = [
+        SearchSpec(name="dense_eng_a", vector_type="dense", metric="dot", k=2, filter=eng_filter),
+        SearchSpec(name="dense_eng_b", vector_type="dense", metric="dot", k=3, filter=eng_filter),
+    ]
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "coalesce_single_filter_out")),
+        params=ParamsConfig(dense_batch_size=5),
+        searches=specs,
+    )
+
+    # Prove a flush genuinely spans MULTIPLE files, not just trust the
+    # per-file eng-count arithmetic above — wrap _concat_dense_batches (only
+    # ever called by _flush_coalesce_group) to record how many files' worth
+    # of batches each flush actually combined.
+    flush_sizes: list[int] = []
+    real_concat = compute_mod._concat_dense_batches
+
+    def _spy_concat(batches):
+        flush_sizes.append(len(batches))
+        return real_concat(batches)
+
+    monkeypatch.setattr(compute_mod, "_concat_dense_batches", _spy_concat)
+
+    paths = run_compute(cfg)
+    assert flush_sizes, "coalescing never flushed at all — test isn't exercising idea #2"
+    assert max(flush_sizes) >= 2, (
+        f"no flush combined more than one file (flush_sizes={flush_sizes}) — "
+        "test isn't exercising genuine cross-file coalescing"
+    )
+
+    eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
+    expectations = {
+        "dense_eng_a": ds["ground_truth"]("dense", 2, allowed=eng_globals),
+        "dense_eng_b": ds["ground_truth"]("dense", 3, allowed=eng_globals),
+    }
+    for name, expected in expectations.items():
+        t = pq.read_table(paths[name]).to_pydict()
+        got = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
+        for q in ds["qids"]:
+            assert got[q] == expected[q], f"search={name} query={q}"
+
+
+def test_coalesced_sparse_batches_match_independent_ground_truth(ds, monkeypatch):
+    """Same as `test_coalesced_batches_match_independent_ground_truth` but
+    for `vector_type="sparse"` — exercises `_concat_sparse_batches`'s CSR
+    row_offsets shift-and-concatenate arithmetic specifically (dense
+    coalescing only needs a plain `np.concatenate`; sparse's offsets are
+    cumulative nnz counts that restart from 0 per file, the one part of
+    idea #2 genuinely at risk of an off-by-one). Same per-file eng counts
+    ([3, 3, 2]) and `sparse_batch_size=5` reasoning as the dense version."""
+    eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
+    specs = [
+        SearchSpec(name="sparse_eng_a", vector_type="sparse", metric="dot", k=2, filter=eng_filter),
+        SearchSpec(name="sparse_eng_b", vector_type="sparse", metric="dot", k=3, filter=eng_filter),
+    ]
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "coalesce_sparse_out")),
+        params=ParamsConfig(sparse_batch_size=5),
+        searches=specs,
+    )
+
+    flush_sizes: list[int] = []
+    real_concat = compute_mod._concat_sparse_batches
+
+    def _spy_concat(batches):
+        flush_sizes.append(len(batches))
+        return real_concat(batches)
+
+    monkeypatch.setattr(compute_mod, "_concat_sparse_batches", _spy_concat)
+
+    paths = run_compute(cfg)
+    assert flush_sizes, "coalescing never flushed at all — test isn't exercising idea #2"
+    assert max(flush_sizes) >= 2, (
+        f"no flush combined more than one file (flush_sizes={flush_sizes}) — "
+        "test isn't exercising genuine cross-file coalescing"
+    )
+
+    eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
+    expectations = {
+        "sparse_eng_a": ds["ground_truth"]("sparse", 2, allowed=eng_globals),
+        "sparse_eng_b": ds["ground_truth"]("sparse", 3, allowed=eng_globals),
+    }
+    for name, expected in expectations.items():
+        t = pq.read_table(paths[name]).to_pydict()
+        got = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
+        for q in ds["qids"]:
+            assert got[q] == expected[q], f"search={name} query={q}"
+
+
+def test_coalesced_batches_with_multiple_distinct_filters(ds, monkeypatch):
+    """Idea #2, the multi-filter-union coalescing case: two DIFFERENT
+    uniform filters (`language == "eng"` / `language == "fra"`, a strict
+    partition of every row) share the "dense" vt with no unfiltered sibling,
+    so `vt_union_filters["dense"]` has two distinct filters — coalescing
+    must rebuild EACH one's own keep-mask across the coalesced group
+    correctly (`_flush_coalesce_group`'s `combined_keeps`), not just assume
+    every row satisfies whichever filter happens to be checked. Since
+    eng+fra partitions every row, the union-compacted "batch" per file is
+    the WHOLE file (`SIZES = [5, 7, 4]`); `dense_batch_size=10` means
+    file0's 5 rows alone don't cross the threshold, but file0+file1
+    together (5+7=12) do — a genuine two-file flush, same reasoning as
+    `test_coalesced_batches_match_independent_ground_truth`."""
+    eng_filter = Filter(must=[FilterCondition(field="language", match="eng")])
+    fra_filter = Filter(must=[FilterCondition(field="language", match="fra")])
+    specs = [
+        SearchSpec(name="dense_eng", vector_type="dense", metric="dot", k=2, filter=eng_filter),
+        SearchSpec(name="dense_fra", vector_type="dense", metric="dot", k=2, filter=fra_filter),
+    ]
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=_out(ds, "coalesce_multi_filter_out")),
+        params=ParamsConfig(dense_batch_size=10),
+        searches=specs,
+    )
+
+    flush_sizes: list[int] = []
+    real_concat = compute_mod._concat_dense_batches
+
+    def _spy_concat(batches):
+        flush_sizes.append(len(batches))
+        return real_concat(batches)
+
+    monkeypatch.setattr(compute_mod, "_concat_dense_batches", _spy_concat)
+
+    paths = run_compute(cfg)
+    assert flush_sizes, "coalescing never flushed at all — test isn't exercising idea #2"
+    assert max(flush_sizes) >= 2, (
+        f"no flush combined more than one file (flush_sizes={flush_sizes}) — "
+        "test isn't exercising genuine cross-file coalescing"
+    )
+
+    eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
+    fra_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "fra"]
+    expectations = {
+        "dense_eng": ds["ground_truth"]("dense", 2, allowed=eng_globals),
+        "dense_fra": ds["ground_truth"]("dense", 2, allowed=fra_globals),
+    }
+    for name, expected in expectations.items():
+        t = pq.read_table(paths[name]).to_pydict()
+        got = {q: hi for q, hi in zip(t["query_id"], t["hit_ids"])}
+        for q in ds["qids"]:
+            assert got[q] == expected[q], f"search={name} query={q}"
+
+
 def test_grouped_matches_ungrouped_per_search(ds):
     """The core regression guard for shared-batch processing: running several
     searches together must produce results BIT-IDENTICAL to running each of
