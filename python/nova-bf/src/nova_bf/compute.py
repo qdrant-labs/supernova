@@ -590,6 +590,12 @@ class SparseCorpusBatch:
         return SparseBatchSlice(Cb, row_norms)
 
 
+# Per-chunk byte budget for the dense query-indicator temp in
+# `SparseBatchSlice.score()` — bounds the largest single allocation of the
+# no-overlap pass regardless of query count.
+_NO_OVERLAP_CHUNK_BYTES = 512 * 1024**2
+
+
 @dataclass
 class SparseBatchSlice:
     """One on-device slice of a sparse corpus batch.
@@ -611,7 +617,13 @@ class SparseBatchSlice:
     overlapping dimensions that cancel, and that row is a real candidate.
     The indicator matmul reuses `Cb`'s own index tensors (only the values
     are swapped for ones) and is computed once per slice, shared across
-    every metric/spec scoring it."""
+    every metric/spec scoring it.
+
+    The query-side indicator `(Q != 0).to(Q.dtype)` is materialized in
+    row-chunks (`_NO_OVERLAP_CHUNK_BYTES` per chunk), never whole: at 100k
+    queries that full-size float temp alone OOM'd a 24 GB A10G. Chunking
+    changes peak memory only — each output cell reduces over the same vocab
+    axis either way, so the mask is bit-identical."""
 
     Cb: object  # torch.Tensor, sparse CSR (n_rows, vocab)
     row_norms: object  # torch.Tensor | None
@@ -630,7 +642,13 @@ class SparseBatchSlice:
                 torch.ones_like(self.Cb.values()),
                 size=self.Cb.shape, check_invariants=False,
             )
-            self._no_overlap = torch.matmul(indicator, (Q != 0).to(Q.dtype).T).T == 0
+            n_q, vocab = Q.shape
+            step = max(1, _NO_OVERLAP_CHUNK_BYTES // max(1, vocab * Q.element_size()))
+            no_overlap = torch.empty((n_q, self.n_rows), dtype=torch.bool, device=Q.device)
+            for i in range(0, n_q, step):
+                q_ind = (Q[i : i + step] != 0).to(Q.dtype)
+                no_overlap[i : i + step] = torch.matmul(indicator, q_ind.T).T == 0
+            self._no_overlap = no_overlap
         raw = _sparse_scores(Q, self.Cb)
         if metric == "cosine":
             raw = raw / self.row_norms.clamp_min(1e-12)[None, :]

@@ -195,6 +195,23 @@ def test_tiling_is_invariant(ds, id_column, metric):
         assert np.allclose(sc_whole, sc_tiled, atol=1e-3)
 
 
+@pytest.mark.parametrize("chunk_bytes", [1, 144])  # step=1; step=3 (ragged: 3 ∤ 4 queries)
+@pytest.mark.parametrize("metric", ["dot", "cosine"])
+def test_no_overlap_chunking_is_invariant(ds, metric, chunk_bytes, monkeypatch):
+    """`score()` materializes the query-side no-overlap indicator in row
+    chunks (`_NO_OVERLAP_CHUNK_BYTES` — the memory fix for 100k-query runs
+    that OOM'd a 24 GB A10G on the full-size float temp). Forcing tiny
+    chunks, including a chunk size that doesn't divide the query count,
+    must reproduce the default run bit-for-bit: chunking only bounds the
+    temp's size, each output cell reduces over the same vocab axis."""
+    import nova_bf.compute as compute_mod
+
+    whole = _run(ds, metric=metric, batch=None, id_column=None, out_name=f"chunk_whole_{metric}_{chunk_bytes}")
+    monkeypatch.setattr(compute_mod, "_NO_OVERLAP_CHUNK_BYTES", chunk_bytes)
+    chunked = _run(ds, metric=metric, batch=None, id_column=None, out_name=f"chunk_tiny_{metric}_{chunk_bytes}")
+    assert chunked == whole
+
+
 @pytest.mark.parametrize("batch", [None, K])
 def test_id_column_uses_raw_ids(ds, batch):
     res = _run(ds, metric="dot", batch=batch, id_column="id", out_name=f"idcol_{batch}")
