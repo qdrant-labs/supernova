@@ -1452,7 +1452,7 @@ def run_compute(
     # Per vector_type: does any spec have no filter (or an explicit-but-empty
     # one — see `_is_unfiltered`) OR a per-query filter (see `_is_per_query` —
     # it has no single row-subset to offer, since different queries need
-    # different rows)? If so every spec of that vector_type shares the whole
+    # different rows)? If so, every spec of that vector_type shares the whole
     # file, uncompacted (`has_baseline`); otherwise every spec has a uniform
     # active filter, so the shared grid is instead the UNION of those
     # filters' surviving rows (`_union_keep`, computed fresh per file below).
@@ -1527,7 +1527,7 @@ def run_compute(
     # only these need the per-file row-level union computed at all (Front B).
     filters_needing_row_union: set[Filter] = {f for fs in vt_union_filters.values() for f in fs}
 
-    # Idea #2 (cross-file batch coalescing): when a vt's union filters are
+    # Cross-file batch coalescing: when a vt's union filters are
     # ALL uniform (none per-query) and a real batch_size is configured,
     # small per-file post-compaction batches (selective filters -> few
     # surviving rows/file) get coalesced across several files into one
@@ -1797,7 +1797,7 @@ def run_compute(
     # queue's own bound caps nothing on its own.
     pending: dict[int, tuple] = {}
 
-    # Idea #2: per-vt accumulation buffer for coalescing several files'
+    # Per-vt accumulation buffer for coalescing several files'
     # (already union-compacted) batches into one larger `_process_shared_
     # batch` call — see `coalesce_eligible_vts` above. Each buffered entry
     # is `(gidx, batch, orig_rows, keeps-restricted-to-this-vt's-own-
