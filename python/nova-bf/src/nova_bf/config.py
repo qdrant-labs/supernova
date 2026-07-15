@@ -103,8 +103,7 @@ class ParamsConfig(BaseModel):
     # (default ~8). So raising io_workers past ~io_thread_count adds NO real S3
     # concurrency — it only piles up read_table calls, inflates per-file latency,
     # and holds more decoded arrays in RAM (each reader ≈ one file; io_workers ×
-    # file_size must fit host memory or the box OOMs — that's what killed the
-    # 96/128-worker runs on a 16 GB g5.xlarge). Keep it modest; the real S3
+    # file_size must fit host memory or the box OOMs. Keep it modest; the real S3
     # concurrency knob is io_thread_count below. When `searches` mixes dense AND
     # sparse specs, each in-flight file's reader decodes BOTH columns at once, so
     # the per-file RAM budget above is (dense_bytes + sparse_bytes), not just one.
@@ -289,6 +288,18 @@ class FilterCondition(BaseModel):
                 "— it needs at least one word"
             )
         return self
+
+    def is_per_query(self) -> bool:
+        """Does this ONE condition vary per query? The per-condition analog of
+        `Filter.is_per_query()` — used to order a group's static conditions
+        before its per-query ones during evaluation (`filters._static_first`),
+        and to tell an exact static leaf from a per-query one in
+        `compute._row_union_from_gpu_leaves`."""
+        return (
+            self.match_from_query is not None
+            or self.range_from_query is not None
+            or self.match_text_from_query is not None
+        )
 
 
 class Filter(BaseModel):

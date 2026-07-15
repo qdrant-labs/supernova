@@ -17,7 +17,7 @@ from nova_bf.config import (
     RangeFromQuery,
     SearchSpec,
 )
-from nova_bf.filters import _literal_then_regex_word_mask, evaluate
+from nova_bf.filters import _literal_then_regex_word_mask, _static_first, evaluate
 
 
 def _table(**cols):
@@ -201,6 +201,25 @@ def test_match_from_query_null_never_matches_on_either_side():
     assert mask[1].tolist() == [False, False, False]
 
 
+def test_match_from_query_list_any_with_nan_query_value():
+    """Regression test: a bare NaN mixed into an otherwise list-valued
+    (per-query MatchAny) column used to crash `_match_any_membership`
+    (`TypeError: 'float' object is not iterable`) — parquet loading turns
+    null list rows into `None`, but a hand-built or pandas-sourced column
+    can carry NaN instead. Must behave exactly like `None`: that query
+    matches nothing."""
+    t = _table(category=["books", "electronics", "toys"])
+    f = Filter(must=[FilterCondition(field="category", match_from_query="allowed")])
+    qv = {"allowed": np.empty(3, dtype=object)}
+    qv["allowed"][:] = [["books", "toys"], np.nan, None]
+    mask = evaluate(f, t, qv)
+    assert mask.tolist() == [
+        [True, False, True],
+        [False, False, False],  # NaN query: matches nothing, same as None
+        [False, False, False],
+    ]
+
+
 def test_range_from_query_single_bound():
     t = _table(cost=[5.0, 15.0, 8.0, 3.0])
     f = Filter(must=[FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget"))])
@@ -371,6 +390,33 @@ def test_should_group_mixes_static_and_per_query_condition():
     # row 0: public -> always eligible. row 1: matches this query's own tenant B.
     # row 2: neither public nor this query's tenant -> excluded.
     assert mask.tolist() == [[True, True, False]]
+
+
+def test_must_group_mixes_static_and_per_query_condition():
+    """Per-query condition listed FIRST in config order: `_static_first`
+    reorders it behind the static one during evaluation, which must not
+    change the result (AND is commutative) — only when the accumulator
+    promotes to 2-D."""
+    t = _table(tenant_id=["A", "B", "A", "C"], status=["active", "active", "archived", "active"])
+    f = Filter(must=[
+        FilterCondition(field="tenant_id", match_from_query="tenant_id"),
+        FilterCondition(field="status", match="active"),
+    ])
+    qv = {"tenant_id": np.array(["A", "B"], dtype=object)}
+    mask = evaluate(f, t, qv)
+    assert mask.shape == (2, 4)
+    # query 0 (tenant A): rows 0/2 are tenant A, but row 2 is archived.
+    # query 1 (tenant B): row 1 is tenant B and active.
+    assert mask.tolist() == [[True, False, False, False], [False, True, False, False]]
+
+
+def test_static_first_orders_static_conditions_before_per_query_stably():
+    static_a = FilterCondition(field="a", match="x")
+    static_b = FilterCondition(field="b", range=RangeCondition(gt=0))
+    per_query_c = FilterCondition(field="c", match_from_query="c_col")
+    per_query_d = FilterCondition(field="d", range_from_query=RangeFromQuery(lt="d_max"))
+    ordered = _static_first([per_query_c, static_a, per_query_d, static_b])
+    assert ordered == [static_a, static_b, per_query_c, per_query_d]
 
 
 def test_range_from_query_requires_a_bound():

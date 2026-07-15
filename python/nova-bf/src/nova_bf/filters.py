@@ -77,9 +77,10 @@ def _match_from_query_mask(
     not_null = ~_corpus_null_mask(table, cond.field)
 
     # Scan every value (not just the first) to decide scalar vs. MatchAny-list
-    # encoding: a column can legitimately mix `None`/NaN (no restriction for
-    # that query) with real lists, and checking only index 0 would misclassify
-    # the whole column whenever THAT one value happens to be null.
+    # encoding: a column can legitimately mix `None`/NaN (that query matches
+    # nothing, same as a null scalar) with real lists, and checking only
+    # index 0 would misclassify the whole column whenever THAT one value
+    # happens to be null.
     if any(isinstance(v, (list, tuple, np.ndarray)) for v in query_vals):
         mask = _match_any_from_query_mask(corpus_vals, query_vals, not_null)
     else:
@@ -90,8 +91,9 @@ def _match_from_query_mask(
 def _match_any_membership(vocab: np.ndarray, list_values) -> np.ndarray:
     """`(len(list_values), len(vocab))` boolean membership matrix: row `i`
     is `True` at column `j` iff `vocab[j]` is a member of `list_values[i]`
-    (a `None` entry in `list_values` means "no restriction" — every column
-    stays `False`, same as an empty list). Shared by
+    (a `None`/NaN entry in `list_values` means that query matches nothing —
+    every column stays `False`, same as an empty list, consistent with a
+    null scalar query value never equaling anything). Shared by
     `_match_any_from_query_mask` (`vocab` = this batch's distinct CORPUS
     values) and `compute.py`'s GPU-native Front A path (`vocab` = the union
     of every query's OWN list values, built once at setup) — same
@@ -100,7 +102,7 @@ def _match_any_membership(vocab: np.ndarray, list_values) -> np.ndarray:
     pos = {v: i for i, v in enumerate(vocab)}
     membership = np.zeros((len(list_values), len(vocab)), dtype=bool)
     for i, values in enumerate(list_values):
-        if values is None:
+        if values is None or (isinstance(values, (float, np.floating)) and values != values):
             continue
         idxs = [pos[v] for v in values if v in pos]
         if idxs:
@@ -287,6 +289,18 @@ def _condition_mask(
     return pc.fill_null(mask, False).to_numpy(zero_copy_only=False)
 
 
+def _static_first(conds) -> list[FilterCondition]:
+    """A group's conditions reordered static-before-per-query (stable within
+    each kind). AND/OR are commutative so the result is bit-identical either
+    way — but combining every static `(rows,)` mask BEFORE the first
+    per-query one keeps the accumulator 1-D as long as possible, instead of
+    an early per-query leaf promoting it to `(n_queries, rows)` and every
+    later static mask paying 2-D broadcast cost. Used by both `evaluate()`
+    below and `compute._gpu_evaluate` (Front A), which mirror each other's
+    combination logic."""
+    return sorted(conds, key=lambda c: c.is_per_query())
+
+
 def evaluate(
     filt: Filter, table: pa.Table, query_values: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
@@ -305,16 +319,16 @@ def evaluate(
     n = len(table)
     keep = np.ones(n, dtype=bool)
 
-    for cond in filt.must:
+    for cond in _static_first(filt.must):
         keep = keep & _condition_mask(cond, table, query_values)
 
     if filt.should:
         any_match = np.zeros(n, dtype=bool)
-        for cond in filt.should:
+        for cond in _static_first(filt.should):
             any_match = any_match | _condition_mask(cond, table, query_values)
         keep = keep & any_match
 
-    for cond in filt.must_not:
+    for cond in _static_first(filt.must_not):
         keep = keep & ~_condition_mask(cond, table, query_values)
 
     return keep

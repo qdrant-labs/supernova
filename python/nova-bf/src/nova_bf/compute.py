@@ -130,7 +130,7 @@ import numpy as np
 from tqdm import tqdm
 
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
-from nova_bf.filters import _condition_mask, _match_any_membership, evaluate
+from nova_bf.filters import _condition_mask, _match_any_membership, _static_first, evaluate
 from nova_bf.ids import make_point_id
 from nova_bf.io import ParquetFile, Store, dense_to_2d, sparse_to_coo_parts
 from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
@@ -215,8 +215,9 @@ def _to_query_array(values: list) -> np.ndarray:
     which is never what a per-query list-of-alternatives means.
 
     Scans every value (not just the first) to decide which encoding applies:
-    a MatchAny column can legitimately have `None` (no restriction) for some
-    query and a real list for another, and checking only `values[0]` would
+    a MatchAny column can legitimately have `None` (that query matches
+    nothing, same as a null scalar) for some query and a real list for
+    another, and checking only `values[0]` would
     misclassify the whole column whenever THAT one row happens to be null —
     `np.array([None, [...], [...]])` raises `ValueError` (inhomogeneous
     shape) rather than producing the object array `filters.py` expects."""
@@ -973,28 +974,37 @@ def _row_union_from_gpu_leaves(
     f: Filter, leaf_arrays: dict[FilterCondition, np.ndarray],
     query_filter_vals: dict[str, np.ndarray], n_rows: int,
 ) -> np.ndarray | None:
-    """`(rows,)` SAFE OVER-APPROXIMATION of "does at least one query's
-    per-query leaf admit this row" for a GPU-eligible per-query filter
-    (Front B — see `run_compute`'s `has_baseline`/`vt_union_filters`), or
-    `None` if no such leaf exists to build one from (caller substitutes
-    all-`True`: no tightening possible, but always correct).
+    """`(rows,)` SAFE OVER-APPROXIMATION of "does at least one query want
+    this row" for a GPU-eligible per-query filter (Front B — see
+    `run_compute`'s `has_baseline`/`vt_union_filters`), or `None` if `f.must`
+    has no leaf at all to build one from (caller substitutes all-`True`: no
+    tightening possible, but always correct).
 
-    Built ONLY from `f.must`'s `match_from_query`/`range_from_query` leaves
-    — deliberately NEVER `should` or `must_not`: a `must` leaf is a
-    NECESSARY condition for the row regardless of anything else in the
-    filter, so whichever query actually wants a row necessarily satisfies
-    THAT query's own version of every one of these leaves — ORing each
-    leaf's "some query's own value admits this row" mask together is
-    therefore provably a superset of the true "some query wants this row"
-    set, however many `must` conditions (per-query or static) there are.
-    `should`/`must_not` don't have this property: a `should` branch's
-    satisfaction doesn't require any ONE specific condition to hold (a row
-    could be admitted via a totally different, possibly static, branch),
-    and a `must_not` leaf's own predicate holding is what EXCLUDES a row,
-    not what admits one — using either here could silently exclude a row
-    some query genuinely wants, so a filter whose only per-query leaf(s)
-    live outside `must` gets no tightening at all here (falls back to
-    all-`True` via the `None` return), never a WRONG one.
+    Built ONLY from `f.must`'s leaves — deliberately NEVER `should` or
+    `must_not`: a `must` leaf is a NECESSARY condition for the row
+    regardless of anything else in the filter, so whichever query actually
+    wants a row necessarily satisfies THAT query's own version of every one
+    of these leaves. That shared witness is what makes ANDing the per-leaf
+    masks together valid: for any row some query `q` wants, `q` itself
+    admits the row via EVERY per-query `must` leaf, so the row is in every
+    leaf's "some query's own value admits this row" mask, hence in their
+    intersection — provably a superset of the true "some query wants this
+    row" set, however many `must` conditions there are (and strictly
+    tighter than ORing the same masks, whenever there's more than one). A
+    STATIC `must` leaf is a necessary condition too, and its exact
+    `(rows,)` mask (already sitting in `leaf_arrays`, built by
+    `_corpus_leaf_array` for `_gpu_cond_mask`) needs no over-approximating
+    at all — it's ANDed in the same way, so a mixed filter like "my own
+    tenant AND status=active" compacts down to only active rows instead of
+    every row any tenant leaf admits. `should`/`must_not` don't have the
+    necessary-condition property: a `should` branch's satisfaction doesn't
+    require any ONE specific condition to hold (a row could be admitted
+    via a totally different, possibly static, branch), and a `must_not`
+    leaf's own predicate holding is what EXCLUDES a row, not what admits
+    one — using either here could silently exclude a row some query
+    genuinely wants, so a filter with no `must` leaves at all gets no
+    tightening here (falls back to all-`True` via the `None` return),
+    never a WRONG one.
 
     `match_from_query`'s test (`arr != -1`) is the same expression whether
     the leaf is scalar or MatchAny: either way, `vocab` (see
@@ -1009,6 +1019,7 @@ def _row_union_from_gpu_leaves(
     extreme, so a row a query's own bounds admit is also admitted by the
     extreme)."""
     mask = None
+    static = None
     for cond in f.must:
         if cond.match_from_query is not None:
             part = leaf_arrays[cond] != -1
@@ -1033,8 +1044,14 @@ def _row_union_from_gpu_leaves(
                 if hi is not None:
                     part &= arr <= hi
         else:
+            # Static match/range leaf — leaf_arrays[cond] IS its exact
+            # (rows,) boolean mask (see _corpus_leaf_array), a necessary
+            # condition for every query, so it tightens the union exactly.
+            static = leaf_arrays[cond] if static is None else (static & leaf_arrays[cond])
             continue
-        mask = part if mask is None else (mask | part)
+        mask = part if mask is None else (mask & part)
+    if static is not None:
+        mask = static if mask is None else (mask & static)
     return mask
 
 
@@ -1176,14 +1193,14 @@ def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str)
 
     n = rows.numel()
     keep = torch.ones(n, dtype=torch.bool, device=device)
-    for cond in f.must:
+    for cond in _static_first(f.must):
         keep = keep & _gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
     if f.should:
         any_match = torch.zeros(n, dtype=torch.bool, device=device)
-        for cond in f.should:
+        for cond in _static_first(f.should):
             any_match = any_match | _gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
         keep = keep & any_match
-    for cond in f.must_not:
+    for cond in _static_first(f.must_not):
         keep = keep & ~_gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
     return keep
 
