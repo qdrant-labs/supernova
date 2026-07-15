@@ -77,9 +77,10 @@ def _match_from_query_mask(
     not_null = ~_corpus_null_mask(table, cond.field)
 
     # Scan every value (not just the first) to decide scalar vs. MatchAny-list
-    # encoding: a column can legitimately mix `None`/NaN (no restriction for
-    # that query) with real lists, and checking only index 0 would misclassify
-    # the whole column whenever THAT one value happens to be null.
+    # encoding: a column can legitimately mix `None`/NaN (that query matches
+    # nothing, same as a null scalar) with real lists, and checking only
+    # index 0 would misclassify the whole column whenever THAT one value
+    # happens to be null.
     if any(isinstance(v, (list, tuple, np.ndarray)) for v in query_vals):
         mask = _match_any_from_query_mask(corpus_vals, query_vals, not_null)
     else:
@@ -90,8 +91,9 @@ def _match_from_query_mask(
 def _match_any_membership(vocab: np.ndarray, list_values) -> np.ndarray:
     """`(len(list_values), len(vocab))` boolean membership matrix: row `i`
     is `True` at column `j` iff `vocab[j]` is a member of `list_values[i]`
-    (a `None` entry in `list_values` means "no restriction" — every column
-    stays `False`, same as an empty list). Shared by
+    (a `None`/NaN entry in `list_values` means that query matches nothing —
+    every column stays `False`, same as an empty list, consistent with a
+    null scalar query value never equaling anything). Shared by
     `_match_any_from_query_mask` (`vocab` = this batch's distinct CORPUS
     values) and `compute.py`'s GPU-native Front A path (`vocab` = the union
     of every query's OWN list values, built once at setup) — same
@@ -100,7 +102,7 @@ def _match_any_membership(vocab: np.ndarray, list_values) -> np.ndarray:
     pos = {v: i for i, v in enumerate(vocab)}
     membership = np.zeros((len(list_values), len(vocab)), dtype=bool)
     for i, values in enumerate(list_values):
-        if values is None:
+        if values is None or (isinstance(values, (float, np.floating)) and values != values):
             continue
         idxs = [pos[v] for v in values if v in pos]
         if idxs:

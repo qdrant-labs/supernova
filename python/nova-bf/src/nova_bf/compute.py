@@ -215,8 +215,9 @@ def _to_query_array(values: list) -> np.ndarray:
     which is never what a per-query list-of-alternatives means.
 
     Scans every value (not just the first) to decide which encoding applies:
-    a MatchAny column can legitimately have `None` (no restriction) for some
-    query and a real list for another, and checking only `values[0]` would
+    a MatchAny column can legitimately have `None` (that query matches
+    nothing, same as a null scalar) for some query and a real list for
+    another, and checking only `values[0]` would
     misclassify the whole column whenever THAT one row happens to be null —
     `np.array([None, [...], [...]])` raises `ValueError` (inhomogeneous
     shape) rather than producing the object array `filters.py` expects."""

@@ -201,6 +201,25 @@ def test_match_from_query_null_never_matches_on_either_side():
     assert mask[1].tolist() == [False, False, False]
 
 
+def test_match_from_query_list_any_with_nan_query_value():
+    """Regression test: a bare NaN mixed into an otherwise list-valued
+    (per-query MatchAny) column used to crash `_match_any_membership`
+    (`TypeError: 'float' object is not iterable`) — parquet loading turns
+    null list rows into `None`, but a hand-built or pandas-sourced column
+    can carry NaN instead. Must behave exactly like `None`: that query
+    matches nothing."""
+    t = _table(category=["books", "electronics", "toys"])
+    f = Filter(must=[FilterCondition(field="category", match_from_query="allowed")])
+    qv = {"allowed": np.empty(3, dtype=object)}
+    qv["allowed"][:] = [["books", "toys"], np.nan, None]
+    mask = evaluate(f, t, qv)
+    assert mask.tolist() == [
+        [True, False, True],
+        [False, False, False],  # NaN query: matches nothing, same as None
+        [False, False, False],
+    ]
+
+
 def test_range_from_query_single_bound():
     t = _table(cost=[5.0, 15.0, 8.0, 3.0])
     f = Filter(must=[FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget"))])
