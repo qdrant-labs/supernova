@@ -18,6 +18,7 @@ from nova_bf.config import (
     ParamsConfig,
     QueriesConfig,
     RangeCondition,
+    RangeFromQuery,
     SearchSpec,
 )
 
@@ -299,3 +300,38 @@ def test_params_rejects_non_positive_batch_size():
     # positive values and None (whole-file) still work
     assert ParamsConfig(dense_batch_size=100).dense_batch_size == 100
     assert ParamsConfig(sparse_batch_size=None).sparse_batch_size is None
+
+
+def test_filter_query_fields_collects_all_three_per_query_kinds():
+    f = Filter(
+        must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")],
+        should=[FilterCondition(field="cost", range_from_query=RangeFromQuery(gt="lo", lt="hi"))],
+        must_not=[FilterCondition(field="title", match_text_from_query="phrase")],
+    )
+    assert f.query_fields() == {"tenant_id", "lo", "hi", "phrase"}
+    assert f.is_per_query() is True
+
+
+def test_filter_query_fields_empty_for_static_only_filter():
+    f = Filter(must=[FilterCondition(field="language", match="eng")])
+    assert f.query_fields() == set()
+    assert f.is_per_query() is False
+
+
+def test_filter_query_fields_ignores_none_bounds_on_range_from_query():
+    f = Filter(must=[FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget"))])
+    assert f.query_fields() == {"max_budget"}
+
+
+def test_range_from_query_requires_at_least_one_bound():
+    with pytest.raises(ValidationError):
+        RangeFromQuery()
+    RangeFromQuery(gt="lo")  # any single bound is valid
+
+
+def test_search_spec_filter_condition_six_way_exclusivity_via_config():
+    with pytest.raises(ValidationError):
+        BruteForceConfig(**_base(searches=[SearchSpec(
+            name="a",
+            filter=Filter(must=[FilterCondition(field="x", match="a", match_from_query="b")]),
+        )]))

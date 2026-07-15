@@ -61,7 +61,7 @@ A single `compute` run computes every entry in `searches:` — one is the common
 Per `vector_type`, searches share GPU work one of two ways:
 
 - **If any search of that vector_type is unfiltered**, every search of that vector_type — filtered or not — shares one full-file GPU pass: the transfer/CSR build and each distinct `metric`'s score matrix are computed once per batch, and every search (including filtered ones) reads its top-K straight from those shared columns, masking down to its own filter's surviving rows first if it has one. This is exact, not an approximation — masking a raw score matrix commutes with computing it — so a filtered search's `metric` never needs to match anything else in the run; scoring one more metric on a batch that's already on the GPU is cheap, unlike a second transfer. In the example above, `dense_eng` and `sparse_eng` both ride `dense_all`/`sparse_all`'s pass this way.
-- **Otherwise** (no search of that vector_type is unfiltered), there's no full-file pass to ride, so searches are grouped by exact filter equality instead and each such group compacts its own rows before transfer — same behavior as a single filtered search run alone.
+- **Otherwise** (no search of that vector_type is unfiltered), there's no full-file pass to ride, so the shared grid instead compacts to the UNION of every distinct active filter's surviving rows, transferred/scored once, with each search masking down further to its own filter's subset of that union — never more row-scoring than treating each filter independently would, and less whenever two filters' surviving rows overlap. A per-query filter (see [Per-query filters](#per-query-filters)) contributes a cheap, safe over-approximation to this same union rather than an exact row-subset, so it benefits from (and doesn't block) compaction too.
 
 Either way, GPU batch size for a vector_type is one run-level setting (`params.dense_batch_size`/`sparse_batch_size`) — it's not something you tune per search, since every search of a vector_type ends up sharing one GPU pass over the corpus regardless of grouping. What happens when it's set below some search's `k` differs by which of the two cases above applies: in the **shared-pass** case, your configured value is kept as-is (an under-filled batch just costs the larger-`k` search a few extra merge rounds — never a wrong answer, and never a memory bound you didn't ask for, since one unrelated search's large `k` would otherwise silently widen every OTHER search's GPU footprint too); in the **grouped-by-filter** case, each group's own batch size floors at the largest `k` among that GROUP's own (related, identically-filtered) members, same as before — there's no unrelated search sharing the grid to protect against there.
 
@@ -123,9 +123,35 @@ searches:
       must_not: []              # AND-NOT
 ```
 
-A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. The filter applies uniformly to every query in that search: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves. Each search has its own independent `filter` (or none).
+A condition's `field` is the only place you name a corpus column — there's no separate list to keep in sync, so `compute` reads exactly (and only) the columns the filter references. By default a filter applies uniformly to every query in that search: it restricts which corpus points are searchable, the same way a Qdrant search filter does — it never touches the queries themselves. Each search has its own independent `filter` (or none). For a filter that varies PER QUERY instead, see [Per-query filters](#per-query-filters) below.
 
 `match_text` requires every whitespace-separated word in the string to appear somewhere in the field, case-insensitively and in any order (an AND of words, not a phrase match) — the same semantics as Qdrant's own full-text-index `MatchText` condition, so ground truth built with it is directly comparable to a real Qdrant filtered search. It's a word-boundary-regex approximation of Qdrant's real tokenizer, not a byte-for-byte replica: a hyphenated query word like `high-fat` is matched as one literal token rather than split into `high`/`fat`, and a word ending directly in trailing punctuation (`C++`) can fail to get a boundary on that side. Good enough for keyword-style corpus filtering.
+
+### Per-query filters
+
+Every condition kind above has a per-query variant — `match_from_query`, `range_from_query`, `match_text_from_query` — that pulls its comparison value(s) from a column in the **queries** file instead of a literal in this config, so two different queries in the same search can each be restricted to a different corpus subset (tenant/user scoping, a per-query budget, a per-query search phrase):
+
+```yaml
+searches:
+  - name: per_tenant_search
+    vector_type: dense
+    filter:
+      must:
+        - field: tenant_id             # corpus column
+          match_from_query: tenant_id  # queries column — each query's own value
+        - field: cost
+          range_from_query: {lt: max_budget}   # queries column per bound
+        - field: title
+          match_text_from_query: search_phrase # queries column — each query's own phrase
+```
+
+A per-query and a static condition can appear together, in any of `must`/`should`/`must_not` — `should: [{field: is_public, match: true}, {field: tenant_id, match_from_query: tenant_id}]` means "public OR this query's own tenant." `match_from_query`'s queries column can hold either a scalar (equality) or a list per row (per-query MatchAny, matching Qdrant's `match` list semantics). `range_from_query` doesn't mix a literal bound with a per-query one in the same condition — express "cost > 0 for everyone AND cost < my own budget" as two separate conditions instead (a static `range: {gt: 0}` plus a `range_from_query: {lt: max_budget}`), which combine the same way any two `must` conditions do. A null/missing value on either side (corpus or queries column) never matches, same convention as a static filter's null handling.
+
+**Cost**: `match_from_query` and `range_from_query` evaluate GPU-natively — a small per-query vocabulary/gather or a direct broadcast comparison, built once per file from small corpus/query-side arrays and evaluated entirely on the GPU — the FLOP cost is no more than an unfiltered search sharing the same batch, and no `(n_queries, rows)` mask is ever materialized on the CPU or shipped over PCIe for either. `match_text_from_query` is different: it dedupes by *distinct word* (not just distinct phrase) and evaluates each distinct word's regex once, but for genuinely per-query search text — the realistic case for real query logs, as opposed to a benchmark with heavily overlapping vocabulary — cost still approaches one regex pass per distinct word, additional CPU-side work that (unlike IO) doesn't overlap with GPU scoring, and stays CPU-only (torch has no string tensor type). Reach for `match_text_from_query` deliberately, not as a default.
+
+**Memory**: unlike an unfiltered search (which never materializes any mask at all — rows are just used as-is), a filter with a `match_text`/`match_text_from_query` leaf anywhere still materializes a full `(n_queries, corpus_rows_in_this_file)` boolean array on the CPU per file (`match_from_query`/`range_from_query` never do, per the GPU-native path above). For a modest query set this is negligible; for a query-log-scale run (hundreds of thousands of queries) against a large corpus file with `match_text_from_query`, this is worth sizing.
+
+A per-query filter can share a compacted batch grid with other filters of the same vector_type, not just ride the whole file: it contributes a cheap, safe over-approximation ("does at least one query's own value admit this row", built only from its `must`-group leaves) to the same row-union compaction every other filter of that vector_type benefits from (see [One search, or several in one pass](#one-search-or-several-in-one-pass)) — its own fine, per-query masking still applies afterward regardless of whether the shared grid ended up compacted or not.
 
 ## Running
 

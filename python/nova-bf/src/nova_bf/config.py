@@ -194,14 +194,57 @@ class RangeCondition(BaseModel):
         return self
 
 
+class RangeFromQuery(BaseModel):
+    """Per-query numeric bounds — same shape as `RangeCondition`, but each
+    bound names a QUERIES column supplying THAT query's own value for the
+    bound, instead of a literal number (e.g. `lt: max_budget` means "each
+    query's own ceiling comes from its own `max_budget` column"). Evaluated
+    via a broadcast comparison (`compute.py`), exactly as cheap as a literal
+    `RangeCondition` — there's no cardinality/factorization cost the way
+    per-query `match` lists have.
+
+    Deliberately does not mix a literal bound and a per-query bound in one
+    condition (no `gt: 0` alongside `lt: max_budget` here) — express that as
+    two separate conditions in the same `must`/`should`/`must_not` list
+    instead (a static `range: {gt: 0}` plus this `range_from_query: {lt:
+    max_budget}`), which the existing AND/OR combination logic already
+    handles for free."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    gt: str | None = None
+    gte: str | None = None
+    lt: str | None = None
+    lte: str | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_bound(self) -> "RangeFromQuery":
+        if all(v is None for v in (self.gt, self.gte, self.lt, self.lte)):
+            raise ValueError("range_from_query needs at least one of gt/gte/lt/lte")
+        return self
+
+
 class FilterCondition(BaseModel):
     """One field predicate: keyword-style equality (`match`), numeric bounds
-    (`range`), or full-text (`match_text`).
+    (`range`), full-text (`match_text`), or a per-query variant of any of the
+    three (`match_from_query`/`range_from_query`/`match_text_from_query`),
+    which pulls its comparison value(s) from a column in the QUERIES file
+    instead of a literal in this config — so two different queries in the
+    same search can each be restricted to a different corpus subset (e.g.
+    each scoped to its own tenant, budget, or search phrase). See
+    `nova_bf.filters`/`compute.py` for how a per-query condition's mask ends
+    up shaped `(n_queries, rows)` instead of `(rows,)`, and how that composes
+    with everything else.
 
-    `match` takes a scalar (equality) or a list (matches any of them — Qdrant's
-    MatchAny). `match_text` requires every whitespace-separated word in the
-    string to appear somewhere in the field (case-insensitive, order-independent).
-    Exactly one of `match`/`range`/`match_text` must be set.
+    `match` takes a scalar (equality) or a list (matches any of them —
+    Qdrant's MatchAny); `match_from_query` does the same but per query, via a
+    queries column holding either a scalar or a list per row. `match_text`
+    requires every whitespace-separated word in the string to appear
+    somewhere in the field (case-insensitive, order-independent);
+    `match_text_from_query` is the same, with each query's own phrase read
+    from a queries column — the one per-query variant with a real, different
+    cost profile (see `filters._match_text_from_query_mask`'s docstring).
+    Exactly one of the six must be set.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -217,13 +260,24 @@ class FilterCondition(BaseModel):
     match: MatchValue | tuple[MatchValue, ...] | None = None
     range: RangeCondition | None = None
     match_text: str | None = None
+    # Per-query variants — see this class's docstring. Each names a QUERIES
+    # column (not a corpus column); `field` above still names the CORPUS
+    # column every one of these compares against.
+    match_from_query: str | None = None
+    range_from_query: RangeFromQuery | None = None
+    match_text_from_query: str | None = None
 
     @model_validator(mode="after")
     def _exactly_one(self) -> "FilterCondition":
-        if sum(v is not None for v in (self.match, self.range, self.match_text)) != 1:
+        options = (
+            self.match, self.range, self.match_text,
+            self.match_from_query, self.range_from_query, self.match_text_from_query,
+        )
+        if sum(v is not None for v in options) != 1:
             raise ValueError(
                 f"filter condition on `{self.field}` must set exactly one of "
-                "`match`, `range`, or `match_text`"
+                "`match`, `range`, `match_text`, `match_from_query`, "
+                "`range_from_query`, or `match_text_from_query`"
             )
         return self
 
@@ -272,6 +326,47 @@ class Filter(BaseModel):
         return {
             c.field for group in self._CONDITION_GROUPS for c in getattr(self, group)
         }
+
+    def all_conditions(self) -> tuple["FilterCondition", ...]:
+        """Every condition in this filter, across all three groups — the one
+        place a caller that needs to walk every leaf (regardless of which
+        group it's in) does so via `_CONDITION_GROUPS`, not its own
+        hardcoded `(*f.must, *f.should, *f.must_not)`, same reason
+        `fields()`/`query_fields()` do."""
+        return tuple(c for group in self._CONDITION_GROUPS for c in getattr(self, group))
+
+    def query_fields(self) -> set[str]:
+        """Every QUERIES column referenced by a per-query condition anywhere
+        in this filter (any group, any of `match_from_query`/
+        `range_from_query`/`match_text_from_query`) — the query-side analog
+        of `fields()`'s "no separate list to keep in sync" principle:
+        `compute.py` reads exactly (and only) the queries columns some
+        per-query condition actually references."""
+        cols: set[str] = set()
+        for group in self._CONDITION_GROUPS:
+            for c in getattr(self, group):
+                if c.match_from_query is not None:
+                    cols.add(c.match_from_query)
+                if c.range_from_query is not None:
+                    cols.update(
+                        v for v in (
+                            c.range_from_query.gt, c.range_from_query.gte,
+                            c.range_from_query.lt, c.range_from_query.lte,
+                        )
+                        if v is not None
+                    )
+                if c.match_text_from_query is not None:
+                    cols.add(c.match_text_from_query)
+        return cols
+
+    def is_per_query(self) -> bool:
+        """Does any condition in this filter vary per query? A per-query
+        filter has no single EXACT row-subset to offer a shared batch grid
+        (different queries need different corpus rows), but `compute.py`'s
+        `run_compute` can still union-compact it via a cheap, safe
+        over-approximation rather than always falling back to the whole
+        file — see `_is_per_query`/`_row_union_from_gpu_leaves`."""
+        return bool(self.query_fields())
 
 
 class SearchSpec(BaseModel):

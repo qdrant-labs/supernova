@@ -71,6 +71,10 @@ searches:
     #       match: eng            # scalar = equality; a list matches any of them
     #     - field: cost
     #       range: {lt: 10}       # gt/gte/lt/lte, combinable in one condition
+    #     # match_from_query / range_from_query / match_text_from_query pull
+    #     # the comparison value from a QUERIES column instead, so it varies
+    #     # per query (tenant scoping, a per-query budget, …) — see
+    #     # docs/brute-force/overview.md#per-query-filters
 
   # - name: sparse
   #   vector_type: sparse
