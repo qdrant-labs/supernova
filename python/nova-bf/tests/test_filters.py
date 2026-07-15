@@ -17,7 +17,7 @@ from nova_bf.config import (
     RangeFromQuery,
     SearchSpec,
 )
-from nova_bf.filters import evaluate
+from nova_bf.filters import _literal_then_regex_word_mask, evaluate
 
 
 def _table(**cols):
@@ -313,6 +313,30 @@ def test_match_text_from_query_shared_word_across_phrases():
     mask = evaluate(f, t, qv)
     assert mask[0].tolist() == [True, False, False, False]
     assert mask[1].tolist() == [False, True, False, False]
+
+
+def test_literal_then_regex_word_mask_matches_single_regex_pass():
+    """Unit test for `_literal_then_regex_word_mask`'s two-pass shortcut:
+    must agree exactly with a plain single regex pass, including the cases
+    that make it non-trivial — a literal substring present but NOT at a
+    word boundary (e.g. "taxes" contains "tax" but isn't the word "tax"),
+    a null corpus value, and a word that appears nowhere at all (exercises
+    the all-literal-miss early return, which skips the regex pass
+    entirely)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    col = pa.chunked_array([pa.array(["tax season", "taxes are due", None, "no match here", "TAX"])])
+    got = _literal_then_regex_word_mask("tax", col)
+    want = pc.fill_null(
+        pc.match_substring_regex(col, pattern=r"\btax\b", ignore_case=True), False,
+    ).to_numpy(zero_copy_only=False)
+    assert got.tolist() == want.tolist() == [True, False, False, False, True]
+
+    # a word absent from every row: the literal prefilter alone must already
+    # return all-False, without ever reaching the regex pass.
+    absent = _literal_then_regex_word_mask("zzz_nowhere", col)
+    assert absent.tolist() == [False, False, False, False, False]
 
 
 def test_static_only_filter_stays_one_dimensional():

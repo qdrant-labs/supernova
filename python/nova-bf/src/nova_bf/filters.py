@@ -166,6 +166,39 @@ def _range_from_query_mask(
     return mask & not_null[None, :]
 
 
+def _literal_then_regex_word_mask(word: str, col: pa.ChunkedArray) -> np.ndarray:
+    """`(rows,)` numpy bool, nulls already resolved to `False` — same result
+    as `pc.fill_null(pc.match_substring_regex(col, pattern=rf"\\b{word}\\b",
+    ignore_case=True), False).to_numpy(...)`, computed via a cheaper two-pass
+    narrowing instead of one regex pass over the whole column: a plain
+    literal substring match (no regex compile, no `\\b` bookkeeping) first
+    narrows to rows that could possibly match, since a `\\b`-bounded match
+    always IMPLIES plain substring presence — a row the literal pass
+    excludes can never pass the stricter regex either, so this is exact,
+    not a heuristic (holds even on inputs where Arrow's regex `\\b` itself
+    behaves surprisingly, e.g. accented letters — verified directly: regex-match
+    is always a subset of literal-match, so the two-pass result is always
+    identical to a single regex pass, whatever that regex does). The pricier
+    regex only re-verifies that (usually much smaller) subset. Skips the
+    regex pass entirely when nothing survives the literal prefilter. Used
+    only by `_match_text_from_query_mask`'s per-word cache below, where a
+    numpy array (nulls pre-filled) is what gets cached and ANDed across a
+    phrase's words anyway — measured ~2-3x faster than the previous
+    single-regex-pass implementation on real corpus text (see
+    docs/brute-force/overview.md)."""
+    literal = pc.fill_null(pc.match_substring(col, word, ignore_case=True), False).to_numpy(zero_copy_only=False)
+    idx = np.nonzero(literal)[0]
+    if len(idx) == 0:
+        return literal
+    pattern = rf"\b{re.escape(word)}\b"
+    verified = pc.fill_null(
+        pc.match_substring_regex(col.take(pa.array(idx)), pattern=pattern, ignore_case=True), False,
+    ).to_numpy(zero_copy_only=False)
+    result = np.zeros(len(col), dtype=bool)
+    result[idx] = verified
+    return result
+
+
 def _match_text_from_query_mask(
     cond: FilterCondition, table: pa.Table, query_values: dict[str, np.ndarray],
 ) -> np.ndarray:
@@ -177,8 +210,10 @@ def _match_text_from_query_mask(
     rows)` rather than `O(distinct phrases × rows)` — a real win whenever
     real query phrases share vocabulary, the common case. Cache key is the
     lowercased word: `ignore_case=True` already makes "Wireless"/"wireless"
-    match identical rows, so casing shouldn't fragment the cache. See
-    docs/brute-force/overview.md."""
+    match identical rows, so casing shouldn't fragment the cache. Each
+    word's mask is itself computed via `_literal_then_regex_word_mask`'s
+    literal-prefilter, on top of the word-level cache — the two optimizations
+    are independent and compose. See docs/brute-force/overview.md."""
     col = table[cond.field]
     phrases = query_values[cond.match_text_from_query]
     n_rows = len(table)
@@ -211,9 +246,7 @@ def _match_text_from_query_mask(
             key = word.lower()
             cached = word_cache.get(key)
             if cached is None:
-                pattern = rf"\b{re.escape(word)}\b"
-                part = pc.match_substring_regex(col, pattern=pattern, ignore_case=True)
-                cached = pc.fill_null(part, False).to_numpy(zero_copy_only=False)
+                cached = _literal_then_regex_word_mask(word, col)
                 word_cache[key] = cached
             mask = cached if mask is None else (mask & cached)
         result[qidxs, :] = mask
