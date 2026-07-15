@@ -314,6 +314,33 @@ def test_union_keep_ors_every_distinct_filter():
     assert keeps["a"][0]
 
 
+def test_pack_unpack_query_axis_round_trips():
+    """Unit test for `_pack_query_axis`/`_unpack_query_axis`: the CPU-fallback
+    per-query mask (`match_text`/`match_text_from_query`) is bit-packed along
+    the query axis to shrink the one `(n_queries, rows)` array still held for
+    a whole file's batch loop — round-tripping through pack/unpack must
+    reproduce the original mask exactly, including when `n_queries` isn't a
+    multiple of 8 (the padding-bit case `count=` exists to trim)."""
+    rng = np.random.default_rng(0)
+    for n_queries in (1, 7, 8, 9, 30, 64):
+        mask = rng.random((n_queries, 11)) < 0.5
+        packed = compute_mod._pack_query_axis(mask)
+        assert packed.dtype == np.uint8
+        assert packed.shape == (-(-n_queries // 8), 11)  # ceil(n_queries / 8)
+        unpacked = compute_mod._unpack_query_axis(packed, n_queries)
+        assert unpacked.dtype == bool
+        assert unpacked.shape == mask.shape
+        assert np.array_equal(unpacked, mask)
+
+    # row-slicing the packed bytes (as `select()` does via `true_rows`)
+    # BEFORE unpacking must agree with slicing then packing.
+    mask = rng.random((13, 20)) < 0.5
+    packed = compute_mod._pack_query_axis(mask)
+    true_rows = np.array([0, 5, 19, 3])
+    sliced_then_unpacked = compute_mod._unpack_query_axis(packed[:, true_rows], 13)
+    assert np.array_equal(sliced_then_unpacked, mask[:, true_rows])
+
+
 def test_to_query_array_scans_every_value_not_just_the_first():
     """Regression test: a per-query MatchAny column can legitimately mix
     `None` (no restriction for that query) with real lists in any order —

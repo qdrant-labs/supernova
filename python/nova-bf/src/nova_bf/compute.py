@@ -102,7 +102,12 @@ transferred to the GPU ONCE per file, then sliced per batch — see
 built ONCE at setup — no `(n_queries, rows)` array is ever materialized on
 the CPU or shipped over PCIe. A filter with a `match_text`/
 `match_text_from_query` leaf anywhere falls back to `nova_bf.filters.
-evaluate()`'s CPU/numpy path unchanged (torch has no string tensor type).
+evaluate()`'s CPU/numpy path unchanged (torch has no string tensor type) —
+its `(n_queries, rows)` result is the one CPU-fallback mask still held for a
+whole file's batch loop, so it's bit-packed along the query axis
+(`np.packbits`, 8 queries/byte) right after `evaluate()` returns, cutting
+that footprint 8x; each batch slice unpacks only its own row-slice
+(`np.unpackbits`) back to one bool per query, right before use.
 """
 
 from __future__ import annotations
@@ -643,6 +648,30 @@ def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str) -> int
     return configured
 
 
+def _pack_query_axis(mask: np.ndarray) -> np.ndarray:
+    """Bit-pack a `(n_queries, rows)` boolean mask along the query axis (8
+    queries/byte, `np.packbits` default `bitorder="big"`) — shrinks the one
+    CPU-fallback per-query mask (a filter with a `match_text`/
+    `match_text_from_query` leaf, ineligible for Front A's GPU-native path)
+    still held on the CPU for a whole file's batch loop, 8x. Rows aren't the
+    packed axis, so slicing by `true_rows` (`keeps[f][:, true_rows]`) stays a
+    plain column slice — no unpacking needed just to select rows. Inverse:
+    `_unpack_query_axis`."""
+    return np.packbits(mask, axis=0)
+
+
+def _unpack_query_axis(packed: np.ndarray, n_queries: int) -> np.ndarray:
+    """Inverse of `_pack_query_axis`: expand a packed `(ceil(n_queries / 8),
+    rows)` byte array back to one `bool` per query, `(n_queries, rows)`.
+    `count=n_queries` trims the padding bits `packbits` adds when
+    `n_queries` isn't a multiple of 8 — without it, the result would carry
+    up to 7 extra all-`False` phantom queries, mismatching every real
+    per-query tensor it's later combined with. `unpackbits` itself returns
+    `uint8` 0/1, not `bool` — cast explicitly, since `~` on a `uint8` tensor
+    flips all 8 bits (`0 -> 255`) rather than negating logically."""
+    return np.unpackbits(packed, axis=0, count=n_queries).astype(bool)
+
+
 def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | None]) -> np.ndarray:
     """OR-reduce of every DISTINCT active filter's keep-mask in `filters` —
     the shared row-set for a vector_type where no search is unfiltered (see
@@ -656,11 +685,13 @@ def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | N
     A UNIFORM filter's (or a GPU-eligible per-query filter's — Front B, see
     `_row_union_from_gpu_leaves`) `keeps[f]` is already `(rows,)`, used as
     -is. A CPU-fallback per-query filter's (`match_text`/
-    `match_text_from_query` leaf present) is `(n_queries, rows)` — reduced
-    to `(rows,)` via `.any(axis=0)` first: EXACT, not a heuristic, since
-    `evaluate()` already computed the full per-query mask for this filter
-    regardless (see `run_compute`'s reader thread), so "does any query want
-    this row" is simply read off it, not approximated."""
+    `match_text_from_query` leaf present) is bit-packed along the query axis,
+    `(ceil(n_queries / 8), rows)` (see `run_compute`'s reader thread) —
+    reduced to `(rows,)` via `.any(axis=0)` first: still EXACT, not a
+    heuristic, since a packed byte is 0 iff every query bit it holds is 0, so
+    byte-truthiness IS "does any query this byte covers want this row"; OR-ing
+    that across bytes is exactly "does any query want this row", simply read
+    off the packed array rather than approximated."""
     parts = [m.any(axis=0) if m.ndim == 2 else m for m in (keeps[f] for f in filters)]
     return np.logical_or.reduce(parts)
 
@@ -1113,7 +1144,14 @@ def _process_shared_batch(
                 if filter_is_gpu_eligible[s.filter]:
                     cell_mask = _gpu_evaluate(s.filter, leaf_gpu, rows, query_gpu, device)
                 else:
-                    cell_np = keeps[s.filter][:, true_rows]
+                    # `keeps[s.filter]` is bit-packed along the query axis
+                    # (see `run_compute`'s reader thread / `_pack_query_axis`)
+                    # — row-slice the packed bytes first (cheap: rows aren't
+                    # the packed axis), THEN unpack, so only this batch
+                    # slice's bytes ever get expanded back to
+                    # one-bool-per-query, not the whole file's.
+                    packed_np = keeps[s.filter][:, true_rows]
+                    cell_np = _unpack_query_axis(packed_np, spec_Q[m].shape[0])
                     cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
                 if filter_share_count[s.filter] > 1:
                     cache[s.filter] = cell_mask
@@ -1463,6 +1501,19 @@ def run_compute(
                 # _row_union_from_gpu_leaves), used only for union-compaction
                 # (`_union_keep`) and the corpus_ids retention check below —
                 # never for the per-query cell_mask itself.
+                #
+                # The CPU-fallback branch below (a filter with a `match_text`/
+                # `match_text_from_query` leaf, so ineligible for Front A) is
+                # the ONLY place `evaluate()` can still return a genuine
+                # `(n_queries, rows)` array — held in `keeps[f]` for this
+                # whole file's batch loop. Bit-packed along the query axis
+                # (`np.packbits(mask, axis=0)`, 8 queries/byte) to cut that
+                # long-lived footprint 8x; every consumer below either works
+                # unchanged on the packed bytes (`.any(axis=0)` in
+                # `_union_keep` — a byte is 0 iff every query bit in it is,
+                # so byte-truthiness IS query-truthiness) or unpacks lazily,
+                # only for the batch-row slice actually needed
+                # (`_process_shared_batch`'s `select`).
                 n_rows = len(table)
                 keeps: dict[Filter | None, np.ndarray | None] = {}
                 leaf_arrays: dict[FilterCondition, np.ndarray] = {}
@@ -1477,7 +1528,8 @@ def run_compute(
                             union = _row_union_from_gpu_leaves(f, leaf_arrays, query_filter_vals, n_rows)
                             keeps[f] = union if union is not None else np.ones(n_rows, dtype=bool)
                     else:
-                        keeps[f] = evaluate(f, table, query_filter_vals)
+                        mask = evaluate(f, table, query_filter_vals)
+                        keeps[f] = _pack_query_axis(mask) if mask.ndim == 2 else mask
                 t2 = time.perf_counter()
                 fq.put((gidx, arrs, ids, keeps, leaf_arrays, t1 - t0, t2 - t1))
             except Exception as exc:
