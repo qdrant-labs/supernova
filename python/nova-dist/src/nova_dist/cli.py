@@ -226,7 +226,7 @@ def bf_compute(config, resources, num_jobs, pool_name, dry_run):
 @click.argument("config")
 def bf_merge(config):
     """
-    Merge per-rank partial results into one top-K parquet (runs on the controller).
+    Merge per-rank partial results into each search's own top-K parquet (runs on the controller).
     """
     _run_local("nova-bf", ["merge", config])
 

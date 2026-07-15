@@ -2,9 +2,9 @@
 
 Exercises the GPU topk path on CPU (small synthetic corpus + queries), covering
 the two pieces most prone to silent corruption:
-  - corpus_batch_size tiling: must yield the *same* top-K as scoring the whole
-    file at once (the `gidx * MAX_ROWS_PER_FILE + row` encoding uses file-local
-    row offsets, so an off-by-a-batch bug would scramble hit ids), and
+  - params.dense_batch_size tiling: must yield the *same* top-K as scoring the
+    whole file at once (the `gidx * MAX_ROWS_PER_FILE + row` encoding uses
+    file-local row offsets, so an off-by-a-batch bug would scramble hit ids), and
   - id resolution: hit_ids come from `corpus.id_column` when set (a real,
     pre-existing identifier) and from `make_point_id(file_key, row)` otherwise.
 """
@@ -30,6 +30,7 @@ from nova_bf.config import (
     ParamsConfig,
     QueriesConfig,
     RangeCondition,
+    SearchSpec,
 )
 from nova_bf.ids import make_point_id
 from nova_bf.io import Store
@@ -105,10 +106,10 @@ def _run(ds, *, batch, id_column, out_name, filt=None):
         corpus=CorpusConfig(path=ds["cdir"], dense_column="dense_embedding", id_column=id_column),
         queries=QueriesConfig(path=ds["qpath"], dense_column="dense_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(k=K, metric="dot", corpus_batch_size=batch, io_workers=2),
-        filter=filt,
+        params=ParamsConfig(io_workers=2, dense_batch_size=batch),
+        searches=[SearchSpec(name="test", k=K, metric="dot", filter=filt)],
     )
-    t = pq.read_table(run_compute(cfg)).to_pydict()
+    t = pq.read_table(run_compute(cfg)["test"]).to_pydict()
     return {q: list(zip(hi, hs)) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
 
 
@@ -193,8 +194,8 @@ def test_filter_range_condition(ds):
 @pytest.mark.parametrize("batch", [None, K])
 def test_filter_preserves_row_numbers_under_batching(ds, batch):
     """A filter must resolve the same (correct) point ids whether or not
-    corpus_batch_size tiles the file — the bug this guards against is filtering
-    renumbering rows instead of keeping their true file-row number."""
+    params.dense_batch_size tiles the file — the bug this guards against is
+    filtering renumbering rows instead of keeping their true file-row number."""
     filt = Filter(must=[FilterCondition(field="language", match="eng")])
     res = _run(ds, batch=batch, id_column=None, out_name=f"filter_defid_{batch}", filt=filt)
     eng_globals = [g for g, lang in enumerate(ds["lang_by_g"]) if lang == "eng"]
@@ -219,3 +220,113 @@ def test_filter_timing_is_reported_only_when_filtering(ds, caplog):
         _run(ds, batch=None, id_column="id", out_name="filter_timing_off")
     assert not any("filter eval" in r.message for r in caplog.records)
     assert any("filter_s=0.0" in r.message for r in caplog.records)  # stable bf-bench schema
+
+
+def test_bad_filter_field_raises_instead_of_hanging(ds):
+    """A filter referencing a column absent from the corpus schema makes
+    `evaluate()` raise inside a reader thread — this must surface as a clear
+    exception in the main thread, not hang forever (an uncaught exception in
+    a daemon thread silently kills it, and the consumer's fixed-count
+    `fq.get()` loop would otherwise block waiting for an item that never
+    arrives)."""
+    filt = Filter(must=[FilterCondition(field="no_such_column", match="eng")])
+    with pytest.raises(RuntimeError, match="reader thread failed"):
+        _run(ds, batch=None, id_column="id", out_name="filter_bad_field", filt=filt)
+
+
+def test_next_in_order_reorders_scrambled_arrivals():
+    """Regression test: reader threads can finish corpus files in any order,
+    but `_next_in_order` must always hand the consumer files back in a
+    fixed, deterministic order (ascending `gidx`) — otherwise which of
+    several EXACTLY tied candidates wins a spot in the top-K merge varies
+    nondeterministically run to run, even for the identical corpus and
+    queries (see `run_compute`'s consumer loop)."""
+    from nova_bf.compute import _next_in_order
+
+    # Arrives scrambled: 2, 0, 3, 1 — must still be consumable in order 0, 1, 2, 3.
+    arrivals = iter([(2, "b"), (0, "a"), (3, "d"), (1, "c")])
+    pending: dict = {}
+    results = [_next_in_order(g, pending, lambda: next(arrivals)) for g in [0, 1, 2, 3]]
+    assert results == [(0, "a"), (1, "c"), (2, "b"), (3, "d")]
+    assert pending == {}  # every buffered arrival was eventually consumed
+
+
+def test_next_in_order_reraises_from_fetch():
+    """`fetch` raising (e.g. the consumer's `_fetch_or_raise` re-raising a
+    reader thread's forwarded exception) must propagate straight through,
+    not get silently swallowed while waiting for `want_gidx`'s turn."""
+    from nova_bf.compute import _next_in_order
+
+    def fetch():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _next_in_order(0, {}, fetch)
+
+
+def test_slow_first_file_cannot_flood_host_memory(tmp_path, monkeypatch):
+    """Regression test for the lookahead `window` semaphore in `run_compute`:
+    the consumer folds files in ascending `gidx` order, so while it waits for
+    a slow file 0 it drains `fq` into the unbounded `pending` dict — every
+    drain frees a queue slot, so `fq`'s own bound provides NO backpressure and
+    (before the window) readers could stream the ENTIRE remaining corpus,
+    decoded, into host RAM during one stalled read. The window holds a permit
+    per file from read-start until the consumer consumes it, so no more than
+    `io_workers * 2` reads may even START while file 0 stalls.
+
+    Also checks the stalled run's results are bit-identical to an unstalled
+    one: the window changes memory behavior, never consumption order."""
+    import threading
+    import time
+
+    rng = np.random.default_rng(7)
+    n_files, rows, n_q, io_workers = 24, 3, 2, 4
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    for fi in range(n_files):
+        _write_vectors(cdir / f"f{fi:03d}.parquet", rng.standard_normal((rows, DIM)).astype(np.float32))
+    qpath = tmp_path / "queries.parquet"
+    _write_vectors(qpath, rng.standard_normal((n_q, DIM)).astype(np.float32), qid=[f"q{i}" for i in range(n_q)])
+
+    def _cfg(out_name):
+        out = tmp_path / out_name
+        out.mkdir()
+        return BruteForceConfig(
+            corpus=CorpusConfig(path=str(cdir), dense_column="dense_embedding"),
+            queries=QueriesConfig(path=str(qpath), dense_column="dense_embedding", id_column="qid"),
+            output=OutputConfig(path=str(out)),
+            params=ParamsConfig(io_workers=io_workers),
+            searches=[SearchSpec(name="test", k=K, metric="dot")],
+        )
+
+    control = pq.read_table(run_compute(_cfg("out_control"))["test"]).to_pydict()
+
+    first_path = Store(str(cdir)).list_parquets()[0].read_path
+    lock = threading.Lock()
+    corpus_reads_started: list[str] = []
+    started_during_stall: list[int] = []
+    real_read = Store.read_columns
+
+    def stalling_read(self, read_path, columns):
+        if str(cdir) in str(read_path):
+            with lock:
+                corpus_reads_started.append(read_path)
+        if read_path == first_path:
+            time.sleep(1.0)  # ample for 23 tiny local reads — without the
+            # window, every other file would start (and finish) in here
+            result = real_read(self, read_path, columns)
+            with lock:
+                started_during_stall.append(len(corpus_reads_started) - 1)
+            return result
+        return real_read(self, read_path, columns)
+
+    monkeypatch.setattr(Store, "read_columns", stalling_read)
+    stalled = pq.read_table(run_compute(_cfg("out_stalled"))["test"]).to_pydict()
+
+    # Structural bound: file 0 holds 1 of the io_workers*2 permits for the
+    # whole stall, so at most io_workers*2 - 1 OTHER reads can have started.
+    assert started_during_stall[0] <= io_workers * 2 - 1, (
+        f"{started_during_stall[0]} reads started while file 0 stalled — "
+        f"the lookahead window (io_workers*2 = {io_workers * 2}) is not binding"
+    )
+    assert stalled == control
