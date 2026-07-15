@@ -300,6 +300,21 @@ def test_match_text_from_query_blank_phrase_never_matches():
     assert mask[2].tolist() == [False, False]
 
 
+def test_match_text_from_query_shared_word_across_phrases():
+    """Two different phrases sharing a word (word-level dedup, not just
+    phrase-level dedup) must each still combine correctly with their OTHER
+    word(s) — the shared word's cached mask must not leak the other
+    phrase's extra condition. Also exercises different casing of the same
+    word ("Wireless" vs "wireless") landing on the same cache key without
+    changing results, since `ignore_case=True` already makes them equivalent."""
+    t = _table(title=["wireless mouse", "wireless keyboard", "wired mouse", "gaming chair"])
+    f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
+    qv = {"phrase": np.array(["wireless mouse", "Wireless keyboard"], dtype=object)}
+    mask = evaluate(f, t, qv)
+    assert mask[0].tolist() == [True, False, False, False]
+    assert mask[1].tolist() == [False, True, False, False]
+
+
 def test_static_only_filter_stays_one_dimensional():
     """No per-query condition anywhere -> evaluate() returns (rows,), exactly
     the pre-per-query-filters shape/cost, not (n_queries, rows)."""

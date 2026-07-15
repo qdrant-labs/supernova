@@ -41,6 +41,7 @@ from nova_bf.config import (
     OutputConfig,
     ParamsConfig,
     QueriesConfig,
+    RangeCondition,
     RangeFromQuery,
     SearchSpec,
 )
@@ -1144,10 +1145,12 @@ def test_per_query_filter_sharing_vt_with_unfiltered_baseline(tmp_path):
 def test_per_query_filter_sharing_vt_with_uniform_filter_no_baseline(tmp_path, caplog):
     """The trickiest routing interaction: a per-query-filtered spec and a
     UNIFORM-filtered spec share a vector_type with NO unfiltered spec at
-    all. `has_baseline` must still become True (forced by the per-query
-    spec alone) — confirmed via the log line — and BOTH specs must still
-    produce correct results, the uniform one riding the whole-file base
-    instead of getting its own union-compaction."""
+    all. Since Front B, a per-query filter no longer forces `has_baseline`
+    by itself — confirmed via the log line — so both specs instead share
+    ONE union-compacted batch (the uniform filter's own rows UNION the
+    per-query filter's row-level over-approximation — see
+    `_row_union_from_gpu_leaves`), and BOTH specs must still produce
+    correct results despite riding that shared, compacted grid."""
     ds = _tenant_dataset(tmp_path, corpus_tenants=["A", "B", "A", "C"], query_tenants=["A", "C"])
     out = tmp_path / "out"
     out.mkdir()
@@ -1168,9 +1171,9 @@ def test_per_query_filter_sharing_vt_with_uniform_filter_no_baseline(tmp_path, c
     )
     with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
         paths = run_compute(cfg)
-    assert any("share one full-file batch pass" in r.message for r in caplog.records), \
-        "a per-query filter alone must force has_baseline, even with no unfiltered sibling"
-    assert not any("union of" in r.message for r in caplog.records)
+    assert any("union of" in r.message for r in caplog.records), \
+        "with no unfiltered spec, a per-query filter must now share union-compaction, not force has_baseline"
+    assert not any("share one full-file batch pass" in r.message for r in caplog.records)
 
     corpus_tenants = ["A", "B", "A", "C"]
     query_tenants = ["A", "C"]
@@ -1243,3 +1246,459 @@ def test_per_query_filter_missing_queries_column_raises_clear_error(tmp_path):
     )
     with pytest.raises(ValueError, match="nonexistent_col"):
         run_compute(cfg)
+
+
+# --- Front A: GPU-native evaluation for match_from_query/range_from_query ---
+
+
+def test_per_query_match_any_from_query_matches_independent_ground_truth(tmp_path):
+    """List-valued match_from_query (MatchAny) exercises Front A's
+    membership-matrix GPU path (see compute._build_gpu_leaf_state /
+    _gpu_cond_mask's clamp+gather), not just the scalar vocab-code path the
+    other match_from_query tests already cover."""
+    rng = np.random.default_rng(13)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    n = len(corpus_tenants)
+    dense = rng.standard_normal((n, DIM)).astype(np.float32)
+    ids = [f"c{i}" for i in range(n)]
+    sparse_rows = [_random_sparse_row(rng) for _ in range(n)]
+    _write_combined(cdir / "f0.parquet", dense, sparse_rows, id=ids, tenant_id=corpus_tenants)
+
+    n_q = 3
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    allowed_tenants = [["A", "B"], ["C"], ["B", "C"]]
+    qpath = tmp_path / "queries.parquet"
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, tenant_id=allowed_tenants)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="any_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+        )],
+    )
+    paths = run_compute(cfg)
+    t = pq.read_table(paths["any_tenant"]).to_pydict()
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(n) if corpus_tenants[i] in allowed_tenants[qi]]
+        scores = qdense[qi] @ dense[allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ids[allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_match_any_from_query_all_empty_lists_never_matches(tmp_path):
+    """Regression test: when EVERY query's MatchAny list is empty/None, the
+    vocab built from the union of query list values (compute._build_gpu_leaf_state)
+    is empty (0 distinct values) — _gpu_cond_mask's membership gather used to
+    index a zero-width dimension with `arr.clamp(min=0)` regardless, raising
+    IndexError. Every query should simply get zero hits, not a crash."""
+    ds = _tenant_dataset(
+        tmp_path, corpus_tenants=["A", "B", "A", "C"], query_tenants=["A", "B"],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    # Overwrite the queries file's tenant_id with all-empty MatchAny lists —
+    # _tenant_dataset itself writes plain scalar strings, so build the
+    # queries file directly here instead.
+    qpath = tmp_path / "queries_empty.parquet"
+    rng = np.random.default_rng(15)
+    n_q = 2
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, tenant_id=[[], None])
+
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="any_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+        )],
+    )
+    paths = run_compute(cfg)  # must not raise
+    t = pq.read_table(paths["any_tenant"]).to_pydict()
+    for hit_ids in t["hit_ids"]:
+        assert hit_ids == []
+
+
+def test_per_query_match_any_from_query_null_element_in_list(tmp_path):
+    """Regression test: a `None` NESTED INSIDE a query's MatchAny list (not
+    the list itself being null) used to crash `np.unique` while building the
+    union-of-query-lists vocab in compute._build_gpu_leaf_state — None can't
+    be sorted against a string. The null element should just be ignored."""
+    ds = _tenant_dataset(
+        tmp_path, corpus_tenants=["A", "B", "A", "C"], query_tenants=["A", "B"],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    qpath = tmp_path / "queries_null_elem.parquet"
+    rng = np.random.default_rng(16)
+    n_q = 2
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    qids = [f"q{i}" for i in range(n_q)]
+    allowed_tenants = [["A", None, "B"], ["C"]]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, tenant_id=allowed_tenants)
+
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="any_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+        )],
+    )
+    paths = run_compute(cfg)  # must not raise
+    t = pq.read_table(paths["any_tenant"]).to_pydict()
+
+    corpus_tenants = ["A", "B", "A", "C"]
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(4) if corpus_tenants[i] in allowed_tenants[qi]]
+        scores = qdense[qi] @ ds["dense"][allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ds["ids"][allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_filter_multiple_batch_slices(tmp_path):
+    """`dense_batch_size` forces `_process_batch_group`'s r0 loop to iterate
+    multiple times over one file — Front A's leaf tensors are transferred
+    ONCE per file but indexed once per SLICE (via `rows`), so this exercises
+    that a small `rows` slice still lines up with the corpus's true rows."""
+    ds = _tenant_dataset(
+        tmp_path, corpus_tenants=["A", "B", "A", "C", "B", "A"], query_tenants=["A", "B", "C"],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(dense_batch_size=1),
+        searches=[SearchSpec(
+            name="per_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+        )],
+    )
+    paths = run_compute(cfg)
+    t = pq.read_table(paths["per_tenant"]).to_pydict()
+
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    query_tenants = ["A", "B", "C"]
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(len(ds["ids"])) if corpus_tenants[i] == query_tenants[qi]]
+        scores = ds["qdense"][qi] @ ds["dense"][allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ds["ids"][allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_filter_mixed_static_and_per_query_leaf(tmp_path):
+    """A filter combining a STATIC condition with a per-query
+    `match_from_query` leaf in the same `must` group exercises Front A's
+    tree-combination logic (`_gpu_evaluate`) promoting a `(rows,)` static
+    leaf against a `(n_queries, rows)` per-query leaf via broadcasting,
+    mirroring `filters.evaluate()`'s own must-group AND — and, since the
+    static condition genuinely excludes some rows here (`cost < 10`), a bug
+    in that combination (e.g. ignoring the static leaf) would show up as
+    extra, wrong hits."""
+    rng = np.random.default_rng(14)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    cost = [5.0, 20.0, 8.0, 3.0, 25.0, 1.0]
+    n = len(corpus_tenants)
+    dense = rng.standard_normal((n, DIM)).astype(np.float32)
+    ids = [f"c{i}" for i in range(n)]
+    sparse_rows = [_random_sparse_row(rng) for _ in range(n)]
+    _write_combined(cdir / "f0.parquet", dense, sparse_rows, id=ids, tenant_id=corpus_tenants, cost=cost)
+
+    n_q = 3
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    query_tenants = ["A", "B", "C"]
+    qpath = tmp_path / "queries.parquet"
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, tenant_id=query_tenants)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="mixed", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[
+                FilterCondition(field="tenant_id", match_from_query="tenant_id"),
+                FilterCondition(field="cost", range=RangeCondition(lt=10.0)),
+            ]),
+        )],
+    )
+    paths = run_compute(cfg)
+    t = pq.read_table(paths["mixed"]).to_pydict()
+
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [
+            i for i in range(n)
+            if corpus_tenants[i] == query_tenants[qi] and cost[i] < 10.0
+        ]
+        scores = qdense[qi] @ dense[allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ids[allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_filter_shared_by_two_specs_matches_independent_ground_truth(tmp_path):
+    """Two specs with an equal (but separately constructed) filter exercise
+    Front A's cache-sharing path (`filter_share_count[s.filter] > 1` in
+    `_process_shared_batch`'s `select`) — both specs must still get
+    correct, independently-verifiable results, and the SAME `cell_mask`
+    object should back both (a `Filter` is frozen/hashable, so value-equal
+    but distinct instances are still one dict key)."""
+    ds = _tenant_dataset(
+        tmp_path, corpus_tenants=["A", "B", "A", "C", "B", "A"], query_tenants=["A", "B", "C"],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[
+            SearchSpec(
+                name="s1", vector_type="dense", metric="dot", k=10,
+                filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+            ),
+            SearchSpec(
+                name="s2", vector_type="dense", metric="cosine", k=10,
+                filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+            ),
+        ],
+    )
+    paths = run_compute(cfg)
+
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    query_tenants = ["A", "B", "C"]
+    for name, metric in (("s1", "dot"), ("s2", "cosine")):
+        t = pq.read_table(paths[name]).to_pydict()
+        for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+            qi = int(qid[1:])
+            allowed = [i for i in range(len(ds["ids"])) if corpus_tenants[i] == query_tenants[qi]]
+            c = ds["dense"][allowed]
+            q = ds["qdense"][qi]
+            if metric == "cosine":
+                c = c / np.linalg.norm(c, axis=1, keepdims=True)
+                q = q / np.linalg.norm(q)
+            scores = q @ c.T
+            order = np.argsort(-scores)[:10]
+            expected = [ds["ids"][allowed[j]] for j in order]
+            assert hit_ids == expected, f"search={name} query={qid}"
+
+
+# --- Front B: row-level union-compaction for per-query filters ---
+
+
+def test_per_query_filter_alone_no_baseline_gets_union_compacted(tmp_path, caplog):
+    """A SINGLE per-query-filtered spec with no unfiltered sibling at all —
+    since Front B, this must now log a union-compaction, not
+    "share one full-file batch pass" (the old, pre-Front-B routing rule) —
+    and must still produce correct, independently-verifiable results."""
+    ds = _tenant_dataset(
+        tmp_path, corpus_tenants=["A", "B", "A", "C", "B", "A"], query_tenants=["A", "B", "C"],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="per_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+        )],
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        paths = run_compute(cfg)
+    assert any("union of" in r.message for r in caplog.records)
+    assert not any("share one full-file batch pass" in r.message for r in caplog.records)
+
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    query_tenants = ["A", "B", "C"]
+    t = pq.read_table(paths["per_tenant"]).to_pydict()
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(len(ds["ids"])) if corpus_tenants[i] == query_tenants[qi]]
+        scores = ds["qdense"][qi] @ ds["dense"][allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ds["ids"][allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_filter_must_not_leaf_falls_back_to_all_rows_safely(tmp_path, caplog):
+    """A per-query filter whose ONLY per-query leaf lives in `must_not` (not
+    `must`/`should`) cannot be safely tightened by
+    `_row_union_from_gpu_leaves` (see its docstring) — it must fall back to
+    an all-True row-level union (still logged as union-compaction, since
+    has_baseline no longer depends on this), and still produce correct
+    results, not merely avoid a crash."""
+    ds = _tenant_dataset(
+        tmp_path, corpus_tenants=["A", "B", "A", "C", "B", "A"], query_tenants=["A", "B", "C"],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="not_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must_not=[FilterCondition(field="tenant_id", match_from_query="tenant_id")]),
+        )],
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        paths = run_compute(cfg)
+    assert any("union of" in r.message for r in caplog.records)
+
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    query_tenants = ["A", "B", "C"]
+    t = pq.read_table(paths["not_tenant"]).to_pydict()
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [i for i in range(len(ds["ids"])) if corpus_tenants[i] != query_tenants[qi]]
+        scores = ds["qdense"][qi] @ ds["dense"][allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ds["ids"][allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_filter_range_and_match_from_query_union_combine(tmp_path, caplog):
+    """A per-query filter combining a `must` `match_from_query` leaf AND a
+    `must` `range_from_query` leaf exercises `_row_union_from_gpu_leaves`'s
+    OR-across-leaves union logic directly — the compacted union must be
+    loose enough to retain every row ANY query could want via EITHER leaf,
+    and the fine per-query AND of both leaves must still apply correctly
+    afterward."""
+    rng = np.random.default_rng(21)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    cost = [5.0, 20.0, 8.0, 3.0, 25.0, 1.0]
+    n = len(corpus_tenants)
+    dense = rng.standard_normal((n, DIM)).astype(np.float32)
+    ids = [f"c{i}" for i in range(n)]
+    sparse_rows = [_random_sparse_row(rng) for _ in range(n)]
+    _write_combined(cdir / "f0.parquet", dense, sparse_rows, id=ids, tenant_id=corpus_tenants, cost=cost)
+
+    n_q = 3
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    query_tenants = ["A", "B", "C"]
+    max_budget = [10.0, 6.0, 4.0]
+    qpath = tmp_path / "queries.parquet"
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, tenant_id=query_tenants, max_budget=max_budget)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="tenant_and_budget", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[
+                FilterCondition(field="tenant_id", match_from_query="tenant_id"),
+                FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget")),
+            ]),
+        )],
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        paths = run_compute(cfg)
+    assert any("union of" in r.message for r in caplog.records)
+
+    t = pq.read_table(paths["tenant_and_budget"]).to_pydict()
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [
+            i for i in range(n)
+            if corpus_tenants[i] == query_tenants[qi] and cost[i] < max_budget[qi]
+        ]
+        scores = qdense[qi] @ dense[allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ids[allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_per_query_match_text_from_query_alone_no_baseline_gets_union_compacted(tmp_path, caplog):
+    """A CPU-fallback per-query filter (match_text_from_query, GPU-
+    ineligible) alone, no unfiltered sibling, also now gets union-compacted
+    (Front B) instead of forcing has_baseline — `_union_keep`'s handling of
+    a `(n_queries, rows)` keeps[f] entry (via `.any(axis=0)`, EXACT since
+    evaluate() already computed the full mask) must not corrupt the
+    compaction or the final result."""
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    titles = [
+        "wireless mouse", "gaming keyboard", "wireless keyboard combo",
+        "mouse pad xl", "bluetooth mouse", "mechanical keyboard",
+    ]
+    n = len(titles)
+    rng = np.random.default_rng(22)
+    dense = rng.standard_normal((n, DIM)).astype(np.float32)
+    ids = [f"c{i}" for i in range(n)]
+    sparse_rows = [_random_sparse_row(rng) for _ in range(n)]
+    _write_combined(cdir / "f0.parquet", dense, sparse_rows, id=ids, title=titles)
+
+    n_q = 3
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    phrases = ["wireless mouse", "keyboard", "wireless mouse"]
+    qpath = tmp_path / "queries.parquet"
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, phrase=phrases)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="by_phrase", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")]),
+        )],
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        paths = run_compute(cfg)
+    assert any("union of" in r.message for r in caplog.records)
+    t = pq.read_table(paths["by_phrase"]).to_pydict()
+
+    import re
+    def word_match(phrase, title):
+        return all(re.search(rf"\b{re.escape(w)}\b", title, re.IGNORECASE) for w in phrase.split())
+
+    hits = dict(zip(t["query_id"], t["hit_ids"]))
+    for qi, phrase in enumerate(phrases):
+        qid = f"q{qi}"
+        allowed = [i for i in range(n) if word_match(phrase, titles[i])]
+        scores = qdense[qi] @ dense[allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ids[allowed[j]] for j in order]
+        assert hits[qid] == expected, f"query={qid}"

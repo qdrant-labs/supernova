@@ -22,6 +22,16 @@ import pyarrow.compute as pc
 from nova_bf.config import Filter, FilterCondition
 
 
+def _word_mask(word: str, col: pa.ChunkedArray) -> pa.ChunkedArray:
+    """One word's substring-match mask — the single-word primitive both
+    `_match_text_mask` (ANDs it across a whole phrase, no caching) and
+    `_match_text_from_query_mask` (caches it across every DISTINCT phrase
+    sharing that word — see there) build on, so the regex/escaping rule
+    lives in exactly one place."""
+    pattern = rf"\b{re.escape(word)}\b"
+    return pc.match_substring_regex(col, pattern=pattern, ignore_case=True)
+
+
 def _match_text_mask(text: str, col: pa.ChunkedArray) -> pa.ChunkedArray:
     """AND of per-word substring matches — Qdrant's MatchText semantics.
 
@@ -34,8 +44,7 @@ def _match_text_mask(text: str, col: pa.ChunkedArray) -> pa.ChunkedArray:
     """
     mask = None
     for word in text.split():
-        pattern = rf"\b{re.escape(word)}\b"
-        part = pc.match_substring_regex(col, pattern=pattern, ignore_case=True)
+        part = _word_mask(word, col)
         mask = part if mask is None else pc.and_(mask, part)
     return mask
 
@@ -78,6 +87,27 @@ def _match_from_query_mask(
     return mask & not_null[None, :]
 
 
+def _match_any_membership(vocab: np.ndarray, list_values) -> np.ndarray:
+    """`(len(list_values), len(vocab))` boolean membership matrix: row `i`
+    is `True` at column `j` iff `vocab[j]` is a member of `list_values[i]`
+    (a `None` entry in `list_values` means "no restriction" — every column
+    stays `False`, same as an empty list). Shared by
+    `_match_any_from_query_mask` (`vocab` = this batch's distinct CORPUS
+    values) and `compute.py`'s GPU-native Front A path (`vocab` = the union
+    of every query's OWN list values, built once at setup) — same
+    build-a-position-dict-then-scatter algorithm either way, only the
+    source of `vocab` differs."""
+    pos = {v: i for i, v in enumerate(vocab)}
+    membership = np.zeros((len(list_values), len(vocab)), dtype=bool)
+    for i, values in enumerate(list_values):
+        if values is None:
+            continue
+        idxs = [pos[v] for v in values if v in pos]
+        if idxs:
+            membership[i, idxs] = True
+    return membership
+
+
 def _match_any_from_query_mask(
     corpus_vals: np.ndarray, query_lists, not_null: np.ndarray,
 ) -> np.ndarray:
@@ -99,16 +129,9 @@ def _match_any_from_query_mask(
     pos = {v: i for i, v in enumerate(distinct)}
     corpus_idx = np.array([pos.get(v, -1) for v in corpus_vals], dtype=np.int64)
 
-    n_q = len(query_lists)
-    membership = np.zeros((n_q, len(distinct)), dtype=bool)
-    for q, values in enumerate(query_lists):
-        if values is None:
-            continue
-        idxs = [pos[v] for v in values if v in pos]
-        if idxs:
-            membership[q, idxs] = True
+    membership = _match_any_membership(distinct, query_lists)
 
-    result = np.zeros((n_q, len(corpus_vals)), dtype=bool)
+    result = np.zeros((len(query_lists), len(corpus_vals)), dtype=bool)
     valid_cols = corpus_idx >= 0
     result[:, valid_cols] = membership[:, corpus_idx[valid_cols]]
     return result
@@ -147,14 +170,15 @@ def _match_text_from_query_mask(
     cond: FilterCondition, table: pa.Table, query_values: dict[str, np.ndarray],
 ) -> np.ndarray:
     """`(n_queries, rows)` — each query's own free-text phrase, matched with
-    the SAME word-boundary-AND semantics as `_match_text_mask` (reused
-    unchanged, once per DISTINCT phrase — not once per query). The one
-    per-query condition type with a real, different cost profile: if many
-    queries share an identical phrase, dedup keeps this cheap; for genuinely
-    per-query search text (the realistic case for real query logs, as
-    opposed to a benchmark with repeated queries), cost approaches
-    `O(distinct phrases × rows)` — additional CPU-side work that, unlike IO,
-    doesn't overlap with GPU scoring. See docs/brute-force/overview.md."""
+    the SAME word-boundary-AND semantics as `_match_text_mask`, but deduped
+    per DISTINCT WORD rather than per distinct phrase: two phrases sharing a
+    word (e.g. "wireless mouse" and "wireless keyboard") reuse that word's
+    regex pass instead of redoing it. Cost approaches `O(distinct words ×
+    rows)` rather than `O(distinct phrases × rows)` — a real win whenever
+    real query phrases share vocabulary, the common case. Cache key is the
+    lowercased word: `ignore_case=True` already makes "Wireless"/"wireless"
+    match identical rows, so casing shouldn't fragment the cache. See
+    docs/brute-force/overview.md."""
     col = table[cond.field]
     phrases = query_values[cond.match_text_from_query]
     n_rows = len(table)
@@ -169,15 +193,30 @@ def _match_text_from_query_mask(
             # the static `match_text` rejects this at config-load time (see
             # `FilterCondition._match_text_not_blank`), but a per-query
             # phrase comes from DATA, not a config literal, so it can't be
-            # rejected upfront the same way. Without this check, `_match_
-            # text_mask` would see zero words, never set its `mask`, and
-            # return `None` — crashing the caller's `pc.fill_null(None, ...)`.
+            # rejected upfront the same way. Without this check, a phrase
+            # would contribute zero words below and never populate `mask`.
             continue
         by_phrase.setdefault(phrase, []).append(q)
 
+    # Null propagation note: filling each word's mask to False here (rather
+    # than ANDing arrow masks with null propagation and filling once at the
+    # end, as the old phrase-level version did) is equivalent — a null
+    # corpus value makes EVERY word's regex mask null at that row, so
+    # filling each to False before ANDing still yields False there, same as
+    # ANDing nulls through and filling once at the end.
+    word_cache: dict[str, np.ndarray] = {}
     for phrase, qidxs in by_phrase.items():
-        mask = _match_text_mask(phrase, col)
-        result[qidxs, :] = pc.fill_null(mask, False).to_numpy(zero_copy_only=False)
+        mask = None
+        for word in phrase.split():
+            key = word.lower()
+            cached = word_cache.get(key)
+            if cached is None:
+                pattern = rf"\b{re.escape(word)}\b"
+                part = pc.match_substring_regex(col, pattern=pattern, ignore_case=True)
+                cached = pc.fill_null(part, False).to_numpy(zero_copy_only=False)
+                word_cache[key] = cached
+            mask = cached if mask is None else (mask & cached)
+        result[qidxs, :] = mask
     return result
 
 
