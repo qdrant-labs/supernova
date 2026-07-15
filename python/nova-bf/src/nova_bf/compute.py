@@ -49,27 +49,32 @@ What rows make up that shared grid depends on whether any search of the
 vector_type is unfiltered:
 
 - If ANY search is unfiltered (or has an explicit-but-empty filter — see
-  `_is_unfiltered`) OR PER-QUERY-filtered (see `_is_per_query` below), the
-  shared grid is the WHOLE file, uncompacted: an unfiltered search needs
-  every row anyway, and a per-query one has no SINGLE row-subset to offer
-  (different queries need different rows from the same batch) — either way,
-  every OTHER (uniformly filtered) search of the vector_type still rides
-  along for free, masking down to its own rows afterward.
-- Otherwise (every search of the vector_type has a UNIFORM active filter —
-  none unfiltered, none per-query), the shared grid is the UNION of every
-  DISTINCT active filter's surviving rows (`_union_keep`), compacted/
-  transferred/scored ONCE, with each search then masking down further to its
-  own filter's subset of that union. This never does MORE row-scoring than
-  treating each distinct filter independently would — in the worst case
-  (fully disjoint filters) it's exactly the same total rows, just one
-  transfer/launch instead of several — and strictly less whenever two
-  filters' surviving rows overlap. The tradeoff: unlike treating each filter
-  independently (which bounds each one's own transfer to its own, typically
-  smaller, surviving-row count), the union's peak transfer size is bounded
-  by `params.dense_batch_size`/`sparse_batch_size` alone when left at their
-  None default — several large, mostly-disjoint filters can produce a union
-  nearly the size of the whole file. Set that batch size explicitly if you
-  have many such filters (see `ParamsConfig`).
+  `_is_unfiltered`), the shared grid is the WHOLE file, uncompacted: an
+  unfiltered search needs every row anyway, so every OTHER (filtered) search
+  of the vector_type rides along for free, masking down to its own rows
+  afterward.
+- Otherwise (every search of the vector_type has an active filter — none
+  unfiltered), the shared grid is the UNION of every DISTINCT active
+  filter's surviving rows (`_union_keep`), compacted/transferred/scored
+  ONCE, with each search then masking down further to its own filter's
+  subset of that union. A per-query filter (see `_is_per_query`) has no
+  SINGLE row-subset to offer here (different queries need different rows
+  from the same batch) — it instead contributes a cheap, safe OVER-
+  approximation ("does at least one query's own leaf admit this row" — Front
+  B, see `_row_union_from_gpu_leaves`), so it still benefits from (and
+  contributes to) compaction; its own FINE per-query masking still applies
+  afterward, via `masked_fill`, same as when it rode the whole-file grid.
+  This never does MORE row-scoring than treating each distinct filter
+  independently would — in the worst case (fully disjoint filters) it's
+  exactly the same total rows, just one transfer/launch instead of several —
+  and strictly less whenever two filters' surviving rows overlap. The
+  tradeoff: unlike treating each filter independently (which bounds each
+  one's own transfer to its own, typically smaller, surviving-row count),
+  the union's peak transfer size is bounded by `params.dense_batch_size`/
+  `sparse_batch_size` alone when left at their None default — several large,
+  mostly-disjoint filters (or one loose per-query over-approximation) can
+  produce a union nearly the size of the whole file. Set that batch size
+  explicitly if you have many such filters (see `ParamsConfig`).
 
 Either way, `_process_shared_batch` does the per-search masking: an
 unfiltered search uses the shared grid as-is; a UNIFORMLY filtered one
@@ -86,6 +91,18 @@ dropped. `nova_bf.filters.evaluate()`'s result is `(rows,)` for a uniform
 filter (unchanged cost/shape from before per-query filters existed) or
 `(n_queries, rows)` the instant any condition, in any of `must`/`should`/
 `must_not`, is per-query.
+
+A per-query filter's `(n_queries, rows)` `cell_mask` is built one of two
+ways, decided once per distinct filter (`_gpu_eligible`): if every leaf is a
+static condition, `match_from_query` (scalar or list/MatchAny), or
+`range_from_query`, it's evaluated GPU-natively (`_gpu_evaluate`) straight
+from small per-file corpus arrays (vocab codes or raw numeric values,
+transferred to the GPU ONCE per file, then sliced per batch — see
+`_corpus_leaf_array`/`_build_gpu_leaf_state`) and small per-query GPU state
+built ONCE at setup — no `(n_queries, rows)` array is ever materialized on
+the CPU or shipped over PCIe. A filter with a `match_text`/
+`match_text_from_query` leaf anywhere falls back to `nova_bf.filters.
+evaluate()`'s CPU/numpy path unchanged (torch has no string tensor type).
 """
 
 from __future__ import annotations
@@ -95,6 +112,7 @@ import os
 import re
 import time
 
+from collections import Counter
 from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Thread
@@ -103,8 +121,8 @@ import numpy as np
 
 from tqdm import tqdm
 
-from nova_bf.config import BruteForceConfig, Filter, SearchSpec
-from nova_bf.filters import evaluate
+from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
+from nova_bf.filters import _condition_mask, _match_any_membership, evaluate
 from nova_bf.ids import make_point_id
 from nova_bf.io import ParquetFile, Store, dense_to_2d, sparse_to_coo_parts
 from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
@@ -630,11 +648,21 @@ def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | N
     the shared row-set for a vector_type where no search is unfiltered (see
     `run_compute`). Never called with `None` in `filters` (that's the
     `has_baseline` case, handled by leaving the whole file uncompacted
-    instead), so every `keeps[f]` here is a real per-row `np.ndarray`, not
-    `None`. `filters` is never empty (a vt only reaches this function once
+    instead), so every `keeps[f]` here is a real `np.ndarray`, not `None`.
+    `filters` is never empty (a vt only reaches this function once
     `vt_spec_idxs` has established it has at least one spec, each with a
-    real filter)."""
-    return np.logical_or.reduce([keeps[f] for f in filters])
+    real filter).
+
+    A UNIFORM filter's (or a GPU-eligible per-query filter's — Front B, see
+    `_row_union_from_gpu_leaves`) `keeps[f]` is already `(rows,)`, used as
+    -is. A CPU-fallback per-query filter's (`match_text`/
+    `match_text_from_query` leaf present) is `(n_queries, rows)` — reduced
+    to `(rows,)` via `.any(axis=0)` first: EXACT, not a heuristic, since
+    `evaluate()` already computed the full per-query mask for this filter
+    regardless (see `run_compute`'s reader thread), so "does any query want
+    this row" is simply read off it, not approximated."""
+    parts = [m.any(axis=0) if m.ndim == 2 else m for m in (keeps[f] for f in filters)]
+    return np.logical_or.reduce(parts)
 
 
 def _process_batch_group(
@@ -737,40 +765,340 @@ def _is_unfiltered(f: Filter | None) -> bool:
 def _is_per_query(f: Filter | None) -> bool:
     """Does `f` have any per-query condition (`match_from_query`/
     `range_from_query`/`match_text_from_query`) anywhere? A per-query
-    filter can never be compacted to one shared row-subset (different
-    queries need different corpus rows from the same batch), so
-    `run_compute` routes it the same way as an unfiltered spec — see
-    `has_baseline` — and `_process_shared_batch`'s `select` masks it via
-    `cell_mask` (a full `(n_queries, rows)` invalidation) rather than a
-    column gather."""
+    filter has no single EXACT row-subset to offer a shared batch grid
+    (different queries need different corpus rows from the same batch), so
+    it no longer forces `run_compute`'s `has_baseline` by itself (see
+    `_row_union_from_gpu_leaves`/`_union_keep` — Front B): it instead
+    contributes a cheap, safe over-approximation to union-compaction like
+    any other filter. Its FINE per-query masking still applies afterward —
+    `_process_shared_batch`'s `select` masks it via `cell_mask` (a full
+    `(n_queries, rows)` invalidation) rather than a column gather."""
     return f is not None and f.is_per_query()
+
+
+def _gpu_eligible(f: Filter | None) -> bool:
+    """Whether `f`'s per-query evaluation can run GPU-natively (Front A — see
+    this module's docstring) instead of `filters.py`'s CPU/numpy path:
+    needs at least one per-query leaf (a purely uniform filter already gets
+    the cheap column-gather path — see `_process_shared_batch` — so there's
+    nothing to speed up here) and no `match_text`/`match_text_from_query`
+    leaf ANYWHERE in the filter — torch has no string tensor type, so
+    regex/substring matching stays CPU-only regardless of what else is in
+    the filter (see `filters._match_text_from_query_mask`'s own word-level
+    dedup instead)."""
+    if f is None or not _is_per_query(f):
+        return False
+    return not any(
+        cond.match_text is not None or cond.match_text_from_query is not None
+        for cond in f.all_conditions()
+    )
+
+
+def _not_null_mask(vals: np.ndarray) -> np.ndarray:
+    """Which entries of `vals` are non-null: `None` (object-dtype arrays) or
+    `nan` (any float dtype) both mean "no restriction"/"never matches" —
+    same convention `filters.py`'s per-query masks already use. A plain
+    int64/bool array has no null representation at all, so every entry
+    counts as non-null."""
+    if vals.dtype == object:
+        return np.array([v is not None and v == v for v in vals], dtype=bool)
+    if vals.dtype.kind == "f":
+        return ~np.isnan(vals)
+    return np.ones(len(vals), dtype=bool)
+
+
+def _is_null_scalar(v) -> bool:
+    """One MatchAny list ELEMENT is null (`None`, or float `nan`) — same
+    "no restriction" convention `_not_null_mask` applies to a whole array,
+    used here to drop a null nested INSIDE a query's own list (as opposed
+    to the list itself being `None`) before vocab-building — `np.unique`
+    can't sort `None`/`nan` against a real value any more than it can for a
+    whole column (see `_encode_against_vocab`)."""
+    return v is None or (isinstance(v, float) and v != v)
+
+
+def _encode_against_vocab(vocab: np.ndarray, vals: np.ndarray) -> np.ndarray:
+    """`vals` -> position in `vocab`, or -1 for null or absent-from-vocab —
+    the corpus-side half of Front A's `match_from_query` GPU path (see
+    `_corpus_leaf_array`). Excludes nulls from the `searchsorted` call
+    itself, same reason `filters._match_any_from_query_mask` does: `vocab`'s
+    dtype has no defined ordering against `None`/`nan` mixed into an
+    object array."""
+    not_null = _not_null_mask(vals)
+    codes = np.full(len(vals), -1, dtype=np.int64)
+    if not_null.any():
+        codes[not_null] = _vocab_lookup(vocab, vals[not_null])
+    return codes
+
+
+def _safe_extreme(vals: np.ndarray, kind: str) -> float | None:
+    """`min`/`max` of `vals`, excluding null entries — `None` if every entry
+    is null (nothing to extremize). Used by `_row_union_from_gpu_leaves` so
+    one query's null per-query bound (which never matches for THAT query,
+    see `_range_from_query_mask`) can't poison a plain `.min()`/`.max()`
+    with `nan`."""
+    not_null = _not_null_mask(vals)
+    if not not_null.any():
+        return None
+    return float(vals[not_null].min() if kind == "min" else vals[not_null].max())
+
+
+def _row_union_from_gpu_leaves(
+    f: Filter, leaf_arrays: dict[FilterCondition, np.ndarray],
+    query_filter_vals: dict[str, np.ndarray], n_rows: int,
+) -> np.ndarray | None:
+    """`(rows,)` SAFE OVER-APPROXIMATION of "does at least one query's
+    per-query leaf admit this row" for a GPU-eligible per-query filter
+    (Front B — see `run_compute`'s `has_baseline`/`vt_union_filters`), or
+    `None` if no such leaf exists to build one from (caller substitutes
+    all-`True`: no tightening possible, but always correct).
+
+    Built ONLY from `f.must`'s `match_from_query`/`range_from_query` leaves
+    — deliberately NEVER `should` or `must_not`: a `must` leaf is a
+    NECESSARY condition for the row regardless of anything else in the
+    filter, so whichever query actually wants a row necessarily satisfies
+    THAT query's own version of every one of these leaves — ORing each
+    leaf's "some query's own value admits this row" mask together is
+    therefore provably a superset of the true "some query wants this row"
+    set, however many `must` conditions (per-query or static) there are.
+    `should`/`must_not` don't have this property: a `should` branch's
+    satisfaction doesn't require any ONE specific condition to hold (a row
+    could be admitted via a totally different, possibly static, branch),
+    and a `must_not` leaf's own predicate holding is what EXCLUDES a row,
+    not what admits one — using either here could silently exclude a row
+    some query genuinely wants, so a filter whose only per-query leaf(s)
+    live outside `must` gets no tightening at all here (falls back to
+    all-`True` via the `None` return), never a WRONG one.
+
+    `match_from_query`'s test (`arr != -1`) is the same expression whether
+    the leaf is scalar or MatchAny: either way, `vocab` (see
+    `_build_gpu_leaf_state`) is built from exactly the values SOME query's
+    leaf references, so a corpus value present in it (a non-`-1` code) is
+    necessarily wanted by whichever query(ies) contributed that value.
+    `range_from_query` unions each configured bound independently across
+    every query (the loosest — min for a lower bound, max for an upper
+    one) rather than per-query per-bound; combining a query's OWN gt/lt
+    pair would be tighter, but this cheaper cross-query union is still a
+    valid superset (each query's own bound is at least as tight as the
+    extreme, so a row a query's own bounds admit is also admitted by the
+    extreme)."""
+    mask = None
+    for cond in f.must:
+        if cond.match_from_query is not None:
+            part = leaf_arrays[cond] != -1
+        elif cond.range_from_query is not None:
+            arr = leaf_arrays[cond]
+            r = cond.range_from_query
+            part = np.ones(n_rows, dtype=bool)
+            if r.gt is not None:
+                lo = _safe_extreme(query_filter_vals[r.gt], "min")
+                if lo is not None:
+                    part &= arr > lo
+            if r.gte is not None:
+                lo = _safe_extreme(query_filter_vals[r.gte], "min")
+                if lo is not None:
+                    part &= arr >= lo
+            if r.lt is not None:
+                hi = _safe_extreme(query_filter_vals[r.lt], "max")
+                if hi is not None:
+                    part &= arr < hi
+            if r.lte is not None:
+                hi = _safe_extreme(query_filter_vals[r.lte], "max")
+                if hi is not None:
+                    part &= arr <= hi
+        else:
+            continue
+        mask = part if mask is None else (mask | part)
+    return mask
+
+
+def _build_gpu_leaf_state(
+    cond: FilterCondition, query_filter_vals: dict[str, np.ndarray], device: str,
+) -> tuple[object, np.ndarray | None]:
+    """Setup-time (once per DISTINCT `match_from_query`/`range_from_query`
+    `FilterCondition` across every GPU-eligible filter in the run — see
+    `run_compute` — NOT per `Filter` and NOT per file): builds and transfers
+    this ONE leaf's small per-query GPU state — vocab-encoded query codes, a
+    MatchAny membership matrix, or per-bound numeric arrays — the per-query
+    analog of `Q_gpu_by_vt`'s one-time transfer. Keying by the condition
+    itself (not by the enclosing filter) means two different filters that
+    happen to share an identical per-query leaf build and transfer it only
+    ONCE, same sharing `leaf_arrays`/`leaf_gpu` already give the corpus side.
+
+    Returns `(query_gpu_entry, vocab_or_none)`: a `match_from_query` entry is
+    `("scalar", codes_gpu)` or `("list", membership_gpu)`, paired with the
+    vocab needed again per file to encode the CORPUS side against the SAME
+    vocab (see `_corpus_leaf_array`) — a corpus value never seen in that
+    vocab can't match any query's `match_from_query` leaf, by construction.
+    A `range_from_query` entry is a `{bound_name: qbounds_gpu}` dict, with no
+    vocab (`None`) since it needs no factorization."""
+    import torch
+
+    if cond.match_from_query is not None:
+        qvals = query_filter_vals[cond.match_from_query]
+        is_list = any(isinstance(v, (list, tuple, np.ndarray)) for v in qvals)
+        if is_list:
+            # Vocab = union of every query's OWN list values (not the
+            # corpus's distinct values) — a corpus value absent from every
+            # query's list can never match anyone, so mapping it to -1 below
+            # (see _gpu_cond_mask's `valid` masking) is exact, not lossy.
+            # Null elements NESTED INSIDE a list (as opposed to the list
+            # itself being None) are dropped before np.unique, same reason
+            # _encode_against_vocab excludes nulls from its own vocab lookup.
+            flat = [
+                v for lst in qvals if lst is not None
+                for v in lst if not _is_null_scalar(v)
+            ]
+            vocab = np.unique(np.asarray(flat)) if flat else np.empty(0)
+            membership = _match_any_membership(vocab, qvals)
+            return ("list", torch.from_numpy(membership).to(device, non_blocking=True)), vocab
+        not_null = _not_null_mask(qvals)
+        vocab = np.unique(qvals[not_null]) if not_null.any() else np.empty(0, dtype=qvals.dtype)
+        # -2: a null per-query value never matches anything — kept distinct
+        # from -1 (corpus null/absent-from-vocab) so the two sentinels can
+        # never accidentally compare equal.
+        codes = np.full(len(qvals), -2, dtype=np.int64)
+        if not_null.any():
+            codes[not_null] = _vocab_lookup(vocab, qvals[not_null])
+        return ("scalar", torch.from_numpy(codes).to(device, non_blocking=True)), vocab
+
+    r = cond.range_from_query
+    bounds: dict[str, object] = {}
+    for name in ("gt", "gte", "lt", "lte"):
+        colname = getattr(r, name)
+        if colname is None:
+            continue
+        qb = query_filter_vals[colname].astype(np.float64, copy=False)
+        bounds[name] = torch.from_numpy(qb).to(device, non_blocking=True)
+    return bounds, None
+
+
+def _corpus_leaf_array(cond: FilterCondition, table, vocab_for_cond: np.ndarray | None) -> np.ndarray:
+    """CPU-side, once per file (see `run_compute`'s reader thread): this
+    condition's corpus-side array for GPU-native evaluation (Front A) —
+    `(rows,)` int64 vocab codes (-1 for null/absent) for a `match_from_query`
+    leaf (scalar OR MatchAny — both compare/gather against one corpus scalar
+    per row), `(rows,)` float64 raw values for `range_from_query` (a null
+    row becomes NaN, which already compares False against every bound — see
+    `_gpu_cond_mask`), or `(rows,)` boolean — this file's already-evaluated
+    result — for a static `match`/`range` leaf, reusing
+    `filters._condition_mask` UNCHANGED so the leaves Front A doesn't need
+    to move at all can never diverge from the CPU reference path."""
+    if cond.match_from_query is not None:
+        corpus_vals = table[cond.field].to_numpy(zero_copy_only=False)
+        return _encode_against_vocab(vocab_for_cond, corpus_vals)
+    if cond.range_from_query is not None:
+        return table[cond.field].to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
+    return _condition_mask(cond, table)
+
+
+def _gpu_cond_mask(cond: FilterCondition, leaf_gpu: dict, rows, query_gpu: dict):
+    """torch-native per-condition mask for one GPU-eligible leaf — the Front
+    A analog of `filters._condition_mask`. `leaf_gpu[cond]` is this
+    condition's corpus-side array (built once per file, transferred once —
+    see `run_compute`); indexing it by `rows` (this slice's true row
+    positions, already a GPU `LongTensor` — the SAME tensor `_merge_topk`'s
+    id-encoding uses) narrows it to the current batch slice with no extra
+    host transfer or `true_rows` bookkeeping needed here. `query_gpu[cond]`
+    is this condition's per-query GPU state, built once at setup (see
+    `_build_gpu_leaf_state`)."""
+    import torch
+
+    arr = leaf_gpu[cond][rows]
+    if cond.match_from_query is not None:
+        kind, qstate = query_gpu[cond]
+        if kind == "scalar":
+            return qstate[:, None] == arr[None, :]
+        # MatchAny: qstate is the (n_queries, n_distinct) membership matrix;
+        # arr is this slice's corpus vocab codes (-1 for null/absent). An
+        # empty vocab (every query's list was null/empty) means n_distinct
+        # is 0 — nothing to gather, and no valid corpus code can exist
+        # either, so short-circuit before indexing a zero-width dimension
+        # (arr.clamp(min=0) would otherwise still try to gather column 0
+        # from it and raise IndexError).
+        if qstate.shape[1] == 0:
+            return torch.zeros((qstate.shape[0], arr.shape[0]), dtype=torch.bool, device=arr.device)
+        # Clamp before gathering to avoid a -1 (null/absent) code wrapping
+        # to the LAST column, then explicitly zero those columns out,
+        # mirroring filters._match_any_from_query_mask's `valid_cols`
+        # handling.
+        valid = arr >= 0
+        gathered = qstate[:, arr.clamp(min=0)]
+        return gathered & valid[None, :]
+    if cond.range_from_query is not None:
+        ops = {"gt": torch.gt, "gte": torch.ge, "lt": torch.lt, "lte": torch.le}
+        mask = None
+        for name, qbounds in query_gpu[cond].items():
+            part = ops[name](arr[None, :], qbounds[:, None])
+            mask = part if mask is None else (mask & part)
+        return mask
+    # Static match/range: leaf_gpu[cond] is already the (rows,) boolean
+    # result of filters._condition_mask, computed once per file — no
+    # per-query broadcast needed for this leaf.
+    return arr
+
+
+def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str):
+    """torch-native analog of `filters.evaluate()`, for a GPU-eligible
+    per-query filter (see `_gpu_eligible`) — identical must/should/must_not
+    combination logic, operating on GPU-resident tensors so a batch slice
+    never needs a host round trip. Always returns a `(n_queries,
+    len(rows))` bool tensor: eligibility requires at least one per-query
+    leaf, so unlike `filters.evaluate()` there's no plain-`(rows,)` case to
+    handle here."""
+    import torch
+
+    n = rows.numel()
+    keep = torch.ones(n, dtype=torch.bool, device=device)
+    for cond in f.must:
+        keep = keep & _gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
+    if f.should:
+        any_match = torch.zeros(n, dtype=torch.bool, device=device)
+        for cond in f.should:
+            any_match = any_match | _gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
+        keep = keep & any_match
+    for cond in f.must_not:
+        keep = keep & ~_gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
+    return keep
 
 
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
     keeps: dict[Filter | None, np.ndarray | None], filter_is_per_query: dict[Filter | None, bool],
+    filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
+    query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
 ) -> float:
     """Every search of this vector_type shares one batch grid: `orig_rows`
-    is `None` when some search is unfiltered OR per-query-filtered (`batch`
-    is the raw, whole file — see `run_compute`'s `has_baseline`), or the
-    true-row map produced by compacting `batch` to the union of every
-    active UNIFORM filter otherwise (see `_union_keep` — a per-query filter
-    never contributes to that union, since it has no single row-subset to
-    offer). Three cases per member, decided by `filter_is_per_query[s.filter]`:
+    is `None` when some search is unfiltered (`batch` is the raw, whole
+    file — see `run_compute`'s `has_baseline`), or the true-row map produced
+    by compacting `batch` to the union of every active filter's surviving
+    rows otherwise (see `_union_keep` — a per-query filter contributes its
+    own safe OVER-approximation to that union, Front B, rather than an
+    exact row-subset). Three cases per member, decided by
+    `filter_is_gpu_eligible[s.filter]` then `filter_is_per_query[s.filter]`:
 
     - Unfiltered: use the shared slice as-is.
+    - Per-query filter (either GPU-eligible via Front A, or the CPU fallback
+      for a `match_text`/`match_text_from_query` leaf — see `_gpu_eligible`):
+      builds this member's `(n_queries, batch_rows)` `cell_mask` — from
+      GPU-resident tensors via `_gpu_evaluate` (`leaf_gpu`/`query_gpu`, no
+      CPU-side mask, no per-slice host transfer) or from `keeps[s.filter]`
+      (computed once per file in `filters.evaluate()`) — cached per filter
+      in `cache` only when `filter_share_count[s.filter] > 1`: a filter used
+      by exactly one spec has nothing to share, so skipping the cache entry
+      lets that tensor be collected as soon as this member's `sel_scores`
+      is built instead of living until the end of this r0-slice's member
+      loop. Every query needs a potentially different row-subset here, so
+      there's no shared column selection to make — instead every column
+      stays, and `cell_mask` gets applied via `masked_fill` in
+      `_process_batch_group`.
     - Uniform filter: mask down to its own filter's surviving COLUMNS, via a
       `local_idx` cached per filter (in `_process_batch_group`'s per-slice
       `cache`) so two members sharing an identical filter don't recompute
       `nonzero` twice — indexing `keeps[s.filter]` by `true_rows` (each
       slice position's TRUE file row), not by position, since the shared
       batch may already be a compacted subset of the file.
-    - Per-query filter: `keeps[s.filter]` is `(n_queries, rows)` — every
-      query needs a potentially different row-subset, so there's no shared
-      column selection to make; instead every column stays, and a `cell_mask`
-      (this member's own `(n_queries, batch_rows)` slice, also cached per
-      filter) gets applied via `masked_fill` in `_process_batch_group`.
 
     See `_process_batch_group` for the shared loop body."""
     import torch
@@ -779,12 +1107,16 @@ def _process_shared_batch(
         s = specs[m]
         if _is_unfiltered(s.filter):
             return rows, None, None
-        if filter_is_per_query[s.filter]:
+        if filter_is_gpu_eligible[s.filter] or filter_is_per_query[s.filter]:
             cell_mask = cache.get(s.filter)
             if cell_mask is None:
-                cell_np = keeps[s.filter][:, true_rows]
-                cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
-                cache[s.filter] = cell_mask
+                if filter_is_gpu_eligible[s.filter]:
+                    cell_mask = _gpu_evaluate(s.filter, leaf_gpu, rows, query_gpu, device)
+                else:
+                    cell_np = keeps[s.filter][:, true_rows]
+                    cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
+                if filter_share_count[s.filter] > 1:
+                    cache[s.filter] = cell_mask
             if not cell_mask.any():
                 return None, None, None
             return rows, None, cell_mask
@@ -974,6 +1306,34 @@ def run_compute(
     # per-member `select` closure below does a cheap dict lookup instead of
     # recomputing `Filter.is_per_query()` (a must/should/must_not walk).
     filter_is_per_query: dict[Filter | None, bool] = {f: _is_per_query(f) for f in distinct_filters}
+    # Which of those per-query filters can skip filters.py's CPU/numpy path
+    # entirely and evaluate GPU-natively instead (Front A — see
+    # _gpu_eligible); each such filter's match_from_query/range_from_query
+    # leaves get their small per-query GPU state (vocab codes, membership
+    # matrices, bound tensors) built ONCE here, not per file — the
+    # per-query analog of Q_gpu_by_vt's one-time transfer above. Keyed by
+    # the FilterCondition itself (not by Filter), so two different filters
+    # sharing an identical per-query leaf build/transfer it only once —
+    # same sharing leaf_arrays/leaf_gpu already give the corpus side below.
+    filter_is_gpu_eligible: dict[Filter | None, bool] = {f: _gpu_eligible(f) for f in distinct_filters}
+    gpu_query_gpu: dict[FilterCondition, object] = {}
+    gpu_vocabs: dict[FilterCondition, np.ndarray] = {}
+    for f in distinct_filters:
+        if not filter_is_gpu_eligible[f]:
+            continue
+        for cond in f.all_conditions():
+            if cond.match_from_query is None and cond.range_from_query is None:
+                continue  # a static leaf inside an eligible filter needs no per-query GPU state
+            if cond in gpu_query_gpu:
+                continue
+            qgpu, vocab = _build_gpu_leaf_state(cond, query_filter_vals, device)
+            gpu_query_gpu[cond] = qgpu
+            if vocab is not None:
+                gpu_vocabs[cond] = vocab
+    # How many specs share each distinct filter — used by _process_shared_batch
+    # to skip caching a per-query cell_mask when nobody else will reuse it
+    # (Front A's memory-shrinking complement).
+    filter_share_count: dict[Filter | None, int] = Counter(spec_filter)
 
     vt_spec_idxs: dict[str, list[int]] = {vt: [] for vt in vts_needed}
     for i, s in enumerate(specs):
@@ -984,9 +1344,10 @@ def run_compute(
     vt_batch_size: dict[str, int | None] = {}
     vt_union_filters: dict[str, list[Filter]] = {}
     for vt, idxs in vt_spec_idxs.items():
-        has_baseline[vt] = any(
-            _is_unfiltered(specs[i].filter) or _is_per_query(specs[i].filter) for i in idxs
-        )
+        # Front B: a per-query filter no longer forces the whole file — see
+        # keeps[f]'s row-level union for a per-query filter (built in the
+        # reader thread below) and _row_union_from_gpu_leaves's docstring.
+        has_baseline[vt] = any(_is_unfiltered(specs[i].filter) for i in idxs)
         # Every search of this vector_type shares one batch grid regardless of
         # which branch below applies, so k_floor spans ALL of them, not just a
         # same-filter subset — see _resolve_vt_batch_size's docstring.
@@ -1004,6 +1365,10 @@ def run_compute(
                 "over the union of %d distinct filter(s) (batch_size=%s)",
                 vt, len(idxs), len(vt_union_filters[vt]), vt_batch_size[vt],
             )
+    # Only a filter that actually appears in SOME vt's union ever reaches
+    # _union_keep (a filter whose vt has has_baseline=True never does) — so
+    # only these need the per-file row-level union computed at all (Front B).
+    filters_needing_row_union: set[Filter] = {f for fs in vt_union_filters.values() for f in fs}
 
     # Prefetch corpus files with a POOL of reader threads so many S3 GETs are in
     # flight at once — otherwise the GPU sits idle behind one file's latency at a
@@ -1084,12 +1449,37 @@ def run_compute(
                 # `query_filter_vals` feeds any per-query condition; `evaluate()`
                 # returns `(rows,)` for a purely-uniform filter (unchanged cost),
                 # or `(n_queries, rows)` the moment any condition is per-query.
-                keeps = {
-                    f: (evaluate(f, table, query_filter_vals) if f is not None else None)
-                    for f in distinct_filters
-                }
+                #
+                # A GPU-eligible per-query filter (Front A — see _gpu_eligible)
+                # skips evaluate() entirely — its FINE, per-query mask is built
+                # lazily, per batch slice, straight from per-CONDITION corpus
+                # arrays instead (`leaf_arrays`, keyed by the FilterCondition
+                # object so two eligible filters sharing an identical leaf
+                # compute it once) — shared per (field, leaf-kind) exactly like
+                # `keeps` is shared per whole Filter. It still gets a `keeps`
+                # entry when SOME vt actually needs it (`filters_needing_row_
+                # union`): a cheap (rows,) safe-superset "does any query want
+                # this row at all" reduction (Front B — see
+                # _row_union_from_gpu_leaves), used only for union-compaction
+                # (`_union_keep`) and the corpus_ids retention check below —
+                # never for the per-query cell_mask itself.
+                n_rows = len(table)
+                keeps: dict[Filter | None, np.ndarray | None] = {}
+                leaf_arrays: dict[FilterCondition, np.ndarray] = {}
+                for f in distinct_filters:
+                    if f is None:
+                        keeps[f] = None
+                    elif filter_is_gpu_eligible[f]:
+                        for cond in f.all_conditions():
+                            if cond not in leaf_arrays:
+                                leaf_arrays[cond] = _corpus_leaf_array(cond, table, gpu_vocabs.get(cond))
+                        if f in filters_needing_row_union:
+                            union = _row_union_from_gpu_leaves(f, leaf_arrays, query_filter_vals, n_rows)
+                            keeps[f] = union if union is not None else np.ones(n_rows, dtype=bool)
+                    else:
+                        keeps[f] = evaluate(f, table, query_filter_vals)
                 t2 = time.perf_counter()
-                fq.put((gidx, arrs, ids, keeps, t1 - t0, t2 - t1))
+                fq.put((gidx, arrs, ids, keeps, leaf_arrays, t1 - t0, t2 - t1))
             except Exception as exc:
                 fq.put(exc)
                 return
@@ -1131,7 +1521,7 @@ def run_compute(
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for want_gidx, _f in mine:
             w0 = time.perf_counter()
-            gidx, arrs, ids, keeps, rsec, fsec = _next_in_order(want_gidx, pending, _fetch_or_raise)
+            gidx, arrs, ids, keeps, leaf_arrays, rsec, fsec = _next_in_order(want_gidx, pending, _fetch_or_raise)
             io_wait += time.perf_counter() - w0
             read_secs += rsec
             filter_secs += fsec
@@ -1148,6 +1538,15 @@ def run_compute(
                 sp_offsets, sp_idx, sp_val, sp_norms = arrs["sparse"]
                 batches["sparse"] = SparseCorpusBatch(sp_offsets, sp_idx, sp_val, sp_norms, query_vocab, need_sparse_norms)
 
+            # Front A: transfer this file's GPU-eligible per-query leaf arrays
+            # to the GPU ONCE here (not once per batch slice) — mirrors
+            # Q_gpu_by_vt's one-time transfer, vector_type-agnostic since a
+            # filter condition reads a payload column, never a vector column.
+            leaf_gpu: dict[FilterCondition, object] = {
+                cond: torch.from_numpy(arr).to(device, non_blocking=True)
+                for cond, arr in leaf_arrays.items()
+            }
+
             # Whole-file bookkeeping, computed BEFORE any spec's per-vector-type
             # compaction below. rows_seen/bytes_seen are counted once per file per
             # distinct vector_type present (pre-filter), not per spec — with
@@ -1163,7 +1562,17 @@ def run_compute(
             # approximation: a restrictive spec's filter dropping the whole
             # file must never block a DIFFERENT spec's id resolution for that
             # same file, but a file every spec's filter drops needs no ids
-            # kept at all.
+            # kept at all. A GPU-eligible filter's `keeps` entry (when
+            # present — see `filters_needing_row_union` above; it's skipped
+            # entirely for a filter no vt's union ever needs) is a safe
+            # OVER-approximation (Front B — see _row_union_from_gpu_leaves),
+            # never a false negative, so `.any()` here is still exact for
+            # "definitely nobody wants this file" and only ever conservative
+            # (never wrongly dropping) in the "maybe somebody does" direction.
+            # A gpu-eligible filter MISSING from `keeps` only happens when
+            # its own vt has has_baseline=True, i.e. some OTHER spec of that
+            # vt is unfiltered — `keeps[None]` (`is None`) already covers
+            # retention for that file, so the missing entry costs nothing.
             if id_col and any(mask is None or mask.any() for mask in keeps.values()):
                 corpus_ids[gidx] = ids
             for vt in vts_needed:
@@ -1184,7 +1593,8 @@ def run_compute(
                     batch, orig_rows = b.compact(_union_keep(vt_union_filters[vt], keeps))
                 gpu_secs += _process_shared_batch(
                     batch, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
-                    keeps, filter_is_per_query, vt_batch_size[vt], gidx, device, orig_rows=orig_rows,
+                    keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
+                    filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=orig_rows,
                 )
 
             if bar.n % 200 == 0:

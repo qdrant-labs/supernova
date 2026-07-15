@@ -327,6 +327,14 @@ class Filter(BaseModel):
             c.field for group in self._CONDITION_GROUPS for c in getattr(self, group)
         }
 
+    def all_conditions(self) -> tuple["FilterCondition", ...]:
+        """Every condition in this filter, across all three groups — the one
+        place a caller that needs to walk every leaf (regardless of which
+        group it's in) does so via `_CONDITION_GROUPS`, not its own
+        hardcoded `(*f.must, *f.should, *f.must_not)`, same reason
+        `fields()`/`query_fields()` do."""
+        return tuple(c for group in self._CONDITION_GROUPS for c in getattr(self, group))
+
     def query_fields(self) -> set[str]:
         """Every QUERIES column referenced by a per-query condition anywhere
         in this filter (any group, any of `match_from_query`/
@@ -353,9 +361,11 @@ class Filter(BaseModel):
 
     def is_per_query(self) -> bool:
         """Does any condition in this filter vary per query? A per-query
-        filter can never be compacted to one shared row-subset (different
-        queries need different corpus rows), so `compute.py`'s `run_compute`
-        routes it the same way as an unfiltered spec — see `_is_per_query`."""
+        filter has no single EXACT row-subset to offer a shared batch grid
+        (different queries need different corpus rows), but `compute.py`'s
+        `run_compute` can still union-compact it via a cheap, safe
+        over-approximation rather than always falling back to the whole
+        file — see `_is_per_query`/`_row_union_from_gpu_leaves`."""
         return bool(self.query_fields())
 
 
