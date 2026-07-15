@@ -23,7 +23,9 @@ are read alongside the vector column and evaluated into a keep-mask *before*
 scoring, so filtered-out rows never reach the GPU. The mask compacts `arr` but
 never renumbers rows — `orig_rows` tracks each surviving row's true file-row
 number, since both `make_point_id` and the `id_column` lookup are keyed on it.
-Mask evaluation is timed separately from the read (`filter_secs`, reported
+Mask evaluation (and, since it happens in the same reader thread right
+afterward, the union-compaction fancy-index copy — see `run_compute`'s
+`reader()`) is timed separately from the read (`filter_secs`, reported
 alongside `read_secs`/`io_wait`/`gpu_secs`) so a slow filter is distinguishable
 from slow IO in the end-of-run timing log.
 
@@ -118,6 +120,7 @@ import re
 import time
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Thread
@@ -602,19 +605,56 @@ class SparseBatchSlice:
         return raw
 
 
-def _merge_topk(top_scores, top_enc, batch_scores, batch_rows, gidx: int, k: int):
+def _concat_dense_batches(batches: list[DenseCorpusBatch]) -> DenseCorpusBatch:
+    """Concatenate several files' (already union-compacted) `DenseCorpusBatch`
+    rows into one combined batch — used to coalesce many small per-file
+    post-filter batches into fewer, larger GPU calls (see `run_compute`'s
+    `_flush_coalesce_group`)."""
+    return DenseCorpusBatch(np.concatenate([b.arr for b in batches], axis=0))
+
+
+def _concat_sparse_batches(batches: list[SparseCorpusBatch]) -> SparseCorpusBatch:
+    """Concatenate several files' (already union-compacted) `SparseCorpusBatch`
+    rows into one combined CSR — the sparse analog of `_concat_dense_batches`.
+    `indices`/`values`/`norms` are simple per-nnz/per-row concatenations, but
+    `row_offsets` (CSR's cumulative nnz-per-row counts) can't just be
+    concatenated as-is — every batch after the first restarts counting from
+    0, so naive concatenation would produce a non-monotonic, garbage offset
+    array. Each subsequent batch's offsets get shifted by the running total
+    nnz seen so far, and its own leading `0` entry is dropped (it would
+    exactly duplicate the previous batch's final, already-accumulated
+    offset). `vocab`/`need_row_norms` are fixed run-wide (see
+    `SparseCorpusBatch`'s own docstring), so the first batch's copy is
+    authoritative for all of them."""
+    indices = np.concatenate([b.indices for b in batches])
+    values = np.concatenate([b.values for b in batches])
+    norms = np.concatenate([b.norms for b in batches]) if batches[0].norms is not None else None
+    offsets_parts = [batches[0].row_offsets]
+    running_nnz = int(batches[0].row_offsets[-1])
+    for b in batches[1:]:
+        offsets_parts.append(b.row_offsets[1:] + running_nnz)
+        running_nnz += int(b.row_offsets[-1])
+    row_offsets = np.concatenate(offsets_parts).astype(np.int64)
+    return SparseCorpusBatch(row_offsets, indices, values, norms, batches[0].vocab, batches[0].need_row_norms)
+
+
+def _merge_topk(top_scores, top_enc, batch_scores, encoded_rows, k: int):
     """Fold one batch's `(n_q, n_candidate_rows)` score matrix into a spec's
     running `(top_scores, top_enc)` top-k state: top-k the batch on its own
     (bounded by however many candidate rows it actually has), append to the
-    running state, and re-top-k down to `k`. `batch_rows` must be the TRUE
-    file row for each of `batch_scores`'s columns, so the encoding stays
-    `global_file_idx * MAX_ROWS_PER_FILE + row` regardless of batching,
-    compaction, or masking."""
+    running state, and re-top-k down to `k`. `encoded_rows` must already be
+    the fully-encoded `global_file_idx * MAX_ROWS_PER_FILE + row` id for each
+    of `batch_scores`'s columns — this function no longer computes that
+    encoding itself (see `_process_batch_group`, which builds `encoded_rows`
+    either from a single file's own `gidx` or, when several files' rows have
+    been coalesced into one batch, from each contributing row's OWN file's
+    gidx), so the same encoding scheme holds regardless of batching,
+    compaction, or coalescing."""
     import torch
 
     bk = min(k, batch_scores.shape[1])
     f_scores, f_local = torch.topk(batch_scores, k=bk, dim=1)
-    f_enc = (gidx * MAX_ROWS_PER_FILE + batch_rows)[f_local]
+    f_enc = encoded_rows[f_local]
     merged_s = torch.cat([top_scores, f_scores], dim=1)
     merged_e = torch.cat([top_enc, f_enc], dim=1)
     new_top_scores, idx = torch.topk(merged_s, k=k, dim=1)
@@ -699,6 +739,7 @@ def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | N
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
+    encoded_row_ids: np.ndarray | None = None,
 ) -> float:
     """The shared per-vector_type primitive behind `_process_shared_batch`:
     iterate `batch` in `batch_size`-row slices, transfer each slice once
@@ -707,29 +748,46 @@ def _process_batch_group(
     that metric reads the same tensor), and merge each member's own top-k
     from those shared columns via `_merge_topk`.
 
-    `orig_rows` maps a slice position to its TRUE file-row number: `None`
-    means position IS the true row — `batch` is the raw, whole file, because
-    some search of this vector_type is unfiltered and needs every row; an
-    array means `batch` was already compacted by the caller (to the union of
-    every active filter's surviving rows — see `run_compute`'s `has_baseline`
-    and `_union_keep`) and this maps back to true rows for `_merge_topk`'s
-    encoding.
+    `orig_rows` maps a slice position to its TRUE file-row number (used to
+    index a filter's keep-mask, and — when `encoded_row_ids` is `None` — to
+    build `_merge_topk`'s output-id encoding too): `None` means position IS
+    the true row, either because `batch` is the raw, whole file (some search
+    of this vector_type is unfiltered and needs every row), or because
+    `batch` is several files' rows COALESCED into one (see `run_compute`'s
+    `_flush_coalesce_group`) whose keep-masks were already rebuilt to align
+    with the coalesced batch's own row order — either way, nothing to remap
+    for keep-mask indexing. An array means `batch` is a SINGLE file's own
+    compacted batch (the union of every active filter's surviving rows —
+    see `run_compute`'s `has_baseline` and `_union_keep`) and this maps back
+    to that one file's true rows.
+
+    `encoded_row_ids`, independently, is `_merge_topk`'s output-id source:
+    `None` means single-file — `gidx * MAX_ROWS_PER_FILE + rows` is computed
+    here (cheaply, directly on device, no CPU round-trip); a caller-supplied
+    array means it's already the fully-encoded id per row (needed for a
+    coalesced batch, where different rows came from different files, so no
+    single scalar `gidx` can encode all of them). This is deliberately a
+    SEPARATE concept from `orig_rows`: a coalesced batch needs identity
+    keep-mask indexing (rebuilt masks already match its own row order) but
+    non-identity, per-source-file id encoding — the two purposes coincide
+    for a single file but diverge once rows from several files share one
+    batch.
 
     `select(m, rows, true_rows, cache) -> (sel_rows, sel_cols, cell_mask)` is
     the per-member filtering strategy (see `_process_shared_batch`):
     `sel_rows is None` skips the merge entirely for this member/slice (e.g.
     a filter keeping zero rows here); `sel_cols` is either `None` (member is
     unfiltered or per-query-filtered — use the slice's rows unchanged) or a
-    column-index tensor used to mask both the score matrix and `rows` down
-    to that member's own (uniform) filter's surviving columns; `cell_mask`
-    is either `None` (no per-(query,row) masking needed) or a `(n_queries,
-    len(rows))` boolean tensor applied via `masked_fill` — a per-query
-    filter's own rows vary BY QUERY, so unlike a uniform filter it can't be
-    expressed as one shared column selection; every column stays, and
-    individual (query, row) cells get invalidated instead. `true_rows`
-    indexes a filter's keep-mask (sized to the whole file, not to this
-    possibly-already-compacted batch): a plain `slice(r0, r1)` when
-    `orig_rows is None` (position IS the true row — a cheap view, no copy),
+    column-index tensor used to mask the score matrix (and `encoded_rows`,
+    identically) down to that member's own (uniform) filter's surviving
+    columns; `cell_mask` is either `None` (no per-(query,row) masking
+    needed) or a `(n_queries, len(rows))` boolean tensor applied via
+    `masked_fill` — a per-query filter's own rows vary BY QUERY, so unlike a
+    uniform filter it can't be expressed as one shared column selection;
+    every column stays, and individual (query, row) cells get invalidated
+    instead. `true_rows` indexes a filter's keep-mask (sized to match
+    `batch`'s own row order, not necessarily one whole file — see above): a
+    plain `slice(r0, r1)` when `orig_rows is None` (a cheap view, no copy),
     or `orig_rows`'s corresponding array slice otherwise. `cache` is a fresh
     dict per r0-slice for `select` to memoize per-filter lookups shared
     across members — it does not persist across slices, since the mask is
@@ -761,6 +819,11 @@ def _process_batch_group(
             true_rows = orig_rows[r0 : r0 + sl.n_rows]
             rows = torch.from_numpy(true_rows).to(device, non_blocking=True)
 
+        if encoded_row_ids is None:
+            encoded_rows = gidx * MAX_ROWS_PER_FILE + rows
+        else:
+            encoded_rows = torch.from_numpy(encoded_row_ids[r0 : r0 + sl.n_rows]).to(device, non_blocking=True)
+
         score_cache: dict[str, object] = {}
         cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
         for m in member_idxs:
@@ -773,11 +836,12 @@ def _process_batch_group(
             if sel_rows is None:
                 continue
             sel_scores = scores if sel_cols is None else scores[:, sel_cols]
+            sel_encoded = encoded_rows if sel_cols is None else encoded_rows[sel_cols]
             if cell_mask is not None:
                 sel_scores = sel_scores.masked_fill(~cell_mask, float("-inf"))
 
             spec_top_scores[m], spec_top_enc[m] = _merge_topk(
-                spec_top_scores[m], spec_top_enc[m], sel_scores, sel_rows, gidx, s.k
+                spec_top_scores[m], spec_top_enc[m], sel_scores, sel_encoded, s.k
             )
     return time.perf_counter() - t0
 
@@ -1099,6 +1163,7 @@ def _process_shared_batch(
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
     query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
+    encoded_row_ids: np.ndarray | None = None,
 ) -> float:
     """Every search of this vector_type shares one batch grid: `orig_rows`
     is `None` when some search is unfiltered (`batch` is the raw, whole
@@ -1130,6 +1195,11 @@ def _process_shared_batch(
       `nonzero` twice — indexing `keeps[s.filter]` by `true_rows` (each
       slice position's TRUE file row), not by position, since the shared
       batch may already be a compacted subset of the file.
+
+    `encoded_row_ids` is passed straight through to `_process_batch_group`
+    (see there) — `None` for a single file (the common case), or a
+    pre-encoded array when `batch` coalesces several files' rows into one
+    (see `run_compute`'s `_flush_coalesce_group`).
 
     See `_process_batch_group` for the shared loop body."""
     import torch
@@ -1170,6 +1240,7 @@ def _process_shared_batch(
     return _process_batch_group(
         batch, member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
         batch_size, gidx, device, orig_rows=orig_rows, select=select,
+        encoded_row_ids=encoded_row_ids,
     )
 
 
@@ -1408,6 +1479,27 @@ def run_compute(
     # only these need the per-file row-level union computed at all (Front B).
     filters_needing_row_union: set[Filter] = {f for fs in vt_union_filters.values() for f in fs}
 
+    # Idea #2 (cross-file batch coalescing): when a vt's union filters are
+    # ALL uniform (none per-query) and a real batch_size is configured,
+    # small per-file post-compaction batches (selective filters -> few
+    # surviving rows/file) get coalesced across several files into one
+    # larger GPU call instead of paying per-file, per-member fixed overhead
+    # on each tiny batch (see `_flush_coalesce_group` below). Excluded
+    # whenever a per-query filter shares the vt: per-query masking
+    # (`_gpu_evaluate`'s `leaf_gpu`, or the CPU-fallback `keeps[f]` packed
+    # mask) is built PER FILE, sized to that one file's own rows —
+    # coalescing would need those rebuilt/concatenated across files too,
+    # which `_flush_coalesce_group` doesn't attempt (it only rebuilds
+    # UNIFORM filters' plain `(rows,)` keeps entries). `vt_batch_size[vt]`
+    # is `None` whenever the user hasn't configured a real batch size
+    # (meaning no memory-bounding is wanted either), so coalescing is
+    # skipped then too, rather than accumulating an unbounded number of
+    # files before ever flushing.
+    coalesce_eligible_vts: set[str] = {
+        vt for vt in vt_union_filters
+        if vt_batch_size[vt] is not None and not any(filter_is_per_query[f] for f in vt_union_filters[vt])
+    }
+
     # Prefetch corpus files with a POOL of reader threads so many S3 GETs are in
     # flight at once — otherwise the GPU sits idle behind one file's latency at a
     # time. pyarrow releases the GIL during IO, so threads parallelize. Reader
@@ -1466,8 +1558,8 @@ def run_compute(
                 table = cstore.read_columns(f.read_path, read_cols)
                 # Decode each vector_type at most ONCE per file, regardless of how many
                 # specs need it — wrapped in the batch abstraction (`DenseCorpusBatch`/
-                # `SparseCorpusBatch`) in the consumer loop below, where every spec of
-                # that vector_type shares it (see `run_compute`'s `has_baseline`).
+                # `SparseCorpusBatch`) below, where every spec of that vector_type shares
+                # it (see `run_compute`'s `has_baseline`).
                 arrs: dict[str, object] = {}
                 if "dense" in vts_needed:
                     arrs["dense"] = dense_to_2d(table[dense_col])
@@ -1517,6 +1609,35 @@ def run_compute(
                 n_rows = len(table)
                 keeps: dict[Filter | None, np.ndarray | None] = {}
                 leaf_arrays: dict[FilterCondition, np.ndarray] = {}
+
+                # CPU-fallback filters (a match_text/match_text_from_query leaf
+                # anywhere, so ineligible for Front A's GPU-native path — see
+                # _gpu_eligible) each write only their OWN keeps[f] slot, with
+                # no shared mutable state between them, so dispatch every
+                # distinct one of THIS file's CPU-fallback filters concurrently
+                # instead of one evaluate() call at a time: pyarrow's regex/
+                # substring compute kernels release the GIL, so this is real
+                # thread-level speedup, not GIL-serialized (measured ~2.5-3.5x
+                # on real corpus text). Only worth the pool overhead when
+                # there's more than one to dispatch.
+                cpu_fallback_filters = [
+                    f for f in distinct_filters if f is not None and not filter_is_gpu_eligible[f]
+                ]
+                if len(cpu_fallback_filters) > 1:
+                    with ThreadPoolExecutor(max_workers=len(cpu_fallback_filters)) as pool:
+                        masks = list(pool.map(
+                            lambda f: evaluate(f, table, query_filter_vals), cpu_fallback_filters
+                        ))
+                else:
+                    masks = [evaluate(f, table, query_filter_vals) for f in cpu_fallback_filters]
+                for f, mask in zip(cpu_fallback_filters, masks):
+                    keeps[f] = _pack_query_axis(mask) if mask.ndim == 2 else mask
+
+                # GPU-eligible filters (and the unfiltered `None` entry) stay
+                # sequential: `leaf_arrays` is shared/deduped ACROSS filters
+                # referencing the same FilterCondition (`if cond not in
+                # leaf_arrays`), which isn't safe to parallelize without a
+                # lock — and this branch has no regex to speed up anyway.
                 for f in distinct_filters:
                     if f is None:
                         keeps[f] = None
@@ -1527,11 +1648,46 @@ def run_compute(
                         if f in filters_needing_row_union:
                             union = _row_union_from_gpu_leaves(f, leaf_arrays, query_filter_vals, n_rows)
                             keeps[f] = union if union is not None else np.ones(n_rows, dtype=bool)
+
+                # Wrap into the vector_type-agnostic batch abstraction and,
+                # per vt, compact to the union of every active filter's
+                # surviving rows RIGHT HERE — moved off the single consumer
+                # thread: this is a real CPU cost (a fancy-index array copy),
+                # and io_workers reader threads can do it concurrently
+                # instead of it all serializing behind the consumer's GPU
+                # enqueue. `raw_stats` is the PRE-compaction (n_rows, nbytes)
+                # per vt, since `run_compute`'s rows_seen/bytes_seen count the
+                # whole file, not the compacted subset. `batch_orig_rows[vt]`
+                # is `None` when `has_baseline[vt]` (no compaction — batch IS
+                # the whole file), else the true-row array `.compact()`
+                # returns, exactly as `_process_shared_batch` already expects.
+                batches: dict[str, object] = {}
+                raw_stats: dict[str, tuple[int, int]] = {}
+                batch_orig_rows: dict[str, np.ndarray | None] = {}
+                if "dense" in vts_needed:
+                    b = DenseCorpusBatch(arrs["dense"])
+                    raw_stats["dense"] = (b.n_rows, b.nbytes)
+                    if has_baseline["dense"]:
+                        batches["dense"], batch_orig_rows["dense"] = b, None
                     else:
-                        mask = evaluate(f, table, query_filter_vals)
-                        keeps[f] = _pack_query_axis(mask) if mask.ndim == 2 else mask
+                        batches["dense"], batch_orig_rows["dense"] = b.compact(
+                            _union_keep(vt_union_filters["dense"], keeps)
+                        )
+                if "sparse" in vts_needed:
+                    sp_offsets, sp_idx, sp_val, sp_norms = arrs["sparse"]
+                    b = SparseCorpusBatch(sp_offsets, sp_idx, sp_val, sp_norms, query_vocab, need_sparse_norms)
+                    raw_stats["sparse"] = (b.n_rows, b.nbytes)
+                    if has_baseline["sparse"]:
+                        batches["sparse"], batch_orig_rows["sparse"] = b, None
+                    else:
+                        batches["sparse"], batch_orig_rows["sparse"] = b.compact(
+                            _union_keep(vt_union_filters["sparse"], keeps)
+                        )
+                # `t2 - t1` now covers filter evaluation AND compaction (moved
+                # here together) — see the `filter_secs` logging below, whose
+                # meaning widens accordingly.
                 t2 = time.perf_counter()
-                fq.put((gidx, arrs, ids, keeps, leaf_arrays, t1 - t0, t2 - t1))
+                fq.put((gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, t1 - t0, t2 - t1))
             except Exception as exc:
                 fq.put(exc)
                 return
@@ -1570,25 +1726,65 @@ def run_compute(
     # matters for reproducibility, not just correctness.
     pending: dict[int, tuple] = {}
 
+    # Idea #2: per-vt accumulation buffer for coalescing several files'
+    # (already union-compacted) batches into one larger `_process_shared_
+    # batch` call — see `coalesce_eligible_vts` above. Each buffered entry
+    # is `(gidx, batch, orig_rows, keeps-restricted-to-this-vt's-own-
+    # filters)` for one file; flushed once the accumulated row count
+    # reaches `vt_batch_size[vt]`, or at the very end of the run for any
+    # remainder. Memory cost: bounded by `vt_batch_size[vt]` rows' worth of
+    # ALREADY-compacted (small) data plus each buffered file's own uniform
+    # filters' keep-masks — not by file size or corpus size.
+    coalesce_buf: dict[str, list[tuple]] = {vt: [] for vt in coalesce_eligible_vts}
+    coalesce_rows: dict[str, int] = {vt: 0 for vt in coalesce_eligible_vts}
+
+    def _flush_coalesce_group(vt: str) -> float:
+        buf = coalesce_buf[vt]
+        if not buf:
+            return 0.0
+        concat = _concat_dense_batches if vt == "dense" else _concat_sparse_batches
+        combined_batch = concat([entry[1] for entry in buf])
+        encoded_ids = np.concatenate([
+            file_gidx * MAX_ROWS_PER_FILE + orig_rows for file_gidx, _, orig_rows, _ in buf
+        ])
+        # Rebuild each of this vt's (uniform-only, by `coalesce_eligible_
+        # vts`' own precondition) filters' keep-mask, restricted to
+        # survivor rows and concatenated in the SAME order as
+        # `combined_batch` — so `orig_rows=None` below (identity indexing)
+        # correctly lines up `select()`'s `keeps[s.filter][true_rows]`
+        # lookups with this GROUP's own row order, not any one file's
+        # original per-file numbering.
+        combined_keeps = {
+            f: np.concatenate([file_keeps[f][orig_rows] for _, _, orig_rows, file_keeps in buf])
+            for f in vt_union_filters[vt]
+        }
+        elapsed = _process_shared_batch(
+            combined_batch, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
+            combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_gpu,
+            filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
+            encoded_row_ids=encoded_ids,
+        )
+        coalesce_buf[vt] = []
+        coalesce_rows[vt] = 0
+        return elapsed
+
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for want_gidx, _f in mine:
             w0 = time.perf_counter()
-            gidx, arrs, ids, keeps, leaf_arrays, rsec, fsec = _next_in_order(want_gidx, pending, _fetch_or_raise)
+            gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, rsec, fsec = _next_in_order(
+                want_gidx, pending, _fetch_or_raise
+            )
             io_wait += time.perf_counter() - w0
             read_secs += rsec
             filter_secs += fsec
             bar.update(1)
 
-            # Wrap this file's decoded arrays in the vector_type-agnostic batch
-            # abstraction ONCE — every spec of a vector_type shares the same
-            # wrapper below, never rebuilding or mutating the underlying
-            # decoded arrays.
-            batches: dict[str, object] = {}
-            if "dense" in vts_needed:
-                batches["dense"] = DenseCorpusBatch(arrs["dense"])
-            if "sparse" in vts_needed:
-                sp_offsets, sp_idx, sp_val, sp_norms = arrs["sparse"]
-                batches["sparse"] = SparseCorpusBatch(sp_offsets, sp_idx, sp_val, sp_norms, query_vocab, need_sparse_norms)
+            # `batches[vt]` is already wrapped AND, when `has_baseline[vt]` is
+            # False, already compacted to the union of every active filter's
+            # surviving rows — both done in the reader thread now (see
+            # `reader()`), not here, so io_workers threads do that CPU work
+            # concurrently instead of it serializing behind GPU enqueue on
+            # this single consumer thread.
 
             # Front A: transfer this file's GPU-eligible per-query leaf arrays
             # to the GPU ONCE here (not once per batch slice) — mirrors
@@ -1599,21 +1795,19 @@ def run_compute(
                 for cond, arr in leaf_arrays.items()
             }
 
-            # Whole-file bookkeeping, computed BEFORE any spec's per-vector-type
-            # compaction below. rows_seen/bytes_seen are counted once per file per
-            # distinct vector_type present (pre-filter), not per spec — with
-            # multiple specs there's no longer a single "the" filtered row count
-            # to report.
+            # rows_seen/bytes_seen count the WHOLE file (pre-compaction) per
+            # distinct vector_type present, not per spec — `raw_stats` carries
+            # that pre-compaction (n_rows, nbytes) from the reader, since
+            # `batches[vt]` itself may already be the compacted subset.
             #
             # corpus_ids is kept only for files where SOME spec could still
             # resolve a hit — i.e. it's unfiltered, or its filter keeps at least
             # one row in this file. Each entry of `keeps` is a mask over this
             # file's rows independent of vector_type (filters read payload
-            # columns, not the vector columns), so checking it here — before
-            # any vector-type-specific compaction below — is exact, not an
-            # approximation: a restrictive spec's filter dropping the whole
-            # file must never block a DIFFERENT spec's id resolution for that
-            # same file, but a file every spec's filter drops needs no ids
+            # columns, not the vector columns), so checking it here is exact,
+            # not an approximation: a restrictive spec's filter dropping the
+            # whole file must never block a DIFFERENT spec's id resolution for
+            # that same file, but a file every spec's filter drops needs no ids
             # kept at all. A GPU-eligible filter's `keeps` entry (when
             # present — see `filters_needing_row_union` above; it's skipped
             # entirely for a filter no vt's union ever needs) is a safe
@@ -1628,32 +1822,36 @@ def run_compute(
             if id_col and any(mask is None or mask.any() for mask in keeps.values()):
                 corpus_ids[gidx] = ids
             for vt in vts_needed:
-                rows_seen += batches[vt].n_rows
-                bytes_seen += batches[vt].nbytes
+                raw_rows, raw_bytes = raw_stats[vt]
+                rows_seen += raw_rows
+                bytes_seen += raw_bytes
 
             for vt in vts_needed:
-                b = batches[vt]
-                if has_baseline[vt]:
-                    batch, orig_rows = b, None
+                if vt in coalesce_eligible_vts:
+                    coalesce_buf[vt].append((
+                        gidx, batches[vt], batch_orig_rows[vt],
+                        {f: keeps[f] for f in vt_union_filters[vt]},
+                    ))
+                    coalesce_rows[vt] += batches[vt].n_rows
+                    if coalesce_rows[vt] >= vt_batch_size[vt]:
+                        gpu_secs += _flush_coalesce_group(vt)
                 else:
-                    # Compact to the union OUTSIDE _process_shared_batch's own
-                    # timer, same as the old per-filter-group compaction did —
-                    # this CPU-side cost (row filtering, array copies — scales
-                    # with corpus size, not GPU work) never counts toward the
-                    # gpu_secs signal (see the io_wait/gpu_secs split docs at
-                    # the top of this module).
-                    batch, orig_rows = b.compact(_union_keep(vt_union_filters[vt], keeps))
-                gpu_secs += _process_shared_batch(
-                    batch, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
-                    keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
-                    filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=orig_rows,
-                )
+                    gpu_secs += _process_shared_batch(
+                        batches[vt], vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
+                        keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
+                        filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=batch_orig_rows[vt],
+                    )
 
             if bar.n % 200 == 0:
                 postfix = f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s"
                 if any_filter:
                     postfix += f" filter={filter_secs:.0f}s"
                 bar.set_postfix_str(postfix, refresh=False)
+
+    # Flush any remainder still buffered for coalescing — a coalesce-eligible
+    # vt's LAST group may not have reached vt_batch_size[vt] on its own.
+    for vt in coalesce_eligible_vts:
+        gpu_secs += _flush_coalesce_group(vt)
 
     wall = time.perf_counter() - wall0
     gb = bytes_seen / 1e9
