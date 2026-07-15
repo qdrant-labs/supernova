@@ -465,12 +465,14 @@ def _sparse_scores(Q, Cb):
     return torch.matmul(Cb, Q.T).T
 
 
-def _scores(Q, C, metric: str):
+def _scores(Q, C, metric: str, q_norms=None):
     import torch.nn.functional as F
 
     if metric == "cosine":
-        # Q is pre-normalized once; normalize C per file.
-        return Q @ F.normalize(C, dim=1).T
+        # C is normalized per file; Q stays RAW (shared with dot searches —
+        # see run_compute's `q_norms_by_vt`), so divide each query's row of
+        # the score matrix by its norm here instead.
+        return (Q @ F.normalize(C, dim=1).T).div_(q_norms[:, None])
     if metric == "dot":
         return Q @ C.T
     # euclidean: negate distance so larger = nearer (topk picks nearest).
@@ -535,8 +537,8 @@ class DenseBatchSlice:
     def n_rows(self) -> int:
         return self.Cb.shape[0]
 
-    def score(self, Q, metric: str):
-        return _scores(Q, self.Cb, metric)
+    def score(self, Q, metric: str, q_norms=None):
+        return _scores(Q, self.Cb, metric, q_norms)
 
 
 class SparseCorpusBatch:
@@ -633,7 +635,7 @@ class SparseBatchSlice:
     def n_rows(self) -> int:
         return self.Cb.shape[0]
 
-    def score(self, Q, metric: str):
+    def score(self, Q, metric: str, q_norms=None):
         import torch
 
         if self._no_overlap is None:
@@ -651,7 +653,10 @@ class SparseBatchSlice:
             self._no_overlap = no_overlap
         raw = _sparse_scores(Q, self.Cb)
         if metric == "cosine":
-            raw = raw / self.row_norms.clamp_min(1e-12)[None, :]
+            # Both divisors in place (`raw` is freshly owned): the corpus
+            # side per row, the query side per query — the latter replaces
+            # a pre-normalized copy of Q (see run_compute's `q_norms_by_vt`).
+            raw = raw.div_(self.row_norms.clamp_min(1e-12)[None, :]).div_(q_norms[:, None])
         return raw.masked_fill_(self._no_overlap, float("-inf"))
 
 
@@ -702,12 +707,21 @@ def _merge_topk(top_scores, top_enc, batch_scores, encoded_rows, k: int):
     compaction, or coalescing."""
     import torch
 
+    # Each intermediate is del'd as soon as the next line no longer needs it:
+    # at n_q=100k / k=1000 they are 0.4-1.6 GiB EACH, and Python locals would
+    # otherwise keep all of them alive until return — ~2.8 GiB of dead
+    # tensors held through the final topk/gather on a GPU already carrying
+    # Q, the batch's score matrices, and both running top-K states.
     bk = min(k, batch_scores.shape[1])
     f_scores, f_local = torch.topk(batch_scores, k=bk, dim=1)
     f_enc = encoded_rows[f_local]
+    del f_local
     merged_s = torch.cat([top_scores, f_scores], dim=1)
+    del f_scores
     merged_e = torch.cat([top_enc, f_enc], dim=1)
+    del f_enc
     new_top_scores, idx = torch.topk(merged_s, k=k, dim=1)
+    del merged_s
     return new_top_scores, merged_e.gather(1, idx)
 
 
@@ -787,7 +801,8 @@ def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | N
 
 
 def _process_batch_group(
-    batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
+    batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
+    spec_top_scores, spec_top_enc,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
     encoded_row_ids: np.ndarray | None = None,
 ) -> float:
@@ -855,6 +870,12 @@ def _process_batch_group(
         return 0.0
     t0 = time.perf_counter()
     step = batch_size or n_rows
+    # How many members read each distinct metric's score matrix — used below
+    # to skip caching one nobody else will reuse (the score-matrix analog of
+    # `filter_share_count`): a single-reader (n_q, rows) matrix — 1.6 GiB at
+    # n_q=100k / rows=4096 — gets collected right after its own merge instead
+    # of sitting in `score_cache` through every later member's matmul+merge.
+    metric_share_count = Counter(specs[m].metric for m in member_idxs)
     for r0 in range(0, n_rows, step):
         r1 = min(r0 + step, n_rows)
         sl = batch.transfer(r0, r1, device)
@@ -878,9 +899,11 @@ def _process_batch_group(
         cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
         for m in member_idxs:
             s = specs[m]
-            if s.metric not in score_cache:
-                score_cache[s.metric] = sl.score(spec_Q[m], s.metric)
-            scores = score_cache[s.metric]
+            scores = score_cache.get(s.metric)
+            if scores is None:
+                scores = sl.score(spec_Q[m], s.metric, spec_q_norms[m])
+                if metric_share_count[s.metric] > 1:
+                    score_cache[s.metric] = scores
 
             sel_rows, sel_cols, cell_mask = select(m, rows, true_rows, cache)
             if sel_rows is None:
@@ -1224,7 +1247,8 @@ def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str)
 
 
 def _process_shared_batch(
-    batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_top_scores, spec_top_enc,
+    batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
+    spec_top_scores, spec_top_enc,
     keeps: dict[Filter | None, np.ndarray | None], filter_is_per_query: dict[Filter | None, bool],
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
     query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
@@ -1304,7 +1328,7 @@ def _process_shared_batch(
         return rows[local_idx], local_idx, None
 
     return _process_batch_group(
-        batch, member_idxs, specs, spec_Q, spec_top_scores, spec_top_enc,
+        batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_scores, spec_top_enc,
         batch_size, gidx, device, orig_rows=orig_rows, select=select,
         encoded_row_ids=encoded_row_ids,
     )
@@ -1445,25 +1469,31 @@ def run_compute(
         mine = mine[:max_files]
 
     # 3. per-spec GPU state: each spec gets its own running (top_scores, top_enc)
-    #    pair, but its (possibly cosine-normalized) query matrix is shared across
-    #    every spec with the same vector_type — normalization is deterministic
-    #    given vector_type alone, so re-normalizing per spec would just hold N
-    #    identical n_q x dim/vocab copies resident on the GPU for no reason.
+    #    pair, but every spec of the same vector_type shares ONE raw query
+    #    matrix regardless of metric. A cosine spec divides its score matrix
+    #    by each query's norm inside `score()` (a per-query scalar, `q_norms`
+    #    below) — holding a pre-normalized second copy of Q instead would
+    #    double the biggest resident tensor on the GPU (n_q × vocab floats:
+    #    7.2 GiB at 100k queries × 18k vocab, which is what OOM'd the
+    #    dot+cosine fineweb run on a 24 GB A10G).
     Q_gpu_by_vt = {
         vt: torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device) for vt in vts_needed
     }
-    normalized_Q_by_vt: dict[str, object] = {}
-    spec_Q, spec_top_scores, spec_top_enc = [], [], []
+    q_norms_by_vt: dict[str, object] = {}
+    spec_Q, spec_q_norms, spec_top_scores, spec_top_enc = [], [], [], []
     for s in specs:
         if s.metric == "cosine":
-            if s.vector_type not in normalized_Q_by_vt:
-                normalized_Q_by_vt[s.vector_type] = torch.nn.functional.normalize(
-                    Q_gpu_by_vt[s.vector_type], dim=1
+            if s.vector_type not in q_norms_by_vt:
+                # clamp matches F.normalize's eps — a zero query scores 0
+                # everywhere instead of NaN (and its no-overlap gate already
+                # -infs every cell anyway).
+                q_norms_by_vt[s.vector_type] = (
+                    Q_gpu_by_vt[s.vector_type].norm(dim=1).clamp_min(1e-12)
                 )
-            Qv = normalized_Q_by_vt[s.vector_type]
+            spec_q_norms.append(q_norms_by_vt[s.vector_type])
         else:
-            Qv = Q_gpu_by_vt[s.vector_type]
-        spec_Q.append(Qv)
+            spec_q_norms.append(None)
+        spec_Q.append(Q_gpu_by_vt[s.vector_type])
         spec_top_scores.append(torch.full((n_q, s.k), float("-inf"), device=device))
         spec_top_enc.append(torch.zeros((n_q, s.k), dtype=torch.int64, device=device))
 
@@ -1848,7 +1878,8 @@ def run_compute(
             for f in vt_union_filters[vt]
         }
         elapsed = _process_shared_batch(
-            combined_batch, vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
+            combined_batch, vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
+            spec_top_scores, spec_top_enc,
             combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_gpu,
             filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
             encoded_row_ids=encoded_ids,
@@ -1927,7 +1958,8 @@ def run_compute(
                         gpu_secs += _flush_coalesce_group(vt)
                 else:
                     gpu_secs += _process_shared_batch(
-                        batches[vt], vt_spec_idxs[vt], specs, spec_Q, spec_top_scores, spec_top_enc,
+                        batches[vt], vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
+                        spec_top_scores, spec_top_enc,
                         keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
                         filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=batch_orig_rows[vt],
                     )
