@@ -123,7 +123,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, Queue
-from threading import Thread
+from threading import Semaphore, Thread
 
 import numpy as np
 
@@ -1585,13 +1585,31 @@ def run_compute(
     work: Queue = Queue()
     for item in mine:
         work.put(item)
-    fq: Queue = Queue(maxsize=io_workers * 2)  # bounded → backpressure on readers
+    fq: Queue = Queue(maxsize=io_workers * 2)
+    # `fq`'s bound alone is NOT the memory ceiling it looks like: the consumer
+    # must fold files in ascending `gidx` order, so while it waits for a slow
+    # file inside `_next_in_order` it keeps draining `fq` into the unbounded
+    # `pending` dict below — every drain frees a queue slot, readers never
+    # block, and one pathologically slow early file (a hung S3 read) would let
+    # the ENTIRE remaining corpus accumulate decoded in host RAM. `window` is
+    # the real end-to-end bound: a permit is held from the moment a reader
+    # STARTS a file until the consumer CONSUMES it, so at most `io_workers*2`
+    # files ever exist anywhere in the pipeline (being read + in `fq` + in
+    # `pending`). Deadlock-free: readers start files in ascending `gidx`
+    # order (`work` is FIFO), so the oldest unconsumed file — exactly the one
+    # the consumer is waiting for — is always inside the window, and consuming
+    # it releases the permit that slides the window forward. In a healthy run
+    # the consumer keeps up and no reader ever blocks here; the permit only
+    # binds in the stall scenario it exists for.
+    window = Semaphore(io_workers * 2)
 
     def reader():
         while True:
+            window.acquire()
             try:
                 gidx, f = work.get_nowait()
             except Empty:
+                window.release()
                 return
             # Wrapped in try/except so a bad read/decode/filter (e.g. a filter
             # field missing from this file's schema, or a type pyarrow can't
@@ -1737,6 +1755,9 @@ def run_compute(
                 t2 = time.perf_counter()
                 fq.put((gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, t1 - t0, t2 - t1))
             except Exception as exc:
+                # Permit deliberately NOT released: the consumer re-raises on
+                # fetching this, killing the run — holding it just stops the
+                # surviving readers from racing further ahead in the meantime.
                 fq.put(exc)
                 return
 
@@ -1768,10 +1789,12 @@ def run_compute(
 
     # `mine` already lists this worker's files in a fixed, deterministic
     # order (ascending `gidx`); `_next_in_order` reorders reader threads'
-    # arbitrary-arrival-order output back into that order (bounded by
-    # `io_workers`-many buffered items, since `fq`'s own bound already caps
-    # how far readers can race ahead) — see its docstring for why this
-    # matters for reproducibility, not just correctness.
+    # arbitrary-arrival-order output back into that order — see its docstring
+    # for why this matters for reproducibility, not just correctness.
+    # `pending`'s size is bounded by the `window` semaphore above (at most
+    # `io_workers * 2` files in flight end-to-end), NOT by `fq`'s maxsize:
+    # the wait loop inside `_next_in_order` drains `fq` while blocked, so the
+    # queue's own bound caps nothing on its own.
     pending: dict[int, tuple] = {}
 
     # Idea #2: per-vt accumulation buffer for coalescing several files'
@@ -1822,6 +1845,7 @@ def run_compute(
             gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, rsec, fsec = _next_in_order(
                 want_gidx, pending, _fetch_or_raise
             )
+            window.release()  # file consumed — a reader may start another
             io_wait += time.perf_counter() - w0
             read_secs += rsec
             filter_secs += fsec

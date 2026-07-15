@@ -262,3 +262,71 @@ def test_next_in_order_reraises_from_fetch():
 
     with pytest.raises(RuntimeError, match="boom"):
         _next_in_order(0, {}, fetch)
+
+
+def test_slow_first_file_cannot_flood_host_memory(tmp_path, monkeypatch):
+    """Regression test for the lookahead `window` semaphore in `run_compute`:
+    the consumer folds files in ascending `gidx` order, so while it waits for
+    a slow file 0 it drains `fq` into the unbounded `pending` dict — every
+    drain frees a queue slot, so `fq`'s own bound provides NO backpressure and
+    (before the window) readers could stream the ENTIRE remaining corpus,
+    decoded, into host RAM during one stalled read. The window holds a permit
+    per file from read-start until the consumer consumes it, so no more than
+    `io_workers * 2` reads may even START while file 0 stalls.
+
+    Also checks the stalled run's results are bit-identical to an unstalled
+    one: the window changes memory behavior, never consumption order."""
+    import threading
+    import time
+
+    rng = np.random.default_rng(7)
+    n_files, rows, n_q, io_workers = 24, 3, 2, 4
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    for fi in range(n_files):
+        _write_vectors(cdir / f"f{fi:03d}.parquet", rng.standard_normal((rows, DIM)).astype(np.float32))
+    qpath = tmp_path / "queries.parquet"
+    _write_vectors(qpath, rng.standard_normal((n_q, DIM)).astype(np.float32), qid=[f"q{i}" for i in range(n_q)])
+
+    def _cfg(out_name):
+        out = tmp_path / out_name
+        out.mkdir()
+        return BruteForceConfig(
+            corpus=CorpusConfig(path=str(cdir), dense_column="dense_embedding"),
+            queries=QueriesConfig(path=str(qpath), dense_column="dense_embedding", id_column="qid"),
+            output=OutputConfig(path=str(out)),
+            params=ParamsConfig(io_workers=io_workers),
+            searches=[SearchSpec(name="test", k=K, metric="dot")],
+        )
+
+    control = pq.read_table(run_compute(_cfg("out_control"))["test"]).to_pydict()
+
+    first_path = Store(str(cdir)).list_parquets()[0].read_path
+    lock = threading.Lock()
+    corpus_reads_started: list[str] = []
+    started_during_stall: list[int] = []
+    real_read = Store.read_columns
+
+    def stalling_read(self, read_path, columns):
+        if str(cdir) in str(read_path):
+            with lock:
+                corpus_reads_started.append(read_path)
+        if read_path == first_path:
+            time.sleep(1.0)  # ample for 23 tiny local reads — without the
+            # window, every other file would start (and finish) in here
+            result = real_read(self, read_path, columns)
+            with lock:
+                started_during_stall.append(len(corpus_reads_started) - 1)
+            return result
+        return real_read(self, read_path, columns)
+
+    monkeypatch.setattr(Store, "read_columns", stalling_read)
+    stalled = pq.read_table(run_compute(_cfg("out_stalled"))["test"]).to_pydict()
+
+    # Structural bound: file 0 holds 1 of the io_workers*2 permits for the
+    # whole stall, so at most io_workers*2 - 1 OTHER reads can have started.
+    assert started_during_stall[0] <= io_workers * 2 - 1, (
+        f"{started_during_stall[0]} reads started while file 0 stalled — "
+        f"the lookahead window (io_workers*2 = {io_workers * 2}) is not binding"
+    )
+    assert stalled == control
