@@ -591,18 +591,49 @@ class SparseCorpusBatch:
 
 @dataclass
 class SparseBatchSlice:
+    """One on-device slice of a sparse corpus batch.
+
+    `score()` marks every `(query, row)` cell with NO shared nonzero dimension
+    as `-inf` rather than letting it surface as a real `0.0` hit. Sparse
+    retrieval engines (Qdrant's inverted index included) can only ever return
+    documents that share at least one token with the query — a zero-overlap
+    document isn't "score zero", it's not a candidate at all. Without this,
+    any query whose (post-filter) overlap set is smaller than k gets its
+    top-K padded with arbitrary tie-ordered 0.0-score rows, which then
+    pollute recall numbers computed against this ground truth. `-inf` rides
+    the exact machinery that already exists for filtered-out cells: sunk by
+    `_merge_topk`, truncated by the `valid = sc > -inf` write path, tallied
+    by `warn_if_short`.
+
+    The gate is STRUCTURAL (an indicator-CSR spmm counting shared dims), not
+    `score == 0.0` — a signed sparse embedding can produce a genuine 0.0 from
+    overlapping dimensions that cancel, and that row is a real candidate.
+    The indicator matmul reuses `Cb`'s own index tensors (only the values
+    are swapped for ones) and is computed once per slice, shared across
+    every metric/spec scoring it."""
+
     Cb: object  # torch.Tensor, sparse CSR (n_rows, vocab)
     row_norms: object  # torch.Tensor | None
+    _no_overlap: object = None  # lazy (n_q, n_rows) bool — see class docstring
 
     @property
     def n_rows(self) -> int:
         return self.Cb.shape[0]
 
     def score(self, Q, metric: str):
+        import torch
+
+        if self._no_overlap is None:
+            indicator = torch.sparse_csr_tensor(
+                self.Cb.crow_indices(), self.Cb.col_indices(),
+                torch.ones_like(self.Cb.values()),
+                size=self.Cb.shape, check_invariants=False,
+            )
+            self._no_overlap = torch.matmul(indicator, (Q != 0).to(Q.dtype).T).T == 0
         raw = _sparse_scores(Q, self.Cb)
         if metric == "cosine":
-            return raw / self.row_norms.clamp_min(1e-12)[None, :]
-        return raw
+            raw = raw / self.row_norms.clamp_min(1e-12)[None, :]
+        return raw.masked_fill_(self._no_overlap, float("-inf"))
 
 
 def _concat_dense_batches(batches: list[DenseCorpusBatch]) -> DenseCorpusBatch:
