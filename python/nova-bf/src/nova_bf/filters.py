@@ -287,6 +287,18 @@ def _condition_mask(
     return pc.fill_null(mask, False).to_numpy(zero_copy_only=False)
 
 
+def _static_first(conds) -> list[FilterCondition]:
+    """A group's conditions reordered static-before-per-query (stable within
+    each kind). AND/OR are commutative so the result is bit-identical either
+    way — but combining every static `(rows,)` mask BEFORE the first
+    per-query one keeps the accumulator 1-D as long as possible, instead of
+    an early per-query leaf promoting it to `(n_queries, rows)` and every
+    later static mask paying 2-D broadcast cost. Used by both `evaluate()`
+    below and `compute._gpu_evaluate` (Front A), which mirror each other's
+    combination logic."""
+    return sorted(conds, key=lambda c: c.is_per_query())
+
+
 def evaluate(
     filt: Filter, table: pa.Table, query_values: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
@@ -305,16 +317,16 @@ def evaluate(
     n = len(table)
     keep = np.ones(n, dtype=bool)
 
-    for cond in filt.must:
+    for cond in _static_first(filt.must):
         keep = keep & _condition_mask(cond, table, query_values)
 
     if filt.should:
         any_match = np.zeros(n, dtype=bool)
-        for cond in filt.should:
+        for cond in _static_first(filt.should):
             any_match = any_match | _condition_mask(cond, table, query_values)
         keep = keep & any_match
 
-    for cond in filt.must_not:
+    for cond in _static_first(filt.must_not):
         keep = keep & ~_condition_mask(cond, table, query_values)
 
     return keep

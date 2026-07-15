@@ -1784,10 +1784,11 @@ def test_per_query_filter_must_not_leaf_falls_back_to_all_rows_safely(tmp_path, 
 def test_per_query_filter_range_and_match_from_query_union_combine(tmp_path, caplog):
     """A per-query filter combining a `must` `match_from_query` leaf AND a
     `must` `range_from_query` leaf exercises `_row_union_from_gpu_leaves`'s
-    OR-across-leaves union logic directly — the compacted union must be
-    loose enough to retain every row ANY query could want via EITHER leaf,
-    and the fine per-query AND of both leaves must still apply correctly
-    afterward."""
+    AND-across-leaves union logic directly — the compacted union intersects
+    the two leaves' per-leaf supersets (valid via the shared-witness
+    argument in its docstring) yet must still retain every row ANY query
+    actually wants, and the fine per-query AND of both leaves must still
+    apply correctly afterward."""
     rng = np.random.default_rng(21)
     cdir = tmp_path / "corpus"
     cdir.mkdir()
@@ -1832,6 +1833,155 @@ def test_per_query_filter_range_and_match_from_query_union_combine(tmp_path, cap
         allowed = [
             i for i in range(n)
             if corpus_tenants[i] == query_tenants[qi] and cost[i] < max_budget[qi]
+        ]
+        scores = qdense[qi] @ dense[allowed].T
+        order = np.argsort(-scores)[:10]
+        expected = [ids[allowed[j]] for j in order]
+        assert hit_ids == expected, f"query={qid}"
+
+
+def test_row_union_ands_static_must_leaf_in_exactly():
+    """`_row_union_from_gpu_leaves` on a MIXED `must` (static match + per-query
+    match_from_query): the static leaf's exact (rows,) mask tightens the
+    union — a row failing the static leaf is dropped even if some query's
+    tenant admits it — while remaining a superset of the true "some query
+    wants this row" set."""
+    from nova_bf.filters import evaluate as filters_evaluate
+
+    table = pa.table({
+        "tenant_id": ["A", "B", "A", "C", "B", "A"],
+        "status": ["active", "active", "archived", "active", "archived", "active"],
+    })
+    per_query = FilterCondition(field="tenant_id", match_from_query="tenant_id")
+    static = FilterCondition(field="status", match="active")
+    f = Filter(must=[static, per_query])
+    qvals = {"tenant_id": np.array(["A", "B"], dtype=object)}
+    vocab = np.unique(qvals["tenant_id"])
+    leaf_arrays = {
+        per_query: compute_mod._corpus_leaf_array(per_query, table, vocab),
+        static: compute_mod._corpus_leaf_array(static, table, None),
+    }
+    union = compute_mod._row_union_from_gpu_leaves(f, leaf_arrays, qvals, len(table))
+    # tenant in {A, B} admits rows 0,1,2,4,5; status=active keeps rows 0,1,3,5
+    # -> union is their intersection. Rows 2/4 (archived) are now dropped
+    # where the per-query over-approximation alone would have kept them.
+    assert union.tolist() == [True, True, False, False, False, True]
+    # Safety: still a superset of the rows ANY query actually wants.
+    fine = filters_evaluate(f, table, qvals)
+    assert not np.any(fine.any(axis=0) & ~union)
+
+
+def test_row_union_static_must_leaf_tightens_when_per_query_leaf_outside_must():
+    """A filter whose ONLY per-query leaf lives in `must_not` used to get no
+    tightening at all (`None` -> all-True). A static `must` leaf is still a
+    necessary condition, so its exact mask alone now tightens the union."""
+    from nova_bf.filters import evaluate as filters_evaluate
+
+    table = pa.table({
+        "tenant_id": ["A", "B", "A", "C"],
+        "status": ["active", "archived", "active", "active"],
+    })
+    static = FilterCondition(field="status", match="active")
+    per_query = FilterCondition(field="tenant_id", match_from_query="tenant_id")
+    f = Filter(must=[static], must_not=[per_query])
+    qvals = {"tenant_id": np.array(["A"], dtype=object)}
+    vocab = np.unique(qvals["tenant_id"])
+    leaf_arrays = {
+        per_query: compute_mod._corpus_leaf_array(per_query, table, vocab),
+        static: compute_mod._corpus_leaf_array(static, table, None),
+    }
+    union = compute_mod._row_union_from_gpu_leaves(f, leaf_arrays, qvals, len(table))
+    assert union.tolist() == [True, False, True, True]
+    fine = filters_evaluate(f, table, qvals)
+    assert not np.any(fine.any(axis=0) & ~union)
+
+
+def test_row_union_ands_two_per_query_must_leaves():
+    """Two per-query `must` leaves (own tenant AND under own budget): the
+    union is the INTERSECTION of the two per-leaf supersets — a row no
+    query's tenant admits is dropped even if some query's budget admits it,
+    and vice versa — while remaining a superset of the true wanted set."""
+    from nova_bf.filters import evaluate as filters_evaluate
+
+    table = pa.table({
+        "tenant_id": ["A", "B", "A", "C", "B", "A"],
+        "cost": [5.0, 20.0, 8.0, 3.0, 25.0, 1.0],
+    })
+    tenant = FilterCondition(field="tenant_id", match_from_query="tenant_id")
+    budget = FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget"))
+    f = Filter(must=[tenant, budget])
+    qvals = {
+        "tenant_id": np.array(["A", "B"], dtype=object),
+        "max_budget": np.array([10.0, 6.0]),
+    }
+    vocab = np.unique(qvals["tenant_id"])
+    leaf_arrays = {
+        tenant: compute_mod._corpus_leaf_array(tenant, table, vocab),
+        budget: compute_mod._corpus_leaf_array(budget, table, None),
+    }
+    union = compute_mod._row_union_from_gpu_leaves(f, leaf_arrays, qvals, len(table))
+    # tenant in {A, B}: rows 0,1,2,4,5. cost < max(budgets)=10: rows 0,2,3,5.
+    # AND -> rows 0,2,5. Row 1 (tenant B, cost 20) and row 3 (tenant C,
+    # cost 3) are dropped, where the old OR kept both.
+    assert union.tolist() == [True, False, True, False, False, True]
+    fine = filters_evaluate(f, table, qvals)
+    assert not np.any(fine.any(axis=0) & ~union)
+
+
+def test_mixed_static_and_per_query_must_filter_matches_ground_truth(tmp_path, caplog):
+    """End-to-end: one spec whose filter mixes a static `must` leaf
+    (status=active) with a per-query `must` leaf (own tenant) — exercises
+    the GPU-native (Front A) static-leaf branch, `_static_first` ordering
+    in `_gpu_evaluate`, AND the statically-tightened union compaction
+    (Front B), all against independent numpy ground truth."""
+    rng = np.random.default_rng(23)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    corpus_tenants = ["A", "B", "A", "C", "B", "A"]
+    status = ["active", "active", "archived", "active", "archived", "active"]
+    n = len(corpus_tenants)
+    dense = rng.standard_normal((n, DIM)).astype(np.float32)
+    ids = [f"c{i}" for i in range(n)]
+    sparse_rows = [_random_sparse_row(rng) for _ in range(n)]
+    _write_combined(
+        cdir / "f0.parquet", dense, sparse_rows,
+        id=ids, tenant_id=corpus_tenants, status=status,
+    )
+
+    n_q = 3
+    qdense = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    q_sparse_rows = [_random_sparse_row(rng) for _ in range(n_q)]
+    query_tenants = ["A", "B", "C"]
+    qpath = tmp_path / "queries.parquet"
+    qids = [f"q{i}" for i in range(n_q)]
+    _write_combined(qpath, qdense, q_sparse_rows, qid=qids, tenant_id=query_tenants)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        searches=[SearchSpec(
+            name="active_own_tenant", vector_type="dense", metric="dot", k=10,
+            filter=Filter(must=[
+                # per-query leaf FIRST in config order, static second — the
+                # evaluation reorders, the result must not care.
+                FilterCondition(field="tenant_id", match_from_query="tenant_id"),
+                FilterCondition(field="status", match="active"),
+            ]),
+        )],
+    )
+    with caplog.at_level(logging.INFO, logger="nova_bf.compute"):
+        paths = run_compute(cfg)
+    assert any("union of" in r.message for r in caplog.records)
+
+    t = pq.read_table(paths["active_own_tenant"]).to_pydict()
+    for qid, hit_ids in zip(t["query_id"], t["hit_ids"]):
+        qi = int(qid[1:])
+        allowed = [
+            i for i in range(n)
+            if corpus_tenants[i] == query_tenants[qi] and status[i] == "active"
         ]
         scores = qdense[qi] @ dense[allowed].T
         order = np.argsort(-scores)[:10]
