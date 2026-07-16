@@ -201,6 +201,56 @@ def _literal_then_regex_word_mask(word: str, col: pa.ChunkedArray) -> np.ndarray
     return result
 
 
+_ASCII_WORD = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _simple_word_masks(
+    col: pa.ChunkedArray, words: set[str], n_rows: int, batch_rows: int = 200_000,
+) -> dict[str, np.ndarray]:
+    r"""`{word: (n_rows,) np.bool}` for plain-ASCII `\w+` `words` (passed
+    already lowercased), built in ONE tokenization pass per row-batch instead
+    of one full-column scan per distinct word (optimization B).
+
+    Tokenizes `lower(text)` by splitting on `\W+` — the SAME RE2 word class the
+    `\b` verify in `_literal_then_regex_word_mask` uses — so for an ASCII `\w+`
+    word, "row matches `\bword\b` case-insensitively" is *exactly* "word is one
+    of that row's `\W`-delimited tokens". This equivalence holds ONLY for ASCII
+    `\w+` words: a word containing punctuation or non-ASCII letters can match a
+    `\b`-bounded span that is not a whole token (e.g. `high-fat`), so the caller
+    keeps those on the regex path — the fuzz test asserts bit-identical output.
+    Case-folding is done once here via `utf8_lower` (optimization D) rather than
+    once per word.
+
+    Row-batched so the transient flattened-token array stays bounded on a
+    multi-GB reshard `text` column. The accumulated per-word masks are the same
+    `(n_rows,)` arrays the per-word cache already held, so peak memory matches
+    the old scan-per-word path."""
+    masks = {w: np.zeros(n_rows, dtype=bool) for w in words}
+    ordered = list(words)
+    total = len(col)
+    off = 0
+    while off < total:
+        chunk = col.slice(off, batch_rows).combine_chunks()
+        toks = pc.split_pattern_regex(pc.utf8_lower(chunk), pattern=r"\W+")
+        flat = pc.list_flatten(toks)
+        parent = pc.list_parent_indices(toks)
+        codes = pc.index_in(flat, value_set=pa.array(ordered, type=flat.type))
+        valid = pc.is_valid(codes)
+        c = pc.filter(codes, valid).to_numpy(zero_copy_only=False)
+        r = pc.filter(parent, valid).to_numpy(zero_copy_only=False)
+        if len(c):
+            order = np.argsort(c, kind="stable")
+            cs = c[order]
+            rs = r[order].astype(np.int64) + off
+            lo = np.searchsorted(cs, np.arange(len(ordered)), side="left")
+            hi = np.searchsorted(cs, np.arange(len(ordered)), side="right")
+            for wi in range(len(ordered)):
+                if hi[wi] > lo[wi]:
+                    masks[ordered[wi]][rs[lo[wi]:hi[wi]]] = True
+        off += batch_rows
+    return masks
+
+
 def _match_text_from_query_mask(
     cond: FilterCondition, table: pa.Table, query_values: dict[str, np.ndarray],
 ) -> np.ndarray:
@@ -252,6 +302,14 @@ def _match_text_from_query_mask(
     # filling each to False before ANDing still yields False there, same as
     # ANDing nulls through and filling once at the end.
     word_cache: dict[str, np.ndarray] = {}
+    # Optimization B: build the masks for all plain-ASCII \w+ words in ONE
+    # tokenization pass (`_simple_word_masks`) instead of one full-column scan
+    # per distinct word. Words with punctuation or non-ASCII letters aren't
+    # safe to answer by tokenization (see there), so they fall through to the
+    # exact per-word regex path below — bit-identical to the old behavior.
+    simple = {w.lower() for phrase in by_phrase for w in phrase.split() if _ASCII_WORD.fullmatch(w)}
+    if simple:
+        word_cache.update(_simple_word_masks(col, simple, n_rows))
     for phrase, qidxs in by_phrase.items():
         mask = None
         for word in phrase.split():
