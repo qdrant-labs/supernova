@@ -217,6 +217,16 @@ def _match_text_from_query_mask(
     literal-prefilter, on top of the word-level cache — the two optimizations
     are independent and compose. See docs/brute-force/overview.md."""
     col = table[cond.field]
+    # `_literal_then_regex_word_mask`'s regex-verify pass does `col.take(idx)`,
+    # which concatenates the gathered chunks into one array. On a corpus whose
+    # text column exceeds 2 GB in a single file (e.g. a FineWeb reshard's
+    # `text`), a 32-bit `string` column's offsets overflow there
+    # ("offset overflow while concatenating arrays"). Cast to `large_string`
+    # (per-chunk, so the cast itself never concatenates past 2 GB) so the gather
+    # uses 64-bit offsets. `string`/`large_string` are match-identical, so this
+    # is purely a capacity fix, not a semantic change.
+    if pa.types.is_string(col.type):
+        col = pc.cast(col, pa.large_string())
     phrases = query_values[cond.match_text_from_query]
     n_rows = len(table)
     result = np.zeros((len(phrases), n_rows), dtype=bool)
