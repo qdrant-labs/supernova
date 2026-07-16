@@ -136,6 +136,15 @@ impl FilterCondition {
         {
             return Err(ConfigError::FilterConditionBlankMatchText { field: self.field.clone() });
         }
+        // An empty `match: []` is vacuously "matches nothing" (Qdrant's own
+        // MatchAny with zero values never matches) — silently accepting it
+        // would make a load test return zero results forever with no config
+        // or runtime error, so treat it the same as a blank `match_text`.
+        if let Some(MatchSpec::Any(values)) = &self.r#match
+            && values.is_empty()
+        {
+            return Err(ConfigError::FilterConditionEmptyMatchAny { field: self.field.clone() });
+        }
         if let Some(range) = &self.range
             && !range.has_bound()
         {
@@ -222,11 +231,19 @@ impl Filter {
 /// [`QueryVector`](crate::queries::QueryVector), then read at request-build
 /// time by a backend's translation (e.g.
 /// `targets::qdrant::to_qdrant_condition`).
+///
+/// `Int` is kept distinct from `Num` (rather than widening every integer
+/// column to `f64` at load time) specifically so an exact `match_from_query`
+/// equality check on a large id (e.g. a snowflake-style `tenant_id` above
+/// 2^53) doesn't silently lose precision round-tripping through `f64` — see
+/// `queries::int_value`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterFieldValue {
     Text(String),
+    Int(i64),
     Num(f64),
     TextList(Vec<String>),
+    IntList(Vec<i64>),
     NumList(Vec<f64>),
 }
 
@@ -322,6 +339,15 @@ must:
         assert!(matches!(
             f.validate().unwrap_err(),
             ConfigError::FilterConditionEmptyRange { field } if field == "price"
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_match_any_list() {
+        let f = de("must:\n  - field: tag\n    match: []\n");
+        assert!(matches!(
+            f.validate().unwrap_err(),
+            ConfigError::FilterConditionEmptyMatchAny { field } if field == "tag"
         ));
     }
 

@@ -203,6 +203,8 @@ pub enum ConfigError {
     FilterConditionBlankMatchText { field: String },
     #[error("filter condition on `{field}` range needs at least one of gt/gte/lt/lte")]
     FilterConditionEmptyRange { field: String },
+    #[error("filter condition on `{field}` has an empty `match: []` list — it would never match anything")]
+    FilterConditionEmptyMatchAny { field: String },
 }
 
 /// Expand `${VAR}` references in `input` from the process environment.
