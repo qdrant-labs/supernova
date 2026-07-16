@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use crate::config::QueryConfig;
 use crate::errors::TargetError;
+use crate::queries::QueryVector;
 
 pub mod qdrant;
 
@@ -45,12 +46,13 @@ pub struct BatchOutcome {
 /// (e.g. `qdrant(products)`).
 #[async_trait]
 pub trait QueryTarget: Send + Sync + std::fmt::Display {
-    /// Fire one batch dispatch covering all of `vectors` in a single
-    /// round-trip and return its latency + outcome. The top-k / vector-name
-    /// knobs are baked into the target at construction, so the hot path is
-    /// just the vectors. A single-element slice is not a special case — it's
-    /// the default (`LoadProfile::batch_size == 1`).
-    async fn query_batch(&self, vectors: &[&[f32]]) -> BatchOutcome;
+    /// Fire one batch dispatch covering all of `queries` in a single
+    /// round-trip and return its latency + outcome. The top-k / vector-name /
+    /// static-filter knobs are baked into the target at construction; each
+    /// [`QueryVector`] itself carries whatever a *per-query* filter needs
+    /// (`filter_values`) alongside its vector. A single-element slice is not
+    /// a special case — it's the default (`LoadProfile::batch_size == 1`).
+    async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome;
 
     /// Tear down connections. Default: nothing (clients close on drop).
     async fn close(&self) -> Result<(), TargetError> {

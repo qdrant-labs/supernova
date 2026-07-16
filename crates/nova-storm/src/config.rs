@@ -11,6 +11,7 @@ use std::env;
 
 use serde::Deserialize;
 
+use crate::filter::Filter;
 use crate::targets::TargetConfig;
 
 /// The full parsed storm config.
@@ -36,6 +37,9 @@ impl StormConfig {
         }
         if cfg.load.batch_size == 0 {
             return Err(ConfigError::ZeroBatchSize);
+        }
+        if let Some(filter) = &cfg.query.filter {
+            filter.validate()?;
         }
         Ok(cfg)
     }
@@ -65,6 +69,10 @@ pub struct QueryConfig {
     /// leaves every one of these at the collection's own defaults.
     #[serde(default)]
     pub search_params: Option<SearchParamsConfig>,
+    /// Payload/metadata filter applied to every query in the run — see
+    /// [`crate::filter::Filter`]. `None` (default) is an unfiltered search.
+    #[serde(default)]
+    pub filter: Option<Filter>,
 }
 
 /// Server-side search-time tuning, passed straight through to Qdrant's
@@ -186,6 +194,15 @@ pub enum ConfigError {
     ZeroTopK,
     #[error("load.batch_size must be greater than 0")]
     ZeroBatchSize,
+    #[error(
+        "filter condition on `{field}` must set exactly one of `match`, `range`, `match_text`, \
+         `match_from_query`, `range_from_query`, or `match_text_from_query`"
+    )]
+    FilterConditionNotExactlyOne { field: String },
+    #[error("filter condition on `{field}` has a blank `match_text` — it needs at least one word")]
+    FilterConditionBlankMatchText { field: String },
+    #[error("filter condition on `{field}` range needs at least one of gt/gte/lt/lte")]
+    FilterConditionEmptyRange { field: String },
 }
 
 /// Expand `${VAR}` references in `input` from the process environment.

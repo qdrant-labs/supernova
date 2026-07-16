@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod errors;
+pub mod filter;
 pub mod queries;
 pub mod runner;
 pub mod targets;
@@ -32,7 +33,7 @@ use runner::Summary;
 pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
     let StormConfig { target, query, load } = config;
 
-    let vectors = load_query_vectors(&query.source)?;
+    let vectors = load_query_vectors(&query.source, query.filter.as_ref())?;
     if vectors.is_empty() {
         return Err(StormError::Other(format!(
             "no query vectors loaded from {:?} (column {:?})",
