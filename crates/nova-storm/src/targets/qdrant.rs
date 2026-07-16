@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
@@ -93,8 +93,29 @@ impl QdrantConfig {
 
         let (static_filter, per_query_filter) = match &query.filter {
             None => (None, None),
-            Some(f) if f.is_per_query() => (None, Some(f.clone())),
-            Some(f) => (Some(to_qdrant_filter(f, None)?), None),
+            Some(f) => {
+                // Defense in depth: `StormConfig::from_yaml` already calls
+                // this, but `StormConfig`'s fields are all `pub` and
+                // `nova_storm::run` is a public library entry point, so a
+                // caller that hand-builds one (skipping `from_yaml`) would
+                // otherwise reach `to_qdrant_condition`'s per-query lookups
+                // with a shape `Filter::validate` was supposed to rule out.
+                f.validate().map_err(|e| TargetError::Other(e.to_string()))?;
+                if f.is_per_query() {
+                    // A per-query filter defers ITS OWN `_from_query` leaves
+                    // to request time (they need real data to translate) —
+                    // but any fully-static sibling condition in the same
+                    // filter can, and should, still be validated now: without
+                    // this, a bad static leaf (e.g. a float `match`) would
+                    // only surface once `query_batch` starts running, failing
+                    // every single dispatch for the run's whole duration
+                    // instead of at startup.
+                    validate_static_conditions(f)?;
+                    (None, Some(f.clone()))
+                } else {
+                    (Some(to_qdrant_filter(f, None)?), None)
+                }
+            }
         };
 
         Ok(QdrantTarget {
@@ -152,6 +173,39 @@ fn to_qdrant_filter(
     })
 }
 
+/// Validate every fully-static condition in `filter` — even one that also has
+/// per-query siblings elsewhere in the same `must`/`should`/`must_not` group —
+/// by actually translating it (and discarding the result). Called eagerly at
+/// `QdrantConfig::into_target` time so a bad static leaf (e.g. a float
+/// `match`) fails at startup like the purely-static case does, instead of
+/// only surfacing once `query_batch` starts running (which would fail every
+/// single dispatch for the run's whole duration on what was a catchable
+/// config mistake). Per-query conditions are skipped — they need real
+/// `QueryVector` data to translate, which doesn't exist yet at this point.
+fn validate_static_conditions(filter: &Filter) -> Result<(), TargetError> {
+    filter
+        .must
+        .iter()
+        .chain(filter.should.iter())
+        .chain(filter.must_not.iter())
+        .filter(|c| !c.is_per_query())
+        .try_for_each(|c| to_qdrant_condition(c, None).map(|_| ()))
+}
+
+/// Look up a `_from_query` column's resolved value for the current query.
+/// Guaranteed present by construction: `queries::load_query_vectors` projects
+/// exactly the columns `Filter::query_fields` names (erroring at load time on
+/// a NULL), so a missing key here would mean that guarantee and this lookup
+/// drifted apart — a logic bug, not a reachable runtime state.
+fn resolve_query_value<'a>(
+    query_values: &'a HashMap<String, FilterFieldValue>,
+    col: &str,
+) -> &'a FilterFieldValue {
+    query_values
+        .get(col)
+        .unwrap_or_else(|| panic!("filter column `{col}` missing from query's resolved filter_values"))
+}
+
 /// Translate one [`FilterCondition`] into a Qdrant [`Condition`]. Exactly one
 /// of the condition's six fields is set (`Filter::validate` enforces this at
 /// config-load time), so this reads as one branch per kind.
@@ -172,27 +226,25 @@ fn to_qdrant_condition(
     // Everything below is a `_from_query` variant — `query_values` is
     // guaranteed `Some` here by construction (`QdrantTarget::effective_filter`
     // only calls this with `None` for a filter that has no per-query
-    // condition at all), and every column a `_from_query` leaf names is
-    // guaranteed present (`queries::load_query_vectors` projects exactly the
-    // columns `Filter::query_fields` names, erroring at load time on a NULL).
-    // A missing key here would mean those two guarantees drifted apart — a
-    // logic bug, not a reachable runtime state.
+    // condition at all).
     let query_values = query_values.expect("per-query filter translation requires resolved query_values");
-    let lookup = |col: &str| {
-        query_values
-            .get(col)
-            .unwrap_or_else(|| panic!("filter column `{col}` missing from query's resolved filter_values"))
-    };
 
     if let Some(col) = &cond.match_from_query {
-        return to_qdrant_match_from_value(&cond.field, lookup(col));
+        return to_qdrant_match_from_value(&cond.field, resolve_query_value(query_values, col));
     }
     if let Some(range) = &cond.range_from_query {
         return to_qdrant_range_from_query(&cond.field, range, query_values);
     }
     if let Some(col) = &cond.match_text_from_query {
-        return match lookup(col) {
-            FilterFieldValue::Text(s) => Ok(Condition::matches_text(&cond.field, s.clone())),
+        return match resolve_query_value(query_values, col) {
+            FilterFieldValue::Text(s) if !s.trim().is_empty() => {
+                Ok(Condition::matches_text(&cond.field, s.clone()))
+            }
+            FilterFieldValue::Text(_) => Err(TargetError::Other(format!(
+                "filter condition on `{}`: `match_text_from_query` column `{col}` resolved to a blank \
+                 value for this query — use a non-matching placeholder instead of an empty string",
+                cond.field
+            ))),
             _ => Err(TargetError::Other(format!(
                 "filter condition on `{}`: `match_text_from_query` column `{col}` must be text",
                 cond.field
@@ -249,16 +301,21 @@ fn float_match_error(field: &str, value: f64) -> TargetError {
 }
 
 /// Translate one query's resolved `_from_query` value for a `match`-shaped
-/// condition. A numeric value must be a whole number — Qdrant's match takes
-/// `i64`, not `f64` — same constraint [`to_qdrant_match_condition`] enforces
-/// for a literal, just discovered from data instead of config.
+/// condition. `Int`/`IntList` (an exact integer-typed queries column, e.g. a
+/// `BIGINT` tenant id) map straight across with no precision loss. A `Num`
+/// value must be a whole number — Qdrant's match takes `i64`, not `f64` —
+/// same constraint [`to_qdrant_match_condition`] enforces for a literal, just
+/// discovered from data instead of config; this path is only reached for a
+/// genuinely float/decimal-typed queries column.
 fn to_qdrant_match_from_value(field: &str, value: &FilterFieldValue) -> Result<Condition, TargetError> {
     match value {
         FilterFieldValue::Text(s) => Ok(Condition::matches(field, s.clone())),
+        FilterFieldValue::Int(i) => Ok(Condition::matches(field, *i)),
         FilterFieldValue::Num(n) => integer_value(*n)
             .map(|i| Condition::matches(field, i))
             .ok_or_else(|| non_integer_from_query_error(field, *n)),
         FilterFieldValue::TextList(xs) => Ok(Condition::matches(field, xs.clone())),
+        FilterFieldValue::IntList(xs) => Ok(Condition::matches(field, xs.clone())),
         FilterFieldValue::NumList(xs) => xs
             .iter()
             .map(|&n| integer_value(n))
@@ -280,11 +337,9 @@ fn to_qdrant_range_from_query(
 ) -> Result<Condition, TargetError> {
     let bound = |col: &Option<String>| -> Result<Option<f64>, TargetError> {
         let Some(name) = col else { return Ok(None) };
-        let value = query_values
-            .get(name)
-            .unwrap_or_else(|| panic!("filter column `{name}` missing from query's resolved filter_values"));
-        match value {
+        match resolve_query_value(query_values, name) {
             FilterFieldValue::Num(n) => Ok(Some(*n)),
+            FilterFieldValue::Int(i) => Ok(Some(*i as f64)),
             _ => Err(TargetError::Other(format!(
                 "filter condition on `{field}`: `range_from_query` column `{name}` must be numeric"
             ))),
@@ -310,6 +365,12 @@ fn non_integer_from_query_error(field: &str, value: f64) -> TargetError {
 #[async_trait]
 impl QueryTarget for QdrantTarget {
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
+        // Started before request-building (not just before the RPC) so a
+        // per-query filter translation failure below reports a real elapsed
+        // duration — same treatment `started.elapsed()` already gets for an
+        // RPC-level `Err` further down — instead of a fake `0` that would
+        // skew this dispatch's contribution to the run's latency percentiles.
+        let started = Instant::now();
         let query_points: Vec<_> = match queries
             .iter()
             .map(|q| {
@@ -337,7 +398,7 @@ impl QueryTarget for QdrantTarget {
             // a finding" treatment as a Qdrant RPC failure below.
             Err(e) => {
                 return BatchOutcome {
-                    latency: Duration::from_secs(0),
+                    latency: started.elapsed(),
                     ok: false,
                     ids: vec![None; queries.len()],
                     error: Some(e.to_string()),
@@ -346,7 +407,6 @@ impl QueryTarget for QdrantTarget {
         };
         let request = QueryBatchPointsBuilder::new(&self.collection_name, query_points);
 
-        let started = Instant::now();
         match self.client.query_batch(request).await {
             // A length mismatch here means the response can no longer be
             // zipped positionally against the submitted queries without
@@ -594,5 +654,40 @@ mod tests {
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n  filter:\n    must:\n      - field: price\n        match: 9.99\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
         assert!(qdrant_config(cfg.target).into_target(&cfg.query).is_err());
+    }
+
+    #[test]
+    fn into_target_rejects_an_invalid_static_sibling_of_a_per_query_condition() {
+        // The filter overall IS per-query (one match_from_query leaf), but a
+        // fully-static sibling condition (a float match) is invalid -- this
+        // must still fail at construction, not silently defer to query_batch.
+        let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
+                    query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n  filter:\n    must:\n      - field: tenant_id\n        match_from_query: tenant_column\n      - field: price\n        match: 9.99\n";
+        let cfg = StormConfig::from_yaml(yaml).expect("parses");
+        let err = qdrant_config(cfg.target).into_target(&cfg.query).map(|_| ()).unwrap_err();
+        assert!(err.to_string().contains("float"));
+    }
+
+    #[test]
+    fn rejects_blank_match_text_from_query_value() {
+        let values =
+            HashMap::from([("phrase_column".to_string(), FilterFieldValue::Text("   ".to_string()))]);
+        let err = to_qdrant_condition(
+            &cond("field: description\nmatch_text_from_query: phrase_column\n"),
+            Some(&values),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("blank"));
+    }
+
+    #[test]
+    fn translates_exact_integer_and_int_list_from_query_values() {
+        let values = HashMap::from([
+            ("tenant_column".to_string(), FilterFieldValue::Int(9_007_199_254_740_993)),
+            ("codes_column".to_string(), FilterFieldValue::IntList(vec![1, 2, 3])),
+        ]);
+        to_qdrant_condition(&cond("field: tenant_id\nmatch_from_query: tenant_column\n"), Some(&values))
+            .unwrap();
+        to_qdrant_condition(&cond("field: code\nmatch_from_query: codes_column\n"), Some(&values)).unwrap();
     }
 }

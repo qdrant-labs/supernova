@@ -167,57 +167,106 @@ fn float(v: &Value) -> Option<f32> {
 }
 
 /// Coerce a DuckDB numeric value (any int width, signed or unsigned, or
-/// float/double) to `f64`. `None` for anything else.
+/// float/double/decimal) to `f64`. `None` for anything else. Used for range
+/// bounds, which are `f64` regardless of the source column's exact type
+/// (`RangeCondition`/`RangeFromQuery` are `f64`-based like `nova-bf`'s own —
+/// see `crate::filter`), so widening an integer column here is fine even
+/// above `f64`'s 2^53 exact-integer limit.
 fn numeric(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float(f) => Some(*f as f64),
+        Value::Double(d) => Some(*d),
+        // `rust_decimal::Decimal` isn't a direct dependency of this crate —
+        // going through its `Display` impl avoids needing one just for this.
+        Value::Decimal(d) => d.to_string().parse().ok(),
+        _ => int_value(v).map(|i| i as f64),
+    }
+}
+
+/// Every DuckDB integer-width variant, signed or unsigned.
+fn is_integer_value(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::TinyInt(_)
+            | Value::SmallInt(_)
+            | Value::Int(_)
+            | Value::BigInt(_)
+            | Value::HugeInt(_)
+            | Value::UTinyInt(_)
+            | Value::USmallInt(_)
+            | Value::UInt(_)
+            | Value::UBigInt(_)
+    )
+}
+
+/// Coerce a DuckDB integer value to `i64` *exactly* — every int width,
+/// signed or unsigned, with no precision loss (unlike widening straight to
+/// `f64`, which silently loses precision above 2^53 — the bug this exists to
+/// avoid for an exact-equality `match_from_query` id). `None` for a value
+/// whose magnitude doesn't fit `i64` (an out-of-range `HugeInt`/`UBigInt`) or
+/// a non-integer `Value`.
+fn int_value(v: &Value) -> Option<i64> {
     match *v {
-        Value::TinyInt(i) => Some(i as f64),
-        Value::SmallInt(i) => Some(i as f64),
-        Value::Int(i) => Some(i as f64),
-        Value::BigInt(i) => Some(i as f64),
-        Value::HugeInt(i) => Some(i as f64),
-        Value::UTinyInt(i) => Some(i as f64),
-        Value::USmallInt(i) => Some(i as f64),
-        Value::UInt(i) => Some(i as f64),
-        Value::UBigInt(i) => Some(i as f64),
-        Value::Float(f) => Some(f as f64),
-        Value::Double(d) => Some(d),
+        Value::TinyInt(i) => Some(i as i64),
+        Value::SmallInt(i) => Some(i as i64),
+        Value::Int(i) => Some(i as i64),
+        Value::BigInt(i) => Some(i),
+        Value::HugeInt(i) => i64::try_from(i).ok(),
+        Value::UTinyInt(i) => Some(i as i64),
+        Value::USmallInt(i) => Some(i as i64),
+        Value::UInt(i) => Some(i as i64),
+        Value::UBigInt(i) => i64::try_from(i).ok(),
         _ => None,
     }
 }
 
 /// Coerce one `_from_query`-referenced column's value into a
-/// [`FilterFieldValue`] — text, numeric, or a homogeneous list of either.
-/// Callers already reject `Value::Null` before this is called (see the NULL
-/// check in [`load_query_vectors`]).
+/// [`FilterFieldValue`] — text, an exact integer, a float/decimal, or a
+/// homogeneous list of one of those. Callers already reject `Value::Null`
+/// before this is called (see the NULL check in [`load_query_vectors`]).
 fn filter_field_value(value: Value) -> Result<FilterFieldValue, QueryLoadError> {
-    match &value {
-        Value::Text(s) => return Ok(FilterFieldValue::Text(s.clone())),
-        Value::List(xs) | Value::Array(xs) => {
-            if xs.iter().all(|v| matches!(v, Value::Text(_))) {
-                return Ok(FilterFieldValue::TextList(
-                    xs.iter()
-                        .filter_map(|v| match v {
-                            Value::Text(s) => Some(s.clone()),
-                            _ => None,
-                        })
-                        .collect(),
-                ));
-            }
-            return xs
-                .iter()
-                .map(numeric)
-                .collect::<Option<Vec<_>>>()
-                .map(FilterFieldValue::NumList)
-                .ok_or_else(|| {
-                    QueryLoadError::Other(
-                        "filter column list is neither all-text nor all-numeric".into(),
-                    )
-                });
-        }
-        _ => {}
+    if let Value::Text(s) = &value {
+        return Ok(FilterFieldValue::Text(s.clone()));
+    }
+    if let Value::List(xs) | Value::Array(xs) = &value {
+        return filter_field_list_value(xs);
+    }
+    if is_integer_value(&value) {
+        return int_value(&value).map(FilterFieldValue::Int).ok_or_else(|| {
+            QueryLoadError::Other(format!(
+                "filter column value `{value:?}` is out of range for an exact integer match \
+                 (Qdrant match only supports i64)"
+            ))
+        });
     }
     numeric(&value).map(FilterFieldValue::Num).ok_or_else(|| {
         QueryLoadError::Other("filter column is not text, numeric, or a list of either".into())
+    })
+}
+
+/// [`filter_field_value`]'s list case: a `LIST`/`ARRAY` of all-text, all-
+/// integer (kept exact, same reasoning as [`int_value`]), or otherwise
+/// all-numeric (widened to `f64`, e.g. a mix of int and double columns —
+/// unusual but not actively wrong for `range_from_query`, which is `f64`
+/// anyway).
+fn filter_field_list_value(xs: &[Value]) -> Result<FilterFieldValue, QueryLoadError> {
+    if xs.iter().all(|v| matches!(v, Value::Text(_))) {
+        return Ok(FilterFieldValue::TextList(
+            xs.iter()
+                .filter_map(|v| match v {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+        ));
+    }
+    if xs.iter().all(is_integer_value) {
+        return xs.iter().map(int_value).collect::<Option<Vec<_>>>().map(FilterFieldValue::IntList).ok_or_else(
+            || QueryLoadError::Other("filter column list has an integer value out of range for i64".into()),
+        );
+    }
+    xs.iter().map(numeric).collect::<Option<Vec<_>>>().map(FilterFieldValue::NumList).ok_or_else(|| {
+        QueryLoadError::Other("filter column list is neither all-text nor all-numeric".into())
     })
 }
 
@@ -441,5 +490,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn large_bigint_filter_column_round_trips_exactly() {
+        // Above f64's 2^53 exact-integer limit (9007199254740992) -- widening
+        // straight to f64 before converting back to i64 would silently round
+        // this to 9007199254740992, submitting the WRONG tenant id to Qdrant
+        // with no error. `filter_field_value` must keep it exact via `Int`.
+        const BIG: i64 = 9_007_199_254_740_993;
+        let dir = std::env::temp_dir().join(format!("nova_storm_qfbig_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("queries.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT] AS embedding, {BIG}::BIGINT AS tenant_column) \
+             TO '{}' (FORMAT PARQUET)",
+            file.display()
+        ))
+        .unwrap();
+
+        let filter =
+            parse_filter("must:\n  - field: tenant_id\n    match_from_query: tenant_column\n");
+        let vectors =
+            load_query_vectors(&source(file.display().to_string(), None), Some(&filter)).unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(vectors[0].filter_values.get("tenant_column"), Some(&FilterFieldValue::Int(BIG)));
+    }
+
+    #[test]
+    fn decimal_filter_column_loads_as_numeric() {
+        let dir = std::env::temp_dir().join(format!("nova_storm_qfdec_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("queries.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT] AS embedding, 42.5::DECIMAL(10,2) AS max_budget) \
+             TO '{}' (FORMAT PARQUET)",
+            file.display()
+        ))
+        .unwrap();
+
+        let filter =
+            parse_filter("must:\n  - field: budget\n    range_from_query:\n      lt: max_budget\n");
+        let vectors =
+            load_query_vectors(&source(file.display().to_string(), None), Some(&filter)).unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(vectors[0].filter_values.get("max_budget"), Some(&FilterFieldValue::Num(42.5)));
     }
 }
