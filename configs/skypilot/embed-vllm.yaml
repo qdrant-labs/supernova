@@ -12,7 +12,13 @@
 resources:
   cloud: aws
   accelerators: A10G:1
-  use_spot: true
+  # A10G:1 alone lands on g5.xlarge (16 GB RAM) — too tight: vLLM's engine
+  # process holds ~6 GB host-side and the pipeline (queued image chunks,
+  # decoded PIL batches, flush buffer) another ~5, and Ray OOM-kills the job
+  # at 95% node memory. 32+ steers to g5.2xlarge (32 GB, same GPU, ~20% more
+  # $/hr).
+  memory: 64+
+  use_spot: false
   # vLLM + CUDA wheels are several GB on top of the embed stack.
   disk_size: 150
   # A real GPU VM AMI (driver + CUDA preinstalled) — see embed.yaml for why
