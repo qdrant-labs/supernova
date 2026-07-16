@@ -195,21 +195,107 @@ def test_tiling_is_invariant(ds, id_column, metric):
         assert np.allclose(sc_whole, sc_tiled, atol=1e-3)
 
 
-@pytest.mark.parametrize("chunk_bytes", [1, 144])  # step=1; step=3 (ragged: 3 ∤ 4 queries)
+def _run_multi(ds, *, order, out_name):
+    """Like `_run` but with several sparse searches sharing one pass — one
+    per metric in `order`, preserving that order in the config."""
+    out = ds["tmp"] / out_name
+    out.mkdir(exist_ok=True)
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], sparse_column="sparse_embedding"),
+        queries=QueriesConfig(path=ds["qpath"], sparse_column="sparse_embedding", id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(io_workers=2),
+        searches=[
+            SearchSpec(name=f"s_{m}", k=K, metric=m, vector_type="sparse") for m in order
+        ],
+    )
+    paths = run_compute(cfg)
+    res = {}
+    for m in order:
+        t = pq.read_table(paths[f"s_{m}"]).to_pydict()
+        res[m] = {q: list(zip(hi, hs)) for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
+    return res
+
+
+def test_metric_order_permutation_invariant(ds):
+    """One raw spmm per slice is shared across metrics (`_masked_raw`), built
+    by whichever metric scores FIRST — so spec order must not matter, and a
+    co-scheduled search must equal its own solo run exactly."""
+    a = _run_multi(ds, order=["dot", "cosine"], out_name="perm_dc")
+    b = _run_multi(ds, order=["cosine", "dot"], out_name="perm_cd")
+    assert a == b
+    for metric in ("dot", "cosine"):
+        solo = _run(ds, metric=metric, batch=None, id_column=None, out_name=f"perm_solo_{metric}")
+        assert a[metric] == solo
+
+
+def test_precoalesced_file_slices_are_valid_csr(tmp_path):
+    """Files are remapped + coalesced ONCE in the reader (`_remap_sparse_file`)
+    and batch slices are pure nnz-range views — a file whose rows carry
+    duplicate AND unsorted tokens, split across 2-row slices, must match the
+    whole-file run and still sum duplicates (row c0's token 3 appears twice:
+    1.0 + 4.0)."""
+    corpus = [[
+        ([3, 0, 3], [1.0, 2.0, 4.0]),  # unsorted + duplicated token 3
+        ([1], [1.0]),
+        ([2, 2, 0], [0.5, 0.5, 1.0]),
+        ([0, 1], [2.0, 3.0]),
+        ([4, 3], [1.0, 1.5]),  # 1.5 not 1.0: keep scores tie-free — tie ORDER
+        # across different batchings is deliberately unpromised (see the
+        # parity-locked tie-break design), and this test is about CSR
+        # validity, not tie order.
+    ]]
+    queries = [([0, 3], [1.0, 1.0])]
+    (tmp_path / "whole").mkdir()
+    whole = _run_tiny(tmp_path / "whole", corpus, queries, k=5)
+    (tmp_path / "sliced").mkdir()
+    sliced = _run_tiny(tmp_path / "sliced", corpus, queries, k=5, batch=2)
+    assert whole == sliced
+    scores = dict(whole["q0"])
+    assert scores["c0"] == pytest.approx(2.0 + 1.0 + 4.0)  # dup token summed
+
+
+def test_zero_gate_file_ok_predicate():
+    """Unit contract of the cheap-gate guard: strictly-positive values with a
+    safe min-product qualify; signed queries, signed corpus values,
+    STORED-ZERO corpus entries (structural overlaps that dot as 0.0 — see
+    the helper's docstring), and denormal-underflow products all fall back
+    to the structural indicator path."""
+    from nova_bf.compute import _zero_gate_file_ok
+
+    pos = np.array([0.5, 2.0], np.float32)
+    assert _zero_gate_file_ok(pos, True, 0.01)
+    assert not _zero_gate_file_ok(pos, False, 0.01)  # signed query side
+    assert not _zero_gate_file_ok(np.array([-0.1, 1.0], np.float32), True, 0.01)
+    assert not _zero_gate_file_ok(np.array([0.0, 1.0], np.float32), True, 0.01)  # stored zero
+    assert not _zero_gate_file_ok(np.array([1e-25], np.float32), True, 1e-25)  # underflow
+    assert _zero_gate_file_ok(np.zeros(0, np.float32), True, 0.01)  # empty file
+    assert _zero_gate_file_ok(pos, True, float("inf"))  # queries with no positives at all
+
+
 @pytest.mark.parametrize("metric", ["dot", "cosine"])
-def test_no_overlap_chunking_is_invariant(ds, metric, chunk_bytes, monkeypatch):
-    """`score()` materializes the query-side no-overlap indicator in row
-    chunks (`_NO_OVERLAP_CHUNK_BYTES` — the memory fix for 100k-query runs
-    that OOM'd a 24 GB A10G on the full-size float temp). Forcing tiny
-    chunks, including a chunk size that doesn't divide the query count,
-    must reproduce the default run bit-for-bit: chunking only bounds the
-    temp's size, each output cell reduces over the same vocab axis."""
+def test_zero_gate_and_structural_gate_agree_on_positive_data(tmp_path, metric, monkeypatch):
+    """On strictly-positive values the cheap `raw == 0` gate and the signed
+    -data structural indicator must select IDENTICAL candidates: run the
+    same corpus twice, once with the gate eligible and once force-disabled
+    (impossible `_ZERO_GATE_MIN_PRODUCT` pushes every file structural).
+    Corpus includes overlap-only, partial-overlap, and zero-overlap docs so
+    both inclusion and exclusion are exercised."""
     import nova_bf.compute as compute_mod
 
-    whole = _run(ds, metric=metric, batch=None, id_column=None, out_name=f"chunk_whole_{metric}_{chunk_bytes}")
-    monkeypatch.setattr(compute_mod, "_NO_OVERLAP_CHUNK_BYTES", chunk_bytes)
-    chunked = _run(ds, metric=metric, batch=None, id_column=None, out_name=f"chunk_tiny_{metric}_{chunk_bytes}")
-    assert chunked == whole
+    corpus = [
+        [([0, 1], [1.0, 2.0]), ([2], [3.0])],
+        [([8], [4.0]), ([0, 8, 9], [0.5, 5.0, 6.0])],
+    ]
+    queries = [([0, 2], [1.0, 1.0]), ([9], [2.0]), ([5], [1.0])]  # q2 overlaps nothing
+
+    (tmp_path / "fast").mkdir()
+    fast = _run_tiny(tmp_path / "fast", corpus, queries, metric=metric, k=4)
+    monkeypatch.setattr(compute_mod, "_ZERO_GATE_MIN_PRODUCT", float("inf"))
+    (tmp_path / "struct").mkdir()
+    structural = _run_tiny(tmp_path / "struct", corpus, queries, metric=metric, k=4)
+    assert fast == structural
+    assert fast["q2"] == []  # zero-overlap query excluded under BOTH gates
 
 
 @pytest.mark.parametrize("batch", [None, K])
@@ -471,7 +557,7 @@ def test_filter_compaction_preserves_duplicate_index_summing(tmp_path):
 
 
 def _run_tiny(tmp_path, corpus_files, query_rows, *, metric="dot", k=5, filt=None,
-              languages=None):
+              languages=None, batch=None):
     """Standalone mini-runner for datasets that need EXACT control over token
     overlap (the module `ds` fixture deliberately guarantees every pair
     overlaps, see NNZ's comment — useless for zero-overlap tests)."""
@@ -493,7 +579,7 @@ def _run_tiny(tmp_path, corpus_files, query_rows, *, metric="dot", k=5, filt=Non
         corpus=CorpusConfig(path=str(cdir), sparse_column="sparse_embedding", id_column="id"),
         queries=QueriesConfig(path=str(qpath), sparse_column="sparse_embedding", id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(io_workers=1),
+        params=ParamsConfig(io_workers=1, sparse_batch_size=batch),
         searches=[SearchSpec(name="test", k=k, metric=metric, vector_type="sparse", filter=filt)],
     )
     t = pq.read_table(run_compute(cfg)["test"]).to_pydict()

@@ -397,14 +397,40 @@ def _compact_sparse_rows(
     return new_row_offsets, new_indices, new_values, new_norms, orig_rows
 
 
+def _remap_sparse_file(
+    row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray, vocab: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Remap one whole file's raw CSR parts into the query vocabulary:
+    out-of-vocab entries dropped (see `_build_query_vocab`), duplicate
+    (row, col) pairs summed and per-row column order sorted
+    (`_coalesce_by_row_col` — both required for valid torch CSR, see
+    `_sparse_batch_to_csr`).
+
+    Runs ONCE per file, in the reader threads (parallel, overlapped with GPU
+    work) — it used to run per batch SLICE on the single consumer thread,
+    serializing an O(nnz log nnz) lexsort with every GPU call (~240 slices/
+    file at fineweb scale). Must run AFTER `_sparse_file_norms`, which needs
+    the raw pre-truncation values (see its docstring)."""
+    n_rows = len(row_offsets) - 1
+    row_ids = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(row_offsets))
+    idx = _vocab_lookup(vocab, indices)
+    keep_nnz = idx >= 0
+    row_ids, idx, val = row_ids[keep_nnz], idx[keep_nnz], values[keep_nnz]
+    row_ids, idx, val = _coalesce_by_row_col(row_ids, idx, val)
+    counts = np.bincount(row_ids, minlength=n_rows)
+    new_offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+    return new_offsets, idx, val
+
+
 def _sparse_batch_to_csr(
     row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray,
     r0: int, r1: int, vocab: np.ndarray, device: str,
 ):
-    """This batch's RAW (unnormalized) CSR rows, remapped into the query
-    vocabulary (out-of-vocab entries dropped — see `_build_query_vocab`).
+    """One row-slice of an ALREADY-remapped file (see `_remap_sparse_file`:
+    indices are query-vocab column ids, per-row sorted and deduped) as a
+    torch sparse CSR on `device`. Pure slicing — no lookup, no sort.
 
-    Deliberately takes no `norms`/metric argument and never scales `b_val` —
+    Deliberately takes no `norms`/metric argument and never scales values —
     this builder is shared across every search of this vector_type that scores
     the same rows via `_process_shared_batch`, including a mix of `cosine` and
     `dot` searches, so it must stay metric-agnostic BY CONSTRUCTION. Cosine
@@ -418,34 +444,18 @@ def _sparse_batch_to_csr(
     just remembering not to pass it, is what prevents that class of bug from
     coming back.
 
-    `check_invariants=False` below skips torch's own validation that each
-    row's column indices are sorted and distinct — a real, enforced CSR
-    invariant (violating it is undefined behavior per torch's own sparse
-    tensor docs, not just a missed optimization). The source parquet's
-    per-row token order isn't guaranteed sorted OR unique (two original
-    token ids can remap to the same vocab column — impossible here since
-    `_vocab_lookup` is injective, but a row can also carry the same raw
-    token id twice, e.g. a hash collision in a real hashed embedder), so
-    `_coalesce_by_row_col` both sorts AND merges duplicate columns before
-    construction, so skipping torch's redundant check stays safe."""
+    `check_invariants=False` skips torch's validation that each row's column
+    indices are sorted and distinct — a real, enforced CSR invariant.
+    `_remap_sparse_file`'s coalesce established exactly those two properties
+    for the whole file, and row-slicing preserves them, so the skip is safe."""
     import torch
 
     lo, hi = int(row_offsets[r0]), int(row_offsets[r1])
-    b_idx = indices[lo:hi]
-    b_val = values[lo:hi]
-    counts = np.diff(row_offsets[r0 : r1 + 1])
-
-    row_ids = np.repeat(np.arange(r1 - r0, dtype=np.int64), counts)
-    b_idx = _vocab_lookup(vocab, b_idx)
-    keep_nnz = b_idx >= 0
-    b_idx, b_val, row_ids = b_idx[keep_nnz], b_val[keep_nnz], row_ids[keep_nnz]
-
-    row_ids, b_idx, b_val = _coalesce_by_row_col(row_ids, b_idx, b_val)
-    new_counts = np.bincount(row_ids, minlength=r1 - r0)
-    crow = np.concatenate(([0], np.cumsum(new_counts))).astype(np.int64)
-
+    crow = (row_offsets[r0 : r1 + 1] - lo).astype(np.int64, copy=False)
     Cb = torch.sparse_csr_tensor(
-        torch.from_numpy(crow), torch.from_numpy(b_idx), torch.from_numpy(b_val),
+        torch.from_numpy(crow),
+        torch.from_numpy(indices[lo:hi]),
+        torch.from_numpy(values[lo:hi]),
         size=(r1 - r0, len(vocab)), check_invariants=False,
     )
     return Cb.to(device, non_blocking=True)
@@ -542,24 +552,37 @@ class DenseBatchSlice:
 
 
 class SparseCorpusBatch:
-    """Decoded sparse corpus CSR parts for one file, plus each row's true
-    (untruncated) L2 norm (`norms`, `None` unless some spec needs cosine —
-    see `_sparse_file_norms`). `vocab`/`need_row_norms` are fixed RUN-WIDE
-    (see `run_compute`'s `need_sparse_norms`) and carried through `.compact()`
-    unchanged, so `.transfer()` needs no extra args beyond the `(r0, r1,
-    device)` every corpus batch takes. This means a batch/filter-group made
+    """Decoded sparse corpus CSR parts for one file — ALREADY remapped into
+    the query vocabulary, per-row sorted and deduped (`_remap_sparse_file`,
+    done once per file in the reader threads; `.transfer()` is pure slicing)
+    — plus each row's true (untruncated, PRE-remap) L2 norm (`norms`, `None`
+    unless some spec needs cosine — see `_sparse_file_norms`). `nbytes`
+    consequently reflects the post-OOV-drop nnz, which only feeds the
+    coalesce-group size heuristic. `vocab`/`need_row_norms` are fixed
+    RUN-WIDE (see `run_compute`'s `need_sparse_norms`) and carried through
+    `.compact()` unchanged, so `.transfer()` needs no extra args beyond the
+    `(r0, r1, device)` every corpus batch takes. This means a batch/filter-group made
     up entirely of `dot` searches still moves `row_norms` to the GPU whenever
     ANY search in the run needs cosine — a negligible extra transfer (one
     float per row in the batch) that a `dot` search's own `.score()` never
     reads, so it costs a little bandwidth, never correctness."""
 
-    def __init__(self, row_offsets, indices, values, norms, vocab: np.ndarray, need_row_norms: bool):
+    def __init__(
+        self, row_offsets, indices, values, norms, vocab: np.ndarray, need_row_norms: bool,
+        zero_gate_ok: bool = False, q_indicator=None,
+    ):
         self.row_offsets = row_offsets
         self.indices = indices
         self.values = values
         self.norms = norms
         self.vocab = vocab
         self.need_row_norms = need_row_norms
+        # Whether this file's slices may use the cheap `raw == 0` no-overlap
+        # gate (see `_zero_gate_file_ok`), and the run-wide `_QueryIndicator`
+        # for the signed fallback — both fixed per file / per run, carried
+        # through `.compact()`/`_concat_sparse_batches` like `vocab`.
+        self.zero_gate_ok = zero_gate_ok
+        self.q_indicator = q_indicator
 
     @property
     def n_rows(self) -> int:
@@ -577,7 +600,10 @@ class SparseCorpusBatch:
             self.row_offsets, self.indices, self.values, self.norms, keep
         )
         return (
-            SparseCorpusBatch(row_offsets, indices, values, norms, self.vocab, self.need_row_norms),
+            SparseCorpusBatch(
+                row_offsets, indices, values, norms, self.vocab, self.need_row_norms,
+                self.zero_gate_ok, self.q_indicator,
+            ),
             orig_rows,
         )
 
@@ -589,13 +615,66 @@ class SparseCorpusBatch:
             torch.from_numpy(self.norms[r0:r1]).to(device, non_blocking=True)
             if self.need_row_norms else None
         )
-        return SparseBatchSlice(Cb, row_norms)
+        return SparseBatchSlice(Cb, row_norms, self.zero_gate_ok, self.q_indicator)
 
 
-# Per-chunk byte budget for the dense query-indicator temp in
-# `SparseBatchSlice.score()` — bounds the largest single allocation of the
-# no-overlap pass regardless of query count.
-_NO_OVERLAP_CHUNK_BYTES = 512 * 1024**2
+# The zero-score no-overlap gate (`raw == 0` in `SparseBatchSlice.score`) is
+# only valid when no product of a query value and a corpus value can flush to
+# 0.0 in f32 (GPU denormal flush-to-zero would otherwise fake a structural
+# miss): require min_positive(Q) * min_positive(C_file) above this. Real
+# embedder weights (~1e-4..10) clear it by >20 orders of magnitude.
+_ZERO_GATE_MIN_PRODUCT = 1e-30
+
+
+def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> bool:
+    """Per corpus file: may `SparseBatchSlice.score` use the cheap
+    `raw == 0` no-overlap gate for this file's slices?  True iff the query
+    side is non-negative, this file's values are STRICTLY positive, and the
+    smallest possible cross-product stays comfortably normal (see
+    `_ZERO_GATE_MIN_PRODUCT`). Strictness matters twice over: a negative
+    value allows cancellation zeros (real candidates), and a STORED-ZERO
+    entry is a structural overlap (it occupies a posting in an inverted
+    index — Qdrant would surface the doc at score 0.0) that contributes 0 to
+    the dot, so `raw == 0` would wrongly gate it — both fall back to the
+    structural indicator path. `values` are the file's raw pre-coalesce
+    entries — coalescing only ever SUMS same-sign values, so raw strict
+    positivity implies scored positivity, and the raw min is a lower bound
+    on the scored min (conservative)."""
+    if not q_nonneg:
+        return False
+    if len(values) == 0:
+        return True  # no entries -> nothing can overlap; the gate is vacuous
+    vmin = float(values.min())
+    if vmin <= 0.0:
+        return False
+    return q_min_pos * vmin > _ZERO_GATE_MIN_PRODUCT
+
+
+class _QueryIndicator:
+    """Run-wide, lazily-built sparse-CSR indicator of Q's nonzero pattern
+    (ones), for the SIGNED-data structural no-overlap gate. Built at most
+    once per run, on the first slice whose file fails `_zero_gate_file_ok`
+    (never for all-positive embedders like ReLU'd mGTE); shared by every
+    slice thereafter. ~nnz(Q) entries (~120 MB at 100k × ~100 nnz queries) —
+    replaces the old per-slice re-materialization of a dense `(Q != 0)`
+    float copy (~7.2 GB of writes per slice at fineweb scale)."""
+
+    def __init__(self):
+        self.csr = None
+
+    def get(self, Q):
+        if self.csr is None:
+            import torch
+
+            nz = Q != 0  # (n_q, vocab) bool — one-time transient
+            crow = torch.zeros(Q.shape[0] + 1, dtype=torch.int64, device=Q.device)
+            torch.cumsum(nz.sum(1), 0, out=crow[1:])
+            cols = nz.nonzero(as_tuple=True)[1]  # row-major order == valid CSR order
+            self.csr = torch.sparse_csr_tensor(
+                crow, cols, torch.ones(cols.numel(), dtype=Q.dtype, device=Q.device),
+                size=tuple(Q.shape), check_invariants=False,
+            )
+        return self.csr
 
 
 @dataclass
@@ -614,50 +693,66 @@ class SparseBatchSlice:
     `_merge_topk`, truncated by the `valid = sc > -inf` write path, tallied
     by `warn_if_short`.
 
-    The gate is STRUCTURAL (an indicator-CSR spmm counting shared dims), not
-    `score == 0.0` — a signed sparse embedding can produce a genuine 0.0 from
-    overlapping dimensions that cancel, and that row is a real candidate.
-    The indicator matmul reuses `Cb`'s own index tensors (only the values
-    are swapped for ones) and is computed once per slice, shared across
-    every metric/spec scoring it.
+    The gate is SEMANTICALLY structural (shared nonzero dims), never
+    `score == 0.0` in general — a signed sparse embedding can produce a
+    genuine 0.0 from overlapping dimensions that cancel, and that row is a
+    real candidate. Two implementations, selected per file by
+    `zero_gate_ok` (see `_zero_gate_file_ok`):
+    - Non-negative data (ReLU'd embedders like mGTE): cancellation is
+      impossible, so `raw == 0` IS the structural gate — free, no extra
+      matmul, underflow fenced by `_ZERO_GATE_MIN_PRODUCT`.
+    - Signed data: an indicator spmm — the run-wide query-pattern CSR
+      (`_QueryIndicator`, built once) against this slice's densified
+      indicator, counting shared dims exactly as before.
 
-    The query-side indicator `(Q != 0).to(Q.dtype)` is materialized in
-    row-chunks (`_NO_OVERLAP_CHUNK_BYTES` per chunk), never whole: at 100k
-    queries that full-size float temp alone OOM'd a 24 GB A10G. Chunking
-    changes peak memory only — each output cell reduces over the same vocab
-    axis either way, so the mask is bit-identical."""
+    The scoring spmm itself runs ONCE per slice regardless of how many
+    metrics score it: `_masked_raw` caches the dot-scale, `-inf`-masked
+    product, and `cosine` is derived from it by two scalar divisions (per
+    corpus row, per query) — `-inf / positive == -inf`, so the gate survives
+    the derivation. At ~200 nnz/row × 100k queries the second spmm was ~a
+    third of all GPU work in the fineweb sparse GT run; the divisions are
+    bandwidth-trivial. Trade-off: a cosine-ONLY run now briefly holds two
+    (n_q, n_rows) matrices (the cached raw + the derived copy) where it
+    previously held one — bounded by `sparse_batch_size`, and dwarfed by
+    the spmm saved in the mixed-metric configs this cache exists for."""
 
     Cb: object  # torch.Tensor, sparse CSR (n_rows, vocab)
     row_norms: object  # torch.Tensor | None
-    _no_overlap: object = None  # lazy (n_q, n_rows) bool — see class docstring
+    zero_gate_ok: bool = False  # may `raw == 0` stand in for the structural gate?
+    q_indicator: object = None  # run-wide _QueryIndicator (signed fallback); lazy local if None
+    _masked_raw: object = None  # lazy dot-scale masked (n_q, n_rows) — see docstring
 
     @property
     def n_rows(self) -> int:
         return self.Cb.shape[0]
 
-    def score(self, Q, metric: str, q_norms=None):
+    def _structural_no_overlap(self, Q):
+        """Signed-data gate: (query-pattern CSR) @ (densified slice
+        indicator, built transposed so no (n_q, …) transpose copy is ever
+        made) == 0. Same FLOPs as the historical per-slice indicator spmm,
+        but the dense operand is the ~300 MB corpus side, not a per-slice
+        re-materialization of the multi-GB query side."""
         import torch
 
-        if self._no_overlap is None:
-            indicator = torch.sparse_csr_tensor(
-                self.Cb.crow_indices(), self.Cb.col_indices(),
-                torch.ones_like(self.Cb.values()),
-                size=self.Cb.shape, check_invariants=False,
-            )
-            n_q, vocab = Q.shape
-            step = max(1, _NO_OVERLAP_CHUNK_BYTES // max(1, vocab * Q.element_size()))
-            no_overlap = torch.empty((n_q, self.n_rows), dtype=torch.bool, device=Q.device)
-            for i in range(0, n_q, step):
-                q_ind = (Q[i : i + step] != 0).to(Q.dtype)
-                no_overlap[i : i + step] = torch.matmul(indicator, q_ind.T).T == 0
-            self._no_overlap = no_overlap
-        raw = _sparse_scores(Q, self.Cb)
-        if metric == "cosine":
-            # Both divisors in place (`raw` is freshly owned): the corpus
-            # side per row, the query side per query — the latter replaces
-            # a pre-normalized copy of Q (see run_compute's `q_norms_by_vt`).
-            raw = raw.div_(self.row_norms.clamp_min(1e-12)[None, :]).div_(q_norms[:, None])
-        return raw.masked_fill_(self._no_overlap, float("-inf"))
+        crow, col = self.Cb.crow_indices(), self.Cb.col_indices()
+        row_ids = torch.repeat_interleave(
+            torch.arange(self.n_rows, device=col.device), crow.diff()
+        )
+        c_ind_t = torch.zeros((self.Cb.shape[1], self.n_rows), dtype=Q.dtype, device=Q.device)
+        c_ind_t[col, row_ids] = 1.0  # Cb is coalesced: (col, row) pairs are unique
+        q_ind = (self.q_indicator or _QueryIndicator()).get(Q)
+        return torch.matmul(q_ind, c_ind_t) == 0
+
+    def score(self, Q, metric: str, q_norms=None):
+        if self._masked_raw is None:
+            raw = _sparse_scores(Q, self.Cb)
+            no_overlap = (raw == 0) if self.zero_gate_ok else self._structural_no_overlap(Q)
+            self._masked_raw = raw.masked_fill_(no_overlap, float("-inf"))
+        if metric == "dot":
+            return self._masked_raw
+        # cosine: a NEW tensor (dot may still read `_masked_raw`), then the
+        # second division in place on that fresh copy.
+        return self._masked_raw.div(self.row_norms.clamp_min(1e-12)[None, :]).div_(q_norms[:, None])
 
 
 def _concat_dense_batches(batches: list[DenseCorpusBatch]) -> DenseCorpusBatch:
@@ -690,7 +785,12 @@ def _concat_sparse_batches(batches: list[SparseCorpusBatch]) -> SparseCorpusBatc
         offsets_parts.append(b.row_offsets[1:] + running_nnz)
         running_nnz += int(b.row_offsets[-1])
     row_offsets = np.concatenate(offsets_parts).astype(np.int64)
-    return SparseCorpusBatch(row_offsets, indices, values, norms, batches[0].vocab, batches[0].need_row_norms)
+    return SparseCorpusBatch(
+        row_offsets, indices, values, norms, batches[0].vocab, batches[0].need_row_norms,
+        # A coalesced group may mix files: the cheap gate needs EVERY part
+        # to qualify; the indicator holder is run-wide, any part's copy works.
+        all(b.zero_gate_ok for b in batches), batches[0].q_indicator,
+    )
 
 
 def _merge_topk(top_scores, top_enc, batch_scores, encoded_rows, k: int):
@@ -1400,6 +1500,11 @@ def run_compute(
     _validate_query_filter_cols(qstore, query_filter_cols)
     Q_np_by_vt: dict[str, np.ndarray] = {}
     query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
+    # Sparse no-overlap gate state (see _zero_gate_file_ok/_QueryIndicator):
+    # query-side flags fixed run-wide; the indicator holder is shared by every
+    # file's batch and builds its CSR lazily, only if a signed file appears.
+    sparse_q_nonneg, sparse_q_min_pos = False, float("inf")
+    sparse_q_indicator = _QueryIndicator()
     query_ids: list[str] | None = None
     payload: dict[str, list] | None = None
     query_filter_vals: dict[str, np.ndarray] | None = None
@@ -1413,6 +1518,13 @@ def run_compute(
                     "sparse query vocabulary is empty (every query has zero nonzero entries) — "
                     "every corpus row will score 0; check queries.sparse_column is correct."
                 )
+            # Query side of the zero-score no-overlap gate (see
+            # `_zero_gate_file_ok`): computed on Q as SCORED (post-densify,
+            # duplicates summed), once per run.
+            sparse_q_nonneg = bool((Q_np >= 0).all())
+            q_pos = Q_np[Q_np > 0]
+            sparse_q_min_pos = float(q_pos.min()) if q_pos.size else float("inf")
+            del q_pos
         else:
             Q_np, q_ids, q_payload, q_filter_vals = load_queries(qstore, cfg.queries, query_filter_cols)
         Q_np_by_vt[vt] = Q_np
@@ -1679,8 +1791,15 @@ def run_compute(
                     arrs["dense"] = dense_to_2d(table[dense_col])
                 if "sparse" in vts_needed:
                     sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[sparse_col])
+                    # Norms and the zero-score gate BEFORE remap: both are
+                    # defined over the raw, untruncated file values (see
+                    # _sparse_file_norms / _zero_gate_file_ok docstrings).
                     sp_norms = _sparse_file_norms(sp_offsets, sp_idx, sp_val) if need_sparse_norms else None
-                    arrs["sparse"] = (sp_offsets, sp_idx, sp_val, sp_norms)
+                    sp_gate = _zero_gate_file_ok(sp_val, sparse_q_nonneg, sparse_q_min_pos)
+                    sp_offsets, sp_idx, sp_val = _remap_sparse_file(
+                        sp_offsets, sp_idx, sp_val, query_vocab
+                    )
+                    arrs["sparse"] = (sp_offsets, sp_idx, sp_val, sp_norms, sp_gate)
                 # carry the id column (combined to one contiguous array) to decode;
                 # None when id_column isn't configured. Same row order as `arrs`.
                 ids = table[id_col].combine_chunks() if id_col else None
@@ -1788,8 +1907,11 @@ def run_compute(
                             _union_keep(vt_union_filters["dense"], keeps)
                         )
                 if "sparse" in vts_needed:
-                    sp_offsets, sp_idx, sp_val, sp_norms = arrs["sparse"]
-                    b = SparseCorpusBatch(sp_offsets, sp_idx, sp_val, sp_norms, query_vocab, need_sparse_norms)
+                    sp_offsets, sp_idx, sp_val, sp_norms, sp_gate = arrs["sparse"]
+                    b = SparseCorpusBatch(
+                        sp_offsets, sp_idx, sp_val, sp_norms, query_vocab, need_sparse_norms,
+                        sp_gate, sparse_q_indicator,
+                    )
                     raw_stats["sparse"] = (b.n_rows, b.nbytes)
                     if has_baseline["sparse"]:
                         batches["sparse"], batch_orig_rows["sparse"] = b, None
