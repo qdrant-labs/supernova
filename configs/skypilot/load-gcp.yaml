@@ -1,0 +1,34 @@
+# GCP override for `nova dist load`.
+#
+# Usage:
+#   nova dist load configs/loader/fineweb_10b_smoke.yaml \
+#     --resources configs/skypilot/load-gcp.yaml \
+#     --num-jobs 3
+#
+#   nova dist load configs/loader/fineweb_10b_full.yaml \
+#     --resources configs/skypilot/load-gcp.yaml \
+#     --num-jobs 7
+
+resources:
+  cloud: gcp
+  instance_type: c4d-standard-384
+  use_spot: false
+  disk_size: 500
+
+# Keep the default nova-load installer behavior unless you need a dev build.
+# This explicit setup keeps behavior obvious and reproducible on GCP workers.
+setup: |
+  set -e
+  case "$(uname -m)" in
+    x86_64) t=x86_64-unknown-linux-gnu ;;
+    aarch64|arm64) t=aarch64-unknown-linux-gnu ;;
+    *) t= ;;
+  esac
+  if [ -n "$t" ] && curl -fsSL "https://github.com/qdrant-labs/supernova/releases/latest/download/nova-load-$t" -o /tmp/nova-load; then
+    sudo install -m 0755 /tmp/nova-load /usr/local/bin/nova-load
+  else
+    command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    . "$HOME/.cargo/env"
+    cargo install --git https://github.com/qdrant-labs/supernova nova-load
+    sudo install -m 0755 "$HOME/.cargo/bin/nova-load" /usr/local/bin/nova-load
+  fi

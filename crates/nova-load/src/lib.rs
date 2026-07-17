@@ -45,6 +45,7 @@ pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
 
     let dims = resolve_dims(&config.datasource, &config.vectors).await?;
     create_collection(store.as_ref(), &config.vectors, dims).await?;
+    store.ensure_payload_indexes(&config.datasource.reader().payload_fields).await?;
     store.defer_indexing().await?;
 
     // `load_files` lists + partitions internally.
@@ -73,6 +74,7 @@ pub async fn prepare(config: LoadConfig) -> Result<(), LoadError> {
     // so prepare doesn't pay to enumerate a huge corpus.
     let dims = resolve_dims(&config.datasource, &config.vectors).await?;
     create_collection(store.as_ref(), &config.vectors, dims).await?;
+    store.ensure_payload_indexes(&config.datasource.reader().payload_fields).await?;
     store.defer_indexing().await?;
     tracing::info!("prepared collection on {store}");
     Ok(())

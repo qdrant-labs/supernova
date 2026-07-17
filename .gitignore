@@ -40,3 +40,6 @@ htmlcov/
 # zensical docs build output
 site/
 .cache/
+
+data/
+thirdparty/

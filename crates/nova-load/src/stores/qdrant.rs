@@ -7,13 +7,13 @@ use serde::Deserialize;
 
 use qdrant_client::qdrant::{
     BinaryQuantization, BinaryQuantizationEncoding, CollectionStatus, CompressionRatio,
-    CreateCollectionBuilder, Datatype, Disabled, Distance, HnswConfigDiff, Modifier,
-    MultiVectorComparator, MultiVectorConfigBuilder, OptimizersConfigDiff,
-    OptimizersConfigDiffBuilder, PointStruct, ProductQuantization, QuantizationType,
-    ScalarQuantization, SparseIndexConfigBuilder, SparseVectorConfig, SparseVectorParams,
-    SparseVectorParamsBuilder, TurboQuantBitSize, TurboQuantization, UpdateCollectionBuilder,
-    UpsertPointsBuilder, Vector, VectorParams, VectorParamsBuilder, VectorParamsMap, VectorsConfig,
-    quantization_config, quantization_config_diff, vectors_config,
+    CreateCollectionBuilder, CreateFieldIndexCollection, Datatype, Disabled, Distance, FieldType,
+    HnswConfigDiff, Modifier, MultiVectorComparator, MultiVectorConfigBuilder,
+    OptimizersConfigDiff, OptimizersConfigDiffBuilder, PointStruct, ProductQuantization,
+    QuantizationType, ScalarQuantization, SparseIndexConfigBuilder, SparseVectorConfig,
+    SparseVectorParams, SparseVectorParamsBuilder, TurboQuantBitSize, TurboQuantization,
+    UpdateCollectionBuilder, UpsertPointsBuilder, Vector, VectorParams, VectorParamsBuilder,
+    VectorParamsMap, VectorsConfig, quantization_config, quantization_config_diff, vectors_config,
 };
 use qdrant_client::{Payload, Qdrant};
 
@@ -81,11 +81,45 @@ pub struct QdrantParams {
     /// Optimizer overrides.
     #[serde(default)]
     pub optimizers: Option<OptimizersConfig>,
+    /// Optional payload index creation policy to run before bulk ingestion.
+    #[serde(default)]
+    pub payload_indexes: Option<PayloadIndexConfig>,
     /// If the collection already exists with incompatible (immutable) params,
     /// drop + recreate instead of erroring. Consumed by the loader, not part of
     /// the `CreateCollection` request itself.
     #[serde(default)]
     pub recreate: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadIndexMode {
+    #[default]
+    None,
+    All,
+    Specific,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadIndexConfig {
+    /// Index creation policy:
+    /// - none: do not create payload indexes
+    /// - all: create indexes for every configured payload field
+    /// - specific: create indexes only for `fields`
+    #[serde(default)]
+    pub mode: PayloadIndexMode,
+    /// Used when `mode: specific`.
+    #[serde(default)]
+    pub fields: Vec<String>,
+    /// Optional per-field type overrides; if omitted for a field, Qdrant infers.
+    /// Supported values: keyword, integer, float, geo, text, bool, datetime, uuid.
+    /// `auto` disables explicit type for that field (infer server-side).
+    #[serde(default)]
+    pub field_types: HashMap<String, String>,
+    /// Whether to wait for each index creation op to apply (defaults to true).
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Errors that surface only when translating the backend-agnostic config into
@@ -118,6 +152,16 @@ pub enum QdrantConfigError {
     UnknownQuantizationEncoding(String),
     #[error("unknown quantization `bits` `{0}` (expected one of: 1, 1.5, 2, 4)")]
     UnknownTurboBits(f32),
+    #[error("payload_indexes.mode=specific requires at least one field in payload_indexes.fields")]
+    PayloadIndexSpecificModeNeedsFields,
+    #[error(
+        "payload index field `{field}` is not present in datasource.payload_fields (available: {available})"
+    )]
+    UnknownPayloadIndexField { field: String, available: String },
+    #[error(
+        "unknown payload index field type `{0}` (expected one of: auto, keyword, integer, float, geo, text, bool, datetime, uuid)"
+    )]
+    UnknownPayloadIndexFieldType(String),
 }
 
 /// Build a `CreateCollection` request by gathering fields from three sources:
@@ -368,6 +412,66 @@ fn parse_turbo_bits(value: Option<f32>) -> Result<Option<TurboQuantBitSize>, Qdr
     }
 }
 
+fn parse_payload_field_type(value: &str) -> Result<Option<FieldType>, QdrantConfigError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let parsed = match normalized.as_str() {
+        "auto" => None,
+        "keyword" => Some(FieldType::Keyword),
+        "integer" | "int" => Some(FieldType::Integer),
+        "float" | "double" | "number" => Some(FieldType::Float),
+        "geo" => Some(FieldType::Geo),
+        "text" => Some(FieldType::Text),
+        "bool" | "boolean" => Some(FieldType::Bool),
+        "datetime" | "date" => Some(FieldType::Datetime),
+        "uuid" => Some(FieldType::Uuid),
+        _ => return Err(QdrantConfigError::UnknownPayloadIndexFieldType(value.to_string())),
+    };
+    Ok(parsed)
+}
+
+fn plan_payload_indexes(
+    cfg: &PayloadIndexConfig,
+    payload_fields: &HashMap<String, String>,
+) -> Result<Vec<(String, Option<FieldType>)>, QdrantConfigError> {
+    let mut fields = match cfg.mode {
+        PayloadIndexMode::None => return Ok(Vec::new()),
+        PayloadIndexMode::All => payload_fields.keys().cloned().collect::<Vec<_>>(),
+        PayloadIndexMode::Specific => {
+            if cfg.fields.is_empty() {
+                return Err(QdrantConfigError::PayloadIndexSpecificModeNeedsFields);
+            }
+            cfg.fields.clone()
+        }
+    };
+    fields.sort();
+    fields.dedup();
+
+    if matches!(cfg.mode, PayloadIndexMode::Specific) {
+        let mut available = payload_fields.keys().cloned().collect::<Vec<_>>();
+        available.sort();
+        let available = available.join(", ");
+        for field in &fields {
+            if !payload_fields.contains_key(field) {
+                return Err(QdrantConfigError::UnknownPayloadIndexField {
+                    field: field.clone(),
+                    available: available.clone(),
+                });
+            }
+        }
+    }
+
+    fields
+        .into_iter()
+        .map(|field| {
+            let field_type = match cfg.field_types.get(&field) {
+                Some(v) => parse_payload_field_type(v)?,
+                None => None,
+            };
+            Ok((field, field_type))
+        })
+        .collect()
+}
+
 /// Quantization config for `CreateCollection` — `None` (no quantization) is
 /// a no-op here (`quantization_config::Quantization` has no "disabled"
 /// variant; there's nothing to turn off on a collection that doesn't exist
@@ -543,6 +647,56 @@ impl VectorStore for QdrantStore {
         Ok(())
     }
 
+    async fn ensure_payload_indexes(
+        &self,
+        payload_fields: &HashMap<String, String>,
+    ) -> Result<(), StoreError> {
+        let Some(cfg) = self.params.payload_indexes.as_ref() else {
+            return Ok(());
+        };
+
+        let planned =
+            plan_payload_indexes(cfg, payload_fields).map_err(|e| StoreError::Other(e.to_string()))?;
+        if planned.is_empty() {
+            return Ok(());
+        }
+
+        for (field, field_type) in planned {
+            let request = CreateFieldIndexCollection {
+                collection_name: self.collection_name.clone(),
+                wait: cfg.wait.or(Some(true)),
+                field_name: field.clone(),
+                field_type: field_type.map(|f| f as i32),
+                field_index_params: None,
+                ordering: None,
+                timeout: None,
+            };
+
+            match self.client.create_field_index(request).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "ensured payload index `{field}` on {}{}",
+                        self,
+                        field_type
+                            .map(|t| format!(" (type={})", t.as_str_name()))
+                            .unwrap_or_default()
+                    );
+                }
+                Err(err) => {
+                    // Index creation is idempotent enough for our use if the field
+                    // index already exists.
+                    let msg = err.to_string();
+                    if msg.to_ascii_lowercase().contains("already exists") {
+                        tracing::info!("payload index `{field}` already exists on {self}; skipping");
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn upsert_batch(&self, points: Vec<Point>) -> Result<(), StoreError> {
         let points: Vec<PointStruct> = points.into_iter().map(PointStruct::from).collect();
         self.client
@@ -667,6 +821,50 @@ mod tests {
     fn qdrant_store(cfg: &LoadConfig) -> &QdrantConfig {
         let VectorStoreConfig::Qdrant(store) = &cfg.vectorstore;
         store
+    }
+
+    #[test]
+    fn payload_index_plan_all_infers_types_by_default() {
+        let cfg = PayloadIndexConfig { mode: PayloadIndexMode::All, ..Default::default() };
+        let payload_fields = HashMap::from([
+            ("language".to_string(), "language".to_string()),
+            ("token_count".to_string(), "token_count".to_string()),
+        ]);
+        let planned = plan_payload_indexes(&cfg, &payload_fields).expect("plan should succeed");
+        assert_eq!(planned.len(), 2);
+        assert!(planned.iter().all(|(_, t)| t.is_none()));
+    }
+
+    #[test]
+    fn payload_index_plan_specific_validates_and_parses_types() {
+        let cfg = PayloadIndexConfig {
+            mode: PayloadIndexMode::Specific,
+            fields: vec!["language".into(), "token_count".into()],
+            field_types: HashMap::from([
+                ("language".to_string(), "keyword".to_string()),
+                ("token_count".to_string(), "integer".to_string()),
+            ]),
+            wait: None,
+        };
+        let payload_fields = HashMap::from([
+            ("language".to_string(), "language".to_string()),
+            ("token_count".to_string(), "token_count".to_string()),
+            ("text".to_string(), "text".to_string()),
+        ]);
+        let planned = plan_payload_indexes(&cfg, &payload_fields).expect("plan should succeed");
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].0, "language");
+        assert_eq!(planned[0].1, Some(FieldType::Keyword));
+        assert_eq!(planned[1].0, "token_count");
+        assert_eq!(planned[1].1, Some(FieldType::Integer));
+    }
+
+    #[test]
+    fn payload_index_specific_requires_fields() {
+        let cfg = PayloadIndexConfig { mode: PayloadIndexMode::Specific, ..Default::default() };
+        let payload_fields = HashMap::from([("language".to_string(), "language".to_string())]);
+        let err = plan_payload_indexes(&cfg, &payload_fields).expect_err("should fail");
+        assert!(matches!(err, QdrantConfigError::PayloadIndexSpecificModeNeedsFields));
     }
 
     /// A minimal dense spec with everything unset, for the size-resolution tests.

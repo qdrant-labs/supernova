@@ -59,10 +59,9 @@ def forward_env(config_path: str, extra: list[str] | None = None) -> dict[str, s
     Env vars to attach to the launch: AWS creds + everything the config
     references + per-tool baselines, filtered to those actually set.
     """
-    # wanted = AWS_ENV_VARS + referenced_env_vars(config_path) + (extra or [])
-    # see if unforwarding AWS creds opens up the skypilot-v1 role
-    # which never expires
-    wanted = referenced_env_vars(config_path) + (extra or [])
+    # Forward AWS creds for cross-cloud runs (e.g. GCP workers reading S3), plus
+    # vars referenced by the workload config and tool-specific extras.
+    wanted = AWS_ENV_VARS + referenced_env_vars(config_path) + (extra or [])
     return {v: os.environ[v] for v in dict.fromkeys(wanted) if os.environ.get(v)}
 
 

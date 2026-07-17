@@ -1,0 +1,57 @@
+# Local smoke-test ingest config (no AWS creds required).
+#
+# Uses the copied sample parquet file under ./data for fast end-to-end validation.
+#
+# Run:
+#   nova load inspect configs/loader/fineweb_10b_smoke_local.yaml --num-jobs 1 --job-rank 0
+#   nova load run configs/loader/fineweb_10b_smoke_local.yaml
+
+datasource:
+  type: local
+  path: /home/mvasquez/data/s3/ten-billion-with-payload
+  id_expression: "vf_point_id(regexp_replace(filename, '^/home/mvasquez/data/s3/ten-billion-with-payload/', ''), file_row_number)"
+  file_list:
+    - 00/train-part0__0047.parquet
+  payload_fields:
+    id: id
+    text: text
+    url: url
+    dump: dump
+    date: date
+    language: language
+    language_score: language_score
+    token_count: token_count
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 768
+    datatype: float16
+
+vectorstore:
+  type: qdrant
+  collection_name: fineweb_gte_10b_local_smoke
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  upsert_wait: false
+  params:
+    recreate: true
+    on_disk_payload: true
+    hnsw:
+      m: 16
+      ef_construct: 100
+      on_disk: true
+    optimizers:
+      indexing_threshold: 0
+      max_segment_size_kb: 3840000
+      flush_interval_sec: 5
+
+loader:
+  batch_size: 256
+  concurrency: 4
+  file_look_ahead: 1
+  file_retries: 3
+  upsert_retries: 3
+  max_failed_files: 1
