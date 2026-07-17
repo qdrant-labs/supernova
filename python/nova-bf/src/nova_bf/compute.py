@@ -2132,18 +2132,44 @@ def run_compute(
     # you're NIC-bound (plateaus there) or still latency-bound (keeps rising).
     # `filter_s` is 0.0 when unfiltered — always present so the line's schema
     # stays stable for scripts parsing it across both filtered and plain runs.
+    # `read_secs`/`filter_secs` are summed across the `io_workers` reader threads
+    # that run concurrently, so divide by io_workers for a wall-clock-comparable
+    # figure. Readers do read -> filter -> compact SERIALLY per file, so the
+    # consumer's `io_wait` (starvation) is driven by BOTH — it is NOT "waiting on
+    # IO" alone. Splitting the reader wall into its read vs filter halves is what
+    # tells IO-bound from filter-bound.
+    read_wall = read_secs / max(1, io_workers)
+    filter_wall = filter_secs / max(1, io_workers)
     logger.info(
         "bf-bench io_workers=%d files=%d rows=%d gb=%.3f wall_s=%.1f "
-        "wall_mbps=%.1f stream_mbps=%.1f io_wait_s=%.1f gpu_s=%.1f filter_s=%.1f",
+        "wall_mbps=%.1f stream_mbps=%.1f io_wait_s=%.1f gpu_s=%.1f filter_s=%.1f "
+        "read_wall_s=%.1f filter_wall_s=%.1f",
         io_workers, len(mine), rows_seen, gb, wall,
         wall_mbps, stream_mbps, io_wait, gpu_secs, filter_secs,
+        read_wall, filter_wall,
     )
+    # Diagnose WHY the consumer starved (io_wait high), distinguishing the two
+    # reader-side costs — raising io_workers only helps when reads, not filtering,
+    # are the reader bottleneck. Comparing io_wait against gpu_secs alone (as this
+    # once did) mislabels a filter-bound run "IO-bound" and wrongly advises more
+    # readers.
     if io_wait > 3 * max(gpu_secs, 1e-6):
-        logger.info(
-            "IO-bound: GPU idle %.0f%% of the time waiting on reads — raise "
-            "params.io_workers (currently %d).",
-            100 * io_wait / max(io_wait + gpu_secs, 1e-9), io_workers,
-        )
+        if filter_wall > read_wall:
+            logger.info(
+                "FILTER-bound: readers spend more wall filtering (~%.0fs) than on IO "
+                "(~%.0fs); io_wait=%.0fs is filter-driven, not slow IO (aggregate read "
+                "%.0f MB/s). Raising params.io_workers (currently %d) won't help — reduce "
+                "filter cost or add ranks.",
+                filter_wall, read_wall, io_wait, wall_mbps, io_workers,
+            )
+        else:
+            logger.info(
+                "IO-bound: readers spend more wall on IO (~%.0fs) than filtering (~%.0fs) "
+                "and the consumer idles %.0f%% waiting — raise params.io_workers "
+                "(currently %d).",
+                read_wall, filter_wall,
+                100 * io_wait / max(io_wait + gpu_secs, 1e-9), io_workers,
+            )
 
     # 4. decode each spec's final top-K into hit ids and write its own output.
     #    Either recompute make_point_id from (file_key, row) — only K*n_q ids,
