@@ -131,6 +131,7 @@ from tqdm import tqdm
 
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import _condition_mask, _match_any_membership, _static_first, evaluate
+from nova_bf.dates import convert_table_date_columns, normalize_date_fields
 from nova_bf.ids import make_point_id
 from nova_bf.io import ParquetFile, Store, dense_to_2d, sparse_to_coo_parts
 from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
@@ -241,11 +242,17 @@ def load_queries(
     ids: list[str] = []
     payload: dict[str, list] = {c: [] for c in qcfg.payload_fields}
     filter_vals: dict[str, list] = {c: [] for c in filter_cols}
+    q_date_fmts = normalize_date_fields(qcfg.date_fields)
     for f in store.list_parquets():
         table = store.read_columns(f.read_path, cols)
-        embs.append(dense_to_2d(table[qcfg.dense_column]))
-        d = table.to_pydict()
-        n = len(table)
+        d = table.to_pydict()  # ORIGINAL values — payload/id keep their source form
+        # Declared datetime query columns -> int64 epoch µs, but ONLY for the
+        # per-query filter arrays, so a range_from_query bound compares as a
+        # number against the (also-µs) corpus date column. A date field carried
+        # in payload_fields keeps its original (string) form in `d` above.
+        conv = convert_table_date_columns(table, q_date_fmts)
+        embs.append(dense_to_2d(conv[qcfg.dense_column]))
+        n = len(conv)
         if qcfg.id_column:
             ids += [str(x) for x in d[qcfg.id_column]]
         else:
@@ -253,7 +260,7 @@ def load_queries(
         for c in qcfg.payload_fields:
             payload[c] += d[c]
         for c in filter_cols:
-            filter_vals[c] += d[c]
+            filter_vals[c] += conv[c].to_pylist()
     Q = np.concatenate(embs, axis=0) if embs else np.zeros((0, 0), np.float32)
     return Q, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
 
@@ -351,13 +358,16 @@ def load_queries_sparse(
     ids: list[str] = []
     payload: dict[str, list] = {c: [] for c in qcfg.payload_fields}
     filter_vals: dict[str, list] = {c: [] for c in filter_cols}
+    q_date_fmts = normalize_date_fields(qcfg.date_fields)
     for f in store.list_parquets():
         table = store.read_columns(f.read_path, cols)
-        row_offsets, idx, val = sparse_to_coo_parts(table[qcfg.sparse_column])
+        d = table.to_pydict()  # ORIGINAL values — payload/id keep their source form
+        # Date columns -> epoch µs for filter arrays only (payload keeps strings).
+        conv = convert_table_date_columns(table, q_date_fmts)
+        row_offsets, idx, val = sparse_to_coo_parts(conv[qcfg.sparse_column])
         counts_parts.append(np.diff(row_offsets))
         indices_parts.append(idx)
         values_parts.append(val)
-        d = table.to_pydict()
         n = len(row_offsets) - 1
         if qcfg.id_column:
             ids += [str(x) for x in d[qcfg.id_column]]
@@ -366,7 +376,7 @@ def load_queries_sparse(
         for c in qcfg.payload_fields:
             payload[c] += d[c]
         for c in filter_cols:
-            filter_vals[c] += d[c]
+            filter_vals[c] += conv[c].to_pylist()
 
     indices = np.concatenate(indices_parts) if indices_parts else np.zeros(0, np.int64)
     values = np.concatenate(values_parts) if values_parts else np.zeros(0, np.float32)
@@ -1722,6 +1732,7 @@ def run_compute(
     # the columns some spec actually references, same guarantee the single-search
     # path always made.
     filter_cols = sorted({c for s in specs if s.filter for c in s.filter.fields()})
+    corpus_date_fmts = normalize_date_fields(cfg.corpus.date_fields)
     read_cols = list(dict.fromkeys(
         ([dense_col] if "dense" in vts_needed else [])
         + ([sparse_col] if "sparse" in vts_needed else [])
@@ -1782,6 +1793,10 @@ def run_compute(
             try:
                 t0 = time.perf_counter()
                 table = cstore.read_columns(f.read_path, read_cols)
+                # Declared datetime corpus columns -> int64 epoch µs before any
+                # filter (static `range` or GPU-native `range_from_query`) reads
+                # them, so every range path stays numeric and unchanged.
+                table = convert_table_date_columns(table, corpus_date_fmts)
                 # Decode each vector_type at most ONCE per file, regardless of how many
                 # specs need it — wrapped in the batch abstraction (`DenseCorpusBatch`/
                 # `SparseCorpusBatch`) below, where every spec of that vector_type shares
