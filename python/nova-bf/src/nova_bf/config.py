@@ -20,6 +20,8 @@ import yaml
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from nova_bf.tokenize import tokenize
+
 import os
 
 _ENV_RE = re.compile(r"\$\{([^}]+)\}")
@@ -238,8 +240,10 @@ class FilterCondition(BaseModel):
     `match` takes a scalar (equality) or a list (matches any of them —
     Qdrant's MatchAny); `match_from_query` does the same but per query, via a
     queries column holding either a scalar or a list per row. `match_text`
-    requires every whitespace-separated word in the string to appear
-    somewhere in the field (case-insensitive, order-independent);
+    requires every token of the string to appear as a token of the field —
+    both sides run through `nova_bf.tokenize` (split on non-alphanumeric, lowercase),
+    the same semantics as Qdrant's full-text `MatchText` against a `word`
+    tokenizer index with `lowercase: true` (order-independent, AND of tokens);
     `match_text_from_query` is the same, with each query's own phrase read
     from a queries column — the one per-query variant with a real, different
     cost profile (see `filters._match_text_from_query_mask`'s docstring).
@@ -281,11 +285,13 @@ class FilterCondition(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _match_text_not_blank(self) -> "FilterCondition":
-        if self.match_text is not None and not self.match_text.strip():
+    def _match_text_has_tokens(self) -> "FilterCondition":
+        if self.match_text is not None and not tokenize(self.match_text):
             raise ValueError(
-                f"filter condition on `{self.field}` has a blank `match_text` "
-                "— it needs at least one word"
+                f"filter condition on `{self.field}` has a `match_text` with no "
+                "alphanumeric tokens — it would match nothing (match_text is "
+                "tokenized like Qdrant's word tokenizer: split on "
+                "non-alphanumeric characters, lowercased)"
             )
         return self
 

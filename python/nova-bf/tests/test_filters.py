@@ -17,7 +17,7 @@ from nova_bf.config import (
     RangeFromQuery,
     SearchSpec,
 )
-from nova_bf.filters import _literal_then_regex_word_mask, _static_first, evaluate
+from nova_bf.filters import _static_first, _token_row_masks, evaluate
 
 
 def _table(**cols):
@@ -304,11 +304,11 @@ def test_match_text_from_query_null_phrase_never_matches():
 
 
 def test_match_text_from_query_blank_phrase_never_matches():
-    """Regression test: a blank/whitespace-only per-query phrase must never
-    reach `_match_text_mask` (zero words -> `text.split()` never sets its
-    `mask`, so it returns `None` and the caller's `pc.fill_null(None, ...)`
-    crashes) — found live against real query data where every query's
-    `title` column happened to be an empty string."""
+    """Regression test: a blank/whitespace-only per-query phrase tokenizes to
+    an empty token list, which must resolve to an all-False row (matches
+    nothing, same as a null phrase) — not crash and not match everything.
+    Originally found live against real query data where every query's `title`
+    column happened to be an empty string."""
     t = _table(title=["wireless mouse", "gaming keyboard"])
     f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
     qv = {"phrase": np.array(["mouse", "", "   "], dtype=object)}
@@ -320,12 +320,12 @@ def test_match_text_from_query_blank_phrase_never_matches():
 
 
 def test_match_text_from_query_shared_word_across_phrases():
-    """Two different phrases sharing a word (word-level dedup, not just
-    phrase-level dedup) must each still combine correctly with their OTHER
-    word(s) — the shared word's cached mask must not leak the other
-    phrase's extra condition. Also exercises different casing of the same
-    word ("Wireless" vs "wireless") landing on the same cache key without
-    changing results, since `ignore_case=True` already makes them equivalent."""
+    """Two different phrases sharing a token must each still combine
+    correctly with their OTHER token(s) — the shared token's row mask (one
+    row of `_token_row_masks`' shared grid) must not leak the other phrase's
+    extra condition. Also exercises different casing of the same word
+    ("Wireless" vs "wireless") tokenizing to the same lowercase token
+    without changing results."""
     t = _table(title=["wireless mouse", "wireless keyboard", "wired mouse", "gaming chair"])
     f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
     qv = {"phrase": np.array(["wireless mouse", "Wireless keyboard"], dtype=object)}
@@ -334,28 +334,17 @@ def test_match_text_from_query_shared_word_across_phrases():
     assert mask[1].tolist() == [False, True, False, False]
 
 
-def test_literal_then_regex_word_mask_matches_single_regex_pass():
-    """Unit test for `_literal_then_regex_word_mask`'s two-pass shortcut:
-    must agree exactly with a plain single regex pass, including the cases
-    that make it non-trivial — a literal substring present but NOT at a
-    word boundary (e.g. "taxes" contains "tax" but isn't the word "tax"),
-    a null corpus value, and a word that appears nowhere at all (exercises
-    the all-literal-miss early return, which skips the regex pass
-    entirely)."""
+def test_token_row_masks_whole_token_null_and_absent():
+    """Unit test for `_token_row_masks`, the text-matching primitive: a
+    query token only matches a row's WHOLE token ("taxes" contains "tax" as
+    a substring but not as a token), a null corpus value never matches, and
+    an absent token yields all-False without error."""
     import pyarrow as pa
-    import pyarrow.compute as pc
 
     col = pa.chunked_array([pa.array(["tax season", "taxes are due", None, "no match here", "TAX"])])
-    got = _literal_then_regex_word_mask("tax", col)
-    want = pc.fill_null(
-        pc.match_substring_regex(col, pattern=r"\btax\b", ignore_case=True), False,
-    ).to_numpy(zero_copy_only=False)
-    assert got.tolist() == want.tolist() == [True, False, False, False, True]
-
-    # a word absent from every row: the literal prefilter alone must already
-    # return all-False, without ever reaching the regex pass.
-    absent = _literal_then_regex_word_mask("zzz_nowhere", col)
-    assert absent.tolist() == [False, False, False, False, False]
+    masks = _token_row_masks(col, {"tax", "zzznowhere"}, len(col))
+    assert masks["tax"].tolist() == [True, False, False, False, True]
+    assert masks["zzznowhere"].tolist() == [False, False, False, False, False]
 
 
 def test_static_only_filter_stays_one_dimensional():
