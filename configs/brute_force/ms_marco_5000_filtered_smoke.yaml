@@ -1,0 +1,155 @@
+# Brute-force ground-truth config for `nova bf` — all 5,000 selected MS MARCO
+# v1.1 queries (medical / government_legal / academic_scientific) against an
+# embedded FineWeb corpus, in ONE run.
+#   nova bf compute configs/brute_force/ms_marco_5000_filtered.yaml
+#   nova dist bf compute configs/brute_force/ms_marco_5000_filtered.yaml --num-jobs 8
+#   nova bf merge   configs/brute_force/ms_marco_5000_filtered.yaml
+#
+# Query set: data/ms_marco/all_5000/queries_tiered.parquet — all 5,000 queries
+# combined. Original source split was 2,505 medical + 1,241 government_legal +
+# 1,254 academic_scientific (see data/ms_marco/ms_marco_v1_filter_candidates.jsonl
+# for provenance); a manual audit pass reclassified 243 queries (4.9%) whose
+# category didn't match their actual topic, so the final split is 2,472 medical
+# + 1,246 government_legal + 1,282 academic_scientific. Also split into
+# low/medium/high selectivity tiers by scripts/build_tiered_queries.py.
+#
+# One search, correct per-query filtering for every query in one pass — made
+# possible by this schema's per-query filter conditions
+# (match_from_query/range_from_query/match_text_from_query, see config.py),
+# which pull each query's own comparison value from a column in queries.parquet
+# instead of a literal shared across the whole batch:
+#
+# Queries are split into three SELECTIVITY TIERS (see scripts/build_tiered_
+# queries.py) — low / medium / high, starting from an even-thirds mechanical
+# split (stratified within each category) then reclassified by a manual agent
+# pass to match each query's actual content (1,053/5,000 moved tier; final
+# split high 1630 / medium 1893 / low 1477 — deliberately left uneven). The
+# tier spans the filter-cardinality spectrum a filtered-ANN engine changes
+# strategy across
+# (Qdrant's payload prefilter vs filterable-HNSW vs full scan), realized by two
+# per-query dials, BOTH under plain all-words AND MatchText semantics:
+#
+#   - `text` keyword requirement: EVERY retained salient term must appear in
+#     the matched document — via `match_text_from_query: keyword_phrase`. The
+#     tier controls HOW MANY terms are retained (and therefore all required):
+#     high = all extracted words, medium = ~half, low = a single word. Fewer
+#     required words => a looser filter (this is the primary selectivity dial).
+#     WHICH words are retained is a MANUAL per-query judgment (25 parallel
+#     agents each ranked one 200-query batch's candidate words most-to-least
+#     important as a filter keyword; 2/5,000 fell back to a document-frequency
+#     rarity ranking), not sentence position — see build_tiered_queries.py's
+#     docstring for why (~63-67% of queries get a different keyword set than
+#     plain first-K truncation would pick).
+#   - `url` domain/authority restriction: an OR-of-known-sites per query, via
+#     up to 9 `domain_slot_N` columns in `should` (unused slots hold the
+#     unmatchable placeholder "zzznomatchzzz000"). The tier controls its
+#     BREADTH — three genuinely distinct levels now (not two: an earlier
+#     version had high and medium share one "category set", so domain breadth
+#     never actually differed between them, only keyword count did):
+#       high:   a SMALL, most-authoritative subset per category — medical
+#               mayoclinic/webmd/nih/cdc/medlineplus (5, down from the full
+#               9); government_legal .gov only; academic_scientific
+#               .edu/.gov only (already narrow, unchanged).
+#       medium: WIDER than high, still narrower than low — medical the full
+#               original 9-site set; government_legal adds .mil plus 3
+#               well-known legal-reference sites (justia, findlaw,
+#               law.cornell.edu); academic_scientific adds 4 well-known
+#               scientific-publishing/reference sites (arxiv, jstor,
+#               sciencedirect, springer).
+#       low:    broad TLD set (com/org/net/edu/gov/...) so the domain clause
+#               stops binding.
+#     medical's high/medium lists and government_legal/academic_scientific's
+#     high lists are verified against the source dataset's own domain_slot_*
+#     values; the medium-tier additions for government_legal/
+#     academic_scientific (mil, justia, findlaw, cornell, arxiv, jstor,
+#     sciencedirect, springer) are hand-picked well-known real sites, NOT
+#     source-verified — see scripts/build_tiered_queries.py's docstring.
+#     Per-query slots are what let one shared `should` list restrict each
+#     query to its own sites without the cross-category leakage a single
+#     static `should` applied to all 5,000 would cause (e.g. a .gov query
+#     incorrectly matching webmd.com).
+#
+# `match_text`/`match_text_from_query` are whole-word (Qdrant MatchText
+# semantics), not substring — e.g. "med" as a bare word does NOT match inside
+# "medlineplus.gov" or "medicalnewstoday.com" (no word boundary between "med"
+# and what follows), which is why the medical domain slots use the actual
+# site-name words — mayoclinic, webmd, nih, cdc, medlineplus at high; those
+# plus drugs, healthline, verywellhealth, medicalnewstoday at medium — rather
+# than generic fragments like "health"/"med".
+#
+# Prerequisites (neither exists yet as of writing this config):
+#   1. An embedded FineWeb corpus parquet (dense_column + `url` payload
+#      column) at corpus.path below.
+#   2. corpus.path needs to be filled in for wherever the corpus lives —
+#      data/ms_marco/all_5000/queries_tiered.parquet (this run's queries file)
+#      already exists locally with the columns described above.
+
+corpus:
+  path: s3://fineweb-gte-with-payloads/resharded/           # TODO: embedded FineWeb corpus location
+  dense_column: dense_embedding
+  # id_column: id  # fineweb's own "<urn:uuid:...>" id column, if carried through embedding
+
+queries:
+  path: s3://qdrant-fineweb-gte-10b--brute-force-search/queries/ms_marco_5000_queries_tiered.parquet
+  dense_column: dense_embedding
+  id_column: query_id
+  payload_fields:
+    - dense_embedding
+    - query
+    - query_type
+    - domain_bucket
+    - selectivity_tier
+    # filter values carried through so results can be re-analyzed later
+    - keyword_phrase
+    - domain_slot_1
+    - domain_slot_2
+    - domain_slot_3
+    - domain_slot_4
+    - domain_slot_5
+    - domain_slot_6
+    - domain_slot_7
+    - domain_slot_8
+    - domain_slot_9
+
+output:
+  # SMOKE output — isolated so a rank-0-of-1 partial can't be merged into the real run
+  path: s3://qdrant-fineweb-gte-10b--brute-force-search/10B/filteredSearch-smoke/
+
+params:
+  io_workers: 8
+  io_thread_count: 256
+  dense_batch_size: 4096
+  merge_prefetch: true
+
+searches:
+  - name: ms_marco_5000_filtered
+    vector_type: dense
+    metric: cosine
+    k: 1000
+    filter:
+      # Small url conditions listed before the big text one — readability
+      # only: evaluate() tokenizes each referenced field exactly once and
+      # combines conditions order-insensitively, so YAML order carries no
+      # performance or semantic weight.
+      should:
+        - field: url
+          match_text_from_query: domain_slot_1
+        - field: url
+          match_text_from_query: domain_slot_2
+        - field: url
+          match_text_from_query: domain_slot_3
+        - field: url
+          match_text_from_query: domain_slot_4
+        - field: url
+          match_text_from_query: domain_slot_5
+        - field: url
+          match_text_from_query: domain_slot_6
+        - field: url
+          match_text_from_query: domain_slot_7
+        - field: url
+          match_text_from_query: domain_slot_8
+        - field: url
+          match_text_from_query: domain_slot_9
+      must:
+        - field: text
+          match_text_from_query: keyword_phrase   # all retained words required (AND)
