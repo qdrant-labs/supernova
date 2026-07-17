@@ -28,8 +28,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from nova_bf.config import Filter, FilterCondition
-from nova_bf.filters import _match_text_from_query_mask, _token_row_masks, evaluate
+from nova_bf.config import Filter, FilterCondition, RangeCondition, RangeFromQuery
+from nova_bf.filters import _condition_mask, _match_text_from_query_mask, _token_row_masks, evaluate
 from nova_bf.tokenize import tokenize
 
 
@@ -146,7 +146,7 @@ def test_fuzz_match_text_from_query_vs_reference(seed):
 def test_fuzz_evaluate_must_should_vs_reference(seed):
     """Mirror the real config: must = text keyword-AND, should = OR of url
     slots — several text conditions, two on the same FIELD, so this also
-    exercises the shared per-field tokenization pass (`_text_token_masks`)."""
+    exercises the shared per-field tokenization pass (`_text_prep`)."""
     rng = random.Random(seed)
     nrows = rng.randint(1, 40)
     texts = [None if rng.random() < 0.1 else _rand_text(rng) for _ in range(nrows)]
@@ -167,6 +167,84 @@ def test_fuzz_evaluate_must_should_vs_reference(seed):
     got = evaluate(f, t, {"kw": kw, "d1": d1, "d2": d2})
     ref = _ref_mask(texts, kw) & (_ref_mask(urls, d1) | _ref_mask(urls, d2))
     assert np.array_equal(got, ref), f"seed={seed}"
+
+
+def _condition_major_evaluate(filt, table, qv=None):
+    """The pre-fusion combine: every condition expands to its own mask
+    (per-query text conditions each materialize (n_queries, rows)), then
+    groups AND/OR the full arrays — the reference the fused, query-major
+    `evaluate()` must match bit-for-bit."""
+    n = len(table)
+    keep = np.ones(n, dtype=bool)
+    for cond in filt.must:
+        keep = keep & _condition_mask(cond, table, qv)
+    if filt.should:
+        any_m = np.zeros(n, dtype=bool)
+        for cond in filt.should:
+            any_m = any_m | _condition_mask(cond, table, qv)
+        keep = keep & any_m
+    for cond in filt.must_not:
+        keep = keep & ~_condition_mask(cond, table, qv)
+    return keep
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_fuzz_fused_evaluate_bit_identical_to_condition_major(seed):
+    """Random filters mixing per-query text conditions with static text,
+    static match/range, and non-text per-query conditions across all three
+    groups: the fused path must return exactly what condition-major
+    combination returns — same bits, same ndim."""
+    rng = random.Random(1000 + seed)
+    nrows = rng.randint(1, 50)
+    texts = [None if rng.random() < 0.1 else _rand_text(rng) for _ in range(nrows)]
+    urls = [rng.choice(["nih.gov docs", "webmd health", "arxiv paper", "blog"]) for _ in range(nrows)]
+    cats = [rng.choice(["a", "b", "c", None]) for _ in range(nrows)]
+    costs = [None if rng.random() < 0.15 else round(rng.uniform(0, 10), 2) for _ in range(nrows)]
+    t = pa.table({
+        "text": pa.array(texts), "url": pa.array(urls),
+        "category": pa.array(cats), "cost": pa.array(costs, type=pa.float64()),
+    })
+
+    nq = rng.randint(1, 10)
+    qv = {
+        "kw": np.array([_rand_phrase(rng) for _ in range(nq)], dtype=object),
+        "d1": np.array([rng.choice(["nih", "webmd", "arxiv", "zzznone", None]) for _ in range(nq)], dtype=object),
+        "d2": np.array([rng.choice(["gov", "health", "paper", ""]) for _ in range(nq)], dtype=object),
+        "cat_q": np.array([rng.choice(["a", "b", "zz", None]) for _ in range(nq)], dtype=object),
+        "budget": np.array([rng.choice([rng.uniform(0, 10), np.nan]) for _ in range(nq)]),
+    }
+
+    def rand_cond():
+        kind = rng.randrange(7)
+        if kind == 0:
+            return FilterCondition(field="text", match_text_from_query="kw")
+        if kind == 1:
+            return FilterCondition(field="url", match_text_from_query=rng.choice(["d1", "d2"]))
+        if kind == 2:
+            return FilterCondition(field="text", match_text="fever dna")
+        if kind == 3:
+            return FilterCondition(field="category", match=rng.choice(["a", "b"]))
+        if kind == 4:
+            return FilterCondition(field="cost", range=RangeCondition(lt=rng.uniform(2, 9)))
+        if kind == 5:
+            return FilterCondition(field="category", match_from_query="cat_q")
+        return FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="budget"))
+
+    groups = {"must": [], "should": [], "must_not": []}
+    for g in groups:
+        for _ in range(rng.randrange(3)):
+            groups[g].append(rand_cond())
+    if not any(groups.values()):
+        groups["must"].append(rand_cond())
+    filt = Filter(**{g: tuple(cs) for g, cs in groups.items()})
+
+    got = evaluate(filt, t, qv)
+    ref = _condition_major_evaluate(filt, t, qv)
+    assert got.ndim == ref.ndim and got.shape == ref.shape, f"seed={seed} {got.shape} vs {ref.shape}"
+    assert np.array_equal(got, ref), (
+        f"seed={seed}\nfilter={filt}\nqv={ {k: v.tolist() for k, v in qv.items()} }\n"
+        f"got={got.tolist()}\nref={ref.tolist()}"
+    )
 
 
 def test_static_match_text_same_tokenized_semantics():

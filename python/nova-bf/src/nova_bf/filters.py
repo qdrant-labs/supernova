@@ -251,30 +251,45 @@ def _phrase_mask(token_masks: dict[str, np.ndarray], toks) -> np.ndarray:
     return mask
 
 
-def _text_token_masks(
+def _text_prep(
     filt: Filter, table: pa.Table, query_values: dict[str, np.ndarray] | None,
-) -> dict[str, dict[str, np.ndarray]]:
-    """`{field: {token: (rows,) mask}}` for EVERY text condition anywhere in
-    `filt`, built with one `_token_row_masks` pass per FIELD — a filter with
-    several text conditions on the same column (e.g. a should-group of
-    per-query slots all on `url`) tokenizes that column once, not once per
-    condition. `evaluate()` builds this up front and threads it down through
-    `_condition_mask`; direct `_condition_mask`/`_match_text_from_query_mask`
-    callers (compute.py's leaf path, tests) can omit it and each condition
-    builds its own masks."""
+) -> tuple[dict[str, dict[str, np.ndarray]], dict[FilterCondition, list[frozenset[str] | None]]]:
+    """The one up-front tokenization step `evaluate()` does for a filter:
+
+    - `text_masks`: `{field: {token: (rows,) mask}}` for EVERY text condition
+      anywhere in `filt`, built with one `_token_row_masks` pass per FIELD —
+      a filter with several text conditions on the same column (e.g. a
+      should-group of per-query slots all on `url`) tokenizes that column
+      once, not once per condition.
+    - `cond_qsets`: for each `match_text_from_query` condition, each query's
+      phrase as a `frozenset` of tokens (`None` for a null/NaN/token-less
+      phrase — the "matches nothing" convention), tokenized once here and
+      shared by the fused combine in `evaluate()`.
+
+    Direct `_condition_mask`/`_match_text_from_query_mask` callers (tests,
+    and any future direct caller — compute.py's leaf path is gated by
+    `_gpu_eligible` and never reaches the text branches) skip this and each
+    condition builds its own masks."""
     field_tokens: dict[str, set[str]] = {}
+    cond_qsets: dict[FilterCondition, list[frozenset[str] | None]] = {}
     for cond in filt.all_conditions():
         if cond.match_text is not None:
             field_tokens.setdefault(cond.field, set()).update(tokenize(cond.match_text))
         elif cond.match_text_from_query is not None:
             tokens = field_tokens.setdefault(cond.field, set())
+            qsets: list[frozenset[str] | None] = []
             for toks in tokenize_many(query_values[cond.match_text_from_query]):
                 if toks:
                     tokens.update(toks)
-    return {
+                    qsets.append(frozenset(toks))
+                else:
+                    qsets.append(None)
+            cond_qsets[cond] = qsets
+    text_masks = {
         field: _token_row_masks(table[field], tokens, len(table))
         for field, tokens in field_tokens.items()
     }
+    return text_masks, cond_qsets
 
 
 def _match_text_static_mask(
@@ -309,7 +324,15 @@ def _match_text_from_query_mask(
     A null/NaN phrase, or one with no alphanumeric tokens, never matches —
     the static `match_text` rejects token-less strings at config-load time
     (`FilterCondition._match_text_has_tokens`), but a per-query phrase comes
-    from DATA, not a config literal, so it's resolved to all-`False` here."""
+    from DATA, not a config literal, so it's resolved to all-`False` here.
+
+    NOT the production combine path: `evaluate()` routes per-query text
+    conditions through its fused, query-major combine instead (see there),
+    which never materializes this per-condition 2-D mask. This builder
+    remains for direct `_condition_mask` callers and as the independent
+    per-condition reference the A/B fuzz test pins the fused path against —
+    a semantics change here MUST be mirrored in the fused path (the fuzz
+    test is what catches a drift)."""
     phrases = query_values[cond.match_text_from_query]
     n_rows = len(table)
     result = np.zeros((len(phrases), n_rows), dtype=bool)
@@ -391,26 +414,162 @@ def evaluate(
 
     Uses non-in-place `&`/`|`/`~` (not `&=`/`|=`) deliberately: this is what
     lets the `(rows,)` accumulator silently promote to `(n_queries, rows)`
-    via numpy broadcasting the first time a per-query condition's mask
-    appears, regardless of which group (`must`/`should`/`must_not`) it's in
-    — an in-place op can't grow its own shape this way. Callers (`compute.py`)
-    tell which case they got via `mask.ndim`."""
+    via numpy broadcasting the first time a NON-TEXT per-query condition's
+    mask appears, regardless of group. Per-query TEXT conditions
+    (`match_text_from_query`) never materialize per-condition 2-D masks at
+    all — they take the fused, query-major path below (see the inline
+    rationale), which writes each query's finished row into the one output
+    array directly. Either way the contract is the same: callers
+    (`compute.py`) tell which case they got via `mask.ndim`."""
     n = len(table)
-    # One tokenization pass per FIELD for every text condition in the filter
-    # (see `_text_token_masks`) — {} when the filter has no text condition.
-    text_masks = _text_token_masks(filt, table, query_values)
+    # One tokenization pass per FIELD for every text condition in the filter,
+    # plus each per-query phrase's token set (see `_text_prep`) — both empty
+    # when the filter has no text condition.
+    text_masks, cond_qsets = _text_prep(filt, table, query_values)
+
+    # Split each group into its `match_text_from_query` members (combined by
+    # the FUSED, query-major path below) and everything else (combined
+    # condition-major, exactly as before — static masks are (rows,) and
+    # cheap; non-text per-query masks are built 2-D by their own builders
+    # either way).
+    must_t = [c for c in filt.must if c.match_text_from_query is not None]
+    should_t = [c for c in filt.should if c.match_text_from_query is not None]
+    mnot_t = [c for c in filt.must_not if c.match_text_from_query is not None]
+
     keep = np.ones(n, dtype=bool)
-
     for cond in _static_first(filt.must):
-        keep = keep & _condition_mask(cond, table, query_values, text_masks)
+        if cond.match_text_from_query is None:
+            keep = keep & _condition_mask(cond, table, query_values, text_masks)
 
-    if filt.should:
-        any_match = np.zeros(n, dtype=bool)
+    rest_or = None
+    if any(c.match_text_from_query is None for c in filt.should):
+        rest_or = np.zeros(n, dtype=bool)
         for cond in _static_first(filt.should):
-            any_match = any_match | _condition_mask(cond, table, query_values, text_masks)
-        keep = keep & any_match
+            if cond.match_text_from_query is None:
+                rest_or = rest_or | _condition_mask(cond, table, query_values, text_masks)
 
     for cond in _static_first(filt.must_not):
-        keep = keep & ~_condition_mask(cond, table, query_values, text_masks)
+        if cond.match_text_from_query is None:
+            keep = keep & ~_condition_mask(cond, table, query_values, text_masks)
 
-    return keep
+    if not (must_t or should_t or mnot_t):
+        # No per-query text condition: the pre-fusion combine, unchanged.
+        if rest_or is not None:
+            keep = keep & rest_or
+        return keep
+
+    # --- fused, query-major combine for the per-query text conditions ---
+    # Rationale: expanding every text condition to its own (n_queries, rows)
+    # array and combining those was ~80% of filter time on the production
+    # workload — pure memory traffic. Instead, group queries by their COMBO
+    # of token sets across all text conditions (real query sets dedupe
+    # heavily), compute each distinct combo's combined (rows,) result once
+    # from the shared per-token masks, and write each query's final row
+    # exactly ONCE. Bit-identical by construction: AND/OR are elementwise
+    # and every (query, row) cell sees the same boolean formula, just
+    # evaluated query-major instead of condition-major.
+    # Every query column referenced by the filter must agree on n_queries —
+    # mismatched lengths raised a loud broadcast ValueError on the old
+    # condition-major path, and silently truncating here instead would be a
+    # correctness trap for direct evaluate() callers (compute.py always
+    # draws all columns from one queries table, so it can't hit this).
+    lengths = {len(cond_qsets[c]) for c in (*must_t, *should_t, *mnot_t)}
+    if len(lengths) > 1:
+        raise ValueError(
+            f"per-query text conditions reference query columns of differing "
+            f"lengths: {sorted(lengths)}"
+        )
+    n_q = lengths.pop()
+    if keep.ndim == 2 and keep.shape[0] != n_q:
+        raise ValueError(f"query column length mismatch: {keep.shape[0]} vs {n_q}")
+    if rest_or is not None and rest_or.ndim == 2 and rest_or.shape[0] != n_q:
+        raise ValueError(f"query column length mismatch: {rest_or.shape[0]} vs {n_q}")
+
+    combos: dict[tuple, list[int]] = {}
+    for q in range(n_q):
+        key = (
+            tuple(cond_qsets[c][q] for c in must_t),
+            tuple(cond_qsets[c][q] for c in should_t),
+            tuple(cond_qsets[c][q] for c in mnot_t),
+        )
+        combos.setdefault(key, []).append(q)
+
+    # (field, token-set) → (rows,) phrase mask, shared across combos. Entries
+    # are refcounted by how many still-unprocessed combos need them and
+    # evicted at zero, so peak cache size tracks LIVE masks, not every
+    # distinct phrase the whole query set uses (which would grow linearly
+    # with text-condition count on poorly-deduping query sets, where the old
+    # condition-major path's peak was constant in condition count).
+    def _combo_key_list(mkey, skey, nkey) -> list[tuple[str, frozenset[str]]]:
+        """The cache keys processing this combo will touch — mirrors the
+        combo loop exactly, including the dead-combo early-out."""
+        if any(ts is None for ts in mkey):
+            return []
+        keys = [(c.field, ts) for c, ts in zip(must_t, mkey)]
+        keys += [(c.field, ts) for c, ts in zip(mnot_t, nkey) if ts is not None]
+        keys += [(c.field, ts) for c, ts in zip(should_t, skey) if ts is not None]
+        return keys
+
+    key_refs: dict[tuple[str, frozenset[str]], int] = {}
+    for (mkey, skey, nkey) in combos:
+        for k in _combo_key_list(mkey, skey, nkey):
+            key_refs[k] = key_refs.get(k, 0) + 1
+    phrase_cache: dict[tuple[str, frozenset[str]], np.ndarray] = {}
+
+    def _pmask(cond: FilterCondition, ts: frozenset[str]) -> np.ndarray:
+        got = phrase_cache.get((cond.field, ts))
+        if got is None:
+            got = _phrase_mask(text_masks[cond.field], ts)
+            phrase_cache[(cond.field, ts)] = got
+        return got
+
+    keep_2d = keep.ndim == 2
+    rest_or_2d = rest_or is not None and rest_or.ndim == 2
+    out = np.empty((n_q, n), dtype=bool)
+    for (mkey, skey, nkey), qidxs in combos.items():
+        if any(ts is None for ts in mkey):
+            # a null/token-less phrase in a `must` matches nothing for that
+            # query, so the whole row is False regardless of anything else.
+            out[qidxs] = False
+            continue
+        # 1-D parts shared by every query in this combo:
+        parts: list[np.ndarray] = [_pmask(c, ts) for c, ts in zip(must_t, mkey)]
+        for c, ts in zip(mnot_t, nkey):
+            if ts is not None:  # None: matches nothing → ¬nothing keeps all
+                parts.append(~_pmask(c, ts))
+        or_2d = None
+        if filt.should:
+            s = None  # this combo's OR over the should group's text members
+            for c, ts in zip(should_t, skey):
+                if ts is None:
+                    continue  # null phrase contributes False to the OR
+                pm = _pmask(c, ts)
+                s = pm if s is None else (s | pm)
+            if rest_or is None:
+                # should group is all-text: s (or nothing matched → False row)
+                parts.append(s if s is not None else np.zeros(n, dtype=bool))
+            elif not rest_or_2d:
+                parts.append(rest_or if s is None else (rest_or | s))
+            else:
+                or_2d = rest_or[qidxs] if s is None else (rest_or[qidxs] | s)
+        if not keep_2d:
+            parts.append(keep)
+        # parts can be empty (e.g. every must_not phrase null for this combo
+        # while `keep` is 2-D) — the combo then constrains nothing 1-D.
+        row = np.ones(n, dtype=bool)
+        for p in parts:
+            row = row & p
+        if keep_2d or or_2d is not None:
+            block = row[None, :]
+            if keep_2d:
+                block = block & keep[qidxs]
+            if or_2d is not None:
+                block = block & or_2d
+            out[qidxs] = block
+        else:
+            out[qidxs] = row
+        for k in _combo_key_list(mkey, skey, nkey):
+            key_refs[k] -= 1
+            if key_refs[k] == 0:
+                phrase_cache.pop(k, None)
+    return out
