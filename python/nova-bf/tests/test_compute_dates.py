@@ -158,3 +158,41 @@ def test_range_from_query_per_query_cutoff(ds):
     assert set(_ids(res["q0"])) == {"c5", "c6", "c7", "c9"}   # >= 2015-01-01
     assert set(_ids(res["q1"])) == {"c9"}                      # >= 2018-01-01
     assert set(_ids(res["q2"])) == {"c2", "c3", "c4", "c5", "c6", "c7", "c9"}  # >= 2011-06-01
+
+
+def test_date_field_in_payload_keeps_original_string(ds):
+    """A query date column carried in payload_fields is emitted in its ORIGINAL
+    RFC-3339 form, even though it's also parsed to epoch µs for the filter."""
+    out = ds["tmp"] / "out_payload"
+    out.mkdir(exist_ok=True)
+    cfgtext = f"""
+corpus:
+  path: {ds["cdir"]}
+  dense_column: dense_embedding
+  id_column: id
+  date_fields: [date]
+queries:
+  path: {ds["qpath"]}
+  dense_column: dense_embedding
+  id_column: qid
+  date_fields: [after]
+  payload_fields: [after]
+output:
+  path: {out}
+params:
+  io_workers: 2
+searches:
+  - name: dated
+    k: {N}
+    metric: dot
+    filter:
+      must:
+        - field: date
+          range_from_query: {{gte: after}}
+"""
+    p = ds["tmp"] / "cfg_payload.yaml"
+    p.write_text(cfgtext)
+    t = pq.read_table(run_compute(load_config(str(p)))["dated"]).to_pydict()
+    afters = dict(zip(t["query_id"], t["after"]))
+    assert afters["q0"] == "2015-01-01T00:00:00Z"     # original string, not epoch µs int
+    assert all(isinstance(v, str) for v in t["after"])

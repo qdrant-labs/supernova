@@ -38,6 +38,16 @@ DEFAULT_FORMAT = "rfc3339"
 _EPOCH_MULT = {"epoch_s": 1_000_000, "epoch_ms": 1_000, "epoch_us": 1}
 
 
+def is_epoch_format(fmt: str) -> bool:
+    """True for the already-numeric epoch formats (epoch_s/epoch_ms/epoch_us).
+
+    Lets config.py decide whether a NUMERIC static `range` bound on a date field
+    needs epoch rescaling (epoch_s/ms) or is already microseconds (epoch_us /
+    rfc3339 / strptime), so a numeric bound never mismatches the rescaled
+    column."""
+    return fmt in _EPOCH_MULT
+
+
 def normalize_date_fields(raw) -> dict[str, str]:
     """`list[str] | dict[str, str | None] | None` -> `{field: format}`.
 
@@ -57,6 +67,8 @@ def parse_scalar_epoch_us(value, fmt: str = DEFAULT_FORMAT) -> int:
     Raises `ValueError` on an unparseable value — a bad date literal in a
     config is a hard error at load, never a silent non-match at runtime."""
     if fmt in _EPOCH_MULT:
+        if _EPOCH_MULT[fmt] == 1:  # epoch_us: already µs — keep exact, no float
+            return int(value)
         return int(round(float(value) * _EPOCH_MULT[fmt]))
     s = str(value)
     if fmt == "rfc3339":
@@ -81,6 +93,8 @@ def to_epoch_us_array(col, fmt: str = DEFAULT_FORMAT) -> pa.Array:
     if isinstance(col, pa.ChunkedArray):
         col = col.combine_chunks()
     if fmt in _EPOCH_MULT:
+        if _EPOCH_MULT[fmt] == 1:  # epoch_us: already µs — stay int64, exact >2^53
+            return pc.cast(col, pa.int64())
         scaled = pc.multiply(pc.cast(col, pa.float64()), float(_EPOCH_MULT[fmt]))
         return pc.cast(pc.round(scaled), pa.int64())
     if fmt == "rfc3339":

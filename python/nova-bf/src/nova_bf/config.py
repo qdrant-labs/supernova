@@ -21,7 +21,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nova_bf.tokenize import tokenize
-from nova_bf.dates import normalize_date_fields, parse_scalar_epoch_us
+from nova_bf.dates import is_epoch_format, normalize_date_fields, parse_scalar_epoch_us
 
 import os
 
@@ -515,6 +515,22 @@ class BruteForceConfig(BaseModel):
             if s.filter is None:
                 continue
             for cond in s.filter.all_conditions():
+                # A declared date field is parsed to epoch µs, so it only makes
+                # sense with range/range_from_query. Using it with an
+                # equality/text predicate would compare/tokenize the raw integer
+                # µs and silently match nothing — reject it at config time.
+                if cond.field in corpus_dates and (
+                    cond.match is not None
+                    or cond.match_text is not None
+                    or cond.match_from_query is not None
+                    or cond.match_text_from_query is not None
+                ):
+                    raise ValueError(
+                        f"corpus date field '{cond.field}' is used with a "
+                        "match/match_text predicate — a declared date field is "
+                        "parsed to epoch µs and only supports `range`/"
+                        "`range_from_query`"
+                    )
                 if cond.range_from_query is None:
                     continue
                 r = cond.range_from_query
@@ -562,18 +578,26 @@ def _normalize_static_date_bounds(data: dict) -> dict:
                 field = cond.get("field")
                 str_bounds = {b for b in ("gt", "gte", "lt", "lte")
                               if isinstance(rng.get(b), str)}
-                if not str_bounds:
-                    continue
-                if field not in corpus_dates:
+                if str_bounds and field not in corpus_dates:
                     raise ValueError(
                         f"filter on '{field}' has a string `range` bound "
                         f"({sorted(str_bounds)}) but '{field}' is not declared in "
                         "corpus.date_fields — declare it (optionally with a format) "
                         "to use datetime bounds, or use a numeric bound"
                     )
+                if field not in corpus_dates:
+                    continue  # ordinary numeric range on a non-date field: untouched
                 fmt = corpus_dates[field]
-                for b in str_bounds:
-                    rng[b] = float(parse_scalar_epoch_us(rng[b], fmt))
+                for b in ("gt", "gte", "lt", "lte"):
+                    v = rng.get(b)
+                    if v is None:
+                        continue
+                    # A string bound is always parsed; a NUMERIC bound is rescaled
+                    # only for epoch_s/epoch_ms fields (whose column is likewise
+                    # rescaled) — for rfc3339/strptime/epoch_us it's already the µs
+                    # value the column uses, so it's left as-is.
+                    if isinstance(v, str) or is_epoch_format(fmt):
+                        rng[b] = float(parse_scalar_epoch_us(v, fmt))
     return data
 
 

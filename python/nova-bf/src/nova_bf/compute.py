@@ -245,13 +245,14 @@ def load_queries(
     q_date_fmts = normalize_date_fields(qcfg.date_fields)
     for f in store.list_parquets():
         table = store.read_columns(f.read_path, cols)
-        # Declared datetime query columns -> int64 epoch µs before we pull them
-        # into per-query filter arrays, so a range_from_query bound compares as
-        # a number against the (also-µs) corpus date column.
-        table = convert_table_date_columns(table, q_date_fmts)
-        embs.append(dense_to_2d(table[qcfg.dense_column]))
-        d = table.to_pydict()
-        n = len(table)
+        d = table.to_pydict()  # ORIGINAL values — payload/id keep their source form
+        # Declared datetime query columns -> int64 epoch µs, but ONLY for the
+        # per-query filter arrays, so a range_from_query bound compares as a
+        # number against the (also-µs) corpus date column. A date field carried
+        # in payload_fields keeps its original (string) form in `d` above.
+        conv = convert_table_date_columns(table, q_date_fmts)
+        embs.append(dense_to_2d(conv[qcfg.dense_column]))
+        n = len(conv)
         if qcfg.id_column:
             ids += [str(x) for x in d[qcfg.id_column]]
         else:
@@ -259,7 +260,7 @@ def load_queries(
         for c in qcfg.payload_fields:
             payload[c] += d[c]
         for c in filter_cols:
-            filter_vals[c] += d[c]
+            filter_vals[c] += conv[c].to_pylist()
     Q = np.concatenate(embs, axis=0) if embs else np.zeros((0, 0), np.float32)
     return Q, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
 
@@ -360,12 +361,13 @@ def load_queries_sparse(
     q_date_fmts = normalize_date_fields(qcfg.date_fields)
     for f in store.list_parquets():
         table = store.read_columns(f.read_path, cols)
-        table = convert_table_date_columns(table, q_date_fmts)
-        row_offsets, idx, val = sparse_to_coo_parts(table[qcfg.sparse_column])
+        d = table.to_pydict()  # ORIGINAL values — payload/id keep their source form
+        # Date columns -> epoch µs for filter arrays only (payload keeps strings).
+        conv = convert_table_date_columns(table, q_date_fmts)
+        row_offsets, idx, val = sparse_to_coo_parts(conv[qcfg.sparse_column])
         counts_parts.append(np.diff(row_offsets))
         indices_parts.append(idx)
         values_parts.append(val)
-        d = table.to_pydict()
         n = len(row_offsets) - 1
         if qcfg.id_column:
             ids += [str(x) for x in d[qcfg.id_column]]
@@ -374,7 +376,7 @@ def load_queries_sparse(
         for c in qcfg.payload_fields:
             payload[c] += d[c]
         for c in filter_cols:
-            filter_vals[c] += d[c]
+            filter_vals[c] += conv[c].to_pylist()
 
     indices = np.concatenate(indices_parts) if indices_parts else np.zeros(0, np.int64)
     values = np.concatenate(values_parts) if values_parts else np.zeros(0, np.float32)

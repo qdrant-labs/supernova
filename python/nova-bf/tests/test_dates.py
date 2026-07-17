@@ -71,6 +71,13 @@ def test_scalar_bad_value_raises():
         parse_scalar_epoch_us("not-a-date")
 
 
+def test_scalar_epoch_us_large_value_stays_exact():
+    # 2^53 + 1 is not representable in float64; epoch_us must not route through it
+    big = 9_007_199_254_740_993
+    assert parse_scalar_epoch_us(big, "epoch_us") == big
+    assert parse_scalar_epoch_us(str(big), "epoch_us") == big
+
+
 # --- to_epoch_us_array -------------------------------------------------------
 
 def test_array_rfc3339_with_null():
@@ -111,6 +118,13 @@ def test_array_strptime_pattern():
 def test_array_epoch_seconds_rescaled():
     col = pa.array([1, 2], type=pa.int64())
     assert to_epoch_us_array(col, "epoch_s").to_pylist() == [1_000_000, 2_000_000]
+
+
+def test_array_epoch_us_large_value_stays_exact():
+    big = 9_007_199_254_740_993  # 2^53 + 1
+    out = to_epoch_us_array(pa.array([big], type=pa.int64()), "epoch_us")
+    assert out.type == pa.int64()
+    assert out.to_pylist() == [big]  # not corrupted by a float64 round-trip
 
 
 def test_array_unparseable_raises():

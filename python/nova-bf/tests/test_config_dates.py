@@ -90,8 +90,8 @@ def test_string_bound_on_non_date_field_rejected(tmp_path):
         """)
 
 
-def test_numeric_bound_on_date_field_passes_through(tmp_path):
-    # A numeric literal is treated as already-epoch µs and left as-is.
+def test_numeric_bound_on_rfc3339_field_passes_through(tmp_path):
+    # A numeric literal on an rfc3339 field is treated as already-epoch µs, as-is.
     cfg = _cfg(tmp_path, """
       corpus:
         path: /tmp/corpus
@@ -108,6 +108,67 @@ def test_numeric_bound_on_date_field_passes_through(tmp_path):
                 range: {gte: 1356998400000000}
     """)
     assert cfg.searches[0].filter.must[0].range.gte == 1356998400000000
+
+
+def test_numeric_bound_on_epoch_s_field_rescaled_to_us(tmp_path):
+    # A NUMERIC bound on an epoch_s field must be rescaled to µs to match the
+    # (also-rescaled) corpus column — otherwise it compares seconds vs µs.
+    cfg = _cfg(tmp_path, """
+      corpus:
+        path: /tmp/corpus
+        date_fields: {t: epoch_s}
+      queries:
+        path: /tmp/queries.parquet
+      output:
+        path: /tmp/out
+      searches:
+        - name: s
+          filter:
+            must:
+              - field: t
+                range: {gte: 1356998400, lt: 1400000000}
+    """)
+    rng = cfg.searches[0].filter.must[0].range
+    assert rng.gte == 1356998400 * 1_000_000
+    assert rng.lt == 1400000000 * 1_000_000
+
+
+def test_date_field_with_match_rejected(tmp_path):
+    with pytest.raises(ValueError, match="only supports"):
+        _cfg(tmp_path, """
+          corpus:
+            path: /tmp/corpus
+            date_fields: [published_at]
+          queries:
+            path: /tmp/queries.parquet
+          output:
+            path: /tmp/out
+          searches:
+            - name: s
+              filter:
+                must:
+                  - field: published_at
+                    match: 5
+        """)
+
+
+def test_date_field_with_match_text_rejected(tmp_path):
+    with pytest.raises(ValueError, match="only supports"):
+        _cfg(tmp_path, """
+          corpus:
+            path: /tmp/corpus
+            date_fields: [published_at]
+          queries:
+            path: /tmp/queries.parquet
+          output:
+            path: /tmp/out
+          searches:
+            - name: s
+              filter:
+                must:
+                  - field: published_at
+                    match_text: "2013"
+        """)
 
 
 def test_range_from_query_requires_declared_query_date_field(tmp_path):
