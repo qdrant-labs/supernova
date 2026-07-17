@@ -21,6 +21,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nova_bf.tokenize import tokenize
+from nova_bf.dates import normalize_date_fields, parse_scalar_epoch_us
 
 import os
 
@@ -72,6 +73,20 @@ class CorpusConfig(BaseModel):
     # include is applied first (keep only matches), then exclude (drop matches).
     include: str | None = None
     exclude: str | None = None
+    # Payload columns that hold datetimes. Only a DECLARED field is treated as
+    # a date — no type sniffing (a plain string column is never silently
+    # reinterpreted). Each declared field is parsed to int64 epoch microseconds
+    # right after a file is read (see nova_bf.dates / compute.py), so `range`
+    # over it compares as numbers — value-for-value comparable to Qdrant's
+    # DatetimeRange. Two accepted shapes:
+    #   date_fields: [published_at]                 # rfc3339 (default)
+    #   date_fields: {published_at: rfc3339,
+    #                 crawl_day: "%Y%m%d",          # any strptime pattern
+    #                 ingested_at: epoch_s}         # already-numeric epoch
+    # A static `range` bound on a date field is written as an RFC-3339 string
+    # in the search filter (e.g. `gte: "2013-01-01T00:00:00Z"`) and parsed to
+    # epoch µs at config load; a string bound on a NON-date field is rejected.
+    date_fields: list[str] | dict[str, str] = []
 
 
 class QueriesConfig(BaseModel):
@@ -85,6 +100,11 @@ class QueriesConfig(BaseModel):
     id_column: str | None = None
     # Columns to carry from the queries file into each output row.
     payload_fields: list[str] = []
+    # Query columns that hold datetimes — same declaration/format rules as
+    # `CorpusConfig.date_fields`. These are the columns a `range_from_query`
+    # draws its per-query bounds from when the corpus field is a date; parsed to
+    # epoch µs so each query's bound compares against the (also-µs) corpus date.
+    date_fields: list[str] | dict[str, str] = []
 
 
 class OutputConfig(BaseModel):
@@ -481,8 +501,85 @@ class BruteForceConfig(BaseModel):
             raise ValueError(f"`searches` names must be unique, got {names}")
         return self
 
+    @model_validator(mode="after")
+    def _validate_date_fields(self) -> "BruteForceConfig":
+        """Keep the corpus and queries date declarations consistent so a
+        datetime bound is never silently compared against a non-datetime column
+        (which would mean a nonsensical unit mismatch — raw µs vs. plain
+        number). A `range_from_query` whose corpus `field` is a declared date
+        field must draw every bound from a declared QUERIES date field, and
+        vice versa."""
+        corpus_dates = set(normalize_date_fields(self.corpus.date_fields))
+        query_dates = set(normalize_date_fields(self.queries.date_fields))
+        for s in self.searches:
+            if s.filter is None:
+                continue
+            for cond in s.filter.all_conditions():
+                if cond.range_from_query is None:
+                    continue
+                r = cond.range_from_query
+                bound_cols = [v for v in (r.gt, r.gte, r.lt, r.lte) if v is not None]
+                field_is_date = cond.field in corpus_dates
+                for col in bound_cols:
+                    col_is_date = col in query_dates
+                    if field_is_date and not col_is_date:
+                        raise ValueError(
+                            f"range_from_query on date field '{cond.field}' draws "
+                            f"its bound from '{col}', which is not declared in "
+                            "queries.date_fields — declare it so its values are "
+                            "parsed to epoch µs and comparable to the corpus date"
+                        )
+                    if col_is_date and not field_is_date:
+                        raise ValueError(
+                            f"range_from_query bound '{col}' is a declared queries "
+                            f"date field but corpus field '{cond.field}' is not a "
+                            "date field (corpus.date_fields) — comparing a datetime "
+                            "bound against a non-datetime column"
+                        )
+        return self
+
+
+def _normalize_static_date_bounds(data: dict) -> dict:
+    """In-place: rewrite every static `range` string bound on a declared corpus
+    date field to its int64 epoch-µs value (as a number), so `RangeCondition`'s
+    plain `float` bounds validate unchanged and every downstream range path
+    stays numeric. A string bound on a NON-date field is rejected here with a
+    clear message instead of surfacing as a bare pydantic "not a number" error.
+    Runs on the raw dict BEFORE validation, so no frozen model needs rebuilding.
+    """
+    corpus_dates = normalize_date_fields((data.get("corpus") or {}).get("date_fields"))
+    for spec in data.get("searches") or []:
+        filt = spec.get("filter")
+        if not isinstance(filt, dict):
+            continue
+        for group in ("must", "should", "must_not"):
+            for cond in filt.get(group) or []:
+                if not isinstance(cond, dict):
+                    continue
+                rng = cond.get("range")
+                if not isinstance(rng, dict):
+                    continue
+                field = cond.get("field")
+                str_bounds = {b for b in ("gt", "gte", "lt", "lte")
+                              if isinstance(rng.get(b), str)}
+                if not str_bounds:
+                    continue
+                if field not in corpus_dates:
+                    raise ValueError(
+                        f"filter on '{field}' has a string `range` bound "
+                        f"({sorted(str_bounds)}) but '{field}' is not declared in "
+                        "corpus.date_fields — declare it (optionally with a format) "
+                        "to use datetime bounds, or use a numeric bound"
+                    )
+                fmt = corpus_dates[field]
+                for b in str_bounds:
+                    rng[b] = float(parse_scalar_epoch_us(rng[b], fmt))
+    return data
+
 
 def load_config(path: str) -> BruteForceConfig:
     with open(path) as f:
         raw = expand_env(f.read())
-    return BruteForceConfig.model_validate(yaml.safe_load(raw))
+    data = yaml.safe_load(raw)
+    data = _normalize_static_date_bounds(data)
+    return BruteForceConfig.model_validate(data)
