@@ -1050,10 +1050,10 @@ def _gpu_eligible(f: Filter | None) -> bool:
     needs at least one per-query leaf (a purely uniform filter already gets
     the cheap column-gather path — see `_process_shared_batch` — so there's
     nothing to speed up here) and no `match_text`/`match_text_from_query`
-    leaf ANYWHERE in the filter — torch has no string tensor type, so
-    regex/substring matching stays CPU-only regardless of what else is in
-    the filter (see `filters._match_text_from_query_mask`'s own word-level
-    dedup instead)."""
+    leaf ANYWHERE in the filter — torch has no string tensor type, so text
+    tokenization/matching stays CPU-only regardless of what else is in the
+    filter (see `filters._token_row_masks`'s single-pass tokenization
+    instead)."""
     if f is None or not _is_per_query(f):
         return False
     return not any(
@@ -1848,11 +1848,13 @@ def run_compute(
                 # _gpu_eligible) each write only their OWN keeps[f] slot, with
                 # no shared mutable state between them, so dispatch every
                 # distinct one of THIS file's CPU-fallback filters concurrently
-                # instead of one evaluate() call at a time: pyarrow's regex/
-                # substring compute kernels release the GIL, so this is real
+                # instead of one evaluate() call at a time: pyarrow's string
+                # compute kernels release the GIL, so this is real
                 # thread-level speedup, not GIL-serialized (measured ~2.5-3.5x
                 # on real corpus text). Only worth the pool overhead when
-                # there's more than one to dispatch.
+                # there's more than one to dispatch. (`_token_row_masks` also
+                # fans its row-batches out on its own inner pool — nested
+                # thread pools are safe, just briefly oversubscribed.)
                 cpu_fallback_filters = [
                     f for f in distinct_filters if f is not None and not filter_is_gpu_eligible[f]
                 ]
@@ -1870,7 +1872,7 @@ def run_compute(
                 # sequential: `leaf_arrays` is shared/deduped ACROSS filters
                 # referencing the same FilterCondition (`if cond not in
                 # leaf_arrays`), which isn't safe to parallelize without a
-                # lock — and this branch has no regex to speed up anyway.
+                # lock — and this branch has no text matching to speed up anyway.
                 for f in distinct_filters:
                     if f is None:
                         keeps[f] = None
