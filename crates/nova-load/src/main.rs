@@ -53,6 +53,12 @@ struct LoadArgs {
     /// This job's index, in `[0, num_jobs)`. Each job loads its own slice.
     #[arg(long, default_value_t = 0)]
     job_rank: usize,
+    /// Resume from a previously persisted checkpoint (if found).
+    #[arg(long, default_value_t = false)]
+    resume: bool,
+    /// Optional checkpoint file path override.
+    #[arg(long)]
+    checkpoint_path: Option<PathBuf>,
 }
 
 impl LoadArgs {
@@ -97,7 +103,15 @@ async fn run(command: Command) -> Result<(), ExitCode> {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
             })?;
-            nova_load::load(load_config(&a.config)?, partition).await
+            nova_load::load(
+                load_config(&a.config)?,
+                partition,
+                nova_load::LoadRuntimeOptions {
+                    resume: a.resume,
+                    checkpoint_path: a.checkpoint_path.clone(),
+                },
+            )
+            .await
         }
         Command::Inspect(a) => {
             let partition = a.partition().map_err(|e| {

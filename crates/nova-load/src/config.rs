@@ -44,6 +44,9 @@ pub struct LoaderConfig {
     /// silently skipping the whole corpus.
     #[serde(default)]
     pub max_failed_files: Option<usize>,
+    /// Optional checkpoint policy for resumable loads.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointConfig>,
 }
 
 impl Default for LoaderConfig {
@@ -55,6 +58,31 @@ impl Default for LoaderConfig {
             file_retries: default_file_retries(),
             upsert_retries: default_upsert_retries(),
             max_failed_files: None,
+            checkpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointConfig {
+    /// Enable checkpoint persistence while loading.
+    #[serde(default = "default_checkpoint_enabled")]
+    pub enabled: bool,
+    /// Directory where worker checkpoint files are persisted.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Persist checkpoint state every N completed files.
+    #[serde(default = "default_checkpoint_flush_every_files")]
+    pub flush_every_files: usize,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_checkpoint_enabled(),
+            path_prefix: None,
+            flush_every_files: default_checkpoint_flush_every_files(),
         }
     }
 }
@@ -73,6 +101,14 @@ fn default_file_retries() -> usize {
 
 fn default_upsert_retries() -> usize {
     5
+}
+
+fn default_checkpoint_enabled() -> bool {
+    true
+}
+
+fn default_checkpoint_flush_every_files() -> usize {
+    1
 }
 
 impl LoadConfig {

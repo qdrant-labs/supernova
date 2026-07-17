@@ -586,6 +586,8 @@ impl QdrantConfig {
     }
 }
 
+const DEFAULT_ENABLED_INDEXING_THRESHOLD: u64 = 20_000;
+
 impl fmt::Display for QdrantStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "qdrant({})", self.collection_name)
@@ -725,12 +727,21 @@ impl VectorStore for QdrantStore {
     }
 
     async fn enable_indexing(&self) -> Result<(), StoreError> {
-        let threshold = self
+        let configured = self
             .params
             .optimizers
             .as_ref()
             .and_then(|o| o.indexing_threshold)
-            .unwrap_or(20_000);
+            .unwrap_or(DEFAULT_ENABLED_INDEXING_THRESHOLD);
+        let threshold = if configured == 0 {
+            tracing::warn!(
+                "indexing_threshold=0 keeps indexing disabled; using default {} for finalize",
+                DEFAULT_ENABLED_INDEXING_THRESHOLD
+            );
+            DEFAULT_ENABLED_INDEXING_THRESHOLD
+        } else {
+            configured
+        };
         self.client
             .update_collection(
                 UpdateCollectionBuilder::new(self.collection_name.as_str()).optimizers_config(
@@ -821,6 +832,54 @@ mod tests {
     fn qdrant_store(cfg: &LoadConfig) -> &QdrantConfig {
         let VectorStoreConfig::Qdrant(store) = &cfg.vectorstore;
         store
+    }
+
+    fn enabled_indexing_threshold(params: &QdrantParams) -> u64 {
+        let configured = params
+            .optimizers
+            .as_ref()
+            .and_then(|o| o.indexing_threshold)
+            .unwrap_or(DEFAULT_ENABLED_INDEXING_THRESHOLD);
+        if configured == 0 {
+            DEFAULT_ENABLED_INDEXING_THRESHOLD
+        } else {
+            configured
+        }
+    }
+
+    #[test]
+    fn finalize_threshold_defaults_when_missing() {
+        assert_eq!(
+            enabled_indexing_threshold(&QdrantParams::default()),
+            DEFAULT_ENABLED_INDEXING_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn finalize_threshold_uses_configured_non_zero() {
+        let params = QdrantParams {
+            optimizers: Some(OptimizersConfig {
+                indexing_threshold: Some(42_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(enabled_indexing_threshold(&params), 42_000);
+    }
+
+    #[test]
+    fn finalize_threshold_ignores_zero() {
+        let params = QdrantParams {
+            optimizers: Some(OptimizersConfig {
+                indexing_threshold: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            enabled_indexing_threshold(&params),
+            DEFAULT_ENABLED_INDEXING_THRESHOLD
+        );
     }
 
     #[test]

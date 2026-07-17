@@ -1,0 +1,2 @@
+export QDRANT_URL="https://qdrant-fineweb-10b.mavcode.io"
+export QDRANT_API_KEY="83923e73f1d028fe8b53bc849d1346e5"
