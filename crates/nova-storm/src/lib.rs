@@ -15,6 +15,7 @@ pub mod config;
 pub mod errors;
 pub mod filter;
 pub mod queries;
+pub mod report;
 pub mod runner;
 pub mod targets;
 
@@ -31,7 +32,22 @@ use runner::Summary;
 /// Run a storm end to end: load the query set, connect the target, drive the
 /// load profile, and return this worker's latency summary.
 pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
-    let StormConfig { target, query, load } = config;
+    let StormConfig { target, query, load, report } = config;
+
+    // Open the time-series sink FIRST: begin() creating the file (or a db
+    // sink its tables) is exactly the step that fails on a bad path, and it
+    // must die here — before query loading and before any load is offered.
+    let recorder = match &report {
+        Some(cfg) => {
+            let mut r = cfg.build();
+            r.begin().map_err(|e| {
+                StormError::Other(format!("report sink `{}` failed to open: {e}", cfg.path))
+            })?;
+            tracing::info!("time-series report: {:?} -> {}", cfg.format, cfg.path);
+            Some(r)
+        }
+        None => None,
+    };
 
     let vectors = load_query_vectors(&query.source, query.filter.as_ref())?;
     if vectors.is_empty() {
@@ -113,7 +129,7 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         ProgressBar::hidden()
     };
 
-    let results = runner::run_storm(target, vectors, &load, query.top_k).await;
+    let results = runner::run_storm(target, vectors, &load, query.top_k, recorder).await;
     spinner.finish_and_clear();
 
     Ok(results.summary())

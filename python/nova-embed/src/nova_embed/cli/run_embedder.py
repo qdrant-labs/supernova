@@ -136,6 +136,20 @@ def embed(config, num_jobs, job_rank, dry_run):
         _print_dry_run(cfg, config_path, source_dict, num_jobs)
         return
 
+    # Carry source provenance (source_file_name + source_row_number) into the
+    # output when enabled. Injected only when on, so sources that don't support
+    # it aren't forced to accept the kwarg. Set BEFORE any source is built so
+    # the row-counting instance is fully configured and reusable as the
+    # pipeline source.
+    if pipeline.include_source_provenance:
+        source_dict["include_provenance"] = True
+
+    # The fields being embedded must survive the source's read projection even
+    # if the user's exclude_columns would drop them.
+    source_dict.setdefault("required_columns", sorted(cfg.input_specs))
+
+    source = None
+    expected_total_rows = None
     filename_prefix = ""
     if num_jobs is not None:
         if job_rank is None:
@@ -161,23 +175,24 @@ def embed(config, num_jobs, job_rank, dry_run):
             slice_limit,
             dataset_total,
         )
-        source_dict["offset"] = slice_offset
-        source_dict["limit"] = slice_limit
+        expected_total_rows = slice_limit
+
+        # Re-scope the counting instance instead of building a second source:
+        # for HF sources a fresh instance re-reads every parquet footer, and at
+        # N ranks that doubles an already-huge burst of rate-limited requests.
+        set_window = getattr(source_for_count, "set_window", None)
+        if callable(set_window):
+            set_window(slice_offset, slice_limit)
+            source = source_for_count
+        else:
+            source_dict["offset"] = slice_offset
+            source_dict["limit"] = slice_limit
 
         rank_width = max(2, len(str(num_jobs - 1)))
         filename_prefix = f"rank{job_rank:0{rank_width}d}_"
 
-    # Carry source provenance (source_file_name + source_row_number) into the
-    # output when enabled. Injected only when on, so sources that don't support
-    # it aren't forced to accept the kwarg.
-    if pipeline.include_source_provenance:
-        source_dict["include_provenance"] = True
-
-    # The fields being embedded must survive the source's read projection even
-    # if the user's exclude_columns would drop them.
-    source_dict.setdefault("required_columns", sorted(cfg.input_specs))
-
-    source = SOURCES.build(dict(source_dict))
+    if source is None:
+        source = SOURCES.build(dict(source_dict))
 
     engine = build_engine(cfg.embedders)
 
@@ -193,9 +208,6 @@ def embed(config, num_jobs, job_rank, dry_run):
 
     storage_dict = cfg.storage.build_dict()
     storage = STORAGE.build(dict(storage_dict))
-
-    # prefer the per-job limit (set by --num-jobs slicing); else there's no cap
-    expected_total_rows = source_dict.get("limit")
 
     asyncio.run(
         run_embedder(

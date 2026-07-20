@@ -169,12 +169,19 @@ fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> f
     hits as f64 / k as f64
 }
 
-/// One batch dispatch's observation forwarded from a worker to the collector.
-/// `latency_ms`/`ok` describe the one round-trip; `recalls` holds 0..N values,
-/// one per query in the batch that had both ground truth and returned ids.
-struct DispatchSample {
-    latency_ms: f64,
-    ok: bool,
+/// One batch dispatch's observation forwarded from a worker to the collector
+/// (and, verbatim, to a configured [`Recorder`](crate::report::Recorder) —
+/// this IS the time-series row). `latency_ms`/`ok` describe the one
+/// round-trip; `recalls` holds 0..N values, one per query in the batch that
+/// had both ground truth and returned ids.
+#[derive(Debug, Clone)]
+pub struct DispatchSample {
+    /// Seconds since the run started, stamped at dispatch COMPLETION (the
+    /// same moment the latency sample exists) in the worker — not at collector
+    /// receive time, which could lag behind under load.
+    pub t_s: f64,
+    pub latency_ms: f64,
+    pub ok: bool,
     /// A query contributes no entry here (not a `0.0` entry) when it had no
     /// ground truth to compare against, OR the whole dispatch failed (`!ok`)
     /// — a failed request has no "returned ids" to score, so it must not
@@ -182,7 +189,7 @@ struct DispatchSample {
     /// under load-induced errors even when every *successful* query has
     /// perfect recall — a different, already-visible finding via
     /// `errors`/`requests_per_sec`, not one recall should also report.
-    recalls: Vec<f64>,
+    pub recalls: Vec<f64>,
 }
 
 /// Build a [`DispatchSample`] from a completed batch dispatch, applying the
@@ -191,11 +198,13 @@ struct DispatchSample {
 /// `out.ids[i]` being `None` already covers both "no ground truth was
 /// tracked" and "the dispatch failed" — see `BatchOutcome::ids` — so `zip`
 /// alone is the whole rule; no separate `out.ok` check is needed here.
+/// `started` anchors the sample's `t_s` on the run's time axis.
 fn dispatch_sample(
     out: &crate::targets::BatchOutcome,
     idxs: &[usize],
     vectors: &[QueryVector],
     top_k: u64,
+    started: Instant,
 ) -> DispatchSample {
     let recalls = idxs
         .iter()
@@ -204,7 +213,12 @@ fn dispatch_sample(
             ids.as_ref().zip(vectors[i].ground_truth.as_ref()).map(|(ids, gt)| recall_at_k(ids, gt, top_k))
         })
         .collect();
-    DispatchSample { latency_ms: out.latency.as_secs_f64() * 1000.0, ok: out.ok, recalls }
+    DispatchSample {
+        t_s: started.elapsed().as_secs_f64(),
+        latency_ms: out.latency.as_secs_f64() * 1000.0,
+        ok: out.ok,
+        recalls,
+    }
 }
 
 /// The batch-of-`batch_size` indices into a round-robin `vectors` set of
@@ -233,18 +247,31 @@ pub async fn run_storm(
     vectors: Vec<QueryVector>,
     profile: &LoadProfile,
     top_k: u64,
+    recorder: Option<Box<dyn crate::report::Recorder>>,
 ) -> StormResults {
     let vectors = Arc::new(vectors);
     let (tx, mut rx) = mpsc::unbounded_channel::<DispatchSample>();
 
-    // Collector: drain samples into the raw distributions + counts. Owning the
-    // accumulation in one task keeps the workers lock-free on the hot path.
+    // Collector: drain samples into the raw distributions + counts, forwarding
+    // each to the recorder (time-series sink) as it lands. Owning both in one
+    // task keeps the workers lock-free on the hot path — a slow sink can lag
+    // the collector, never the load loop (the channel is unbounded).
     let collector = tokio::spawn(async move {
+        let mut recorder = recorder;
         let mut latencies = Vec::new();
         let mut recalls = Vec::new();
         let mut n_ok = 0u64;
         let mut n_err = 0u64;
         while let Some(s) = rx.recv().await {
+            if let Some(r) = recorder.as_mut()
+                && let Err(e) = r.record(&s)
+            {
+                // Time-series is auxiliary: losing it mid-run (disk full,
+                // closed pipe) must not kill the load test. Warn once,
+                // stop recording, keep the summary intact.
+                tracing::warn!("report sink failed, disabling time-series output: {e}");
+                recorder = None;
+            }
             latencies.push(s.latency_ms);
             recalls.extend(s.recalls);
             if s.ok {
@@ -252,6 +279,11 @@ pub async fn run_storm(
             } else {
                 n_err += 1;
             }
+        }
+        if let Some(mut r) = recorder
+            && let Err(e) = r.finish()
+        {
+            tracing::warn!("report sink failed on finish: {e}");
         }
         (latencies, recalls, n_ok, n_err)
     });
@@ -261,9 +293,9 @@ pub async fn run_storm(
     let batch_size = profile.batch_size.max(1);
 
     if profile.target_rps > 0.0 {
-        run_paced(&target, &vectors, profile, stop_at, top_k, &tx).await;
+        run_paced(&target, &vectors, profile, started, stop_at, top_k, &tx).await;
     } else {
-        run_closed_loop(&target, &vectors, profile, stop_at, top_k, &tx).await;
+        run_closed_loop(&target, &vectors, profile, started, stop_at, top_k, &tx).await;
     }
 
     // Drop the last sender so the collector's `recv` loop ends.
@@ -282,6 +314,7 @@ async fn run_closed_loop(
     target: &Arc<dyn QueryTarget>,
     vectors: &Arc<Vec<QueryVector>>,
     profile: &LoadProfile,
+    started: Instant,
     stop_at: Instant,
     top_k: u64,
     tx: &mpsc::UnboundedSender<DispatchSample>,
@@ -303,7 +336,7 @@ async fn run_closed_loop(
                 let idxs = batch_indices(start, batch_size, n);
                 let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
                 let out = target.query_batch(&queries).await;
-                let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k));
+                let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, started));
             }
         });
     }
@@ -320,6 +353,7 @@ async fn run_paced(
     target: &Arc<dyn QueryTarget>,
     vectors: &Arc<Vec<QueryVector>>,
     profile: &LoadProfile,
+    started: Instant,
     stop_at: Instant,
     top_k: u64,
     tx: &mpsc::UnboundedSender<DispatchSample>,
@@ -350,7 +384,7 @@ async fn run_paced(
         inflight.spawn(async move {
             let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
             let out = target.query_batch(&queries).await;
-            let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k));
+            let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, started));
             drop(permit); // release the in-flight slot
         });
 
@@ -423,7 +457,7 @@ mod tests {
     async fn closed_loop_fires_many_and_records_each() {
         let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results = run_storm(target, vectors(), &profile, 10).await;
+        let results = run_storm(target, vectors(), &profile, 10, None).await;
         let summary = results.summary();
 
         assert!(summary.requests > 0);
@@ -444,7 +478,7 @@ mod tests {
         let duration_s = 0.5;
         let profile = LoadProfile { concurrency: 16, duration_s, target_rps, batch_size: 1 };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results = run_storm(target, vectors(), &profile, 10).await;
+        let results = run_storm(target, vectors(), &profile, 10, None).await;
         let summary = results.summary();
 
         // The whole point: pacing holds the offered rate at/under target. Allow a
@@ -478,7 +512,7 @@ mod tests {
             .collect();
 
         let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
-        let results = run_storm(target, vectors, &profile, 4).await;
+        let results = run_storm(target, vectors, &profile, 4, None).await;
         let summary = results.summary();
 
         // every recorded recall sample must be exactly 0.25 -- never 0, never
@@ -507,7 +541,7 @@ mod tests {
             .collect();
 
         let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
-        let results = run_storm(target, vectors, &profile, 1).await;
+        let results = run_storm(target, vectors, &profile, 1, None).await;
         let summary = results.summary();
 
         assert_eq!(summary.errors, summary.requests); // every query failed
@@ -630,7 +664,7 @@ mod tests {
         ];
         // duration long enough to cycle through all 3 at concurrency=1 several times
         let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1 };
-        let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2).await;
+        let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2, None).await;
 
         // Only asserts the pipeline actually produced all 3 distinct values --
         // NOT their exact proportions, which depend on how many times each of
@@ -664,6 +698,34 @@ mod tests {
         // mean and median coincide here (symmetric distribution) -- min is the
         // one that actually differs from both, proving it's not just an alias.
         assert_ne!(summary.min_recall, summary.mean_recall);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recorder_receives_one_timestamped_row_per_dispatch() {
+        use crate::report::{Recorder, ReportConfig, ReportFormat};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ts.csv").to_string_lossy().into_owned();
+        let cfg = ReportConfig { format: ReportFormat::Csv, path: path.clone() };
+        let mut recorder = cfg.build();
+        recorder.begin().expect("begin");
+
+        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
+        let target = Arc::new(MockTarget::ok(vec![]));
+        let results = run_storm(target, vectors(), &profile, 10, Some(recorder)).await;
+        let summary = results.summary();
+
+        let text = std::fs::read_to_string(&path).expect("csv written");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "t_s,latency_ms,ok,recalls");
+        // exactly one row per dispatch — the time series IS the raw run
+        assert_eq!(lines.len() as u64, 1 + summary.requests);
+        // timestamps are on the run's time axis: non-negative, within the
+        // window (plus scheduling slack), and present on every row
+        for line in &lines[1..] {
+            let t: f64 = line.split(',').next().unwrap().parse().expect("t_s parses");
+            assert!(t >= 0.0 && t < 5.0, "t_s out of range: {t}");
+        }
     }
 
     #[test]
@@ -719,7 +781,7 @@ mod tests {
         let batch_size = 3;
         let profile = LoadProfile { concurrency: 1, duration_s: 0.15, target_rps: 0.0, batch_size };
         let target = Arc::new(BatchCapturingTarget { call_lens: std::sync::Mutex::new(Vec::new()) });
-        let results = run_storm(target.clone(), vectors, &profile, 2).await;
+        let results = run_storm(target.clone(), vectors, &profile, 2, None).await;
 
         let call_lens = target.call_lens.lock().unwrap();
         assert!(!call_lens.is_empty());

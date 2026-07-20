@@ -31,3 +31,6 @@ duckdb = { workspace = true }
 
 # Target backend.
 qdrant-client = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

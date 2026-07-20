@@ -1,8 +1,9 @@
 //! Parsing for the storm `.yaml`.
 //!
-//! Three top-level keys: `target` (the cluster under test, dispatched on its
-//! `type`), `query` (what to search with + where the query vectors live), and
-//! `load` (the per-worker profile).
+//! Four top-level keys: `target` (the cluster under test, dispatched on its
+//! `type`), `query` (what to search with + where the query vectors live),
+//! `load` (the per-worker profile), and optional `report` (per-dispatch
+//! time-series output — see [`crate::report::ReportConfig`]).
 //!
 //! Mirrors `nova-load`'s config paradigm: `${VAR}` references are expanded from
 //! the environment before deserializing (see [`expand_env`]).
@@ -12,6 +13,7 @@ use std::env;
 use serde::Deserialize;
 
 use crate::filter::Filter;
+use crate::report::ReportConfig;
 use crate::targets::TargetConfig;
 
 /// The full parsed storm config.
@@ -22,6 +24,9 @@ pub struct StormConfig {
     pub query: QueryConfig,
     #[serde(default)]
     pub load: LoadProfile,
+    /// Per-dispatch time-series output. Absent (default) = summary only.
+    #[serde(default)]
+    pub report: Option<ReportConfig>,
 }
 
 impl StormConfig {
@@ -358,6 +363,33 @@ load:
         // `qps` was replaced by `rps` with no back-compat alias -- an old config
         // using it now hits `deny_unknown_fields` like any other typo'd key.
         assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::Yaml(_)));
+    }
+
+    #[test]
+    fn parses_report_section_and_defaults_to_none() {
+        let base = r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+"#;
+        // absent -> None: summary-only, exactly the pre-report behavior
+        let cfg = StormConfig::from_yaml(base).expect("parses");
+        assert!(cfg.report.is_none());
+
+        let with_report = format!("{base}report:\n  format: csv\n  path: /tmp/ts.csv\n");
+        let cfg = StormConfig::from_yaml(&with_report).expect("parses");
+        let report = cfg.report.expect("present");
+        assert_eq!(report.format, crate::report::ReportFormat::Csv);
+        assert_eq!(report.path, "/tmp/ts.csv");
+
+        // unknown format dies at parse time like any other config typo
+        let bad = format!("{base}report:\n  format: sqlite\n  path: /tmp/ts.db\n");
+        assert!(matches!(StormConfig::from_yaml(&bad).unwrap_err(), ConfigError::Yaml(_)));
     }
 
     #[test]

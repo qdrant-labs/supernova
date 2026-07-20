@@ -48,3 +48,14 @@ load:
   # individual queries — actual query throughput is `rps * batch_size` (see
   # the `qps` field in the printed summary).
   # rps: 500
+
+# Optional: per-dispatch TIME-SERIES output, for plotting transient behavior
+# (acute load, the cluster re-optimizing mid-run) that the end-of-run summary
+# collapses away. One raw row per dispatch, in completion order:
+#   t_s (seconds since run start), latency_ms, ok, recalls
+# Deliberately unaggregated — bucket/smooth downstream (pandas/polars/duckdb).
+# Omit the section for summary-only (default). `path: "-"` streams to stdout —
+# fine interactively, but it breaks `--json` consumers like `nova sweep`.
+# report:
+#   format: csv                     # csv | jsonl
+#   path: storm_ts.csv
