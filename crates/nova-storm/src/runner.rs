@@ -301,8 +301,8 @@ async fn run_closed_loop(
                 // fetch_add wraps far below usize::MAX over any real run.
                 let start = cursor.fetch_add(batch_size, Ordering::Relaxed) % n;
                 let idxs = batch_indices(start, batch_size, n);
-                let vecs: Vec<&[f32]> = idxs.iter().map(|&i| vectors[i].vector.as_slice()).collect();
-                let out = target.query_batch(&vecs).await;
+                let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
+                let out = target.query_batch(&queries).await;
                 let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k));
             }
         });
@@ -348,8 +348,8 @@ async fn run_paced(
         let vectors = vectors.clone();
         let tx = tx.clone();
         inflight.spawn(async move {
-            let vecs: Vec<&[f32]> = idxs.iter().map(|&i| vectors[i].vector.as_slice()).collect();
-            let out = target.query_batch(&vecs).await;
+            let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
+            let out = target.query_batch(&queries).await;
             let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k));
             drop(permit); // release the in-flight slot
         });
@@ -363,6 +363,8 @@ async fn run_paced(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::targets::BatchOutcome;
     use async_trait::async_trait;
@@ -389,26 +391,32 @@ mod tests {
 
     #[async_trait]
     impl QueryTarget for MockTarget {
-        async fn query_batch(&self, vectors: &[&[f32]]) -> BatchOutcome {
+        async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
             if self.fail {
                 return BatchOutcome {
                     latency: Duration::from_micros(100),
                     ok: false,
-                    ids: vec![None; vectors.len()],
+                    ids: vec![None; queries.len()],
                     error: Some("mock failure".into()),
                 };
             }
             BatchOutcome {
                 latency: Duration::from_micros(100),
                 ok: true,
-                ids: vec![Some(self.ids.clone()); vectors.len()],
+                ids: vec![Some(self.ids.clone()); queries.len()],
                 error: None,
             }
         }
     }
 
     fn vectors() -> Vec<QueryVector> {
-        (0..16).map(|i| QueryVector { vector: vec![i as f32; 4], ground_truth: None }).collect()
+        (0..16)
+            .map(|i| QueryVector {
+                vector: vec![i as f32; 4],
+                ground_truth: None,
+                filter_values: HashMap::new(),
+            })
+            .collect()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -465,6 +473,7 @@ mod tests {
                 } else {
                     None
                 },
+                filter_values: HashMap::new(),
             })
             .collect();
 
@@ -493,6 +502,7 @@ mod tests {
             .map(|i| QueryVector {
                 vector: vec![i as f32; 4],
                 ground_truth: Some(HashSet::from(["a".to_string()])),
+                filter_values: HashMap::new(),
             })
             .collect();
 
@@ -597,12 +607,12 @@ mod tests {
         }
         #[async_trait]
         impl QueryTarget for PerQueryTarget {
-            async fn query_batch(&self, vectors: &[&[f32]]) -> BatchOutcome {
+            async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
                 // vector[0] selects which of the 3 fixed ids come back.
-                let ids = vectors
+                let ids = queries
                     .iter()
-                    .map(|v| {
-                        Some(match v[0] as i64 {
+                    .map(|q| {
+                        Some(match q.vector[0] as i64 {
                             0 => vec![], // 0/2 in ground truth -> recall 0.0
                             1 => vec!["a".to_string()], // 1/2 -> recall 0.5
                             _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
@@ -614,9 +624,9 @@ mod tests {
         }
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
         let vectors = vec![
-            QueryVector { vector: vec![0.0], ground_truth: gt.clone() },
-            QueryVector { vector: vec![1.0], ground_truth: gt.clone() },
-            QueryVector { vector: vec![2.0], ground_truth: gt },
+            QueryVector { vector: vec![0.0], ground_truth: gt.clone(), filter_values: HashMap::new() },
+            QueryVector { vector: vec![1.0], ground_truth: gt.clone(), filter_values: HashMap::new() },
+            QueryVector { vector: vec![2.0], ground_truth: gt, filter_values: HashMap::new() },
         ];
         // duration long enough to cycle through all 3 at concurrency=1 several times
         let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1 };
@@ -680,12 +690,12 @@ mod tests {
         }
         #[async_trait]
         impl QueryTarget for BatchCapturingTarget {
-            async fn query_batch(&self, vectors: &[&[f32]]) -> BatchOutcome {
-                self.call_lens.lock().unwrap().push(vectors.len());
+            async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
+                self.call_lens.lock().unwrap().push(queries.len());
                 // position 0 -> 0/2 in ground truth -> recall 0.0
                 // position 1 -> 1/2 -> recall 0.5
                 // position 2 -> 2/2 -> recall 1.0
-                let ids = (0..vectors.len())
+                let ids = (0..queries.len())
                     .map(|pos| {
                         Some(match pos % 3 {
                             0 => vec![],
@@ -699,8 +709,13 @@ mod tests {
         }
 
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
-        let vectors: Vec<QueryVector> =
-            (0..9).map(|i| QueryVector { vector: vec![i as f32], ground_truth: gt.clone() }).collect();
+        let vectors: Vec<QueryVector> = (0..9)
+            .map(|i| QueryVector {
+                vector: vec![i as f32],
+                ground_truth: gt.clone(),
+                filter_values: HashMap::new(),
+            })
+            .collect();
         let batch_size = 3;
         let profile = LoadProfile { concurrency: 1, duration_s: 0.15, target_rps: 0.0, batch_size };
         let target = Arc::new(BatchCapturingTarget { call_lens: std::sync::Mutex::new(Vec::new()) });

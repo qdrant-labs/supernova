@@ -148,6 +148,70 @@ Use this to measure the recall/latency tradeoff of a quantized collection
 [Collection-wide params](../loading/overview.md#collection-wide-params)) under
 different query-time settings without reloading data.
 
+### Filtering (`query.filter`)
+
+Optional payload/metadata filter, shaped like `nova bf`'s own filter (see
+[Brute-Force overview](../brute-force/overview.md)) — `must`/`should`/`must_not`
+groups of `match`/`range`/`match_text` conditions — so a filter authored for a
+`nova bf` ground-truth run and a `nova storm` load test read the same way.
+Translating this into an actual request is backend-specific; today that's
+Qdrant's own `Filter`.
+
+A **static** filter applies uniformly to every query in the run:
+
+```yaml
+query:
+  source:
+    uri: s3://my-bucket/queries.parquet
+    column: query_embedding
+  filter:
+    must:
+      - field: category
+        match: shoes
+      - field: price
+        range:
+          gte: 10.0
+          lt: 100.0
+    should:
+      - field: description
+        match_text: "waterproof hiking"
+```
+
+A **per-query** filter pulls each condition's comparison value from a column in
+the *queries* file instead of a literal — `match_from_query`,
+`range_from_query`, `match_text_from_query` — so two different queries in the
+same run can each be restricted to a different subset (their own tenant,
+budget, or search phrase):
+
+```yaml
+query:
+  source:
+    uri: s3://my-bucket/queries.parquet
+    column: query_embedding
+  filter:
+    must:
+      - field: tenant_id
+        match_from_query: tenant_column   # each query's own tenant, from this column
+      - field: budget
+        range_from_query:
+          lt: max_budget                   # each query's own ceiling
+```
+
+Every column a `_from_query` condition names is read alongside that query's
+vector when the queries file is loaded — a NULL in one of those columns is a
+load-time error, not "no filter for this query": use a non-matching
+placeholder value instead (the same convention `nova bf`'s own MS MARCO
+configs use for unused per-query slots, e.g. `domain_slot_N` columns holding
+`"zzznomatchzzz000"`).
+
+**Qdrant caveat**: Qdrant's match condition has no float-equality variant (only
+keyword, integer, bool, and `MatchAny` lists of integers or keywords) — a
+`match`/`match_from_query` value that's a float, or a `MatchAny` list that mixes
+types, is rejected with a clear error (at config-load time for a static filter,
+at query-dispatch time for a per-query one, since the value there comes from
+data). Use `range`/`range_from_query` with equal `gte`/`lte` bounds for a
+numeric equality check instead.
+
 ## nova sweep
 
 Orchestrate `nova-load` + `nova-storm` across a matrix of collection/index/search
