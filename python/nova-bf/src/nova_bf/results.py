@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import logging
 
-import logging
-
 import pyarrow as pa
 
-from nova_bf.config import BruteForceConfig
+from nova_bf.config import BruteForceConfig, SearchSpec
 
 # Reserved output columns; everything else in a result row is carried payload.
 RESERVED = ("query_id", "hit_ids", "hit_scores")
@@ -19,12 +17,12 @@ def queries_stem(queries_path: str) -> str:
     return base[:-8] if base.endswith(".parquet") else base
 
 
-def result_name(cfg: BruteForceConfig) -> str:
-    return f"bf_{queries_stem(cfg.queries.path)}_k{cfg.params.k}.parquet"
+def result_name(cfg: BruteForceConfig, spec: SearchSpec) -> str:
+    return f"bf_{queries_stem(cfg.queries.path)}_{spec.name}_k{spec.k}.parquet"
 
 
-def partial_dir(cfg: BruteForceConfig) -> str:
-    return f"_bf_partial_{queries_stem(cfg.queries.path)}_k{cfg.params.k}"
+def partial_dir(cfg: BruteForceConfig, spec: SearchSpec) -> str:
+    return f"_bf_partial_{queries_stem(cfg.queries.path)}_{spec.name}_k{spec.k}"
 
 
 def build_result_table(
@@ -41,7 +39,7 @@ def build_result_table(
     return pa.table(data)
 
 
-def warn_if_short(short: int, total: int, k: int, logger: logging.Logger) -> None:
+def warn_if_short(short: int, total: int, k: int, search_name: str, logger: logging.Logger) -> None:
     """Log if any query's FINAL top-K came out shorter than k. Not an error —
     hit_ids/hit_scores are already correctly truncated (see the `-inf` sentinel
     handling in compute.py) — just a signal that the corpus, or `filter` if one
@@ -50,11 +48,12 @@ def warn_if_short(short: int, total: int, k: int, logger: logging.Logger) -> Non
 
     Takes pre-computed counts (not a hit_ids list) so the streaming `merge`, which
     never materializes a full hit_ids list, can tally `short` per batch and still
-    share this one warning.
+    share this one warning. `search_name` identifies which search this is about —
+    a run can compute several (see SearchSpec), each with its own short-count.
     """
     if short:
         logger.warning(
-            "%d/%d quer%s returned fewer than k=%d hits — the corpus (after "
-            "any `filter`) didn't have enough matches for them",
-            short, total, "y" if short == 1 else "ies", k,
+            "search=%r: %d/%d quer%s returned fewer than k=%d hits — the corpus "
+            "(after any `filter`) didn't have enough matches for them",
+            search_name, short, total, "y" if short == 1 else "ies", k,
         )
