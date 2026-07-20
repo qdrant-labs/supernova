@@ -23,6 +23,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::TrySendError;
 
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -54,6 +55,13 @@ pub struct StormResults {
     /// raw samples so `summary()` can self-describe regardless of what
     /// `LoadProfile` is in scope.
     pub batch_size: usize,
+    /// Time-series samples dropped because the report sink couldn't keep pace
+    /// (the bounded writer queue was full). `0` unless `report:` is configured
+    /// AND its sink lagged; the load test and this summary are unaffected — the
+    /// only casualty is completeness of the time-series file. Not the same as
+    /// `n_err` (failed dispatches): a dropped sample was a *successful* (or
+    /// failed) dispatch whose row simply never reached the sink.
+    pub dropped_samples: u64,
 }
 
 /// Aggregated stats for THIS worker. Fleet-wide stats must merge raw samples
@@ -252,40 +260,56 @@ pub async fn run_storm(
     let vectors = Arc::new(vectors);
     let (tx, mut rx) = mpsc::unbounded_channel::<DispatchSample>();
 
-    // Collector: drain samples into the raw distributions + counts, forwarding
-    // each to the recorder (time-series sink) as it lands. Owning both in one
-    // task keeps the workers lock-free on the hot path — a slow sink can lag
-    // the collector, never the load loop (the channel is unbounded).
+    // Hand the (already-`begin()`-ed) recorder to a dedicated OS thread so its
+    // blocking writes never land on a runtime worker — see `report::spawn_writer`
+    // for why that matters (especially on a 1-vCPU box). The collector forwards
+    // to it over a bounded channel and drops-on-full, so a sink slower than
+    // dispatch can neither grow memory unbounded nor backpressure the load loop.
+    let (writer_tx, writer_handle) = match recorder {
+        Some(r) => {
+            let (wtx, handle) = crate::report::spawn_writer(r);
+            (Some(wtx), Some(handle))
+        }
+        None => (None, None),
+    };
+
+    // Collector: drain samples into the raw distributions + counts, then forward
+    // each to the writer thread. The accumulation here is the authoritative
+    // summary and never loses a sample; only the (auxiliary) time-series file
+    // does, and only when its sink can't keep up. Owning the accumulation in one
+    // task keeps the workers lock-free on the hot path.
     let collector = tokio::spawn(async move {
-        let mut recorder = recorder;
+        let mut writer_tx = writer_tx;
         let mut latencies = Vec::new();
         let mut recalls = Vec::new();
         let mut n_ok = 0u64;
         let mut n_err = 0u64;
+        let mut dropped = 0u64;
         while let Some(s) = rx.recv().await {
-            if let Some(r) = recorder.as_mut()
-                && let Err(e) = r.record(&s)
-            {
-                // Time-series is auxiliary: losing it mid-run (disk full,
-                // closed pipe) must not kill the load test. Warn once,
-                // stop recording, keep the summary intact.
-                tracing::warn!("report sink failed, disabling time-series output: {e}");
-                recorder = None;
-            }
+            // Accumulate first — copying the fields the summary needs — so `s`
+            // is still owned to hand to the writer without a clone.
             latencies.push(s.latency_ms);
-            recalls.extend(s.recalls);
+            recalls.extend(s.recalls.iter().copied());
             if s.ok {
                 n_ok += 1;
             } else {
                 n_err += 1;
             }
+            if let Some(wtx) = writer_tx.as_ref() {
+                match wtx.try_send(s) {
+                    Ok(()) => {}
+                    // Sink is behind: count the drop and keep going rather than
+                    // block (blocking would perturb the measurement).
+                    Err(TrySendError::Full(_)) => dropped += 1,
+                    // Writer stopped (a record() error disabled it, or it already
+                    // finished): stop forwarding for the rest of the run.
+                    Err(TrySendError::Disconnected(_)) => writer_tx = None,
+                }
+            }
         }
-        if let Some(mut r) = recorder
-            && let Err(e) = r.finish()
-        {
-            tracing::warn!("report sink failed on finish: {e}");
-        }
-        (latencies, recalls, n_ok, n_err)
+        // Drop the sender so the writer thread's `recv` ends and it runs finish().
+        drop(writer_tx);
+        (latencies, recalls, n_ok, n_err, dropped)
     });
 
     let started = Instant::now();
@@ -302,10 +326,25 @@ pub async fn run_storm(
     drop(tx);
     let wall_s = started.elapsed().as_secs_f64();
 
-    let (latencies_ms, recalls, n_ok, n_err) = collector.await.unwrap_or_default();
+    let (latencies_ms, recalls, n_ok, n_err, dropped_samples) =
+        collector.await.unwrap_or_default();
+    // Join the writer thread so its `finish()` (final flush) completes before we
+    // return — otherwise a caller reading the file back could race the flush.
+    // Cheap: the load is done and the channel is closed, so the thread is already
+    // exiting.
+    if let Some(handle) = writer_handle {
+        let _ = handle.join();
+    }
+    if dropped_samples > 0 {
+        tracing::warn!(
+            "time-series report incomplete: dropped {dropped_samples} sample(s) — the sink \
+             couldn't keep pace with dispatch (bounded writer queue full); the summary is \
+             unaffected"
+        );
+    }
     let _ = target.close().await;
 
-    StormResults { latencies_ms, recalls, n_ok, n_err, wall_s, batch_size }
+    StormResults { latencies_ms, recalls, n_ok, n_err, wall_s, batch_size, dropped_samples }
 }
 
 /// Hold `concurrency` requests in flight until the window closes; each task
@@ -689,6 +728,7 @@ mod tests {
             n_err: 0,
             wall_s: 1.0,
             batch_size: 1,
+            dropped_samples: 0,
         };
         let summary = results.summary();
 
@@ -702,7 +742,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recorder_receives_one_timestamped_row_per_dispatch() {
-        use crate::report::{Recorder, ReportConfig, ReportFormat};
+        use crate::report::{ReportConfig, ReportFormat};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ts.csv").to_string_lossy().into_owned();
@@ -718,14 +758,46 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("csv written");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "t_s,latency_ms,ok,recalls");
-        // exactly one row per dispatch — the time series IS the raw run
-        assert_eq!(lines.len() as u64, 1 + summary.requests);
+        // one row per dispatch that reached the sink — the time series IS the
+        // raw run, minus any samples dropped when the writer queue was full
+        // (with an instant mock target the load loop can briefly outrun the
+        // writer; the summary still counts every dispatch).
+        assert_eq!(lines.len() as u64, 1 + summary.requests - results.dropped_samples);
         // timestamps are on the run's time axis: non-negative, within the
         // window (plus scheduling slack), and present on every row
         for line in &lines[1..] {
             let t: f64 = line.split(',').next().unwrap().parse().expect("t_s parses");
-            assert!(t >= 0.0 && t < 5.0, "t_s out of range: {t}");
+            assert!((0.0..5.0).contains(&t), "t_s out of range: {t}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_sink_disables_recording_without_killing_the_run() {
+        // The central robustness guarantee: a report sink that errors on write
+        // must NOT take down the load test — the summary stays whole, the run
+        // completes normally, only the (auxiliary) time series is lost.
+        struct FailingRecorder;
+        impl crate::report::Recorder for FailingRecorder {
+            fn begin(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn record(&mut self, _s: &DispatchSample) -> std::io::Result<()> {
+                Err(std::io::Error::other("sink is down"))
+            }
+            fn finish(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
+        let target = Arc::new(MockTarget::ok(vec![]));
+        let results =
+            run_storm(target, vectors(), &profile, 10, Some(Box::new(FailingRecorder))).await;
+        let summary = results.summary();
+
+        // Load ran to completion despite the sink failing on the very first row.
+        assert!(summary.requests > 0, "the load test must complete even with a dead sink");
+        assert_eq!(summary.errors, 0, "dispatch errors are unrelated to sink failure");
     }
 
     #[test]
