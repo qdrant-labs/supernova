@@ -92,8 +92,13 @@ class HuggingFaceSource(DatasetSource):
                 the configured input columns here so the field being embedded
                 always survives.
             offset / limit: applied as a row-window across all selected files.
-            total_rows_override: skip the metadata sweep at construction time by
-                trusting this number; metadata is still read per-file as we go.
+            total_rows_override: trust this number instead of summing every
+                file's footer. THE knob for fleet runs: with it set, a rank
+                never does the full-dataset footer sweep — it reads footers in
+                path order only until its own (offset, limit) window is covered
+                (see _ensure_counts), cutting HF requests per rank from
+                O(all files) to O(files before the window's end). The total is
+                printed in every run's "Indexed ... total rows" log line.
             path_filter: substring filter on parquet file paths (e.g. "train/").
                 Defaults to filtering by the split name when present in paths.
             metadata_workers: parallelism for the per-file footer fetches. Keep
@@ -155,78 +160,124 @@ class HuggingFaceSource(DatasetSource):
                 f"path_filter={path_filter!r}"
             )
         self._parquet_paths = parquet_paths
-        # lazy: list of (path, num_rows) -- populated on first use
-        self._files_with_counts: list[tuple[str, int]] | None = None
+        # incremental footer index: (path, num_rows) in path order, extended on
+        # demand — see _ensure_counts. _next_path_idx is the first unread path.
+        self._files_with_counts: list[tuple[str, int]] = []
+        self._next_path_idx = 0
+        self._counts_complete = False
 
     @property
     def source_name(self) -> str:
         return self.dataset_name
 
-    def _ensure_counts(self) -> None:
-        if self._files_with_counts is not None:
-            return
+    def set_window(self, offset: int, limit: int | None) -> None:
+        """Re-scope this source to a row window, keeping the footer index.
 
+        Lets the CLI reuse the instance it built for `--num-jobs` row counting
+        as the pipeline source, instead of building a second instance that
+        re-reads every footer — at fleet scale the footer sweep is the dominant
+        HF request cost, so it must happen at most once per process.
+        """
+        self._offset = offset or 0
+        self._limit = limit
+        self._local_paths = {}  # prefetch staging is window-scoped
+
+    def _fetch_count(self, path: str) -> tuple[str, int | None]:
         import pyarrow.parquet as pq
 
-        def fetch(path: str) -> tuple[str, int | None]:
-            url = f"datasets/{self.dataset_name}/{path}"
-            last_err: Exception | None = None
-            for attempt in range(6):
-                try:
-                    pf = pq.ParquetFile(url, filesystem=self._fs)
-                    return path, pf.metadata.num_rows
-                except Exception as e:
-                    last_err = e
-                    is_rate_limit = "429" in str(e) or "Too Many Requests" in str(e)
-                    if is_rate_limit:
-                        # HF rate-limit windows are minutes-long, so back off harder.
-                        wait = min(5 * 2**attempt, 120)
-                        reason = "rate limited"
-                    else:
-                        # Generic flake (5xx, connection reset, DNS hiccup, etc.).
-                        # These are usually one-shot — a couple of seconds is enough.
-                        wait = min(2 * 2**attempt, 30)
-                        reason = f"transient error ({type(e).__name__})"
-                    logger.warning(
-                        "%s reading footer for %s (attempt %d/6), retrying in %ds: %s",
-                        reason,
-                        path,
-                        attempt + 1,
-                        wait,
-                        e,
-                    )
-                    time.sleep(wait)
-            logger.warning(
-                "Giving up on footer read for %s after 6 retries: %s", path, last_err
-            )
-            return path, None
+        url = f"datasets/{self.dataset_name}/{path}"
+        last_err: Exception | None = None
+        for attempt in range(6):
+            try:
+                pf = pq.ParquetFile(url, filesystem=self._fs)
+                return path, pf.metadata.num_rows
+            except Exception as e:
+                last_err = e
+                is_rate_limit = "429" in str(e) or "Too Many Requests" in str(e)
+                if is_rate_limit:
+                    # HF rate-limit windows are minutes-long, so back off harder.
+                    wait = min(5 * 2**attempt, 120)
+                    reason = "rate limited"
+                else:
+                    # Generic flake (5xx, connection reset, DNS hiccup, etc.).
+                    # These are usually one-shot — a couple of seconds is enough.
+                    wait = min(2 * 2**attempt, 30)
+                    reason = f"transient error ({type(e).__name__})"
+                logger.warning(
+                    "%s reading footer for %s (attempt %d/6), retrying in %ds: %s",
+                    reason,
+                    path,
+                    attempt + 1,
+                    wait,
+                    e,
+                )
+                time.sleep(wait)
+        logger.warning(
+            "Giving up on footer read for %s after 6 retries: %s", path, last_err
+        )
+        return path, None
 
+    def _ensure_counts(self, through: int | None = None) -> None:
+        """Extend the footer index far enough to cover global row `through`.
+
+        ``through=None`` indexes every file. Otherwise footers are read in path
+        order, in small parallel batches, and reading STOPS once the cumulative
+        row count reaches ``through`` — a rank whose window ends early never
+        pays for footers past it. Each footer is ~2-3 HTTP requests against
+        HF's rate-limited resolve endpoint, and N ranks × all files is how a
+        fleet burns through a request quota in minutes, so never read more
+        than the caller needs. Results accumulate: a later, broader call
+        continues where this one stopped.
+        """
+        if self._counts_complete:
+            return
+        cumulative = sum(n for _, n in self._files_with_counts)
+        if through is not None and cumulative >= through:
+            return
+
+        remaining = len(self._parquet_paths) - self._next_path_idx
         logger.info(
-            "Reading parquet footers for %d files (parallel=%d)...",
+            "Reading parquet footers (%d of %d files unread, parallel=%d%s)...",
+            remaining,
             len(self._parquet_paths),
             self._metadata_workers,
+            "" if through is None else f", stopping at row {through:,}",
         )
+        batch_size = self._metadata_workers * 8
         with ThreadPoolExecutor(max_workers=self._metadata_workers) as ex:
-            results = list(ex.map(fetch, self._parquet_paths))
+            while self._next_path_idx < len(self._parquet_paths):
+                batch = self._parquet_paths[
+                    self._next_path_idx : self._next_path_idx + batch_size
+                ]
+                results = list(ex.map(self._fetch_count, batch))
+                failed = [p for p, n in results if n is None]
+                if failed:
+                    # Silently dropping files would corrupt the offset table --
+                    # offsets are derived from the cumulative sum of file row
+                    # counts. Better to fail loud so the user knows their slice
+                    # is incomplete.
+                    raise RuntimeError(
+                        f"Footer read failed for {len(failed)}/{len(results)} parquet "
+                        f"files in {self.dataset_name}. First failures: {failed[:5]}. "
+                        "Retry, or pass a tighter path_filter to skip them explicitly."
+                    )
+                self._next_path_idx += len(batch)
+                for p, n in results:
+                    # zero-row files are real and ok (just empty), but we drop
+                    # them from the offset table to keep the math clean.
+                    if n > 0:
+                        self._files_with_counts.append((p, n))
+                        cumulative += n
+                if through is not None and cumulative >= through:
+                    break
 
-        failed = [p for p, n in results if n is None]
-        if failed:
-            # Silently dropping files would corrupt the offset table -- offsets are
-            # derived from cumulative sum of file row counts. Better to fail loud
-            # so the user knows their slice is incomplete.
-            raise RuntimeError(
-                f"Footer read failed for {len(failed)}/{len(results)} parquet files in "
-                f"{self.dataset_name}. First failures: {failed[:5]}. "
-                "Retry, or pass a tighter path_filter to skip them explicitly."
-            )
-
-        # zero-row files are real and ok (just empty), but we drop them from the
-        # offset table to keep the math clean.
-        self._files_with_counts = [(p, n) for p, n in results if n > 0]
+        if self._next_path_idx >= len(self._parquet_paths):
+            self._counts_complete = True
         logger.info(
-            "Indexed %d parquet files, %d total rows",
+            "Indexed %d parquet files, %d rows%s",
             len(self._files_with_counts),
-            sum(n for _, n in self._files_with_counts),
+            cumulative,
+            "" if self._counts_complete else " (partial index, window-bounded)",
         )
 
     def list_files(self) -> list[tuple[str, int]]:
@@ -239,6 +290,11 @@ class HuggingFaceSource(DatasetSource):
             return self._total_rows_override
         self._ensure_counts()
         return sum(n for _, n in self._files_with_counts)
+
+    @property
+    def _window_end(self) -> int | None:
+        """Global row index just past this rank's window (None = unbounded)."""
+        return None if self._limit is None else self._offset + self._limit
 
     def _prefetch_files(self) -> None:
         """Download only the parquet files overlapping this rank's window to local disk.
@@ -254,7 +310,7 @@ class HuggingFaceSource(DatasetSource):
         from pathlib import Path
         from huggingface_hub import hf_hub_download
 
-        self._ensure_counts()
+        self._ensure_counts(self._window_end)
         to_download = [
             path
             for path, _ in files_in_window(
@@ -296,7 +352,7 @@ class HuggingFaceSource(DatasetSource):
         Same membership as ``files_in_window`` (the sharding contract), plus each
         file's global start offset so the reader can compute its intra-file slice.
         """
-        self._ensure_counts()
+        self._ensure_counts(self._window_end)
         out: list[tuple[str, int, int]] = []
         cumulative = 0
         for path, num_rows in self._files_with_counts:
