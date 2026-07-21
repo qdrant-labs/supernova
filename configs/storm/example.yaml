@@ -21,6 +21,10 @@ query:
   # Named vector to hit. Omit for a single-(unnamed-)vector collection.
   vector_name: dense
   top_k: 10                         # neighbours per query (default 10)
+  # Return each hit's full payload (default false = ids/scores only). Turn on
+  # when the modeled production traffic fetches payloads — payload reads and
+  # response bytes are real cost the benchmark otherwise understates.
+  # with_payload: true
   source:
     # Query vectors — a parquet file (or dir) at a local path or s3:// URI, read
     # via DuckDB. Each row's `column` is one query vector.

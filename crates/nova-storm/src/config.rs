@@ -68,6 +68,14 @@ pub struct QueryConfig {
     pub vector_name: Option<String>,
     #[serde(default = "default_top_k")]
     pub top_k: u64,
+    /// Ask the server to return each hit's full payload. Default `false`
+    /// (ids/scores only). Turn it on when the production traffic being
+    /// modeled fetches payloads — payload retrieval is real server-side work
+    /// (reads payload storage, possibly from disk, for every hit) and real
+    /// response bytes, so benchmarking without it understates latency for
+    /// such workloads.
+    #[serde(default)]
+    pub with_payload: bool,
     pub source: QuerySource,
     /// Server-side search-time tuning (Qdrant's `SearchParams`) — distinct from
     /// `load`'s client-side knobs (concurrency/batch_size/rps). `None` (default)
@@ -287,6 +295,7 @@ load:
 "#;
         let cfg = StormConfig::from_yaml(yaml).expect("should parse");
         assert_eq!(cfg.query.top_k, 10);
+        assert!(!cfg.query.with_payload); // default: ids/scores only
         assert_eq!(cfg.query.source.limit, 1000);
         assert_eq!(cfg.load.concurrency, 8);
         assert_eq!(cfg.load.target_rps, 75.0); // `rps` -> target_rps
@@ -363,6 +372,23 @@ load:
         // `qps` was replaced by `rps` with no back-compat alias -- an old config
         // using it now hits `deny_unknown_fields` like any other typo'd key.
         assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::Yaml(_)));
+    }
+
+    #[test]
+    fn parses_with_payload() {
+        let yaml = r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  with_payload: true
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+"#;
+        let cfg = StormConfig::from_yaml(yaml).expect("parses");
+        assert!(cfg.query.with_payload);
     }
 
     #[test]

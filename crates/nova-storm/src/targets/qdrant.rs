@@ -38,6 +38,11 @@ pub struct QdrantTarget {
     /// a wasted allocation (a `String` clone per returned point) on every
     /// query.
     collect_ids: bool,
+    /// Ask the server for each hit's full payload (`query.with_payload`).
+    /// The payloads are dropped on arrival — storm measures, it doesn't
+    /// consume — but requesting them makes the server do the payload reads
+    /// and ship the bytes, which is the cost being modeled.
+    with_payload: bool,
     /// Translated once at construction and applied unchanged to every
     /// query — set only when `query.filter` has no `_from_query` condition
     /// (a uniform filter has nothing to resolve per query). `None` when
@@ -125,6 +130,7 @@ impl QdrantConfig {
             top_k: query.top_k,
             search_params: query.search_params.as_ref().map(SearchParams::from),
             collect_ids: query.source.ground_truth_column.is_some(),
+            with_payload: query.with_payload,
             static_filter,
             per_query_filter,
         })
@@ -377,7 +383,7 @@ impl QueryTarget for QdrantTarget {
                 let mut builder = QueryPointsBuilder::new(&self.collection_name)
                     .query(q.vector.to_vec())
                     .limit(self.top_k)
-                    .with_payload(false);
+                    .with_payload(self.with_payload);
                 if let Some(name) = &self.vector_name {
                     builder = builder.using(name.clone());
                 }
