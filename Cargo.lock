@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "nova-inspect"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "clap",
  "duckdb",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "nova-load"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "async-trait",
  "clap",
@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "nova-storm"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "async-trait",
  "clap",

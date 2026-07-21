@@ -15,11 +15,12 @@ resources:
   cpus: 8+
   use_spot: true
   disk_size: 100
+  region: us-west-2
 
 # Build from source on each worker (slow cold compile). Useful for an un-released
 # branch; for released code the default download is much faster.
-setup: |
-  command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  source "$HOME/.cargo/env"
-  cargo install --git https://github.com/qdrant-labs/supernova@my-branch nova-load
-  sudo install -m 0755 "$HOME/.cargo/bin/nova-load" /usr/local/bin/nova-load
+# setup: |
+#   command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+#   source "$HOME/.cargo/env"
+#   cargo install --git https://github.com/qdrant-labs/supernova@my-branch nova-load
+#   sudo install -m 0755 "$HOME/.cargo/bin/nova-load" /usr/local/bin/nova-load

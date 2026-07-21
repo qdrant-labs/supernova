@@ -1,6 +1,6 @@
 [project]
 name = "nova-embed"
-version = "0.0.8"
+version = "0.0.9"
 description = "Embedding generation for the supernova toolset — stream datasets, embed at scale, write parquet."
 requires-python = ">=3.11"
 # Base deps are light enough to import the config layer and the CLI scaffolding.
