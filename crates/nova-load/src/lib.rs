@@ -44,7 +44,8 @@ pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
 
     let dims = resolve_dims(&config.datasource, &config.vectors).await?;
-    create_collection(store.as_ref(), &config.vectors, dims).await?;
+    let schema = CollectionSchema { vectors: config.vectors.clone(), dims };
+    store.ensure_collection(&schema).await?;
     store.defer_indexing().await?;
 
     // `load_files` lists + partitions internally.
@@ -59,7 +60,7 @@ pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
     )
     .await?;
 
-    finish_indexing(store.as_ref()).await?;
+    finish_indexing(store.as_ref(), &schema).await?;
     tracing::info!("done: {n} points loaded");
     Ok(())
 }
@@ -72,7 +73,8 @@ pub async fn prepare(config: LoadConfig) -> Result<(), LoadError> {
     // No file listing — dims come from sampling one file (or explicit config),
     // so prepare doesn't pay to enumerate a huge corpus.
     let dims = resolve_dims(&config.datasource, &config.vectors).await?;
-    create_collection(store.as_ref(), &config.vectors, dims).await?;
+    let schema = CollectionSchema { vectors: config.vectors.clone(), dims };
+    store.ensure_collection(&schema).await?;
     store.defer_indexing().await?;
     tracing::info!("prepared collection on {store}");
     Ok(())
@@ -100,23 +102,34 @@ pub async fn load(config: LoadConfig, partition: Partition) -> Result<(), LoadEr
 /// every worker's `load` has completed.
 pub async fn finalize(config: LoadConfig) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
-    finish_indexing(store.as_ref()).await?;
+    // This process never called `ensure_collection`, so re-derive the schema
+    // that `enable_indexing` needs (per-vector metric etc.). No dims needed here —
+    // the collection already exists, so no backend creates fields in this phase —
+    // which also means `finalize` doesn't have to reach the datasource to sample.
+    let schema = CollectionSchema { vectors: config.vectors.clone(), dims: HashMap::new() };
+    finish_indexing(store.as_ref(), &schema).await?;
     tracing::info!("finalized {store}");
     Ok(())
 }
 
-/// Patch HNSW/quantization/optimizer settings on an *already-existing*
-/// collection in place, then wait for the change to finish optimization — no data is
-/// touched. Uses the same `LoadConfig` shape as every other phase; `datasource`
-/// and `vectors` are required by that shared schema but unused here (only
-/// `vectorstore.params.{hnsw,quantization,optimizers}` matters).
+/// Re-apply index settings from config to an *already-existing* collection, then
+/// wait for the change to reconverge — no data is touched. Uses the same
+/// `LoadConfig` shape as every other phase. Backends read what they need from it:
+/// Qdrant patches `vectorstore.params.{hnsw,quantization,optimizers}` in place;
+/// Milvus drops+rebuilds each index with the configured `index_type`/`index_params`
+/// and the per-vector `distance`.
 pub async fn reindex(config: LoadConfig) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
+    // Build the schema so backends that rebuild (Milvus/Elastic) can read
+    // per-vector settings (metric). No dims needed — reindex touches an existing
+    // collection, so nothing here creates fields; this also keeps reindex from
+    // having to reach the datasource just to sample a dimension.
+    let schema = CollectionSchema { vectors: config.vectors.clone(), dims: HashMap::new() };
     let started = Instant::now();
-    store.reindex().await?;
+    store.reindex(&schema).await?;
     let converged_at = store.wait_for_indexing().await?;
     let effective_elapsed = converged_at.duration_since(started);
-    tracing::info!("reindex timing: effective_seconds={:.3}", effective_elapsed.as_secs_f64());
+    tracing::info!("reindex timing: index_seconds={:.3}", effective_elapsed.as_secs_f64());
     tracing::info!("reindexed {store}");
     Ok(())
 }
@@ -189,20 +202,23 @@ async fn resolve_dims(
     Ok(engine::infer_dims(&sample, vectors))
 }
 
-async fn create_collection(
+async fn finish_indexing(
     store: &dyn VectorStore,
-    vectors: &HashMap<String, VectorSpec>,
-    dims: HashMap<String, u64>,
+    schema: &CollectionSchema,
 ) -> Result<(), LoadError> {
-    let schema = CollectionSchema { vectors: vectors.clone(), dims };
-    store.ensure_collection(&schema).await?;
-    Ok(())
-}
-
-async fn finish_indexing(store: &dyn VectorStore) -> Result<(), LoadError> {
     tracing::info!("re-enabling indexing…");
-    store.enable_indexing().await?;
-    store.wait_for_indexing().await?;
+    // Time index building the same way `reindex` does: from kicking indexing off
+    // (`enable_indexing`) to the instant the backend first reached its converged
+    // state — `wait_for_indexing` returns that instant, so this EXCLUDES the
+    // stability hold each backend adds on top (e.g. Qdrant's 5s green-hold,
+    // Milvus's 30s pending-zero hold). It's the effective build time, not wall
+    // clock. Backend-agnostic: reports for whichever store this is.
+    let started = Instant::now();
+    store.enable_indexing(schema).await?;
+    let converged_at = store.wait_for_indexing().await?;
+    // Each backend reports its own timing: build time (Qdrant/Milvus) vs ES's
+    // inline index_time (Elasticsearch) — see `report_index_time`.
+    store.report_index_time(converged_at.duration_since(started)).await;
     store.close().await?;
     Ok(())
 }

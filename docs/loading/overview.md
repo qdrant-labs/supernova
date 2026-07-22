@@ -205,6 +205,24 @@ JSON-string columns that parse to a dict are automatically unpacked into the pay
 4. **Deferred indexing** -- HNSW construction is disabled during load, then built in one pass
 5. **Per-file resilience** -- each file's download + read is retried (`file_retries`, default 3) with exponential backoff; a file that still fails is logged and **skipped** so one bad object can't abort the whole load. `max_failed_files` caps how many skips are tolerated before aborting.
 
+## Indexing time in the logs
+
+After the upload each backend logs `indexing finished: index_seconds=…` (and `reindex`
+logs `reindex timing: index_seconds=…`). **These numbers are not directly comparable
+across backends** — each vector store accounts for indexing time differently, so treat
+`index_seconds` as a within-backend signal (e.g. comparing index/quantization variants
+on the same store via `reindex`), not an apples-to-apples cross-system benchmark:
+
+- **Qdrant / Milvus** — `index_seconds` is a distinct *post-upload* index build, timed
+  directly (Qdrant defers HNSW during load then builds it in one pass; Milvus builds the
+  index after inserting). Milvus additionally logs a separate `load_seconds` for pulling
+  the built index into memory — a step Qdrant and Elasticsearch have no equivalent of.
+- **Elasticsearch** — builds the HNSW graph *inline during ingestion*, so there is no
+  separate build phase to time. `index_seconds` there is Elasticsearch's own `index_time`
+  stat (a fused ingest+build figure); the parenthetical `merge-settle` is only how long
+  the post-load wait for background merges took (usually ~0). The ingestion cost itself
+  shows up in the loader's throughput lines (`… pts/s`).
+
 ## Tuning
 
 | Parameter | Default | Guidance |

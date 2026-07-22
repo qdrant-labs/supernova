@@ -126,7 +126,12 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
     async fn defer_indexing(&self) -> Result<(), StoreError>;
 
     /// Re-enable indexing after bulk load. Called after all upserts complete.
-    async fn enable_indexing(&self) -> Result<(), StoreError>;
+    /// Receives the same [`CollectionSchema`] passed to `ensure_collection` so
+    /// backends that defer index *creation* until the data is in (e.g. Milvus,
+    /// which loads into an unindexed collection and builds the index here) have
+    /// the vector specs + dims on hand — the caller re-derives it in the
+    /// distributed `finalize` step, which never called `ensure_collection`.
+    async fn enable_indexing(&self, schema: &CollectionSchema) -> Result<(), StoreError>;
 
     /// Block until indexing is complete. Called after enable_indexing().
     ///
@@ -134,14 +139,43 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
     /// ultimately held long enough to be accepted as converged.
     async fn wait_for_indexing(&self) -> Result<std::time::Instant, StoreError>;
 
-    /// Patch index-affecting collection settings (HNSW/quantization/optimizer
-    /// overrides, from this store's own config) on an *already-existing*
-    /// collection, in place — does not touch data. Callers that need to block
-    /// until the change has reconverged should call [`wait_for_indexing`]
-    /// (`VectorStore::wait_for_indexing`) afterward, same as the existing
-    /// `enable_indexing`/`wait_for_indexing` split. Backends that can't patch
-    /// in place must still implement this explicitly (e.g. as a no-op).
-    async fn reindex(&self) -> Result<(), StoreError>;
+    /// Log a one-line indexing-time report after a load's `wait_for_indexing`.
+    /// `effective` is the converged instant minus when indexing was kicked off
+    /// (build time, excluding the stability hold). Default: report it as
+    /// `index_seconds` — correct for backends that build the index *after*
+    /// the upload (Qdrant, Milvus). Backends whose real cost is NOT in this
+    /// window — Elasticsearch builds the HNSW graph inline during ingest, so the
+    /// post-load window is ~0 — override this to report a meaningful figure.
+    ///
+    /// CAVEAT — these timings are NOT directly comparable across backends. Each
+    /// vector store accounts for "indexing time" differently, so treat the
+    /// numbers as within-backend signals, not an apples-to-apples benchmark:
+    ///   - Qdrant / Milvus: `index_seconds` = a distinct post-upload index build
+    ///     we time directly (Qdrant defers HNSW; Milvus builds after insert).
+    ///   - Elasticsearch: builds the graph inline *during* ingest, so
+    ///     `index_seconds` is ES's own `index_time` stat (fused ingest+build),
+    ///     not the post-upload window — and ingest cost is really in the loader's
+    ///     throughput (`pts/s`), not here.
+    ///   - Milvus also reports a separate `load_seconds` (pulling the index into
+    ///     memory) that the others have no equivalent of.
+    async fn report_index_time(&self, effective: std::time::Duration) {
+        tracing::info!(
+            "{self} indexing finished: index_seconds={:.3}",
+            effective.as_secs_f64()
+        );
+    }
+
+    /// Re-apply index settings from config to an *already-existing* collection —
+    /// does not touch data. Backends patch in place where they can (Qdrant:
+    /// HNSW/quantization/optimizer overrides); where they can't (Milvus), this
+    /// drops and rebuilds the index with the configured type/params/metric.
+    /// Receives the [`CollectionSchema`] so backends can read per-vector settings
+    /// (e.g. Milvus's metric from the distance). Callers that need to block until
+    /// the change reconverges should call [`wait_for_indexing`]
+    /// (`VectorStore::wait_for_indexing`) afterward, same as the
+    /// `enable_indexing`/`wait_for_indexing` split. Backends that can't patch in
+    /// place and have nothing to rebuild must still implement this (e.g. no-op).
+    async fn reindex(&self, schema: &CollectionSchema) -> Result<(), StoreError>;
 
     /// Delete the collection if it exists. A no-op if it doesn't.
     async fn delete_collection(&self) -> Result<(), StoreError>;
