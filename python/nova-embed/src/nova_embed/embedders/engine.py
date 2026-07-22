@@ -8,9 +8,10 @@ which owns the three launch-time concerns:
   modalities fail on the registry *class*, before any model download starts.
 * **instance sharing** — two entries naming the same backend config (e.g. CLIP
   on the image column AND the caption column) share one loaded model.
-* **hybrid fusion** — a dense + sparse entry pair pointing at the same
-  sentence_transformer model and the same input column collapse into a single
-  forward pass that feeds both output columns.
+* **fusion** — entries pointing at the same model and input column collapse
+  into a single forward pass feeding all their output columns, when the
+  backend registered a FusedEmbedder for the `type` (e.g. bge_m3's three
+  heads). Detection is automatic; configs never opt in.
 
 At run time the worker calls `engine.embed(rows)` with plain row dicts and gets
 back `{entry_name: [embedding | None, ...]}`. The engine decodes each distinct
@@ -30,10 +31,9 @@ import numpy as np
 
 from nova_embed import media
 from nova_embed.config import EmbedderEntry
-from nova_embed.embedders.base import Embedder
 from nova_embed.media import Modality
 from nova_embed.models import Embedding, MultiVectorEmbedding, OutputKind
-from nova_embed.registry import EMBEDDERS
+from nova_embed.registry import EMBEDDERS, FUSED_EMBEDDERS
 
 logger = logging.getLogger(__name__)
 
@@ -87,15 +87,15 @@ class OutputSpec:
 class _Unit:
     """One forward pass: an embedder bound to its input spec and output name(s)."""
 
-    embedder: Any  # Embedder, or SentenceTransformerHybridEmbedder for fused units
+    embedder: Any  # Embedder, or FusedEmbedder for fused units
     input_column: str | None
     modality: Modality
     max_length: int | None
     name: str | None = None  # plain unit: the entry name
     # multimodal unit: part modality -> column (input_column is None then)
     parts: dict[Modality, str] | None = None
-    dense_name: str | None = None  # fused unit: dense entry name
-    sparse_name: str | None = None  # fused unit: sparse entry name
+    # fused unit: output kind -> entry name (name is None then)
+    fused_names: dict[OutputKind, str] | None = None
     # pooling (multivector entries only): derived dense output
     pooled_name: str | None = None
     pooling_type: str | None = None
@@ -165,24 +165,22 @@ class EmbeddingEngine:
             if unit.max_length is not None:
                 values = [v[: unit.max_length] for v in values]
 
-            if unit.dense_name is not None:  # fused dense+sparse forward pass
-                if values:
-                    dense, sparse = await unit.embedder.embed(values)
-                else:
-                    dense, sparse = [], []
-                out[unit.dense_name] = _scatter(dense, mask)
-                out[unit.sparse_name] = _scatter(sparse, mask)
-                continue
+            if unit.fused_names is not None:  # one forward pass, several kinds
+                fused = await unit.embedder.embed(values) if values else {}
+                for kind, entry_name in unit.fused_names.items():
+                    out[entry_name] = _scatter(fused.get(kind, []), mask)
+                pooling_source = unit.fused_names.get(OutputKind.MULTIVECTOR)
+            else:
+                results = await unit.embedder.embed(values) if values else []
+                out[unit.name] = _scatter(results, mask)
+                pooling_source = unit.name
 
-            results = await unit.embedder.embed(values) if values else []
-            out[unit.name] = _scatter(results, mask)
-
-            if unit.pooled_name is not None:
+            if unit.pooled_name is not None and pooling_source is not None:
                 out[unit.pooled_name] = [
                     pool_multivector(mv, unit.pooling_type, unit.pooling_normalize)
                     if mv is not None
                     else None
-                    for mv in out[unit.name]
+                    for mv in out[pooling_source]
                 ]
         return out
 
@@ -235,15 +233,45 @@ def _cache_key(kind: OutputKind, type_: str, kwargs: dict) -> str:
     return f"{kind.value}/{type_}::{sorted(kwargs.items())!r}"
 
 
-def _can_fuse(dense: EmbedderEntry, sparse: EmbedderEntry) -> bool:
-    """Same ST model reading the same input → one forward pass for both."""
-    return (
-        dense.type == sparse.type == "sentence_transformer"
-        and dense.model is not None
-        and dense.model == sparse.model
-        and dense.input_column == sparse.input_column
-        and dense.max_length == sparse.max_length
-    )
+def _fusion_groups(
+    entries: list[EmbedderEntry],
+) -> list[tuple[type, list[EmbedderEntry]]]:
+    """Groups of entries that one fused forward pass can serve.
+
+    Entries group when everything that changes the embeddings is identical:
+    backend `type`, input column, truncation, and constructor kwargs.
+    `batch_size` is exempt — it's a pure throughput knob, so differing values
+    still fuse (on the min, warned about at instantiation). A group needs at
+    least two entries with pairwise-distinct kinds; duplicate kinds (e.g. two
+    dense entries on the same model) fall back to plain units.
+    """
+    candidates: dict[tuple, list[EmbedderEntry]] = {}
+    for e in entries:
+        if e.input_columns is not None:  # multimodal entries never fuse
+            continue
+        cls = FUSED_EMBEDDERS.get(e.type)
+        if cls is None:
+            continue
+        if e.kind not in cls.fusable_kinds or e.modality not in cls.supported_modalities:
+            continue
+        kwargs = e.backend_kwargs()
+        kwargs.pop("batch_size", None)
+        key = (e.type, e.input_column, e.max_length, repr(sorted(kwargs.items())))
+        candidates.setdefault(key, []).append(e)
+
+    groups: list[tuple[type, list[EmbedderEntry]]] = []
+    for group in candidates.values():
+        if len(group) < 2:
+            continue
+        kinds = [e.kind for e in group]
+        if len(set(kinds)) != len(kinds):
+            logger.info(
+                "Not fusing entries %s: duplicate output kinds on one model",
+                [e.name for e in group],
+            )
+            continue
+        groups.append((FUSED_EMBEDDERS.get(group[0].type), group))
+    return groups
 
 
 def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
@@ -263,60 +291,96 @@ def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
                 f"support modality {e.modality.value!r}. Supported: {supported}"
             )
 
-    # -- hybrid fusion: pair up dense+sparse entries on the same ST model ----
-    fused: list[tuple[EmbedderEntry, EmbedderEntry]] = []
-    taken: set[str] = set()
-    dense_entries = [e for e in entries if e.kind == OutputKind.DENSE]
-    sparse_entries = [e for e in entries if e.kind == OutputKind.SPARSE]
-    for d in dense_entries:
-        partner = next(
-            (s for s in sparse_entries if s.name not in taken and _can_fuse(d, s)),
-            None,
-        )
-        if partner is not None:
-            fused.append((d, partner))
-            taken.update((d.name, partner.name))
-
     units: list[_Unit] = []
     specs: list[OutputSpec] = []
-    instances: dict[str, Embedder] = {}
+    instances: dict[str, Any] = {}
+    taken: set[str] = set()
 
-    if fused:
-        from nova_embed.embedders.backends.sentence_transformer import (
-            SentenceTransformerHybridEmbedder,
+    # -- fusion: entry groups whose backend registered a FusedEmbedder -------
+    for cls, group in _fusion_groups(entries):
+        kinds = frozenset(e.kind for e in group)
+        kwargs = group[0].backend_kwargs()
+        kwargs.pop("batch_size", None)
+        batch_sizes = sorted(
+            {
+                e.backend_kwargs()["batch_size"]
+                for e in group
+                if "batch_size" in e.backend_kwargs()
+            }
         )
+        if batch_sizes:
+            if len(batch_sizes) > 1:
+                logger.warning(
+                    "Fused entries %s declare different batch_size values %s; "
+                    "one forward pass serves all of them — using the min, %s",
+                    [e.name for e in group],
+                    batch_sizes,
+                    batch_sizes[0],
+                )
+            kwargs["batch_size"] = batch_sizes[0]
 
-    for d, s in fused:
-        logger.info(
-            "Fusing dense %r + sparse %r into one forward pass (%s)",
-            d.name,
-            s.name,
-            d.model,
-        )
-        hybrid = SentenceTransformerHybridEmbedder(**d.backend_kwargs())
+        key = f"fused/{group[0].type}::{sorted(k.value for k in kinds)}::{sorted(kwargs.items())!r}"
+        embedder = instances.get(key)
+        if embedder is None:
+            logger.info(
+                "Fusing entries %s into one %r forward pass (%s)",
+                [e.name for e in group],
+                group[0].type,
+                group[0].model,
+            )
+            embedder = cls(kinds=kinds, **kwargs)
+            instances[key] = embedder
+        else:
+            logger.info(
+                "Fused entries %s share the already-loaded %r instance",
+                [e.name for e in group],
+                group[0].type,
+            )
+
+        # ≤1 pooled entry per group: only multivector entries may pool, and
+        # group kinds are pairwise distinct
+        mv_pooled = next((e for e in group if e.pooling is not None), None)
         units.append(
             _Unit(
-                embedder=hybrid,
-                input_column=d.input_column,
-                modality=d.modality,
-                max_length=d.max_length,
-                dense_name=d.name,
-                sparse_name=s.name,
+                embedder=embedder,
+                input_column=group[0].input_column,
+                modality=group[0].modality,
+                max_length=group[0].max_length,
+                fused_names={e.kind: e.name for e in group},
+                pooled_name=mv_pooled.pooled_column if mv_pooled else None,
+                pooling_type=mv_pooled.pooling.type if mv_pooled else None,
+                pooling_normalize=mv_pooled.pooling.normalize if mv_pooled else True,
             )
         )
-        for entry, kind in ((d, OutputKind.DENSE), (s, OutputKind.SPARSE)):
+        taken.update(e.name for e in group)
+        for e in group:
             specs.append(
                 OutputSpec(
-                    name=entry.name,
-                    column=entry.column,
-                    kind=kind,
-                    model_name=hybrid.model_name,
-                    dimensions=hybrid.dimensions if kind == OutputKind.DENSE else None,
-                    max_tokens=hybrid.max_tokens,
-                    input_column=entry.input_column,
-                    modality=entry.modality,
+                    name=e.name,
+                    column=e.column,
+                    kind=e.kind,
+                    model_name=embedder.model_name,
+                    dimensions=embedder.dimensions_for(e.kind),
+                    max_tokens=embedder.max_tokens,
+                    input_column=e.input_column,
+                    modality=e.modality,
+                    instruction=embedder.instruction,
                 )
             )
+            if e.pooled_column:
+                specs.append(
+                    OutputSpec(
+                        name=e.pooled_column,
+                        column=e.pooled_column,
+                        kind=OutputKind.DENSE,
+                        model_name=f"{embedder.model_name} ({e.pooling.type}-pooled)",
+                        dimensions=embedder.dimensions_for(e.kind),
+                        max_tokens=embedder.max_tokens,
+                        input_column=e.input_column,
+                        modality=e.modality,
+                        instruction=embedder.instruction,
+                    )
+                )
 
     # -- plain units, sharing instances when the backend config matches ------
     for e in entries:

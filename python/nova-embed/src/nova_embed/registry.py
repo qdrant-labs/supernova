@@ -143,6 +143,50 @@ class EmbedderRegistry:
         return sorted(n for k, n in self._classes if k == str(kind))
 
 
+class FusedEmbedderRegistry:
+    """Fused (multi-kind) embedder classes, keyed on the config `type` name.
+
+    Parallel to EMBEDDERS: a backend whose model produces several output kinds
+    in one forward pass registers its fused class here under the SAME `type`
+    name as its plain per-kind classes. Configs never name a fused class —
+    ``build_engine`` consults this registry to collapse matching entry groups
+    into one forward pass, and falls back to the plain classes otherwise.
+    """
+
+    def __init__(self):
+        self._classes: dict[str, type] = {}
+
+    def register(self, *names: str):
+        if not names:
+            raise ValueError("register() needs at least one name")
+
+        def decorate(cls):
+            kinds = getattr(cls, "fusable_kinds", None)
+            if not kinds or len(kinds) < 2:
+                raise ValueError(
+                    f"{cls.__name__} must declare `fusable_kinds` with at least "
+                    f"two kinds to register as a fused embedder"
+                )
+            for name in names:
+                existing = self._classes.get(name)
+                if existing is not None and existing is not cls:
+                    raise ValueError(
+                        f"fused embedder name {name!r} is already registered to "
+                        f"{existing.__name__}"
+                    )
+                self._classes[name] = cls
+            return cls
+
+        return decorate
+
+    def get(self, name: str) -> type | None:
+        """The fused class for a `type` name, or None — fusion is best-effort."""
+        return self._classes.get(name)
+
+    def names(self) -> list[str]:
+        return sorted(self._classes)
+
+
 if TYPE_CHECKING:
     from nova_embed.chunkers.base import Chunker
     from nova_embed.sources.base import DatasetSource
@@ -151,6 +195,7 @@ if TYPE_CHECKING:
 # The registries. One per pluggable component kind.
 SOURCES: "Registry[DatasetSource]" = Registry("source")
 EMBEDDERS = EmbedderRegistry()
+FUSED_EMBEDDERS = FusedEmbedderRegistry()
 # Chunkers select on `strategy:` and default to the no-op passthrough.
 CHUNKERS: "Registry[Chunker]" = Registry("chunker", key="strategy", default="passthrough")
 # Storage defaults to s3 when `type:` is omitted (matches prior behaviour).

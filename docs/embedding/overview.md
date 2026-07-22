@@ -44,7 +44,7 @@ storage:
 
 Unknown entry keys (`batch_size`, `dtype`, `device`, …) pass through to the backend constructor. See [Dense Embedders](dense-embedders.md) and [Sparse Embedders](sparse-embedders.md) for the available backends.
 
-Two automatic optimizations: a dense + sparse entry pair pointing at the same `sentence_transformer` model and input column is fused into a single forward pass, and entries sharing an identical backend config share one loaded model instance.
+Two automatic optimizations: entries pointing at the same model and input column are **fused into a single forward pass** when the model natively produces several output kinds (e.g. `bge_m3` — declare dense, sparse, and multivector entries on `BAAI/bge-m3` and it loads once and runs one forward pass for all three), and entries sharing an identical backend config share one loaded model instance. Fusion requires matching backend settings across the entries; `batch_size` is the exception — differing values fuse on the smallest, with a warning.
 
 ### Column naming
 

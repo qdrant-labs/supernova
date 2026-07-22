@@ -1,7 +1,12 @@
 """
-sentence-transformers backends: dense (text + image), sparse, and the
-internal hybrid class used when the engine fuses a dense + sparse pair that
-point at the same model.
+sentence-transformers backends: dense (text + image) and sparse.
+
+No fused backend here, deliberately: sentence-transformers splits dense and
+sparse into separate classes (SentenceTransformer / SparseEncoder) with no
+shared-backbone API, so a "fused" implementation would still load two models
+and run two forward passes — module surgery on ST internals to actually share
+the transformer is too version-fragile to be worth it. Models that natively
+multi-head (e.g. bge-m3) get real fusion via their own backend.
 """
 
 import asyncio
@@ -145,6 +150,9 @@ class SentenceTransformerSparseEmbedder(Embedder):
         self._model_name = model
         self._batch_size = batch_size
         self._max_tokens = self._model.max_seq_length
+        # serialize concurrent pipeline workers — same contract as the dense
+        # embedder's lock; a torch forward pass is not thread-safe
+        self._encode_lock = threading.Lock()
 
     @property
     def model_name(self) -> str:
@@ -155,89 +163,13 @@ class SentenceTransformerSparseEmbedder(Embedder):
         return self._max_tokens
 
     def _encode(self, texts: list[str]) -> list[SparseEmbedding]:
-        results = self._model.encode(
-            texts,
-            batch_size=self._batch_size,
-            show_progress_bar=False,
-        )
+        with self._encode_lock:
+            results = self._model.encode(
+                texts,
+                batch_size=self._batch_size,
+                show_progress_bar=False,
+            )
         return _sparse_rows_to_embeddings(results)
 
     async def embed(self, texts: list[str]) -> list[SparseEmbedding]:
-        return await asyncio.to_thread(self._encode, texts)
-
-
-class SentenceTransformerHybridEmbedder:
-    """
-    Single model that produces both dense and sparse embeddings in one forward pass.
-
-    Internal, never exposed in config: the EmbeddingEngine creates it when a
-    dense entry and a sparse entry point at the same sentence_transformer model
-    AND the same input column. When the underlying model supports both (e.g.
-    gte-multilingual-base), the SparseEncoder shares the transformer backbone,
-    avoiding redundant computation.
-    """
-
-    def __init__(
-        self,
-        model: str = "Alibaba-NLP/gte-multilingual-base",
-        batch_size: int = 32,
-        device: str | None = None,
-        dtype: str = "float32",
-        trust_remote_code: bool = False,
-    ):
-        self._device = device or detect_device()
-        torch_dtype = DTYPE_MAP.get(dtype, torch.float32)
-        logger.info(
-            "Loading hybrid encoder %s on %s (dtype=%s)", model, self._device, dtype
-        )
-
-        self._dense_model = SentenceTransformer(
-            model,
-            device=self._device,
-            trust_remote_code=trust_remote_code,
-            model_kwargs={"dtype": torch_dtype},
-        )
-        self._sparse_model = SparseEncoder(
-            model,
-            device=self._device,
-            trust_remote_code=trust_remote_code,
-        )
-
-        self._model_name = model
-        self._batch_size = batch_size
-        self._dimensions_val = self._dense_model.get_sentence_embedding_dimension()
-        self._max_tokens = self._dense_model.max_seq_length
-
-    @property
-    def model_name(self) -> str:
-        return self._model_name
-
-    @property
-    def dimensions(self) -> int | None:
-        return self._dimensions_val
-
-    @property
-    def max_tokens(self) -> int:
-        return self._max_tokens
-
-    def _encode(
-        self, texts: list[str]
-    ) -> tuple[list[list[float]], list[SparseEmbedding]]:
-        dense_np = self._dense_model.encode(
-            texts,
-            batch_size=self._batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-        sparse_raw = self._sparse_model.encode(
-            texts,
-            batch_size=self._batch_size,
-            show_progress_bar=False,
-        )
-        # float32 ndarray rows, not .tolist() — see the dense embedder note
-        return list(dense_np), _sparse_rows_to_embeddings(sparse_raw)
-
-    async def embed(
-        self, texts: list[str]
-    ) -> tuple[list[list[float]], list[SparseEmbedding]]:
         return await asyncio.to_thread(self._encode, texts)

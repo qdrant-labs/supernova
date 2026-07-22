@@ -103,7 +103,9 @@ class VLLMEmbedder(Embedder):
         return self._instruction
 
     def _templated_input(self, text: Any, image: Any) -> dict:
-        """One chat-templated vLLM input: prompt text + optional image data."""
+        """
+        One chat-templated vLLM input: prompt text + optional image data.
+        """
         content: list[dict] = []
         if image is not None:
             content.append({"type": "image", "image": image})
