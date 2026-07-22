@@ -20,6 +20,10 @@ use crate::errors::TargetError;
 use crate::queries::QueryVector;
 
 pub mod qdrant;
+#[cfg(feature = "elastic")]
+pub mod elastic;
+#[cfg(feature = "milvus")]
+pub mod milvus;
 
 /// Outcome of a single batch dispatch (one `query_batch` round-trip, covering
 /// `vectors.len()` queries). A failure is recorded here (`ok = false`) rather
@@ -61,19 +65,34 @@ pub trait QueryTarget: Send + Sync + std::fmt::Display {
 }
 
 /// Target backend config, dispatched on `type:`. Each backend owns its config
-/// struct in its own module.
+/// struct in its own module; the elastic/milvus variants are gated on the same
+/// cargo feature that pulls their SDK in (off by default).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TargetConfig {
     Qdrant(qdrant::QdrantConfig),
+    #[cfg(feature = "elastic")]
+    Elastic(elastic::ElasticConfig),
+    #[cfg(feature = "milvus")]
+    Milvus(milvus::MilvusConfig),
 }
 
 impl TargetConfig {
-    /// Connect and build the shared target. `query` carries the vector name and
-    /// top-k the backend bakes in.
-    pub fn into_target(self, query: &QueryConfig) -> Result<Arc<dyn QueryTarget>, TargetError> {
+    /// Connect and build the shared target. `query` carries the vector name,
+    /// top-k, payload/filter/search-param knobs the backend bakes in. Async
+    /// because some backends do connect-time work (e.g. Milvus loads the
+    /// collection into memory and detects its metric before firing).
+    pub async fn into_target(
+        self,
+        query: &QueryConfig,
+    ) -> Result<Arc<dyn QueryTarget>, TargetError> {
         match self {
+            // Qdrant's build is synchronous (lazy client); no await needed.
             TargetConfig::Qdrant(c) => Ok(Arc::new(c.into_target(query)?)),
+            #[cfg(feature = "elastic")]
+            TargetConfig::Elastic(c) => Ok(Arc::new(c.into_target(query).await?)),
+            #[cfg(feature = "milvus")]
+            TargetConfig::Milvus(c) => Ok(Arc::new(c.into_target(query).await?)),
         }
     }
 }

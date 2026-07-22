@@ -75,7 +75,7 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         );
     }
 
-    let target = target.into_target(&query)?;
+    let target = target.into_target(&query).await?;
 
     let mode = if load.target_rps > 0.0 {
         format!(

@@ -2043,8 +2043,11 @@ dependencies = [
  "async-trait",
  "clap",
  "duckdb",
+ "elasticsearch",
  "indicatif",
+ "milvus-sdk-rust",
  "qdrant-client",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2053,6 +2056,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

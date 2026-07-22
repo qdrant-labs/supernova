@@ -15,10 +15,42 @@ use qdrant_client::qdrant::Filter as QdrantFilter;
 use serde::Deserialize;
 
 use super::{BatchOutcome, QueryTarget};
-use crate::config::{QuantizationSearchParamsConfig, QueryConfig, SearchParamsConfig};
+use crate::config::QueryConfig;
 use crate::errors::TargetError;
 use crate::filter::{Filter, FilterCondition, FilterFieldValue, MatchSpec, MatchValue, RangeCondition, RangeFromQuery};
 use crate::queries::QueryVector;
+
+/// Qdrant's server-side search-time tuning (`query.search_params` for a
+/// `qdrant` target). All fields optional; the server applies its own defaults
+/// for any left unset. `deny_unknown_fields` rejects a key that isn't a Qdrant
+/// search param — so a Milvus/Elastic knob under a `qdrant` target is caught.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchParamsConfig {
+    /// HNSW beam-search width at query time. Higher = more accurate, slower.
+    #[serde(default)]
+    pub hnsw_ef: Option<u64>,
+    /// Search without approximation (brute-force exact search for this query).
+    #[serde(default)]
+    pub exact: Option<bool>,
+    #[serde(default)]
+    pub quantization: Option<QuantizationSearchParamsConfig>,
+}
+
+/// Quantization behavior at query time.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuantizationSearchParamsConfig {
+    /// Skip the quantized index entirely for this query.
+    #[serde(default)]
+    pub ignore: Option<bool>,
+    /// Re-score quantized top-k candidates against the original vectors.
+    #[serde(default)]
+    pub rescore: Option<bool>,
+    /// Extra candidates to preselect via the quantized index before rescoring.
+    #[serde(default)]
+    pub oversampling: Option<f64>,
+}
 
 /// Fires nearest-neighbour queries at a Qdrant collection over gRPC.
 pub struct QdrantTarget {
@@ -96,6 +128,15 @@ impl QdrantConfig {
         }
         let client = builder.build()?;
 
+        // Parse the raw, backend-specific `search_params` into Qdrant's schema;
+        // `deny_unknown_fields` rejects a param that isn't Qdrant's here.
+        let search_params: Option<SearchParamsConfig> = query
+            .search_params
+            .as_ref()
+            .map(|v| serde_yaml::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| TargetError::Other(format!("qdrant search_params: {e}")))?;
+
         let (static_filter, per_query_filter) = match &query.filter {
             None => (None, None),
             Some(f) => {
@@ -128,7 +169,7 @@ impl QdrantConfig {
             collection_name: self.collection_name,
             vector_name: query.vector_name.clone(),
             top_k: query.top_k,
-            search_params: query.search_params.as_ref().map(SearchParams::from),
+            search_params: search_params.as_ref().map(SearchParams::from),
             collect_ids: query.source.ground_truth_column.is_some(),
             with_payload: query.with_payload,
             static_filter,
@@ -199,17 +240,18 @@ fn validate_static_conditions(filter: &Filter) -> Result<(), TargetError> {
 }
 
 /// Look up a `_from_query` column's resolved value for the current query.
-/// Guaranteed present by construction: `queries::load_query_vectors` projects
-/// exactly the columns `Filter::query_fields` names (erroring at load time on
-/// a NULL), so a missing key here would mean that guarantee and this lookup
-/// drifted apart — a logic bug, not a reachable runtime state.
+/// Present by construction: `queries::load_query_vectors` projects exactly the
+/// columns `Filter::query_fields` names (erroring at load time on NULL). A
+/// missing key would mean that invariant broke (e.g. a hand-built config via the
+/// public API) — return an `Err` (a failed batch) rather than panic a worker
+/// mid-storm ("errors at the limit are a finding, not a crash").
 fn resolve_query_value<'a>(
     query_values: &'a HashMap<String, FilterFieldValue>,
     col: &str,
-) -> &'a FilterFieldValue {
-    query_values
-        .get(col)
-        .unwrap_or_else(|| panic!("filter column `{col}` missing from query's resolved filter_values"))
+) -> Result<&'a FilterFieldValue, TargetError> {
+    query_values.get(col).ok_or_else(|| {
+        TargetError::Other(format!("filter column `{col}` missing from the query's filter_values"))
+    })
 }
 
 /// Translate one [`FilterCondition`] into a Qdrant [`Condition`]. Exactly one
@@ -229,20 +271,22 @@ fn to_qdrant_condition(
         return Ok(Condition::matches_text(&cond.field, text.clone()));
     }
 
-    // Everything below is a `_from_query` variant — `query_values` is
-    // guaranteed `Some` here by construction (`QdrantTarget::effective_filter`
-    // only calls this with `None` for a filter that has no per-query
-    // condition at all).
-    let query_values = query_values.expect("per-query filter translation requires resolved query_values");
+    // Everything below is a `_from_query` variant — `query_values` is `Some`
+    // here by construction (`QdrantTarget::effective_filter` only passes `None`
+    // for a filter with no per-query condition). Return an `Err` rather than
+    // panic if that invariant is ever violated (e.g. a hand-built config).
+    let query_values = query_values.ok_or_else(|| {
+        TargetError::Other("per-query filter translation requires resolved query_values".to_string())
+    })?;
 
     if let Some(col) = &cond.match_from_query {
-        return to_qdrant_match_from_value(&cond.field, resolve_query_value(query_values, col));
+        return to_qdrant_match_from_value(&cond.field, resolve_query_value(query_values, col)?);
     }
     if let Some(range) = &cond.range_from_query {
         return to_qdrant_range_from_query(&cond.field, range, query_values);
     }
     if let Some(col) = &cond.match_text_from_query {
-        return match resolve_query_value(query_values, col) {
+        return match resolve_query_value(query_values, col)? {
             FilterFieldValue::Text(s) if !s.trim().is_empty() => {
                 Ok(Condition::matches_text(&cond.field, s.clone()))
             }
@@ -343,9 +387,22 @@ fn to_qdrant_range_from_query(
 ) -> Result<Condition, TargetError> {
     let bound = |col: &Option<String>| -> Result<Option<f64>, TargetError> {
         let Some(name) = col else { return Ok(None) };
-        match resolve_query_value(query_values, name) {
+        match resolve_query_value(query_values, name)? {
             FilterFieldValue::Num(n) => Ok(Some(*n)),
-            FilterFieldValue::Int(i) => Ok(Some(*i as f64)),
+            // Qdrant range bounds are f64; reject an integer that can't round-trip
+            // exactly (|i| > 2^53) rather than silently shifting the bound.
+            FilterFieldValue::Int(i) => {
+                let f = *i as f64;
+                // `f as i64` saturates, so guard the top-of-range rounding case
+                // (i64::MAX → 2^63) explicitly before the round-trip check.
+                if f >= TWO_POW_63 || f as i64 != *i {
+                    return Err(TargetError::Other(format!(
+                        "filter condition on `{field}`: `range_from_query` column `{name}` value `{i}` \
+                         can't be represented exactly as an f64 range bound"
+                    )));
+                }
+                Ok(Some(f))
+            }
             _ => Err(TargetError::Other(format!(
                 "filter condition on `{field}`: `range_from_query` column `{name}` must be numeric"
             ))),
@@ -357,8 +414,19 @@ fn to_qdrant_range_from_query(
     ))
 }
 
+/// 2^63 = i64::MAX+1 — the first f64 above the i64 range (i64::MAX itself isn't
+/// exactly representable as f64; i64::MIN = -2^63 IS). Used to reject f64 values
+/// that would *saturate* on an `as i64` cast rather than convert faithfully.
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// A whole-valued, in-range `f64` as `i64`. Rejects non-finite, non-whole, and
+/// out-of-range values — a plain `n as i64` SATURATES (e.g. `1e30 → i64::MAX`),
+/// which would silently submit the wrong id to a `match`.
 fn integer_value(n: f64) -> Option<i64> {
-    (n.fract() == 0.0).then_some(n as i64)
+    if !n.is_finite() || n.fract() != 0.0 || n < i64::MIN as f64 || n >= TWO_POW_63 {
+        return None;
+    }
+    Some(n as i64)
 }
 
 fn non_integer_from_query_error(field: &str, value: f64) -> TargetError {
@@ -377,6 +445,9 @@ impl QueryTarget for QdrantTarget {
         // RPC-level `Err` further down — instead of a fake `0` that would
         // skew this dispatch's contribution to the run's latency percentiles.
         let started = Instant::now();
+        if queries.is_empty() {
+            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+        }
         let query_points: Vec<_> = match queries
             .iter()
             .map(|q| {
@@ -430,19 +501,38 @@ impl QueryTarget for QdrantTarget {
                     queries.len()
                 )),
             },
-            Ok(resp) => BatchOutcome {
-                latency: started.elapsed(),
-                ok: true,
-                ids: resp
-                    .result
-                    .into_iter()
-                    .map(|batch_result| {
-                        self.collect_ids
-                            .then(|| batch_result.result.iter().filter_map(point_id_string).collect())
-                    })
-                    .collect(),
-                error: None,
-            },
+            Ok(resp) => {
+                if !self.collect_ids {
+                    return BatchOutcome {
+                        latency: started.elapsed(),
+                        ok: true,
+                        ids: vec![None; resp.result.len()],
+                        error: None,
+                    };
+                }
+                let mut ids = Vec::with_capacity(resp.result.len());
+                for batch_result in &resp.result {
+                    // A scored point without a usable id is an unexpected
+                    // response — fail rather than silently drop it and understate
+                    // recall (consistent with the milvus/elastic targets).
+                    let mut query_ids = Vec::with_capacity(batch_result.result.len());
+                    for point in &batch_result.result {
+                        let Some(id) = point_id_string(point) else {
+                            return BatchOutcome {
+                                latency: started.elapsed(),
+                                ok: false,
+                                ids: vec![None; queries.len()],
+                                error: Some(
+                                    "qdrant returned a scored point without a valid id".to_string(),
+                                ),
+                            };
+                        };
+                        query_ids.push(id);
+                    }
+                    ids.push(Some(query_ids));
+                }
+                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+            }
             Err(e) => BatchOutcome {
                 latency: started.elapsed(),
                 ok: false,
@@ -502,12 +592,12 @@ mod tests {
         assert_eq!(point_id_string(&scored(None)), None);
     }
 
-    #[test]
-    fn builds_target() {
+    #[tokio::test]
+    async fn builds_target() {
         // `from_url(...).build()` is lazy (no connection yet), so this succeeds
         // offline and exercises the construction path.
         let cfg = cfg();
-        let target = cfg.target.into_target(&cfg.query).expect("builds");
+        let target = cfg.target.into_target(&cfg.query).await.expect("builds");
         assert_eq!(target.to_string(), "qdrant(c)");
     }
 
@@ -535,9 +625,14 @@ mod tests {
     }
 
     fn qdrant_config(target: crate::targets::TargetConfig) -> QdrantConfig {
-        match target {
-            crate::targets::TargetConfig::Qdrant(c) => c,
-        }
+        // `let ... else` so this stays exhaustive whether or not the optional
+        // `elastic`/`milvus` variants are compiled in.
+        #[allow(irrefutable_let_patterns)]
+        let crate::targets::TargetConfig::Qdrant(c) = target
+        else {
+            panic!("expected a qdrant target config");
+        };
+        c
     }
 
     #[test]
