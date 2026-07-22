@@ -38,5 +38,15 @@ indicatif = { workspace = true }
 qdrant-client = { workspace = true }
 duckdb = { workspace = true }
 
+# Optional load backends — off by default, enabled with `--features elastic,milvus`.
+elasticsearch = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+milvus = { workspace = true, optional = true }
+
+[features]
+default = []
+elastic = ["dep:elasticsearch", "dep:url"]
+milvus = ["dep:milvus"]
+
 [dev-dependencies]
 rstest = "0.26.1"
