@@ -1,0 +1,24 @@
+[package]
+# `nova contract` — a generic, language-neutral conformance checker. Runs a
+# backend executable's `capabilities --json` and validates it against a shared
+# contract spec (contracts/<command>/vN.yaml). This is the cross-language half
+# of the two-layer contract model: the native trait gives compile-time checking
+# within one language; this gives runtime conformance across any language.
+name = "nova-contract"
+version = "0.0.8"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+[[bin]]
+name = "nova-contract"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+clap = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+# Shared front-controller logic for the `nova-*` command shims. NOT itself a
+# command — a library the shim crates (commands/nova-load, commands/nova-storm)
+# depend on so their dispatch behavior (config-type lookup, backend resolution,
+# exec semantics, argv passthrough) is defined once and can't drift between them.
+name = "nova-shim"
+version = "0.0.8"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+[lib]
+name = "nova_shim"
+path = "src/lib.rs"
+
+[dependencies]
+serde_yaml = { workspace = true }

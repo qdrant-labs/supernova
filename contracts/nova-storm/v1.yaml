@@ -1,0 +1,76 @@
+# Language-neutral contract for `nova storm` backends — v1.
+#
+# This is the CANONICAL, cross-language contract. Every `nova-storm-<backend>`
+# executable must satisfy it, whatever language it's written in. Conformance is
+# checked at runtime by `nova contract check <backend-exe> --contract this-file`,
+# which reads the backend's `capabilities --json` and validates it below.
+#
+# Rust backends additionally get compile-time enforcement by implementing the
+# `QueryTarget` trait in `backends/nova-storm/contracts/rust`. Keep this file,
+# that trait, and each backend's advertised `capabilities` in lockstep.
+
+id: nova-storm-backend
+version: 1
+# The exact `contract` string a conforming backend must advertise.
+contract: nova-storm-backend/v1
+description: >
+  Sustained query-load generator: fire nearest-neighbour queries at a vector
+  store under a configured load shape and report latency percentiles (and recall
+  when ground truth is provided).
+
+# CLI surface the executable must expose (checked against `commands` in
+# `capabilities --json`). `run` is the default positional-config invocation
+# (`nova-storm-<backend> <config> [--json]`); `capabilities` prints this
+# descriptor.
+required_commands:
+  - run
+  - capabilities
+
+# Backend method names — the internal target abstraction every backend
+# implements. Matches the Rust `QueryTarget` trait in
+# backends/nova-storm/contracts/rust and the `methods` array in capabilities.
+required_methods:
+  - query_batch    # fire one batch dispatch (all vectors, one round-trip)
+  - close          # tear down connections
+
+# Load-generation modes the runner supports (matches `search_modes`).
+required_search_modes:
+  - closed_loop    # fixed concurrency, loop until deadline
+  - open_loop      # paced virtual schedule + semaphore ceiling
+
+# Capabilities the backend must report supporting.
+required_features:
+  - recall         # compare returned ids to ground truth when provided
+  - percentiles    # latency percentiles from raw samples
+
+# `nova contract check --level live` runs the storm itself against a live target.
+# `{config}` is replaced by the `--config` path; keep its `load.duration_s`
+# short. This is a real load run, so point it at a throwaway collection.
+live_check:
+  args: ["{config}"]
+
+# ---------------------------------------------------------------------------
+# Shared behavior notes (prose; not machine-checked, but part of the contract).
+# ---------------------------------------------------------------------------
+behavior_notes: |
+  Config env expansion: same as nova-load — `${VAR}`, `${VAR:-default}`, `$$`.
+
+  Load modes: CLOSED-LOOP runs a fixed number of concurrent workers looping
+  until a deadline. OPEN-LOOP paces dispatches on a virtual schedule with a
+  semaphore ceiling, deliberately avoiding coordinated omission (a slow server
+  must not slow the offered rate). A backend's timing must not conflate these.
+
+  Failed dispatch = data, not abort: a query batch that errors is recorded as a
+  BatchOutcome{ok:false} sample, NOT a hard error that stops the run. A storm
+  measures behavior under load, so errors at the limit are a finding.
+
+  Percentiles: computed ONCE, nearest-rank, from the raw per-dispatch samples —
+  never averaged per-worker. This is required for correct fleet-wide aggregation
+  when many workers' samples are merged.
+
+  Replicated work: every fleet worker runs the SAME query mix (contrast with
+  nova-load's stride partitioning). Storm replicates; it does not partition.
+
+  Recall / ground truth: when the query source declares a ground-truth column,
+  recall is hits/top_k per query, aggregated (mean/median/min) across queries.
+  With no ground truth, recall fields are absent — never reported as 0.0.

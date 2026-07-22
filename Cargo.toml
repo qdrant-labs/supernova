@@ -1,9 +1,22 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/nova-storm",
-    "crates/nova-load",
-    "crates/nova-inspect",
+    # Per-language shared interfaces: the Rust contract each Rust backend
+    # implements (compile-time enforcement within Rust).
+    "backends/nova-load/contracts/rust",
+    "backends/nova-storm/contracts/rust",
+    # Backend implementations (execute the real work behind a command contract).
+    "backends/nova-storm/qdrant",
+    "backends/nova-load/qdrant",
+    # User-facing commands: thin shims that dispatch to a backend, plus the
+    # generic contract checker. `nova-shim` is the shared shim library (not a
+    # command) that nova-load/nova-storm both build on.
+    "commands/nova-shim",
+    "commands/nova-load",
+    "commands/nova-storm",
+    "commands/nova-contract",
+    # Standalone dev tool, not backend-dispatched.
+    "commands/nova-inspect",
 ]
 version = "0.0.8"
 

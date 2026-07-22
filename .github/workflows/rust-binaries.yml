@@ -46,13 +46,19 @@ jobs:
       - name: Build deps
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake
 
+      # Each user-facing command is now a thin shim (`nova-load`, `nova-storm`)
+      # plus a backend executable (`nova-load-qdrant`, `nova-storm-qdrant`); a
+      # worker needs BOTH. `nova-dist` downloads each of these release assets.
       - name: Build (release)
-        run: cargo build --release -p nova-load -p nova-storm
+        run: >
+          cargo build --release
+          -p nova-load -p nova-load-qdrant
+          -p nova-storm -p nova-storm-qdrant
 
       - name: Stage assets as <bin>-<target>
         run: |
           mkdir -p dist
-          for bin in nova-load nova-storm; do
+          for bin in nova-load nova-load-qdrant nova-storm nova-storm-qdrant; do
             cp "target/release/$bin" "dist/$bin-${{ matrix.target }}"
           done
 

@@ -1,0 +1,24 @@
+[package]
+# The user-facing `nova storm` command. Thin front controller: reads only
+# `target.type` from the config, then `exec`s the matching backend executable
+# (`nova-storm-<type>`, e.g. `nova-storm-qdrant`) with the original args
+# unchanged. The real work lives in backends/nova-storm/*.
+name = "nova-storm"
+version = "0.0.8"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+[[bin]]
+name = "nova-storm"
+path = "src/main.rs"
+
+# `cargo binstall nova-storm` fetches the prebuilt shim from each `v*` release
+# (see .github/workflows/rust-binaries.yml). Matches the asset naming there.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+
+[dependencies]
+# Shared shim front-controller logic (config-type dispatch + exec). See
+# commands/nova-shim; keeps this shim identical to the nova-load shim.
+nova-shim = { path = "../nova-shim" }

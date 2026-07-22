@@ -92,12 +92,20 @@ pool/job YAMLs without launching. Templates live in `configs/skypilot/`.
 supernova/
 ├── pyproject.toml          # the `nova` dispatcher (src/cli/)
 ├── src/cli/                # git-style dispatch: nova <cmd> -> nova-<cmd>
-├── crates/                 # Rust tools
-│   ├── nova-load/          #   nova load
-│   └── nova-storm/         #   nova storm
-├── python/
-│   ├── nova-embed/         # nova embed (ML pipeline; [embed] extra)
-│   └── nova-dist/          # nova dist  (SkyPilot orchestration)
+├── commands/               # ALL user-facing nova-* commands (any language)
+│   ├── nova-load/          #   nova load  (Rust shim → dispatches on vectorstore.type)
+│   ├── nova-storm/         #   nova storm (Rust shim → dispatches on target.type)
+│   ├── nova-contract/      #   nova contract (Rust backend conformance checker)
+│   ├── nova-inspect/       #   nova inspect (Rust dev tool)
+│   ├── nova-embed/         #   nova embed (Python ML pipeline; [embed] extra)
+│   ├── nova-bf/            #   nova bf    (Python brute-force ground truth)
+│   ├── nova-opt/           #   nova opt   (Python tuner; WIP, tracked on another branch)
+│   ├── nova-sweep/         #   nova sweep (Python sweep orchestrator)
+│   └── nova-dist/          #   nova dist  (Python SkyPilot orchestration)
+├── backends/               # backend implementations behind command contracts
+│   ├── nova-load/{contracts/rust, qdrant}    #   → nova-load-qdrant
+│   └── nova-storm/{contracts/rust, qdrant}   #   → nova-storm-qdrant
+├── contracts/              # language-neutral contract specs (nova-load, nova-storm)
 ├── configs/                # example YAML configs (+ skypilot/ resource templates)
 ├── docs/                   # zensical docs site
 └── Makefile

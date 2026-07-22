@@ -1,0 +1,18 @@
+[package]
+# Shared Rust interface for `nova storm` backends. Any Rust target backend
+# depends on this crate and implements its `QueryTarget` trait, so the compiler
+# enforces the contract at build time within Rust. The language-neutral
+# `contracts/nova-storm/v1.yaml` is canonical across languages; this crate is
+# its Rust embodiment and must be kept in lockstep with it.
+name = "nova-storm-contract-rust"
+version = "0.0.8"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+[lib]
+name = "nova_storm_contract_rust"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }

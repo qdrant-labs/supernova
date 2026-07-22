@@ -1,0 +1,100 @@
+# Language-neutral contract for `nova load` backends — v1.
+#
+# This is the CANONICAL, cross-language contract. Every `nova-load-<backend>`
+# executable must satisfy it, whatever language it's written in. Conformance is
+# checked at runtime by `nova contract check <backend-exe> --contract this-file`,
+# which reads the backend's `capabilities --json` and validates it below.
+#
+# Rust backends additionally get compile-time enforcement by implementing the
+# `VectorStore` trait in `backends/nova-load/contracts/rust`. Keep this file,
+# that trait, and each backend's advertised `capabilities` in lockstep.
+
+id: nova-load-backend
+version: 1
+# The exact `contract` string a conforming backend must advertise.
+contract: nova-load-backend/v1
+description: >
+  Bulk-load pre-embedded vectors from a datasource (parquet on local disk or
+  S3) into a vector store, with a distributed prepare/load/finalize phase model.
+
+# CLI subcommands the executable must expose (checked against the `commands`
+# array in `capabilities --json`).
+required_commands:
+  - capabilities   # print this descriptor as JSON
+  - run            # single-node: prepare + load-all + finalize
+  - prepare        # master: create collection, defer indexing
+  - load           # worker: load this rank's partition
+  - finalize       # master: re-enable indexing and wait
+  - inspect        # dry-run: config + file list, no connect
+  - reindex        # patch index settings in place on an existing collection
+  - delete         # delete the collection if it exists
+
+# Flags each listed subcommand must accept (checked against `flags` in
+# `capabilities --json`). These are the distributed-work contract.
+required_flags:
+  load:
+    - --num-jobs
+    - --job-rank
+  inspect:
+    - --num-jobs
+    - --job-rank
+
+# Backend method names — the internal store abstraction every backend
+# implements. Matches the Rust `VectorStore` trait in
+# backends/nova-load/contracts/rust and the `methods` array in capabilities.
+required_methods:
+  - ensure_collection    # create/verify the collection from a neutral schema
+  - upsert_batch         # upsert a batch of points
+  - close                # tear down connections
+  - defer_indexing       # disable indexing for fast bulk load
+  - enable_indexing      # re-enable indexing after load
+  - wait_for_indexing    # block until indexing converges
+  - reindex              # patch index settings in place
+  - delete_collection    # delete the collection if present
+
+# Vector shapes a backend must be able to accept (matches `VectorValue`).
+required_vector_kinds:
+  - dense
+  - sparse
+  - multivector
+
+# Point id shapes the reader can produce and the backend must accept
+# (matches `PointId`).
+required_point_id_types:
+  - integer
+  - string
+
+# `nova contract check --level live` runs this against a real backend. `{config}`
+# is replaced by the `--config` path. `inspect` connects to nothing and mutates
+# nothing, so it's a safe live-ish smoke check that config + source resolve.
+live_check:
+  args: ["inspect", "{config}"]
+
+# ---------------------------------------------------------------------------
+# Shared behavior notes (prose; not machine-checked, but part of the contract).
+# ---------------------------------------------------------------------------
+behavior_notes: |
+  Config env expansion: raw YAML is expanded before parsing. `${VAR}` requires
+  the variable; `${VAR:-default}` supplies a fallback; `$$` is a literal `$`.
+
+  Distributed partitioning: `load`/`inspect` split the file list by STRIDE, not
+  by chunking — `files.skip(job_rank).step_by(num_jobs)`. This interleaves
+  large/small files across workers with zero coordination and MUST be preserved
+  by every backend for fleet-wide balance and completeness.
+
+  Phase model: `prepare` (master creates the collection and defers indexing) →
+  `load` (each worker loads its stride) → `finalize` (master re-enables indexing
+  and waits for convergence). `run` is the single-node all-in-one. Workers never
+  coordinate with each other; the split is what makes that safe.
+
+  Point ids: integer or string. A backend must accept both shapes; how it maps
+  them onto its own id space is backend-specific.
+
+  Vectors: dense, sparse (indices+values), and multivector, per the collection's
+  declared `vectors:` specs.
+
+  Failure semantics: a file that fails to download/read is skipped after its
+  retries, up to `max_failed_files` (unbounded by default); exceeding the cap
+  aborts. A failed *upsert*, by contrast, aborts the run after its retries — a
+  persistent upsert failure means the store is down/misconfigured, not a bad
+  file. These two philosophies are deliberately different.

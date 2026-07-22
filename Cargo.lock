@@ -1633,6 +1633,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nova-contract"
+version = "0.0.8"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "nova-inspect"
 version = "0.0.8"
 dependencies = [
@@ -1644,11 +1654,29 @@ dependencies = [
 name = "nova-load"
 version = "0.0.8"
 dependencies = [
+ "nova-shim",
+]
+
+[[package]]
+name = "nova-load-contract-rust"
+version = "0.0.8"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nova-load-qdrant"
+version = "0.0.8"
+dependencies = [
  "async-trait",
  "clap",
  "duckdb",
  "futures",
  "indicatif",
+ "nova-load-contract-rust",
  "object_store",
  "qdrant-client",
  "rstest",
@@ -1663,13 +1691,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "nova-shim"
+version = "0.0.8"
+dependencies = [
+ "serde_yaml",
+]
+
+[[package]]
 name = "nova-storm"
+version = "0.0.8"
+dependencies = [
+ "nova-shim",
+]
+
+[[package]]
+name = "nova-storm-contract-rust"
+version = "0.0.8"
+dependencies = [
+ "async-trait",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nova-storm-qdrant"
 version = "0.0.8"
 dependencies = [
  "async-trait",
  "clap",
  "duckdb",
  "indicatif",
+ "nova-storm-contract-rust",
  "qdrant-client",
  "serde",
  "serde_json",

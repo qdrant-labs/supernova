@@ -1,0 +1,46 @@
+[package]
+# Qdrant backend for `nova storm`. Built as the executable `nova-storm-qdrant`;
+# the user-facing `nova-storm` shim (commands/nova-storm) execs it based on
+# `target.type` in the config. The library crate keeps the historical name
+# `nova_storm` (see `[lib]`) so no internal module paths change.
+name = "nova-storm-qdrant"
+version = "0.0.8"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+# Keep the library name stable so `use nova_storm::...` in main.rs and the
+# inline tests keeps working after the package rename.
+[lib]
+name = "nova_storm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nova-storm-qdrant"
+path = "src/main.rs"
+
+# `cargo binstall nova-storm` fetches the prebuilt binary from the matching
+# `v*` release (see .github/workflows/rust-binaries.yml) instead of compiling.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+
+[dependencies]
+# Shared Rust interface this backend implements (the `QueryTarget` trait +
+# `BatchOutcome`/`TargetError`). See backends/nova-storm/contracts/rust.
+nova-storm-contract-rust = { path = "../contracts/rust" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif = { workspace = true }
+
+# Query vectors are read from parquet (local or s3://) via DuckDB.
+duckdb = { workspace = true }
+
+# Target backend.
+qdrant-client = { workspace = true }

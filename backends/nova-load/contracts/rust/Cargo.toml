@@ -1,0 +1,21 @@
+[package]
+# Shared Rust interface for `nova load` backends. Any Rust backend (the Qdrant
+# one today, a future Milvus/Vespa one tomorrow) depends on this crate and
+# implements its `VectorStore` trait — so the compiler enforces the contract at
+# build time within Rust. The language-neutral `contracts/nova-load/v1.yaml` is
+# the canonical cross-language contract; this crate is its Rust embodiment and
+# must be kept in lockstep with it.
+name = "nova-load-contract-rust"
+version = "0.0.8"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+[lib]
+name = "nova_load_contract_rust"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

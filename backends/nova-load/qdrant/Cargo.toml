@@ -1,0 +1,55 @@
+[package]
+# Qdrant backend for `nova load`. Built as the executable `nova-load-qdrant`;
+# the user-facing `nova-load` shim (commands/nova-load) execs it based on
+# `vectorstore.type` in the config. The library crate keeps the historical
+# name `nova_load` (see `[lib]`) so no internal module paths change.
+name = "nova-load-qdrant"
+version = "0.0.8"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+# Keep the library name stable so `use nova_load::...` in main.rs and the
+# inline tests keeps working after the package rename.
+[lib]
+name = "nova_load"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nova-load-qdrant"
+path = "src/main.rs"
+
+# `cargo binstall nova-load` fetches the prebuilt binary the rust-binaries.yml
+# workflow attaches to each `v*` release (named `<bin>-<target>`), instead of
+# compiling. Matches the asset naming in that workflow.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+
+[dependencies]
+# Shared Rust interface this backend implements (the `VectorStore` trait +
+# neutral types). See backends/nova-load/contracts/rust.
+nova-load-contract-rust = { path = "../contracts/rust" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+object_store = { workspace = true }
+futures = { workspace = true }
+indicatif = { workspace = true }
+
+# Metrics sink (postgres compiled in so one binary serves stdout + postgres
+# configs; the backend is chosen at runtime from metrics.type).
+# nova-metrics = { workspace = true, features = ["postgres"] }
+
+# feature-specific dependencies
+qdrant-client = { workspace = true }
+duckdb = { workspace = true }
+
+[dev-dependencies]
+rstest = "0.26.1"
