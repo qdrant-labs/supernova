@@ -519,6 +519,84 @@ impl From<Point> for PointStruct {
     }
 }
 
+impl QdrantStore {
+    /// Sanity check: confirm the collection's live config reflects the HNSW and
+    /// optimizer index params we requested. Every field set in config must match
+    /// what `collection_info` reports; unset fields are skipped (Qdrant keeps its
+    /// defaults). Runs after indexing settles in `wait_for_indexing`.
+    async fn verify_params(&self) -> Result<(), StoreError> {
+        if self.params.hnsw.is_none() && self.params.optimizers.is_none() {
+            return Ok(());
+        }
+        let config = self
+            .client
+            .collection_info(self.collection_name.as_str())
+            .await?
+            .result
+            .and_then(|r| r.config);
+
+        if let Some(want) = &self.params.hnsw {
+            let live = config.as_ref().and_then(|c| c.hnsw_config.clone()).unwrap_or_default();
+            self.check_u64("hnsw.m", want.m, live.m)?;
+            self.check_u64("hnsw.ef_construct", want.ef_construct, live.ef_construct)?;
+            self.check_u64(
+                "hnsw.full_scan_threshold",
+                want.full_scan_threshold,
+                live.full_scan_threshold,
+            )?;
+            self.check_u64(
+                "hnsw.max_indexing_threads",
+                want.max_indexing_threads,
+                live.max_indexing_threads,
+            )?;
+            self.check_u64("hnsw.payload_m", want.payload_m, live.payload_m)?;
+            if let Some(w) = want.on_disk
+                && live.on_disk != Some(w)
+            {
+                return Err(StoreError::Other(format!(
+                    "sanity check FAILED on {self} hnsw.on_disk: requested {w} but live \
+                     config has {:?}",
+                    live.on_disk
+                )));
+            }
+        }
+
+        if let Some(want) = &self.params.optimizers {
+            let live = config.as_ref().and_then(|c| c.optimizer_config.clone()).unwrap_or_default();
+            self.check_u64(
+                "optimizers.indexing_threshold",
+                want.indexing_threshold,
+                live.indexing_threshold,
+            )?;
+            self.check_u64(
+                "optimizers.default_segment_number",
+                want.default_segment_number,
+                live.default_segment_number,
+            )?;
+            self.check_u64(
+                "optimizers.max_segment_size",
+                want.max_segment_size,
+                live.max_segment_size,
+            )?;
+            self.check_u64("optimizers.memmap_threshold", want.memmap_threshold, live.memmap_threshold)?;
+        }
+
+        tracing::info!("{self} index params verified against live collection config");
+        Ok(())
+    }
+
+    fn check_u64(&self, field: &str, want: Option<u64>, got: Option<u64>) -> Result<(), StoreError> {
+        if let Some(w) = want
+            && got != Some(w)
+        {
+            return Err(StoreError::Other(format!(
+                "sanity check FAILED on {self} {field}: requested {w} but live config has {got:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl VectorStore for QdrantStore {
     async fn ensure_collection(&self, schema: &CollectionSchema) -> Result<(), StoreError> {
@@ -570,7 +648,7 @@ impl VectorStore for QdrantStore {
         Ok(())
     }
 
-    async fn enable_indexing(&self) -> Result<(), StoreError> {
+    async fn enable_indexing(&self, _schema: &CollectionSchema) -> Result<(), StoreError> {
         let threshold = self
             .params
             .optimizers
@@ -617,6 +695,10 @@ impl VectorStore for QdrantStore {
             if is_green {
                 let since = *green_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= GREEN_HOLD {
+                    // Sanity-check the live config against the requested index
+                    // params. Runs after `since` (the converged instant we
+                    // return), so it's not counted in the caller's build timing.
+                    self.verify_params().await?;
                     return Ok(since);
                 }
             } else {
@@ -627,7 +709,7 @@ impl VectorStore for QdrantStore {
         }
     }
 
-    async fn reindex(&self) -> Result<(), StoreError> {
+    async fn reindex(&self, _schema: &CollectionSchema) -> Result<(), StoreError> {
         let builder = build_update_collection(&self.collection_name, &self.params)
             .map_err(|e| StoreError::Other(e.to_string()))?;
         self.client.update_collection(builder).await?;

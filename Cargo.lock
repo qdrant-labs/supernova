@@ -2023,6 +2023,7 @@ dependencies = [
  "milvus-sdk-rust",
  "object_store",
  "qdrant-client",
+ "reqwest",
  "rstest",
  "serde",
  "serde_json",
