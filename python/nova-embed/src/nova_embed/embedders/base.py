@@ -21,7 +21,7 @@ from typing import Any, ClassVar
 from nova_embed.media import Modality
 from nova_embed.models import Embedding, OutputKind
 
-__all__ = ["Embedder", "OutputKind"]
+__all__ = ["Embedder", "FusedEmbedder", "OutputKind"]
 
 
 class Embedder(ABC):
@@ -80,4 +80,53 @@ class Embedder(ABC):
         because it CHANGES the embedding space: query-side embedding at search
         time must reproduce the exact same instruction, or recall quietly tanks.
         """
+        return None
+
+
+class FusedEmbedder(ABC):
+    """
+    Abstract base for backends that produce SEVERAL output kinds from one
+    forward pass — models with multiple heads on a shared backbone (bge-m3:
+    dense + lexical + colbert).
+
+    Never selected by a config `type` directly. Users declare one plain entry
+    per kind, exactly as if fusion didn't exist; `build_engine` swaps in the
+    fused class (looked up in FUSED_EMBEDDERS under the same `type` name as
+    the plain per-kind classes) when a group of entries shares the backend
+    config and input column. Constructed as ``cls(kinds=<requested subset>,
+    **backend_kwargs)`` so the implementation only computes the heads that
+    were actually asked for.
+    """
+
+    # Every kind this backend can produce in one pass. The engine only fuses
+    # entries whose kind is in this set — others stay plain units.
+    fusable_kinds: ClassVar[frozenset[OutputKind]]
+    supported_modalities: ClassVar[frozenset[Modality]] = frozenset({Modality.TEXT})
+
+    @abstractmethod
+    async def embed(self, batch: list[Any]) -> dict[OutputKind, list[Embedding]]:
+        """
+        One result list per requested kind, each with one embedding per input
+        in the same order.
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        """Human-readable model identifier, written into the manifest."""
+        pass
+
+    def dimensions_for(self, kind: OutputKind) -> int | None:
+        """Per-kind vector dimension (heads on one backbone may differ)."""
+        return None
+
+    @property
+    def max_tokens(self) -> int | None:
+        """See [`Embedder.max_tokens`][]."""
+        return None
+
+    @property
+    def instruction(self) -> str | None:
+        """See [`Embedder.instruction`][]."""
         return None

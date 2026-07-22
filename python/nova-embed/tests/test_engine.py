@@ -9,11 +9,11 @@ import pytest
 pytest.importorskip("obstore")  # nova_embed.embedders package pulls in storage
 
 import fake_backends  # noqa: F401  — registers the fake (kind, "fake") backends
-from fake_backends import DENSE_INSTANTIATIONS
+from fake_backends import DENSE_INSTANTIATIONS, FUSED_INSTANTIATIONS
 
 from nova_embed.config import EmbedderEntry
-from nova_embed.embedders.engine import _can_fuse, build_engine
-from nova_embed.models import MultiVectorEmbedding, SparseEmbedding
+from nova_embed.embedders.engine import build_engine
+from nova_embed.models import MultiVectorEmbedding, OutputKind, SparseEmbedding
 
 
 def entry(**overrides) -> EmbedderEntry:
@@ -221,16 +221,118 @@ def test_multimodal_specs_groups_and_manifest_fields():
     assert t_spec.instruction is None
 
 
-def test_fusion_predicate():
-    d = entry(kind="dense", type="sentence_transformer", model="m")
-    s = entry(name="s", kind="sparse", type="sentence_transformer", model="m",
-              output_column="s_col")
-    assert _can_fuse(d, s)
-    assert not _can_fuse(d, entry(name="x", kind="sparse", type="fake", model="m",
-                                  output_column="x1"))
-    assert not _can_fuse(d, entry(name="y", kind="sparse",
-                                  type="sentence_transformer", model="other",
-                                  output_column="x2"))
-    assert not _can_fuse(d, entry(name="z", kind="sparse",
-                                  type="sentence_transformer", model="m",
-                                  input_column="body", output_column="x3"))
+# ------------------------------------------------------------------- fusion
+
+def fused_entry(**overrides) -> EmbedderEntry:
+    overrides.setdefault("model", "m")
+    return entry(type="fake_fused", **overrides)
+
+
+def test_fused_group_one_instance_one_pass():
+    FUSED_INSTANTIATIONS.clear()
+    DENSE_INSTANTIATIONS.clear()
+    engine = build_engine(
+        [
+            fused_entry(name="d"),
+            fused_entry(name="s", kind="sparse", output_column="s_col"),
+            fused_entry(name="mv", kind="multivector", output_column="mv_col"),
+        ]
+    )
+    # one fused instance covering all three kinds, no plain instantiation
+    assert len(FUSED_INSTANTIATIONS) == 1
+    assert FUSED_INSTANTIATIONS[0].kinds == {
+        OutputKind.DENSE, OutputKind.SPARSE, OutputKind.MULTIVECTOR,
+    }
+    assert DENSE_INSTANTIATIONS == []
+
+    out = embed(engine, [{"text": "abc"}, {"text": ""}])
+    assert out["d"] == [[3.0, 3.0], None]  # empty inputs masked in fused path too
+    assert out["s"] == [SparseEmbedding(indices=[3], values=[1.0]), None]
+    assert isinstance(out["mv"][0], MultiVectorEmbedding)
+
+    # one spec per entry — fusion is invisible downstream
+    d_spec, s_spec, mv_spec = engine.output_specs
+    assert [s.name for s in engine.output_specs] == ["d", "s", "mv"]
+    assert d_spec.dimensions == 2 and s_spec.dimensions is None
+    assert d_spec.kind == "dense" and mv_spec.kind == "multivector"
+
+
+def test_fused_subset_of_kinds():
+    FUSED_INSTANTIATIONS.clear()
+    build_engine(
+        [
+            fused_entry(name="d"),
+            fused_entry(name="s", kind="sparse", output_column="s_col"),
+        ]
+    )
+    assert len(FUSED_INSTANTIATIONS) == 1
+    assert FUSED_INSTANTIATIONS[0].kinds == {OutputKind.DENSE, OutputKind.SPARSE}
+
+
+def test_no_fusion_across_different_inputs_or_kwargs():
+    FUSED_INSTANTIATIONS.clear()
+    DENSE_INSTANTIATIONS.clear()
+    build_engine(
+        [
+            fused_entry(name="d"),
+            fused_entry(name="s", kind="sparse", input_column="body",
+                        output_column="s1"),  # different input column
+            fused_entry(name="s2", kind="sparse", model="other",
+                        output_column="s2_col"),  # different model
+        ]
+    )
+    assert FUSED_INSTANTIATIONS == []  # three groups of one -> all plain units
+
+
+def test_no_fusion_on_duplicate_kinds():
+    FUSED_INSTANTIATIONS.clear()
+    build_engine(
+        [
+            fused_entry(name="a"),
+            fused_entry(name="b", output_column="b_col"),
+            fused_entry(name="s", kind="sparse", output_column="s_col"),
+        ]
+    )
+    assert FUSED_INSTANTIATIONS == []
+
+
+def test_fused_batch_size_mismatch_warns_and_takes_min(caplog):
+    FUSED_INSTANTIATIONS.clear()
+    with caplog.at_level("WARNING"):
+        build_engine(
+            [
+                fused_entry(name="d", batch_size=128),
+                fused_entry(name="s", kind="sparse", batch_size=32,
+                            output_column="s_col"),
+            ]
+        )
+    assert len(FUSED_INSTANTIATIONS) == 1
+    assert FUSED_INSTANTIATIONS[0].batch_size == 32
+    assert any("batch_size" in r.message for r in caplog.records)
+
+
+def test_fused_multivector_member_pools():
+    engine = build_engine(
+        [
+            fused_entry(name="d"),
+            fused_entry(name="mv", kind="multivector", output_column="mv_col",
+                        pooling={"type": "mean", "normalize": False}),
+        ]
+    )
+    out = embed(engine, [{"text": "hi"}])
+    assert out["mv_pooled"] == [[1.5, 2.0]]  # mean of [3,0] and [0,4]
+    pooled_spec = next(s for s in engine.output_specs if s.name == "mv_pooled")
+    assert pooled_spec.kind == "dense"
+
+
+def test_plain_type_never_fuses():
+    FUSED_INSTANTIATIONS.clear()
+    DENSE_INSTANTIATIONS.clear()
+    build_engine(
+        [
+            entry(name="d", model="m"),
+            entry(name="s", kind="sparse", model="m", output_column="s_col"),
+        ]
+    )
+    assert FUSED_INSTANTIATIONS == []  # type "fake" has no fused registration
+    assert len(DENSE_INSTANTIATIONS) == 1

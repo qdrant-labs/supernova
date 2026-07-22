@@ -1,0 +1,58 @@
+# Fused embedding: all three of bge-m3's heads from ONE model load and ONE
+# forward pass.
+#
+# bge-m3 is a multi-head model — dense, sparse (lexical), and multivector
+# (colbert) share a backbone. Declare one entry per kind exactly as if fusion
+# didn't exist; the engine detects that they name the same model and input
+# column and collapses them into a single forward pass ("Fusing entries …" in
+# the launch log). No opt-in key: entries fuse whenever the backend registered
+# a fused implementation and the settings below match across entries.
+#
+# What must match for entries to fuse: type, model, input_column, max_length,
+# and backend kwargs (dtype, device, …). batch_size is the one exception —
+# it's a pure throughput knob, so differing values still fuse, on the SMALLEST
+# with a warning. Entries that don't match simply run as separate models.
+
+source:
+  type: huggingface_parquet
+  dataset_name: mteb/tweet_sentiment_extraction
+  split: train
+  prefetch: true
+
+embedders:
+  - name: bge_m3_dense
+    kind: dense
+    type: bge_m3
+    model: BAAI/bge-m3
+    input_column: text
+    modality: text
+    batch_size: 1
+    dtype: float16              # bge_m3 supports float16 | float32
+
+  - name: bge_m3_sparse
+    kind: sparse
+    type: bge_m3
+    model: BAAI/bge-m3
+    input_column: text
+    modality: text
+    batch_size: 1
+    dtype: float16
+
+  - name: bge_m3_multivector
+    kind: multivector
+    type: bge_m3
+    model: BAAI/bge-m3
+    input_column: text
+    modality: text
+    batch_size: 1             # smaller than the others would also fuse (min wins)
+    dtype: float16
+    # pooling:                  # optionally derive a dense column from the
+    #   type: mean              # multivector output — works on fused entries too
+    #   normalize: true
+
+storage:
+  type: local
+  output_dir: /tmp/mteb_tweets_bge-m3
+
+pipeline:
+  flush_threshold: 10000

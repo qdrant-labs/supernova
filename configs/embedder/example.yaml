@@ -48,8 +48,9 @@ embedders:
 
   # Same column through several models (comparison runs), or different columns
   # through different models (e.g. CLIP on an image column), are both just more
-  # entries. A dense + sparse pair on the SAME sentence_transformer model and
-  # input column is automatically fused into one forward pass.
+  # entries. Entries pointing at the same multi-head model and input column
+  # (e.g. dense + sparse + multivector on bge_m3) are automatically fused into
+  # one forward pass — see example_fused.yaml.
   #
   # - name: clip
   #   kind: dense
