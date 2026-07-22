@@ -155,3 +155,15 @@ nova embed configs/embedder/my_dataset.yaml
 ```
 
 The local runner uses async workers with a priority queue buffer to ensure ordered output. Good for development and small datasets.
+
+(`nova embed <config>` is shorthand for the default subcommand, `nova embed run <config>`.)
+
+## Predicting throughput and cost
+
+Before committing GPUs, predict what a config will cost — no GPU needed:
+
+```bash
+nova embed predict configs/embedder/my_dataset.yaml --gpu h100 --num-gpus 8
+```
+
+`predict` samples the dataset (default 100k rows), tokenizes with each model's own tokenizer, runs a Monte Carlo padding simulation over the empirical token distribution, and prices each **forward pass** with the compute model `T_max = TFLOPS × 1e12 / (2 × params)`, discounted by the padding efficiency. It plans passes with the same fusion grouping the engine uses, so a fused bge-m3 dense+sparse+multivector config is priced as one pass, and per-pass rates combine into a whole-pipeline texts/s and a dollar estimate. Everything dataset- and model-shaped comes from the config; GPU, cost, and simulation knobs are flags (`nova embed predict --help`).

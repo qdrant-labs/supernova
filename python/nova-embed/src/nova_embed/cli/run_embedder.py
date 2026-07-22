@@ -82,7 +82,7 @@ def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | Non
     click.echo("=" * 70)
 
 
-@click.command(name="embed", help="Embed a dataset locally.")
+@click.command(name="run", help="Embed a dataset locally (the default command).")
 @click.argument("config", required=False)
 @click.option(
     "--num-jobs",
