@@ -9,28 +9,65 @@
 #
 # Prints a latency summary (requests, errors, throughput, p50/p95/p99, max).
 
-# The cluster under test, dispatched on `type` (qdrant today).
+# The cluster under test, dispatched on `type` — `qdrant` (always available),
+# or `milvus` / `elastic` (feature-gated: build with `--features elastic,milvus`).
 target:
   type: qdrant
   url: ${QDRANT_URL}                # env substitution; ${VAR:-default} also works
   api_key: ${QDRANT_API_KEY}
   collection_name: fiqa_bge-m3
 
+  # --- Or one of the other backends (replace the `qdrant` block above). For
+  # milvus/elastic, `query.vector_name` is REQUIRED (the vector field to search)
+  # and `query.filter` is NOT yet supported (qdrant only).
+  #
+  # type: milvus
+  # url: http://localhost:19530       # gRPC + REST share this endpoint (2.4+)
+  # collection_name: fiqa_bge-m3
+  # username: root                    # optional — set both or neither; env
+  # password: my-password             #   substitution works here too, as above
+  #   NOTE: a COSINE collection is queried over REST (the Rust SDK has no native
+  #   cosine metric) — slower than the SDK path used for L2/IP; a warning is
+  #   logged. Payload isn't persisted by the milvus loader, so `with_payload`
+  #   has no effect here.
+  #
+  # type: elastic
+  # url: https://localhost:9200
+  # index_name: fiqa_bge-m3
+  # username: elastic                 # or `api_key: <base64 id:api_key>`; optional
+  # password: my-password
+  # tls_insecure: false               # true only for a self-signed dev node
+
 # What to search with.
 query:
-  # Named vector to hit. Omit for a single-(unnamed-)vector collection.
+  # Named vector to hit. Omit for a single-(unnamed-)vector Qdrant collection;
+  # REQUIRED for milvus (the annsField) and elastic (the dense_vector field).
   vector_name: dense
   top_k: 10                         # neighbours per query (default 10)
   # Return each hit's full payload (default false = ids/scores only). Turn on
   # when the modeled production traffic fetches payloads — payload reads and
-  # response bytes are real cost the benchmark otherwise understates.
+  # response bytes are real cost the benchmark otherwise understates. (No-op on
+  # milvus, which doesn't persist payload; on elastic it returns `_source`
+  # excluding the vector, to match Qdrant's payload-only fetch.)
   # with_payload: true
+
+  # Server-side search tuning — the SHAPE IS PER-BACKEND and validated (an
+  # unknown/foreign key is rejected). Omit to use the backend's own defaults.
+  #   qdrant:  { hnsw_ef: 128, exact: false, quantization: { rescore: true, oversampling: 2.0 } }
+  #   milvus:  { ef: 128 }       # HNSW; or { nprobe: 32 } for IVF — not both
+  #   elastic: { num_candidates: 128 }   # per-shard HNSW candidate pool, must be >= top_k
+  # search_params:
+  #   hnsw_ef: 128
   source:
     # Query vectors — a parquet file (or dir) at a local path or s3:// URI, read
     # via DuckDB. Each row's `column` is one query vector.
     uri: s3://qdrant--vectorforge/fiqa/bge-m3/queries.parquet
     column: dense_embedding
     limit: 5000                     # load this many vectors and cycle through them
+    # For recall@k, name a list<string> column of known-correct top-k ids (e.g.
+    # `nova bf`'s `hit_ids`), read from the same row as the vector. Ids are
+    # compared as strings — works across Qdrant/Milvus/Elastic identically.
+    # ground_truth_column: hit_ids
 
 # Per-worker load shape (replicated across the fleet).
 load:

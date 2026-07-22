@@ -100,6 +100,12 @@ or rps} × batch_size`.
 nova storm <config> [--json]
 ```
 
+The target backend is chosen by the config's `target.type` — `qdrant` (always
+built in) or `milvus` / `elastic` (build with `--features elastic,milvus`).
+`milvus`/`elastic` require `query.vector_name` (the vector field) and don't yet
+support `query.filter`; `search_params` are validated per backend. See
+`configs/storm/example.yaml`.
+
 The config's `load` block picks the mode:
 
 - **closed-loop** (default, `rps` unset) — hold `concurrency` requests in flight
@@ -108,8 +114,9 @@ The config's `load` block picks the mode:
   schedule with `concurrency` as an in-flight cap; avoids coordinated omission.
 
 `batch_size` (default `1`) is how many query vectors go in each dispatch (one
-Qdrant `query_batch` RPC per dispatch) — not a special case at `1`, just the
-default. `rps` paces *dispatches*, not individual queries.
+batched round-trip per dispatch — Qdrant `query_batch`, Milvus batched search,
+or an Elasticsearch `_msearch`) — not a special case at `1`, just the default.
+`rps` paces *dispatches*, not individual queries.
 
 Prints a latency summary at the end: requests/errors (dispatch counts),
 `batch_size`, `requests_per_sec` (dispatch rate) and `qps` (actual query
