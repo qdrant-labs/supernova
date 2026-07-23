@@ -15,6 +15,7 @@ nav = [
     "embedding/dense-embedders.md",
     "embedding/sparse-embedders.md",
     "embedding/storage.md",
+    "embedding/throughput-prediction.md",
   ]},
   {"Loading" = [
     "loading/overview.md",

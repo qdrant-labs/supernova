@@ -18,10 +18,14 @@ from the environment. All shard themselves with `--num-jobs` / `--job-rank`
 
 ## nova embed
 
-Embed a dataset into parquet (Python).
+Embed a dataset into parquet (Python). Two subcommands; `run` is the default,
+so the bare form routes to it and the original interface is unchanged.
+
+### nova embed run (default)
 
 ```bash
 nova embed <config> [--num-jobs N --job-rank R] [--dry-run]
+nova embed run <config> ...        # explicit form, identical
 ```
 
 | Flag | Meaning |
@@ -32,6 +36,18 @@ nova embed <config> [--num-jobs N --job-rank R] [--dry-run]
 | `--dry-run` | Print the resolved plan (source, engine, storage, slice) and exit |
 
 See [Embedding overview](../embedding/overview.md) for the config.
+
+### nova embed predict
+
+Predict throughput and cost for a config before committing GPUs — samples the
+dataset's token distribution and prices each forward pass; no GPU needed.
+
+```bash
+nova embed predict <config> [--gpu h100 --num-gpus 8 ...]
+```
+
+See [Throughput Prediction](../embedding/throughput-prediction.md) for the
+method and full flag reference.
 
 ## nova load
 
