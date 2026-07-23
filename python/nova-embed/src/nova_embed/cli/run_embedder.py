@@ -46,6 +46,15 @@ def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | Non
     click.echo(f"storage:   {cfg.storage.type}")
 
     source = SOURCES.build(dict(source_dict))
+    jobs = num_jobs or 1
+
+    # File-sharded sources (jsonl) have no cheap row total — partition by file
+    # instead, and never call get_total_rows() (it would scan the corpus).
+    if callable(getattr(source, "set_file_shard", None)):
+        _print_file_partition(source, jobs, num_jobs)
+        click.echo("=" * 70)
+        return
+
     total = source.get_total_rows()
     list_files = getattr(source, "list_files", None)
     files = list_files() if callable(list_files) else None
@@ -56,7 +65,6 @@ def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | Non
     else:
         click.echo(f"dataset:   {total:,} rows")
 
-    jobs = num_jobs or 1
     rows_per_job = math.ceil(total / jobs) if total else 0
     click.echo(f"partition: {jobs} job(s), ~{rows_per_job:,} rows/job")
     click.echo("-" * 70)
@@ -80,6 +88,32 @@ def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | Non
             "same file each download that whole file (row windows don't split files)."
         )
     click.echo("=" * 70)
+
+
+def _print_file_partition(source, jobs: int, num_jobs: int | None) -> None:
+    """Dry-run partition for a file-sharded source: files per rank, no download."""
+    files = [p for p, _ in source.list_files()]
+    n = len(files)
+    click.echo("-" * 70)
+    click.echo(f"dataset:   {n:,} jsonl files (row counts unknown without scanning)")
+    click.echo(f"partition: {jobs} job(s), file-granular (~{math.ceil(n / jobs)} files/job)")
+    click.echo("-" * 70)
+
+    width = max(1, len(str(jobs - 1)))
+    empty = 0
+    for rank in range(jobs):
+        assigned = source.files_for_rank(rank, jobs)
+        empty += len(assigned) == 0
+        span = ""
+        if assigned:
+            span = f"  ·  {assigned[0].split('/')[-1]} .. {assigned[-1].split('/')[-1]}"
+        click.echo(f"  rank {rank:>{width}}: {len(assigned):>6,} files{span}")
+
+    if empty:
+        click.echo(
+            f"\n  ⚠  {empty} job(s) receive 0 files — num_jobs ({num_jobs}) exceeds the "
+            f"file count ({n}); reduce it."
+        )
 
 
 @click.command(name="embed", help="Embed a dataset locally.")
@@ -159,34 +193,47 @@ def embed(config, num_jobs, job_rank, dry_run):
                 f"Auto-detected job rank {job_rank} from SKYPILOT_JOB_RANK env var"
             )
 
-        # build source to query total rows (source-agnostic)
-        source_for_count = SOURCES.build(dict(source_dict))
-        dataset_total = source_for_count.get_total_rows()
+        built_source = SOURCES.build(dict(source_dict))
 
-        rows_per_job = math.ceil(dataset_total / num_jobs)
-        slice_offset = job_rank * rows_per_job
-        slice_limit = min(rows_per_job, dataset_total - slice_offset)
-
-        logging.getLogger("nova_embed").info(
-            "Job %d/%d: offset=%d limit=%d (dataset_total=%d)",
-            job_rank + 1,
-            num_jobs,
-            slice_offset,
-            slice_limit,
-            dataset_total,
-        )
-        expected_total_rows = slice_limit
-
-        # Re-scope the counting instance instead of building a second source:
-        # for HF sources a fresh instance re-reads every parquet footer, and at
-        # N ranks that doubles an already-huge burst of rate-limited requests.
-        set_window = getattr(source_for_count, "set_window", None)
-        if callable(set_window):
-            set_window(slice_offset, slice_limit)
-            source = source_for_count
+        # Two sharding protocols. A file-sharded source (e.g. jsonl, which has
+        # no cheap row index) advertises set_file_shard and owns whole files;
+        # we must NOT call get_total_rows() on it (that would scan the corpus).
+        # A row-addressable source (parquet) partitions by a computed row window.
+        set_file_shard = getattr(built_source, "set_file_shard", None)
+        if callable(set_file_shard):
+            set_file_shard(job_rank, num_jobs)
+            source = built_source
+            expected_total_rows = None  # unknown without scanning; runner tolerates None
+            logging.getLogger("nova_embed").info(
+                "Job %d/%d: file-sharded source", job_rank + 1, num_jobs
+            )
         else:
-            source_dict["offset"] = slice_offset
-            source_dict["limit"] = slice_limit
+            dataset_total = built_source.get_total_rows()
+
+            rows_per_job = math.ceil(dataset_total / num_jobs)
+            slice_offset = job_rank * rows_per_job
+            slice_limit = min(rows_per_job, dataset_total - slice_offset)
+
+            logging.getLogger("nova_embed").info(
+                "Job %d/%d: offset=%d limit=%d (dataset_total=%d)",
+                job_rank + 1,
+                num_jobs,
+                slice_offset,
+                slice_limit,
+                dataset_total,
+            )
+            expected_total_rows = slice_limit
+
+            # Re-scope the counting instance instead of building a second source:
+            # for HF sources a fresh instance re-reads every parquet footer, and at
+            # N ranks that doubles an already-huge burst of rate-limited requests.
+            set_window = getattr(built_source, "set_window", None)
+            if callable(set_window):
+                set_window(slice_offset, slice_limit)
+                source = built_source
+            else:
+                source_dict["offset"] = slice_offset
+                source_dict["limit"] = slice_limit
 
         rank_width = max(2, len(str(num_jobs - 1)))
         filename_prefix = f"rank{job_rank:0{rank_width}d}_"

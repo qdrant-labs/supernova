@@ -1,3 +1,5 @@
+import fnmatch
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Iterator, TYPE_CHECKING
@@ -8,6 +10,12 @@ from nova_embed.models import Record
 
 if TYPE_CHECKING:
     from nova_embed.chunkers import Chunker
+
+
+# Provenance columns stamped onto each row when include_provenance=True. Shared
+# across sources so the output schema is identical whichever source produced it.
+SOURCE_FILE_COLUMN = "source_file_name"
+SOURCE_ROW_COLUMN = "source_row_number"
 
 
 def files_in_window(
@@ -29,6 +37,83 @@ def files_in_window(
             out.append((path, num_rows))
         cumulative = file_end
     return out
+
+
+def files_for_shard(paths: list[str], job_rank: int, num_jobs: int) -> list[str]:
+    """Assign whole files to a rank via a balanced *contiguous* split.
+
+    File-granular sharding for sources with no cheap row index (e.g. jsonl,
+    which has no footer): rather than mapping a row window to files, each rank
+    owns a contiguous block of ~len(paths)/num_jobs files. Contiguous (not
+    round-robin) so a rank's prefetch downloads adjacent files in order.
+
+    The first ``len(paths) % num_jobs`` ranks get one extra file, so counts
+    differ by at most one and every file is covered exactly once. When
+    ``num_jobs > len(paths)`` the trailing ranks get an empty list (idle
+    workers — the caller warns).
+    """
+    if num_jobs <= 0:
+        raise ValueError(f"num_jobs must be positive, got {num_jobs}")
+    if not 0 <= job_rank < num_jobs:
+        raise ValueError(f"job_rank {job_rank} out of range for num_jobs {num_jobs}")
+    n = len(paths)
+    base, extra = divmod(n, num_jobs)
+    # ranks [0, extra) get base+1 files; the rest get base.
+    if job_rank < extra:
+        start = job_rank * (base + 1)
+        count = base + 1
+    else:
+        start = extra * (base + 1) + (job_rank - extra) * base
+        count = base
+    return paths[start : start + count]
+
+
+def filter_paths(paths: list[str], pattern: str | list[str] | None) -> list[str]:
+    """Filter a list of repo file paths.
+
+    Patterns:
+      - None: pass-through.
+      - "regex:<expr>": treat <expr> as a Python regex (re.search).
+      - any other string: glob (fnmatch).
+      - list of patterns: union (a path matches if it matches any pattern),
+        de-duplicated, preserving first-seen order.
+
+    Shared by the HF (parquet) and jsonl sources so path selection behaves
+    identically across formats.
+    """
+    if pattern is None:
+        return list(paths)
+    if isinstance(pattern, list):
+        out: list[str] = []
+        seen: set[str] = set()
+        for sub in pattern:
+            for p in filter_paths(paths, sub):
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+        return out
+    if pattern.startswith("regex:"):
+        rx = re.compile(pattern[len("regex:") :])
+        return [p for p in paths if rx.search(p)]
+    return fnmatch.filter(paths, pattern)
+
+
+def apply_record_projection(
+    row: dict,
+    render_columns: dict[str, str],
+    exclude_columns: set[str],
+) -> Record:
+    """Normalize a raw row into a Record: render derived columns, then exclude.
+
+    Derived columns are rendered from the FULL row first (a template may
+    reference a column the user then excludes), then exclude_columns is applied.
+    Shared by every source's ``format_record`` so the projection semantics can't
+    drift between formats.
+    """
+    rendered = {name: tpl.format(**row) for name, tpl in render_columns.items()}
+    columns = {k: v for k, v in row.items() if k not in exclude_columns}
+    columns.update(rendered)
+    return Record(row=columns)
 
 
 class DatasetSource(ABC):
