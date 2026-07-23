@@ -1,17 +1,21 @@
 """Sweep target backend registry, dispatched on `target.type` — mirrors the
 tagged-enum shape of `nova-load`'s `VectorStoreConfig` and `nova-storm`'s
-`TargetConfig`. Qdrant is the only registered backend today; a future backend
-means adding a module like `qdrant.py` and a line in `_REGISTRY`, not touching
-`runner.py`.
+`TargetConfig`. Qdrant, Milvus, and Elasticsearch are registered; a future
+backend means adding a module like `qdrant.py` and a line in `_REGISTRY`, not
+touching `runner.py`.
 """
 
 from __future__ import annotations
 
 from nova_sweep.backends.base import SweepBackend, TargetConfigBase
+from nova_sweep.backends.elastic import ElasticBackend, ElasticTargetConfig
+from nova_sweep.backends.milvus import MilvusBackend, MilvusTargetConfig
 from nova_sweep.backends.qdrant import QdrantBackend, QdrantTargetConfig
 
 _REGISTRY: dict[str, tuple[type[TargetConfigBase], SweepBackend]] = {
     "qdrant": (QdrantTargetConfig, QdrantBackend()),
+    "milvus": (MilvusTargetConfig, MilvusBackend()),
+    "elastic": (ElasticTargetConfig, ElasticBackend()),
 }
 
 

@@ -6,12 +6,11 @@ collection/index/search configurations, producing one combined report
 search setting affect recall/latency" across many settings at once, instead
 of hand-running `nova load` + `nova storm` once per combination.
 
-**Qdrant is the only implemented target today.** `target.type` (see below)
-dispatches to a backend adapter, mirroring `nova-load`'s `VectorStore` and
-`nova-storm`'s `QueryTarget` extension points — but only the `qdrant` backend
-is wired up. A future backend (e.g. Milvus) would need its own adapter module
-registered the same way; **it is not implemented**, and adding it is out of
-scope here.
+**Three targets are implemented: `qdrant`, `milvus`, and `elastic`.**
+`target.type` (see below) is **required** and dispatches to a backend adapter,
+mirroring `nova-load`'s `VectorStore` and `nova-storm`'s `QueryTarget`
+extension points. A future backend needs its own adapter module registered the
+same way, without touching the runner.
 
 **Ground truth is out of scope.** `nova sweep` assumes a `nova bf`-shaped
 parquet (a dense vector column plus a `hit_ids` column of known-correct
@@ -20,7 +19,7 @@ it — exactly the shape `nova-storm`'s own `query.source` expects. It never
 invokes `nova bf` itself.
 
 ```
-                          ┌─▶ nova load ──▶ Qdrant ──▶ nova storm
+                          ┌─▶ nova load ──▶ store ──▶ nova storm
 nova bf (ground truth) ───┤        ▲                       │
                           └────────┴─── nova sweep orchestrates both ───┘
 ```
@@ -45,9 +44,7 @@ queries:
   limit: 1000
 
 target:
-  type: qdrant             # optional — defaults to qdrant (the only backend
-                            # implemented today) when omitted, so configs
-                            # written before this field existed still work
+  type: qdrant             # REQUIRED — qdrant | milvus | elastic
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
   recreate: never          # never (default) | always — see "Collections" below
@@ -79,19 +76,42 @@ fully-annotated version of this file.
 `target.type` selects which backend `nova sweep` drives — it's dispatched the
 same way `nova-load`'s `vectorstore.type` and `nova-storm`'s `target.type`
 are, so a config's `target:` block is backend-specific past `type` and
-`recreate` (e.g. Qdrant's `url`/`api_key`).
+`recreate`. `type` is **required**: an omitted, null, or unknown `type` is a
+hard config error at parse time (there is no default). The three implemented
+backends and their extra `target:` fields:
 
-- **`qdrant`** (default) — the only backend implemented. Omitting `type`
-  entirely is equivalent to `type: qdrant`, so configs written before this
-  field existed keep working unchanged.
-- Any other `type` value is a hard config error at parse time — there is no
-  silent fallback to Qdrant for a *misspelled or unimplemented* type, only
-  for a *missing* one.
-- Adding a new backend (e.g. Milvus — **not implemented**) means writing a
-  new adapter module under `nova_sweep.backends` and registering it there; it
-  does not require changes to the sweep runner, which only calls
-  backend-neutral methods (`collection_exists`, `build_load_config`,
-  `build_reindex_config`, `build_delete_config`, `build_storm_config`).
+- **`qdrant`** — `url`, `api_key`. Structural params (`hnsw.*`,
+  `quantization.*`, `vectors.dense.*`) nest under `vectorstore.params` in the
+  generated `nova-load` config; search params are `{hnsw_ef, exact,
+  quantization}`.
+- **`milvus`** — `url`, `username`, `password` (`username`/`password` must be
+  set together, or neither — a lone one is a config error). `vectorstore`
+  fields are FLAT: `index_type` (`HNSW`/`IVF_FLAT`/`AUTOINDEX`/…) and
+  `index_params` (`{M, efConstruction}`, `{nlist}`, …). Search params are
+  `{ef, nprobe}`. The metric comes from `vectors.dense.distance` (not a
+  separate field) on both the fresh load *and* every reindex. **Caveat:** an
+  `index_type` on the `data_layouts` axis must carry its *complete*
+  `index_params` (a bare `HNSW` with no `M`/`efConstruction` fails at index
+  creation). A data_layout's index spec is the base of every reindex, so
+  `index_variants` can sweep `index_params` under a fixed `index_type`; don't
+  switch to a different index family in a variant without also overriding
+  `index_params`, or the mismatched params error out per-slice.
+- **`elastic`** — `url`, `username`/`password` or `api_key`, `tls_insecure`
+  (as with milvus, `username`/`password` must be set together — use `api_key`
+  for token auth). The swept collection name maps to the ES **index name**.
+  `vectorstore` fields are FLAT: `index_options` (`{type, m, ef_construction}`
+  — ES 8.x defaults to `int8_hnsw`). Search param is `{num_candidates}` (must
+  be `>= top_k`). **Caveat:** `similarity`/`distance` and the `index_options`
+  `type` are fixed at field creation and CANNOT be changed by `reindex`, and
+  HNSW `m` may only *increase* — so put a distance/type change on the
+  `data_layouts` axis (fresh load), never `index_variants` (an in-place
+  reindex to a conflicting mapping errors out per-slice).
+
+Adding a new backend means writing a new adapter module under
+`nova_sweep.backends` and registering it in `_REGISTRY`; it does not require
+changes to the sweep runner, which only calls backend-neutral methods
+(`collection_exists`, `build_load_config`, `build_reindex_config`,
+`build_delete_config`, `build_storm_config`).
 
 ## Running
 
@@ -120,23 +140,27 @@ A YAML `null` at a leaf omits that key entirely from the generated config
 
 ## How it works
 
-For each expanded `data_layouts` entry, `nova sweep` creates **one Qdrant
-collection for its entire lifetime**:
+For each expanded `data_layouts` entry, `nova sweep` creates **one collection
+for its entire lifetime** (a Qdrant/Milvus collection or an ES index):
 
 1. **Load once.** `nova-load run` creates the collection and inserts the
    corpus — this is the only step that reads/writes data.
 2. **Patch in place, per `index_variants` entry.** `nova-load reindex`
-   patches HNSW/quantization/optimizer settings on that *same* collection —
-   never a new collection, never a delete/recreate between variants.
+   patches index settings on that *same* collection — never a new collection,
+   never a delete/recreate between variants.
 3. **Search, per `searches` entry.** `nova-storm --json` runs against the
    now-patched collection; its structured summary (recall, latency,
    throughput) becomes one report row.
 
-Only `data_layouts` changes force a reload — `vectors.dense.distance`/
-`datatype`/`size` and `shard_number` are fixed at collection creation.
-Everything under `index_variants` (HNSW, quantization, optimizers) is
-patchable on an already-loaded collection via Qdrant's `update_collection`,
-and `searches` never touches Qdrant at all.
+Only `data_layouts` changes force a reload — anything fixed at collection
+creation belongs here: `vectors.dense.distance`/`datatype`/`size` and
+`shard_number` for Qdrant, and for Elastic the vector `similarity` and the
+`index_options` `type` (both immutable in ES). Everything under
+`index_variants` is patchable on an already-loaded collection — Qdrant HNSW/
+quantization/optimizers via `update_collection`, Milvus by drop+rebuild of the
+index, Elastic via the Update Mapping API + force-merge (only *widening*
+changes like an HNSW `m` increase; a conflicting change is recorded as a
+per-slice error, not a crash). `searches` never touches the store at all.
 
 Collection names are now explicit in the config, not inferred from the file
 name: the config's `collection_name` is used directly when there is only the
@@ -145,9 +169,9 @@ implicit default layout, otherwise each expanded `data_layouts` entry is named
 
 ### Rebuild-cost ordering
 
-`index_variants` are walked in an order chosen to minimize rebuild cost, not
-declaration order. HNSW changes are treated as **expensive** (Qdrant fully
-rebuilds the graph on any `hnsw_config` change); quantization/optimizer
+Qdrant `index_variants` are walked in an order chosen to minimize rebuild
+cost, not declaration order. HNSW changes are treated as **expensive** (Qdrant
+fully rebuilds the graph on any `hnsw_config` change); quantization/optimizer
 changes are treated as **cheap** — small-scale empirical testing showed a
 quantization-only change reindexes meaningfully faster than an HNSW change
 on the same collection. Combinations are sorted so expensive fields change
@@ -155,6 +179,12 @@ as infrequently as possible — e.g. for `quantization.type: [none, scalar]` ×
 `hnsw.m: [8, 16]` (4 combinations), both `hnsw.m: 8` variants run before
 either `hnsw.m: 16` variant, regardless of how the axes were declared. The
 *set* of combinations tested is unaffected — only the order.
+
+This cost sort keys only off Qdrant's `hnsw.*` fields, so for Milvus
+(`index_type`/`index_params`) and Elastic (`index_options`) it is a stable
+no-op and variants run in **declaration order**. This matters for Elastic,
+where HNSW `m` may only increase across in-place reindexes: list such
+variants in increasing order yourself.
 
 ## Collections
 
@@ -203,7 +233,7 @@ the whole run, since it's a config/intent problem, not a runtime failure.
 ## Distribution
 
 `nova sweep` is single-machine and sequential today — no `--num-jobs`/
-`--job-rank`. This isn't an oversight: a single Qdrant target's slices run
+`--job-rank`. This isn't an oversight: a single target's slices run
 one after another regardless (contending for the same instance buys nothing),
 so sharding only has a coherent meaning once there's more than one
 independent target to spread slices across. That (bin-packing slices across

@@ -22,6 +22,24 @@ def test_deterministic_auto_naming():
     assert combos[0]["_name"] == "m8_ef_construct100"
 
 
+def test_dict_valued_axis_names_are_index_name_safe():
+    # Milvus `index_params` / Elastic `index_options` are dict-valued. Their
+    # `_name` becomes part of the collection/ES-index name on the data_layouts
+    # axis, so it must render as a `[A-Za-z0-9_]` slug of the dict's contents,
+    # NOT the Python repr (whose `{`, `'`, and spaces are illegal index names).
+    combos = expand_grid({"index_options": [{"type": "int8_hnsw", "m": 16, "ef_construction": 100}]})
+    name = combos[0]["_name"]
+    assert name == "index_optionstypeint8_hnsw_m16_ef_construction100"
+    assert not (set(name) - set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"))
+    # the dict value itself is still set intact for config generation
+    assert combos[0]["index_options"] == {"type": "int8_hnsw", "m": 16, "ef_construction": 100}
+
+
+def test_list_valued_axis_name_is_slugged():
+    combos = expand_grid({"multi_probe": [[1, 2, 3]]})
+    assert combos[0]["_name"] == "multi_probe1_2_3"
+
+
 def test_empty_grid_is_a_single_default_combination():
     combos = expand_grid({})
     assert combos == [{"_name": "default"}]

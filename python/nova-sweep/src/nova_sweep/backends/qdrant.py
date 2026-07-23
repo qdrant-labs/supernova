@@ -1,15 +1,22 @@
-"""Qdrant sweep backend — the only concrete implementation today. Owns the
-`target.type: qdrant` config fields plus every Qdrant-specific translation of
-sweep params into `nova-load`/`nova-storm` configs.
+"""Qdrant sweep backend. Owns the `target.type: qdrant` config fields plus
+every Qdrant-specific translation of sweep params into `nova-load`/`nova-storm`
+configs. Unlike the Milvus/Elastic backends (flat vectorstore blocks), Qdrant
+nests structural params under `vectorstore.params`.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 from qdrant_client import QdrantClient
 
-from nova_sweep.backends.base import VECTOR_NAME, SweepBackend, TargetConfigBase, base_load_config
+from nova_sweep.backends.base import (
+    SweepBackend,
+    TargetConfigBase,
+    apply_corpus_layout,
+    base_load_config,
+    build_storm_query,
+)
 
 if TYPE_CHECKING:
     from nova_sweep.config import SweepConfig
@@ -59,36 +66,13 @@ class QdrantBackend(SweepBackend):
     def build_load_config(self, cfg: "SweepConfig", slc: "Slice", *, recreate: bool) -> dict:
         load_cfg = base_load_config(cfg)
         load_cfg["vectorstore"] = self._vectorstore_block(cfg, slc.collection_name)
-        # Overlay this data_layout's `vectors.dense.*` overrides (distance/datatype/size/...).
-        # `vectors`/`vectors.dense` must expand to mappings — guarded explicitly
-        # so a typo'd axis (e.g. `data_layouts: {vectors: [...]}`, missing the
-        # `.dense.<field>` suffix) fails with a clear message instead of an
-        # opaque AttributeError/ValueError from `dict.get`/`dict.update`.
-        layout_vectors_block = slc.data_layout.get("vectors", {})
-        if not isinstance(layout_vectors_block, dict):
-            raise ValueError(
-                f"data_layouts: `vectors` must expand to a mapping (did you mean "
-                f"`vectors.dense.<field>: [...]`?), got {layout_vectors_block!r} "
-                f"for data_layout '{slc.data_layout_name}'"
-            )
-        layout_vectors = layout_vectors_block.get("dense", {})
-        if not isinstance(layout_vectors, dict):
-            raise ValueError(
-                f"data_layouts: `vectors.dense` must expand to a mapping of field "
-                f"overrides (e.g. `vectors.dense.distance: [...]`), got "
-                f"{layout_vectors!r} for data_layout '{slc.data_layout_name}'"
-            )
-        load_cfg["vectors"]["dense"].update(layout_vectors)
-        # The recommended id_expression for supernova-produced corpora — matches
-        # `nova bf`'s own point-id derivation, so ground truth lines up.
-        load_cfg["datasource"]["id_expression"] = "vf_point_id(filename, file_row_number)"
-        # Every other data_layout key is a collection-wide create-time param
-        # (shard_number, replication_factor, write_consistency_factor,
-        # on_disk_payload — see QdrantParams in
-        # crates/nova-load/src/stores/qdrant.rs) that lives under
-        # vectorstore.params, sibling to `recreate`. `vectors`/`_name` are
-        # handled separately above.
-        layout_params = {k: v for k, v in slc.data_layout.items() if k not in ("vectors", "_name")}
+        # Overlay `vectors.dense.*` + stamp the supernova id_expression, and get
+        # back the remaining structural data_layout params. Unlike Milvus/Elastic
+        # (flat), Qdrant nests those under `vectorstore.params` — collection-wide
+        # create-time params (shard_number, replication_factor,
+        # write_consistency_factor, on_disk_payload — see QdrantParams in
+        # crates/nova-load/src/stores/qdrant.rs), sibling to `recreate`.
+        layout_params = apply_corpus_layout(load_cfg, slc)
         load_cfg["vectorstore"]["params"] = {**layout_params, "recreate": recreate}
         return load_cfg
 
@@ -105,30 +89,7 @@ class QdrantBackend(SweepBackend):
 
     def build_storm_config(self, cfg: "SweepConfig", slc: "Slice", search: dict) -> dict:
         target: QdrantTargetConfig = cfg.target
-        search_params: dict[str, Any] = {}
-        load: dict[str, Any] = {}
-        top_k = 10
-        for key, value in search.items():
-            if key in ("_name",):
-                continue
-            if key == "top_k":
-                top_k = value
-            elif key in _SEARCH_PARAM_KEYS:
-                search_params[key] = value
-            else:
-                load[key] = value
-
-        source: dict[str, Any] = {
-            "uri": cfg.queries.uri,
-            "column": cfg.queries.column,
-            "limit": cfg.queries.limit,
-        }
-        if cfg.queries.ground_truth_column:
-            source["ground_truth_column"] = cfg.queries.ground_truth_column
-
-        query: dict[str, Any] = {"vector_name": VECTOR_NAME, "top_k": top_k, "source": source}
-        if search_params:
-            query["search_params"] = search_params
+        query, load = build_storm_query(cfg, search, _SEARCH_PARAM_KEYS)
 
         return {
             "target": {

@@ -33,8 +33,9 @@ def test_target_with_explicit_qdrant_type():
 
 
 def test_target_with_unknown_type_raises():
+    # `weaviate` isn't a registered backend (qdrant/milvus/elastic are).
     with pytest.raises(ValueError, match="unknown sweep target type"):
-        _cfg({"type": "milvus", "url": "http://localhost:19530"})
+        _cfg({"type": "weaviate", "url": "http://localhost:8080"})
 
 
 def test_target_that_is_not_a_mapping_raises_a_clear_error():

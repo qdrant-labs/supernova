@@ -28,9 +28,12 @@ queries:
 
 target:
   # Backend dispatch, same idea as nova-load's vectorstore.type / nova-storm's
-  # target.type. Optional: defaults to qdrant (the only backend implemented
-  # today) when omitted, so configs written before this field existed still
-  # work unchanged. See docs/sweep/overview.md#target-backends.
+  # target.type. REQUIRED — one of qdrant | milvus | elastic (an omitted, null,
+  # or unknown type is a hard error). Each backend has its own target: fields;
+  # see docs/sweep/overview.md#target-backends.
+  #   milvus:  {type: milvus,  url, username?, password?}   # user+pass together
+  #   elastic: {type: elastic, url, (username+password) | api_key?, tls_insecure?}
+  # (username/password must be set together on both — use api_key for ES tokens.)
   type: qdrant
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
@@ -62,7 +65,7 @@ index_variants:
   hnsw.m: [8, 16, 32]
   hnsw.ef_construct: [64, 128]
 
-# Storm-only — no Qdrant-side change at all, just query-time tuning.
+# Storm-only — no store-side change at all, just query-time tuning.
 searches:
   top_k: [10]
   hnsw_ef: [64, 128]           # -> query.search_params.hnsw_ef
