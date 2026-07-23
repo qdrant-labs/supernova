@@ -78,6 +78,16 @@ Passes are planned with the **same fusion grouping the engine uses**, so the pre
 
 The GPU table's `effective_tflops_bf16` values are *achieved* encoder-workload throughput, not datasheet peaks — tune with `--gpu-scale` if your measurements disagree.
 
+## How accurate is it?
+
+Predictions were validated against measured throughput across six models (0.02B–4B params), multiple datasets, and cutoffs from 64 to 2048 tokens:
+
+![Predicted vs actual throughput (texts/s), log-log scatter across six embedding models. Points cluster along the y = x line over three orders of magnitude.](../fig/predicted_vs_actual.svg)
+
+Across these 26 runs the median prediction is off by ~1.6×, 73% land within 2× and 92% within 3×, with log-log R² ≈ 0.89 over three orders of magnitude. The errors are also *structured* in a useful way: large models (Qwen3-4B) sit almost exactly on the line — they're genuinely compute-bound, which is what the model prices — while small models drift off it as overheads the model doesn't see (tokenization, kernel launch, data movement) start to matter.
+
+The figure regenerates from `scripts/plot_predicted_vs_actual.py` + `scripts/throughput_experiments.csv`.
+
 ## What it can and can't price
 
 - **Text entries only.** The FLOPs model is token-based; image and multimodal entries are listed as skipped in the report and excluded from the totals.
