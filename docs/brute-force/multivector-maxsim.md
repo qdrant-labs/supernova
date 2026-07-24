@@ -201,3 +201,41 @@ sync. Neutral on CPU, small but real win on GPU — the reason it was worth remo
 **Tiling:** `query_block=None` (45 ms) is fastest; smaller blocks are marginally
 slower (48 ms at block=8) — same as CPU. The knobs are for memory-bounding only;
 prefer the largest that fits VRAM.
+
+### GPU optimization sweep — realistic scale (A10G), what to land
+
+A second A10G run benchmarked the two candidate optimizations at realistic
+ColBERT scale (D=1024, ~356k doc-tokens/slice), measuring speed, memory, and —
+critically for a GT tool — whether they preserve the ranking / Qdrant parity.
+
+**(a) Matmul precision — the 66% lever. TF32 landed as opt-in; bf16 rejected.**
+
+| matmul | time | speedup | median rel err | top-100 vs f32 | Qdrant parity |
+|---|--:|--:|--:|--:|--:|
+| f32 (default) | 41.9 ms | 1.0× | — | — | ✅ |
+| **TF32** | 24.0 ms | **1.75×** | 2.9e-4 | **100/100** | ✅ **still passes** |
+| bf16 | 15.9 ms | 2.63× | 2.9e-3 | 100/100 | (not run) |
+
+TF32 is 1.75× on the matmul (~1.4× on the score path) and — decisively — the
+**live-Qdrant MaxSim parity test still passes with TF32 enabled**, with zero
+top-100 ranking change. It is now exposed as **`params.allow_tf32`** (default
+**off** — GT stays bit-exact f32; on = the measured speedup at ~3e-4 relative
+error). bf16 is faster still but its `max|Δ|` was 0.75 (8-bit mantissa) — too
+coarse to trust for exact GT, so it is not exposed.
+
+**(b) Segment-max `pad+amax` — rejected.** The earlier "14% faster on GPU"
+held only at an artificially small `max_tok` (49). At realistic doc-length
+distributions it does not survive:
+
+| distribution | max_tok | scatter_reduce | pad+amax |
+|---|--:|--:|--:|
+| tight (mean 120) | 168 | 26.8 ms / 8.1 GB | 25.7 ms / 10.2 GB (1.04×, 1.3× mem) |
+| **skewed (mean 80, 5% tail→512)** | 512 | 20.7 ms / 7.6 GB | **37.9 ms / 13.9 GB (0.55×, 1.8× mem)** |
+
+Real corpora have a doc-length tail, so `pad+amax` is a wash at best and **1.8×
+slower + 1.8× more memory** under skew (it pads every doc to the longest and
+`amax`es over mostly-`-inf`). `scatter_reduce` stays the default; `pad+amax` is
+**not** landed.
+
+Net: the one landed GPU optimization is the opt-in `allow_tf32` knob (~1.4× on
+the score path when enabled), plus the already-landed host-sync removal.

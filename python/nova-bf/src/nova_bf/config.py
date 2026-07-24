@@ -201,6 +201,19 @@ class ParamsConfig(BaseModel):
     # `multivector_query_block` you left as None; an explicitly-set knob always
     # wins over the derived value. None (default) = no auto-derivation.
     multivector_token_budget: int | None = Field(default=None, gt=0)
+    # Allow TF32 tensor-core matmuls on Ampere+ GPUs (CUDA only — a no-op on
+    # CPU). OFF by default so ground truth stays bit-for-bit f32, matching
+    # Qdrant's f32 scoring exactly. When on, the score matmul runs in TF32
+    # (10-bit mantissa): measured on an A10G it makes the multivector matmul
+    # ~1.75x faster (the matmul is ~66% of GPU score time, so ~1.4x on the
+    # score path), with ~3e-4 median relative error — ranking-preserving in
+    # testing (top-100 overlap 100/100 vs f32) and the live-Qdrant MaxSim
+    # parity test still passes with it enabled. It is NOT bit-exact, so enable
+    # it only for a run where you've confirmed that ~3e-4-scale score error
+    # can't perturb the recall numbers you compute against this GT (e.g. no
+    # pathological score ties at your k). Affects every vector_type's dense
+    # matmul (dense scoring, multivector MaxSim); sparse SpMM is unaffected.
+    allow_tf32: bool = False
     # `merge` reduces the W per-rank partials in row-batches of this many queries,
     # streaming the result to disk so the full output never sits in RAM (that's what
     # let the old merge OOM at 1M queries). Peak host memory is ~(this × W × k)

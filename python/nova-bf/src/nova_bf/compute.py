@@ -1793,6 +1793,17 @@ def run_compute(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         logger.warning("No GPU detected — brute force on CPU will be slow.")
+    # Opt-in TF32 tensor-core matmuls (see ParamsConfig.allow_tf32). CUDA-only;
+    # torch's flag is a no-op on CPU, but gate on device anyway so the log is
+    # honest. OFF by default keeps GT bit-exact f32 (matching Qdrant).
+    if cfg.params.allow_tf32 and device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.warning(
+            "params.allow_tf32=True: TF32 matmuls enabled (CUDA) — ~1.75x faster "
+            "multivector/dense matmul, but scores are NOT bit-exact f32 (~3e-4 "
+            "relative error). Ensure this can't perturb your recall numbers."
+        )
 
     # 1. queries — loaded once per DISTINCT vector_type needed across all specs
     #    (queries files are small, so no need to dedupe further than that).

@@ -323,6 +323,31 @@ def test_cosine_is_scale_invariant(tmp_path):
                 assert abs(got[qi][di] - base[qi][di]) < 1e-3, f"scale={scale} q{qi} d{di} score drift"
 
 
+def test_allow_tf32_flag_roundtrips_and_is_correct(ds):
+    """`params.allow_tf32` is accepted and a run with it set still produces the
+    exact ranking. On this CPU box it's a no-op (torch's TF32 flag is CUDA-only),
+    so results must be identical to the default run — this pins the plumbing;
+    the actual TF32 speedup + ranking-preservation + Qdrant parity were measured
+    live on an A10G (see docs/brute-force/multivector-maxsim.md)."""
+    base = _run(ds["tmp"], ds["cdir"], ds["qpath"], metric="dot", k=8)
+    out = ds["tmp"] / "out_tf32"
+    out.mkdir(exist_ok=True)
+    cfg_text = f"""
+corpus: {{path: {ds["cdir"]}, multivector_column: multivector_embedding, id_column: id}}
+queries: {{path: {ds["qpath"]}, multivector_column: multivector_embedding, id_column: qid}}
+output: {{path: {out}}}
+params: {{io_workers: 2, allow_tf32: true}}
+searches:
+  - {{name: mv, k: 8, metric: dot, vector_type: multivector}}
+"""
+    p = ds["tmp"] / "cfg_tf32.yaml"
+    p.write_text(cfg_text)
+    t = pq.read_table(run_compute(load_config(str(p)))["mv"]).to_pydict()
+    got = {int(q): [int(i) for i in hi] for q, hi in zip(t["query_id"], t["hit_ids"])}
+    for qi in base:
+        assert got[qi] == list(base[qi].keys())
+
+
 def test_decoder_null_empty_and_slice():
     D = 3
     inner = pa.ListArray.from_arrays(
