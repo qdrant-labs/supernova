@@ -42,11 +42,24 @@ pub struct StormResults {
     /// query — a single gRPC round-trip's timing can't be honestly
     /// disaggregated into per-query numbers.
     pub latencies_ms: Vec<f64>,
-    /// One entry per query that had ground truth (see [`QueryVector::ground_truth`]).
-    /// Recall stays per-query even though latency doesn't: `QueryBatchResponse`
-    /// gives one distinct result per submitted query, so each query's recall is
-    /// still individually real, not approximated from the batch.
-    pub recalls: Vec<f64>,
+    /// One entry per query that had (non-empty) ground truth (see
+    /// [`QueryVector::ground_truth`]). Recall stays per-query even though latency
+    /// doesn't: `QueryBatchResponse` gives one distinct result per submitted
+    /// query, so each query's recall is still individually real, not approximated
+    /// from the batch. Each sample carries a `short` flag so the summary can
+    /// account for full-depth and short-ground-truth queries separately (see
+    /// [`RecallSample`]).
+    pub recalls: Vec<RecallSample>,
+    /// Total query firings excluded from recall because their ground truth was
+    /// present but empty (`truth_len == 0`) — see [`DispatchSample::empty_ground_truth`].
+    /// A firing count (queries cycle round-robin), consistent with the `n` in
+    /// the recall buckets, not a distinct-query count.
+    pub empty_ground_truth: u64,
+    /// Total suspected filter-leak firings (filter configured AND the vdb
+    /// returned more ids than the ground truth holds) — see
+    /// [`DispatchSample::filter_overreturn`]. A firing count, like the recall
+    /// bucket `n`s.
+    pub filter_overreturn: u64,
     /// Count of batch dispatches, not individual queries.
     pub n_ok: u64,
     pub n_err: u64,
@@ -80,25 +93,72 @@ pub struct Summary {
     pub p95_ms: f64,
     pub p99_ms: f64,
     pub max_ms: f64,
-    /// `None` when no query in this run had ground truth (feature unused, or
-    /// misconfigured — e.g. wrong column name — which looks the same from here).
-    /// `mean_recall` alone can hide a bimodal distribution (some queries near-
-    /// perfect, some near-zero) the same way it would for latency — hence
-    /// `median_recall`/`min_recall` alongside it, from the same raw samples.
-    pub mean_recall: Option<f64>,
-    pub median_recall: Option<f64>,
-    /// The single worst query's recall — the "tail" that matters for recall,
-    /// which is the LOW end (unlike latency's p95/p99, which watch the high
-    /// end) — so this is a min, not a high percentile.
-    pub min_recall: Option<f64>,
+    /// Recall over queries whose ground truth held at least `top_k` ids, scored
+    /// against `top_k` (the conventional recall@k). `None` when no such query ran
+    /// (feature unused, misconfigured column, or every ground-truth list was
+    /// short).
+    pub full_recall: Option<RecallBucket>,
+    /// Recall over queries whose ground truth held FEWER than `top_k` ids, scored
+    /// against the ground truth's own length (not `top_k`) so a short list isn't
+    /// dragged down by a denominator it could never fill. `None` when no such
+    /// query ran. Kept separate from `full_recall` so a run with mixed depths
+    /// doesn't blend two different denominators into one misleading mean.
+    pub short_recall: Option<RecallBucket>,
+    /// Recall over ALL ground-truthed queries (`full` + `short`), each scored by
+    /// its own denominator. `None` when no query in this run had ground truth.
+    pub total_recall: Option<RecallBucket>,
+    /// Query firings excluded from every recall bucket above because their
+    /// ground truth was present but empty (`truth_len == 0`) — nothing to score
+    /// against. `0` in the common case; a non-zero value tells the operator some
+    /// firings silently sat out recall (distinct from queries with no ground
+    /// truth configured at all, which were never in scope for recall).
+    pub empty_ground_truth: u64,
+    /// Suspected filter leaks: firings where, **with a filter configured**, the
+    /// vdb returned MORE result ids than the ground truth holds
+    /// (`returned.len() > truth_len`). Recall is unchanged. Only tallied under a
+    /// filter — unfiltered over-return is benign truncation (a shallow ground
+    /// truth vs a deeper `top_k`), not a bug — and it's a valid leak signal only
+    /// when the filtered ground truth is the EXHAUSTIVE match set (bf found all
+    /// matching docs, i.e. wasn't itself capped). `0` when it never happened.
+    pub filter_overreturn: u64,
+}
+
+/// One recall bucket's headline: how many queries fell in it and their mean
+/// recall. Count travels with the mean so a mean over 3 queries can't be read
+/// as if it were over 3000.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RecallBucket {
+    pub n: u64,
+    pub mean: f64,
+}
+
+impl RecallBucket {
+    /// `None` for an empty slice — an absent bucket, not a `0.0` mean.
+    fn from(recalls: &[f64]) -> Option<Self> {
+        (!recalls.is_empty())
+            .then(|| RecallBucket { n: recalls.len() as u64, mean: recalls.iter().sum::<f64>() / recalls.len() as f64 })
+    }
+}
+
+/// One query's recall observation, tagged with whether its ground truth held
+/// fewer ids than `top_k`. `short` queries divide by their own ground-truth
+/// length rather than `top_k` (see [`recall_at_k`]); the flag is what lets the
+/// summary and the time-series report keep the two populations apart.
+#[derive(Debug, Clone, Copy)]
+pub struct RecallSample {
+    pub recall: f64,
+    pub short: bool,
 }
 
 impl StormResults {
     pub fn summary(&self) -> Summary {
         let mut ms = self.latencies_ms.clone();
         ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mut rc = self.recalls.clone();
-        rc.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // Split the per-query recall samples into the full-depth and short
+        // buckets; `total` scores every ground-truthed query together.
+        let full: Vec<f64> = self.recalls.iter().filter(|s| !s.short).map(|s| s.recall).collect();
+        let short: Vec<f64> = self.recalls.iter().filter(|s| s.short).map(|s| s.recall).collect();
+        let all: Vec<f64> = self.recalls.iter().map(|s| s.recall).collect();
         let total = self.n_ok + self.n_err;
         let requests_per_sec = if self.wall_s > 0.0 { total as f64 / self.wall_s } else { 0.0 };
         Summary {
@@ -111,9 +171,11 @@ impl StormResults {
             p95_ms: percentile(&ms, 95.0),
             p99_ms: percentile(&ms, 99.0),
             max_ms: ms.last().copied().unwrap_or(0.0),
-            mean_recall: (!rc.is_empty()).then(|| rc.iter().sum::<f64>() / rc.len() as f64),
-            median_recall: (!rc.is_empty()).then(|| percentile(&rc, 50.0)),
-            min_recall: rc.first().copied(),
+            full_recall: RecallBucket::from(&full),
+            short_recall: RecallBucket::from(&short),
+            total_recall: RecallBucket::from(&all),
+            empty_ground_truth: self.empty_ground_truth,
+            filter_overreturn: self.filter_overreturn,
         }
     }
 }
@@ -131,14 +193,24 @@ impl std::fmt::Display for Summary {
             format!("{:>16}: {:.2}", "p99_ms", self.p99_ms),
             format!("{:>16}: {:.2}", "max_ms", self.max_ms),
         ];
-        if let Some(r) = self.mean_recall {
-            lines.push(format!("{:>16}: {:.4}", "mean_recall", r));
+        if let Some(b) = self.full_recall {
+            lines.push(format!("{:>16}: {:.4} (n={})", "recall_full", b.mean, b.n));
         }
-        if let Some(r) = self.median_recall {
-            lines.push(format!("{:>16}: {:.4}", "median_recall", r));
+        if let Some(b) = self.short_recall {
+            lines.push(format!("{:>16}: {:.4} (n={})", "recall_short", b.mean, b.n));
         }
-        if let Some(r) = self.min_recall {
-            lines.push(format!("{:>16}: {:.4}", "min_recall", r));
+        if let Some(b) = self.total_recall {
+            lines.push(format!("{:>16}: {:.4} (n={})", "recall_total", b.mean, b.n));
+        }
+        // Only when it actually happened — a 0 here is the norm and would just
+        // be noise next to the recall means.
+        if self.empty_ground_truth > 0 {
+            lines.push(format!("{:>16}: {}", "recall_empty_gt", self.empty_ground_truth));
+        }
+        // Suspected filter leaks — visibility only, recall above is unaffected.
+        // Shown when it happened.
+        if self.filter_overreturn > 0 {
+            lines.push(format!("{:>16}: {}", "filter_overreturn", self.filter_overreturn));
         }
         write!(f, "{}", lines.join("\n"))
     }
@@ -155,18 +227,32 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
     sorted_ms[rank.min(n) - 1]
 }
 
-/// Recall@k for one query: the fraction of the known-correct top-k ids
+/// Recall@k for one query: the fraction of the known-correct ids
 /// (`ground_truth`) that appear among the ids the target actually `returned`.
-/// Divides by `k` (not `ground_truth.len()` or `returned.len()`) — the
-/// conventional recall@k definition — so `ground_truth` should hold at least
-/// `k` ids (nova-bf's own `k` at or above storm's `top_k`) or recall reads
-/// artificially low; `lib.rs` warns at startup if any loaded row is short.
-/// `ground_truth` is already a `HashSet` (built once at load time in
-/// `queries.rs`, not per call) since this runs on every query firing.
+///
+/// The denominator adapts to the ground truth's own depth:
+/// * `ground_truth.len() >= k` — divides by `k` (the conventional recall@k),
+///   and the sample is tagged `short = false`.
+/// * `ground_truth.len() < k` — divides by `ground_truth.len()`, tagged
+///   `short = true`. A list shorter than `k` (e.g. nova-bf's `k=10` vs storm's
+///   `top_k=100`) can never fill a `k`-sized denominator, so scoring it against
+///   `k` would read as an artificial recall regression rather than the sparse
+///   ground truth it actually is; the summary keeps these queries in their own
+///   bucket for honest accounting.
+///
+/// Returns `None` for empty `ground_truth` — there's nothing to measure against,
+/// and dividing by zero would poison the mean with a `NaN` (a NULL column value
+/// is already dropped upstream in `queries.rs`, but a present-but-empty list
+/// reaches here). `ground_truth` is already a `HashSet` (built once at load time
+/// in `queries.rs`, not per call) since this runs on every query firing.
 /// `returned` is deduped before counting hits — a target that ever repeated an
 /// id within one query's results must not let that repeat count twice, which
 /// would push recall above the `1.0` ceiling a fraction is supposed to have.
-fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> f64 {
+fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> Option<RecallSample> {
+    let truth_len = ground_truth.len() as u64;
+    if truth_len == 0 {
+        return None;
+    }
     let hits = returned
         .iter()
         .map(String::as_str)
@@ -174,7 +260,9 @@ fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> f
         .into_iter()
         .filter(|id| ground_truth.contains(*id))
         .count();
-    hits as f64 / k as f64
+    let short = truth_len < k;
+    let denom = if short { truth_len } else { k };
+    Some(RecallSample { recall: hits as f64 / denom as f64, short })
 }
 
 /// One batch dispatch's observation forwarded from a worker to the collector
@@ -191,13 +279,30 @@ pub struct DispatchSample {
     pub latency_ms: f64,
     pub ok: bool,
     /// A query contributes no entry here (not a `0.0` entry) when it had no
-    /// ground truth to compare against, OR the whole dispatch failed (`!ok`)
-    /// — a failed request has no "returned ids" to score, so it must not
-    /// count as recall=0. Conflating the two would make `mean_recall` crash
+    /// (or empty) ground truth to compare against, OR the whole dispatch failed
+    /// (`!ok`) — a failed request has no "returned ids" to score, so it must not
+    /// count as recall=0. Conflating the two would make mean recall crash
     /// under load-induced errors even when every *successful* query has
     /// perfect recall — a different, already-visible finding via
-    /// `errors`/`requests_per_sec`, not one recall should also report.
-    pub recalls: Vec<f64>,
+    /// `errors`/`requests_per_sec`, not one recall should also report. Each
+    /// sample carries its `short` flag so the time-series report can split the
+    /// two buckets too (see [`RecallSample`]).
+    pub recalls: Vec<RecallSample>,
+    /// How many queries in this dispatch had a ground-truth list that was
+    /// *present but empty* (`truth_len == 0`) — configured for recall, dispatch
+    /// succeeded, but there was nothing to score against, so they produced no
+    /// `recalls` entry. Counted (not silently dropped) so the summary can report
+    /// how many firings were excluded from recall for this reason, separately
+    /// from queries that simply had no ground truth configured (`None`).
+    pub empty_ground_truth: u64,
+    /// Suspected filter leaks in this dispatch: queries where, with a filter
+    /// configured, the vdb returned MORE result ids than their ground truth
+    /// holds (`returned.len() > truth_len`, ground truth non-empty). Recall is
+    /// unaffected. Counted only under a filter — without one, over-return is
+    /// benign truncation (shallow ground truth vs deeper `top_k`), not a leak —
+    /// so `dispatch_sample` takes the run's `filtered` flag rather than
+    /// inferring it here.
+    pub filter_overreturn: u64,
 }
 
 /// Build a [`DispatchSample`] from a completed batch dispatch, applying the
@@ -212,20 +317,37 @@ fn dispatch_sample(
     idxs: &[usize],
     vectors: &[QueryVector],
     top_k: u64,
+    filtered: bool,
     started: Instant,
 ) -> DispatchSample {
-    let recalls = idxs
-        .iter()
-        .zip(out.ids.iter())
-        .filter_map(|(&i, ids)| {
-            ids.as_ref().zip(vectors[i].ground_truth.as_ref()).map(|(ids, gt)| recall_at_k(ids, gt, top_k))
-        })
-        .collect();
+    // A query scores recall only when the dispatch returned ids for it AND it
+    // had ground truth. `recall_at_k` returning `None` there means the ground
+    // truth was present but empty — count those separately rather than lose them.
+    let mut recalls = Vec::new();
+    let mut empty_ground_truth = 0u64;
+    let mut filter_overreturn = 0u64;
+    for (&i, ids) in idxs.iter().zip(out.ids.iter()) {
+        if let Some((ids, gt)) = ids.as_ref().zip(vectors[i].ground_truth.as_ref()) {
+            // Suspected filter leak: with a filter active, the vdb returned more
+            // ids than the (exhaustive) filtered ground truth holds. Only under
+            // a filter — unfiltered over-return is benign truncation (shallow gt
+            // vs deeper top_k). An empty gt is its own bucket, counted above.
+            if filtered && !gt.is_empty() && ids.len() as u64 > gt.len() as u64 {
+                filter_overreturn += 1;
+            }
+            match recall_at_k(ids, gt, top_k) {
+                Some(sample) => recalls.push(sample),
+                None => empty_ground_truth += 1,
+            }
+        }
+    }
     DispatchSample {
         t_s: started.elapsed().as_secs_f64(),
         latency_ms: out.latency.as_secs_f64() * 1000.0,
         ok: out.ok,
         recalls,
+        empty_ground_truth,
+        filter_overreturn,
     }
 }
 
@@ -249,12 +371,14 @@ fn batch_indices(start: usize, batch_size: usize, n: usize) -> Vec<usize> {
 /// `vectors` is the query set to cycle through (round-robin). A dispatch failure
 /// is recorded as an error sample, not a hard error — see [`BatchOutcome`](
 /// crate::targets::BatchOutcome). `top_k` is the denominator for recall — see
-/// [`recall_at_k`].
+/// [`recall_at_k`]. `filtered` is whether a query filter is configured — it
+/// gates the `filter_overreturn` leak count (only meaningful under a filter).
 pub async fn run_storm(
     target: Arc<dyn QueryTarget>,
     vectors: Vec<QueryVector>,
     profile: &LoadProfile,
     top_k: u64,
+    filtered: bool,
     recorder: Option<Box<dyn crate::report::Recorder>>,
 ) -> StormResults {
     let vectors = Arc::new(vectors);
@@ -282,6 +406,8 @@ pub async fn run_storm(
         let mut writer_tx = writer_tx;
         let mut latencies = Vec::new();
         let mut recalls = Vec::new();
+        let mut empty_gt = 0u64;
+        let mut over_gt = 0u64;
         let mut n_ok = 0u64;
         let mut n_err = 0u64;
         let mut dropped = 0u64;
@@ -290,6 +416,8 @@ pub async fn run_storm(
             // is still owned to hand to the writer without a clone.
             latencies.push(s.latency_ms);
             recalls.extend(s.recalls.iter().copied());
+            empty_gt += s.empty_ground_truth;
+            over_gt += s.filter_overreturn;
             if s.ok {
                 n_ok += 1;
             } else {
@@ -309,7 +437,7 @@ pub async fn run_storm(
         }
         // Drop the sender so the writer thread's `recv` ends and it runs finish().
         drop(writer_tx);
-        (latencies, recalls, n_ok, n_err, dropped)
+        (latencies, recalls, empty_gt, over_gt, n_ok, n_err, dropped)
     });
 
     let started = Instant::now();
@@ -317,16 +445,16 @@ pub async fn run_storm(
     let batch_size = profile.batch_size.max(1);
 
     if profile.target_rps > 0.0 {
-        run_paced(&target, &vectors, profile, started, stop_at, top_k, &tx).await;
+        run_paced(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx).await;
     } else {
-        run_closed_loop(&target, &vectors, profile, started, stop_at, top_k, &tx).await;
+        run_closed_loop(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx).await;
     }
 
     // Drop the last sender so the collector's `recv` loop ends.
     drop(tx);
     let wall_s = started.elapsed().as_secs_f64();
 
-    let (latencies_ms, recalls, n_ok, n_err, dropped_samples) =
+    let (latencies_ms, recalls, empty_ground_truth, filter_overreturn, n_ok, n_err, dropped_samples) =
         collector.await.unwrap_or_default();
     // Join the writer thread so its `finish()` (final flush) completes before we
     // return — otherwise a caller reading the file back could race the flush.
@@ -344,7 +472,17 @@ pub async fn run_storm(
     }
     let _ = target.close().await;
 
-    StormResults { latencies_ms, recalls, n_ok, n_err, wall_s, batch_size, dropped_samples }
+    StormResults {
+        latencies_ms,
+        recalls,
+        empty_ground_truth,
+        filter_overreturn,
+        n_ok,
+        n_err,
+        wall_s,
+        batch_size,
+        dropped_samples,
+    }
 }
 
 /// Hold `concurrency` requests in flight until the window closes; each task
@@ -356,6 +494,7 @@ async fn run_closed_loop(
     started: Instant,
     stop_at: Instant,
     top_k: u64,
+    filtered: bool,
     tx: &mpsc::UnboundedSender<DispatchSample>,
 ) {
     let n = vectors.len();
@@ -375,7 +514,7 @@ async fn run_closed_loop(
                 let idxs = batch_indices(start, batch_size, n);
                 let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
                 let out = target.query_batch(&queries).await;
-                let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, started));
+                let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, filtered, started));
             }
         });
     }
@@ -395,6 +534,7 @@ async fn run_paced(
     started: Instant,
     stop_at: Instant,
     top_k: u64,
+    filtered: bool,
     tx: &mpsc::UnboundedSender<DispatchSample>,
 ) {
     let n = vectors.len();
@@ -423,7 +563,7 @@ async fn run_paced(
         inflight.spawn(async move {
             let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
             let out = target.query_batch(&queries).await;
-            let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, started));
+            let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, filtered, started));
             drop(permit); // release the in-flight slot
         });
 
@@ -496,7 +636,7 @@ mod tests {
     async fn closed_loop_fires_many_and_records_each() {
         let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results = run_storm(target, vectors(), &profile, 10, None).await;
+        let results = run_storm(target, vectors(), &profile, 10, false, None).await;
         let summary = results.summary();
 
         assert!(summary.requests > 0);
@@ -508,7 +648,7 @@ mod tests {
         assert!((summary.qps - summary.requests_per_sec).abs() < 1e-9);
         // no query in `vectors()` carries ground truth -> recall untouched, not zero
         assert!(results.recalls.is_empty());
-        assert_eq!(summary.mean_recall, None);
+        assert!(summary.total_recall.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -517,7 +657,7 @@ mod tests {
         let duration_s = 0.5;
         let profile = LoadProfile { concurrency: 16, duration_s, target_rps, batch_size: 1 };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results = run_storm(target, vectors(), &profile, 10, None).await;
+        let results = run_storm(target, vectors(), &profile, 10, false, None).await;
         let summary = results.summary();
 
         // The whole point: pacing holds the offered rate at/under target. Allow a
@@ -551,14 +691,18 @@ mod tests {
             .collect();
 
         let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
-        let results = run_storm(target, vectors, &profile, 4, None).await;
+        let results = run_storm(target, vectors, &profile, 4, false, None).await;
         let summary = results.summary();
 
         // every recorded recall sample must be exactly 0.25 -- never 0, never
-        // computed against a query that had no ground truth.
+        // computed against a query that had no ground truth. Ground truth is 4
+        // ids at k=4, so all samples are full-depth (not short).
         assert!(!results.recalls.is_empty());
-        assert!(results.recalls.iter().all(|&r| (r - 0.25).abs() < 1e-9));
-        assert_eq!(summary.mean_recall, Some(0.25));
+        assert!(results.recalls.iter().all(|s| !s.short && (s.recall - 0.25).abs() < 1e-9));
+        let full = summary.full_recall.expect("full-depth queries present");
+        assert!((full.mean - 0.25).abs() < 1e-9);
+        assert!(summary.short_recall.is_none()); // no short ground truth in this run
+        assert!((summary.total_recall.unwrap().mean - 0.25).abs() < 1e-9);
         // fewer recall samples than total requests -- only the ground-truthed half
         assert!((results.recalls.len() as u64) < summary.requests);
     }
@@ -580,24 +724,120 @@ mod tests {
             .collect();
 
         let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
-        let results = run_storm(target, vectors, &profile, 1, None).await;
+        let results = run_storm(target, vectors, &profile, 1, false, None).await;
         let summary = results.summary();
 
         assert_eq!(summary.errors, summary.requests); // every query failed
         assert!(results.recalls.is_empty()); // -> zero recall SAMPLES, not samples of 0.0
-        assert_eq!(summary.mean_recall, None); // -> "unknown", not "search returned nothing"
+        assert!(summary.total_recall.is_none()); // -> "unknown", not "search returned nothing"
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn present_but_empty_ground_truth_is_counted_not_scored() {
+        // A query whose ground-truth column value is an empty list has nothing
+        // to score against: it must NOT become a recall=0 sample (which would
+        // read as a search miss) NOR a divide-by-zero NaN -- it's counted under
+        // `empty_ground_truth` and left out of every recall bucket.
+        let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
+        let vectors: Vec<QueryVector> = (0..10)
+            .map(|i| QueryVector {
+                vector: vec![i as f32; 4],
+                // even: real ground truth (recall@2 = 1/2); odd: present-but-empty.
+                ground_truth: Some(if i % 2 == 0 {
+                    HashSet::from(["a".to_string(), "zzz".into()])
+                } else {
+                    HashSet::new()
+                }),
+                filter_values: HashMap::new(),
+            })
+            .collect();
+
+        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let results = run_storm(target, vectors, &profile, 2, false, None).await;
+        let summary = results.summary();
+
+        // The empty-gt firings are counted, not scored...
+        assert!(summary.empty_ground_truth > 0);
+        // ...and never leaked into a recall bucket: every recorded sample is the
+        // 0.5 from the real-ground-truth queries, none a 0.0 or NaN.
+        assert!(results.recalls.iter().all(|s| (s.recall - 0.5).abs() < 1e-9));
+        assert!((summary.total_recall.unwrap().mean - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filter_overreturn_counts_only_under_a_filter_and_never_touches_recall() {
+        // The mock always returns 2 ids; each query's ground truth holds just 1.
+        // So every firing has returned(2) > truth_len(1) — a suspected filter
+        // leak ONLY when a filter is configured. Without a filter it's benign
+        // truncation and must NOT be counted.
+        let vectors = || -> Vec<QueryVector> {
+            (0..8)
+                .map(|i| QueryVector {
+                    vector: vec![i as f32; 4],
+                    ground_truth: Some(HashSet::from(["a".to_string()])), // 1 id, "a" is a hit
+                    filter_values: HashMap::new(),
+                })
+                .collect()
+        };
+        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+
+        // With a filter: every firing over-returned relative to its 1-id ground
+        // truth, so it's counted...
+        let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
+        let filtered = run_storm(target, vectors(), &profile, 5, true, None).await;
+        let fs = filtered.summary();
+        assert!(fs.filter_overreturn > 0);
+        assert_eq!(fs.filter_overreturn, fs.total_recall.unwrap().n);
+        // ...but recall is untouched: short bucket, 1 hit / 1 gt id = 1.0.
+        assert!(filtered.recalls.iter().all(|s| s.short && (s.recall - 1.0).abs() < 1e-9));
+        assert_eq!(fs.empty_ground_truth, 0); // a different signal
+
+        // Same over-return WITHOUT a filter -> not a leak, count stays 0, while
+        // recall is identical.
+        let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
+        let unfiltered = run_storm(target, vectors(), &profile, 5, false, None).await;
+        let us = unfiltered.summary();
+        assert_eq!(us.filter_overreturn, 0);
+        assert!(unfiltered.recalls.iter().all(|s| (s.recall - 1.0).abs() < 1e-9));
     }
 
     #[test]
-    fn recall_at_k_divides_by_k_not_returned_or_ground_truth_len() {
+    fn recall_at_k_full_depth_divides_by_k_and_is_not_short() {
         let returned = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let ground_truth =
             HashSet::from(["a".to_string(), "b".to_string(), "z".to_string(), "y".to_string()]);
-        // 2 of the 3 returned ids are in ground_truth, k=4 -> 2/4, not 2/3 or 2/4-of-gt-len coincidence
-        assert_eq!(recall_at_k(&returned, &ground_truth, 4), 0.5);
-        assert_eq!(recall_at_k(&returned, &ground_truth, 2), 1.0); // capped by k, not clamped to <=1 elsewhere
-        assert_eq!(recall_at_k(&[], &ground_truth, 4), 0.0);
-        assert_eq!(recall_at_k(&returned, &HashSet::new(), 4), 0.0);
+        // gt has 4 ids (>= k), so denominator is k, not gt len or returned len.
+        // 2 of the 3 returned ids are in ground_truth, k=4 -> 2/4.
+        let r = recall_at_k(&returned, &ground_truth, 4).unwrap();
+        assert_eq!((r.recall, r.short), (0.5, false));
+        // k=2 (<= gt len) still divides by k -> 2/2 = 1.0, still full-depth.
+        let r = recall_at_k(&returned, &ground_truth, 2).unwrap();
+        assert_eq!((r.recall, r.short), (1.0, false));
+        // no returned ids -> 0 hits over k, still a real (full-depth) sample.
+        let r = recall_at_k(&[], &ground_truth, 4).unwrap();
+        assert_eq!((r.recall, r.short), (0.0, false));
+    }
+
+    #[test]
+    fn recall_at_k_short_ground_truth_divides_by_its_own_length_and_is_flagged() {
+        // gt has 2 ids but k=4 -> can never fill k. Score against gt len (2),
+        // not k, and flag it short so the summary keeps it in its own bucket.
+        let returned = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let ground_truth = HashSet::from(["a".to_string(), "b".to_string()]);
+        let r = recall_at_k(&returned, &ground_truth, 4).unwrap();
+        assert_eq!((r.recall, r.short), (1.0, true)); // 2 hits / 2 gt, NOT 2/4
+        // one hit of the two -> 1/2, still short.
+        let one = vec!["a".to_string(), "zzz".to_string()];
+        let r = recall_at_k(&one, &ground_truth, 4).unwrap();
+        assert_eq!((r.recall, r.short), (0.5, true));
+    }
+
+    #[test]
+    fn recall_at_k_empty_ground_truth_is_no_sample_not_a_nan() {
+        // Dividing by an empty gt's length would be NaN and poison the mean;
+        // an empty (or absent) ground truth is simply "nothing to measure".
+        let returned = vec!["a".to_string()];
+        assert!(recall_at_k(&returned, &HashSet::new(), 4).is_none());
     }
 
     #[test]
@@ -607,7 +847,7 @@ mod tests {
         // fraction that's supposed to be capped at 1.0).
         let returned = vec!["a".to_string(), "a".to_string(), "a".to_string()];
         let ground_truth = HashSet::from(["a".to_string(), "b".to_string()]);
-        assert_eq!(recall_at_k(&returned, &ground_truth, 2), 0.5);
+        assert_eq!(recall_at_k(&returned, &ground_truth, 2).unwrap().recall, 0.5);
     }
 
     #[test]
@@ -630,16 +870,36 @@ mod tests {
             p95_ms: 2.0,
             p99_ms: 3.0,
             max_ms: 4.0,
-            mean_recall: None,
-            median_recall: None,
-            min_recall: None,
+            full_recall: None,
+            short_recall: None,
+            total_recall: None,
+            empty_ground_truth: 0,
+            filter_overreturn: 0,
         };
         assert!(!base.to_string().contains("recall"));
 
-        let with_recall = Summary { mean_recall: Some(0.87), ..base };
-        assert!(with_recall.to_string().contains("mean_recall"));
-        assert!(!with_recall.to_string().contains("median_recall")); // still None -> still absent
-        assert!(with_recall.to_string().ends_with("0.8700"));
+        // A run with only full-depth queries: full + total print, short stays absent.
+        let with_recall = Summary {
+            full_recall: Some(RecallBucket { n: 8, mean: 0.87 }),
+            total_recall: Some(RecallBucket { n: 8, mean: 0.87 }),
+            ..base
+        };
+        let s = with_recall.to_string();
+        assert!(s.contains("recall_full"));
+        assert!(s.contains("recall_total"));
+        assert!(!s.contains("recall_short")); // no short bucket -> still absent
+        assert!(s.contains("0.8700 (n=8)"));
+        assert!(!s.contains("recall_empty_gt")); // 0 empty -> line stays absent
+
+        assert!(!s.contains("filter_overreturn")); // 0 -> line stays absent
+
+        // A non-zero empty-ground-truth count prints its own line.
+        let with_empty = Summary { empty_ground_truth: 3, ..base };
+        assert!(with_empty.to_string().contains("recall_empty_gt: 3"));
+
+        // A non-zero returned-over-ground-truth count prints its own line.
+        let with_over = Summary { filter_overreturn: 7, ..base };
+        assert!(with_over.to_string().contains("filter_overreturn: 7"));
     }
 
     #[test]
@@ -654,16 +914,22 @@ mod tests {
             p95_ms: 2.0,
             p99_ms: 3.0,
             max_ms: 4.0,
-            mean_recall: Some(0.87),
-            median_recall: Some(0.9),
-            min_recall: Some(0.5),
+            full_recall: Some(RecallBucket { n: 6, mean: 0.9 }),
+            short_recall: Some(RecallBucket { n: 2, mean: 0.75 }),
+            total_recall: Some(RecallBucket { n: 8, mean: 0.87 }),
+            empty_ground_truth: 5,
+            filter_overreturn: 3,
         };
         let json = serde_json::to_string(&summary).expect("serializes");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(parsed["requests"], 10);
         assert_eq!(parsed["batch_size"], 4);
         assert_eq!(parsed["qps"], 20.0);
-        assert_eq!(parsed["mean_recall"], 0.87);
+        assert_eq!(parsed["total_recall"]["mean"], 0.87);
+        assert_eq!(parsed["total_recall"]["n"], 8);
+        assert_eq!(parsed["short_recall"]["mean"], 0.75);
+        assert_eq!(parsed["empty_ground_truth"], 5);
+        assert_eq!(parsed["filter_overreturn"], 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -703,27 +969,37 @@ mod tests {
         ];
         // duration long enough to cycle through all 3 at concurrency=1 several times
         let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1 };
-        let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2, None).await;
+        let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2, false, None).await;
 
         // Only asserts the pipeline actually produced all 3 distinct values --
         // NOT their exact proportions, which depend on how many times each of
         // the 3 round-robin slots happened to be hit inside a fixed wall-clock
-        // window (not guaranteed 1:1:1). The exact mean/median/min math itself
+        // window (not guaranteed 1:1:1). The exact per-bucket mean math itself
         // is covered deterministically, with no timing dependency, by
-        // `summary_aggregates_recall_distribution_correctly` below.
-        assert!(results.recalls.iter().any(|&r| (r - 0.0).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|&r| (r - 0.5).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|&r| (r - 1.0).abs() < 1e-9));
+        // `summary_aggregates_recall_buckets_correctly` below. gt is 2 ids at
+        // k=2, so every sample is full-depth (not short).
+        assert!(results.recalls.iter().all(|s| !s.short));
+        assert!(results.recalls.iter().any(|s| (s.recall - 0.0).abs() < 1e-9));
+        assert!(results.recalls.iter().any(|s| (s.recall - 0.5).abs() < 1e-9));
+        assert!(results.recalls.iter().any(|s| (s.recall - 1.0).abs() < 1e-9));
     }
 
     #[test]
-    fn summary_aggregates_recall_distribution_correctly() {
+    fn summary_aggregates_recall_buckets_correctly() {
         // Deterministic, no async/timing involved -- exercises StormResults::summary()
-        // directly, so it can assert exact mean/median/min without depending on
-        // how many times a round-robin cycle happened to repeat within a window.
+        // directly, so it can assert exact per-bucket counts + means without
+        // depending on how many times a round-robin cycle repeated in a window.
+        // Two full-depth samples (mean 0.75) and one short sample (mean 0.40);
+        // total blends all three, each by its own denominator.
         let results = StormResults {
             latencies_ms: vec![1.0, 2.0, 3.0],
-            recalls: vec![0.0, 0.5, 1.0],
+            recalls: vec![
+                RecallSample { recall: 0.5, short: false },
+                RecallSample { recall: 1.0, short: false },
+                RecallSample { recall: 0.4, short: true },
+            ],
+            empty_ground_truth: 2,
+            filter_overreturn: 0,
             n_ok: 3,
             n_err: 0,
             wall_s: 1.0,
@@ -732,12 +1008,17 @@ mod tests {
         };
         let summary = results.summary();
 
-        assert_eq!(summary.min_recall, Some(0.0)); // the worst query, not hidden by the mean
-        assert!((summary.mean_recall.unwrap() - 0.5).abs() < 1e-9); // (0+0.5+1)/3 = 0.5
-        assert!((summary.median_recall.unwrap() - 0.5).abs() < 1e-9);
-        // mean and median coincide here (symmetric distribution) -- min is the
-        // one that actually differs from both, proving it's not just an alias.
-        assert_ne!(summary.min_recall, summary.mean_recall);
+        let full = summary.full_recall.unwrap();
+        assert_eq!(full.n, 2);
+        assert!((full.mean - 0.75).abs() < 1e-9); // (0.5 + 1.0) / 2
+        let short = summary.short_recall.unwrap();
+        assert_eq!(short.n, 1);
+        assert!((short.mean - 0.4).abs() < 1e-9);
+        let total = summary.total_recall.unwrap();
+        assert_eq!(total.n, 3);
+        assert!((total.mean - (0.5 + 1.0 + 0.4) / 3.0).abs() < 1e-9); // all three, each own denom
+        // empty-ground-truth firings pass through untouched, outside every bucket.
+        assert_eq!(summary.empty_ground_truth, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -752,12 +1033,12 @@ mod tests {
 
         let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results = run_storm(target, vectors(), &profile, 10, Some(recorder)).await;
+        let results = run_storm(target, vectors(), &profile, 10, false, Some(recorder)).await;
         let summary = results.summary();
 
         let text = std::fs::read_to_string(&path).expect("csv written");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "t_s,latency_ms,ok,recalls");
+        assert_eq!(lines[0], "t_s,latency_ms,ok,recalls_full,recalls_short");
         // one row per dispatch that reached the sink — the time series IS the
         // raw run, minus any samples dropped when the writer queue was full
         // (with an instant mock target the load loop can briefly outrun the
@@ -792,7 +1073,7 @@ mod tests {
         let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results =
-            run_storm(target, vectors(), &profile, 10, Some(Box::new(FailingRecorder))).await;
+            run_storm(target, vectors(), &profile, 10, false, Some(Box::new(FailingRecorder))).await;
         let summary = results.summary();
 
         // Load ran to completion despite the sink failing on the very first row.
@@ -853,15 +1134,15 @@ mod tests {
         let batch_size = 3;
         let profile = LoadProfile { concurrency: 1, duration_s: 0.15, target_rps: 0.0, batch_size };
         let target = Arc::new(BatchCapturingTarget { call_lens: std::sync::Mutex::new(Vec::new()) });
-        let results = run_storm(target.clone(), vectors, &profile, 2, None).await;
+        let results = run_storm(target.clone(), vectors, &profile, 2, false, None).await;
 
         let call_lens = target.call_lens.lock().unwrap();
         assert!(!call_lens.is_empty());
         assert!(call_lens.iter().all(|&len| len == batch_size), "{call_lens:?}");
 
-        assert!(results.recalls.iter().any(|&r| (r - 0.0).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|&r| (r - 0.5).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|&r| (r - 1.0).abs() < 1e-9));
+        assert!(results.recalls.iter().any(|s| (s.recall - 0.0).abs() < 1e-9));
+        assert!(results.recalls.iter().any(|s| (s.recall - 0.5).abs() < 1e-9));
+        assert!(results.recalls.iter().any(|s| (s.recall - 1.0).abs() < 1e-9));
         assert_eq!(results.summary().batch_size, batch_size);
     }
 }
