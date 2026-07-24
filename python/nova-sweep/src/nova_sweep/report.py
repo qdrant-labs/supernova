@@ -45,10 +45,13 @@ def build_row(
     error: str | None,
 ) -> dict[str, Any]:
     """One flattened report row for a single (data_layout, index_variant,
-    search) point. `summary` is nova-storm's `--json` output (already a flat
-    dict of its `Summary` fields — see `crates/nova-storm/src/runner.rs`);
-    `None` when the point never got as far as a storm run (recorded as an
-    error row instead — errors are data, not aborts)."""
+    search) point. `summary` is nova-storm's `--json` output (its `Summary`
+    fields — see `crates/nova-storm/src/runner.rs`); mostly scalars, but the
+    recall buckets (`full_recall`/`short_recall`/`total_recall`) are nested
+    `{n, mean}` objects, so they're flattened to dotted columns
+    (`total_recall.mean`, `total_recall.n`, …) rather than written as struct
+    columns. `None` when the point never got as far as a storm run (recorded as
+    an error row instead — errors are data, not aborts)."""
     row: dict[str, Any] = {
         "collection_name": collection_name,
         "data_layout_name": data_layout_name,
@@ -63,7 +66,13 @@ def build_row(
     _flatten("index_variant", index_variant, row)
     _flatten("search", search, row)
     if summary:
-        row.update(summary)
+        # Scalars land as-is; nested recall buckets flatten to dotted columns so
+        # the parquet stays a flat table (no struct-typed columns).
+        for key, value in summary.items():
+            if isinstance(value, dict):
+                _flatten(key, value, row)
+            else:
+                row[key] = value
     return row
 
 

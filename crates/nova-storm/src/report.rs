@@ -127,10 +127,14 @@ pub fn spawn_writer(
 
 /// CSV/JSONL file sink (`path: "-"` = stdout).
 ///
-/// CSV columns: `t_s,latency_ms,ok,recalls` — `recalls` is `;`-joined (one
-/// value per ground-truthed query in the dispatch; usually 0 or 1 values at
-/// batch_size=1), empty when none. JSONL carries the same fields with
-/// `recalls` as a real array.
+/// CSV columns: `t_s,latency_ms,ok,recalls_full,recalls_short` — each recall
+/// column is `;`-joined (one value per ground-truthed query in the dispatch
+/// that fell in that bucket; usually 0 or 1 values total at batch_size=1),
+/// empty when none. `recalls_full` holds queries scored against `top_k`;
+/// `recalls_short` holds queries whose ground truth was shorter than `top_k`
+/// and were scored against their own length (see [`recall_at_k`](
+/// crate::runner)). JSONL carries the same split as two real arrays,
+/// `recalls_full` / `recalls_short`.
 struct FileRecorder {
     path: String,
     format: ReportFormat,
@@ -152,7 +156,7 @@ impl Recorder for FileRecorder {
         };
         let mut out = BufWriter::new(sink);
         if self.format == ReportFormat::Csv {
-            writeln!(out, "t_s,latency_ms,ok,recalls")?;
+            writeln!(out, "t_s,latency_ms,ok,recalls_full,recalls_short")?;
         }
         self.out = Some(out);
         Ok(())
@@ -162,29 +166,37 @@ impl Recorder for FileRecorder {
         let out = self.out.as_mut().ok_or_else(|| {
             io::Error::other("record() before begin()")
         })?;
+        // One dispatch's recall samples split into the two buckets — a query is
+        // in exactly one, so the two joins together reproduce every sample.
+        let join = |short: bool, sep: &str| {
+            s.recalls
+                .iter()
+                .filter(|r| r.short == short)
+                .map(|r| format!("{:.4}", r.recall))
+                .collect::<Vec<_>>()
+                .join(sep)
+        };
         match self.format {
-            ReportFormat::Csv => {
-                let recalls = s
-                    .recalls
-                    .iter()
-                    .map(|r| format!("{r:.4}"))
-                    .collect::<Vec<_>>()
-                    .join(";");
-                writeln!(out, "{:.6},{:.3},{},{}", s.t_s, s.latency_ms, s.ok, recalls)
-            }
+            ReportFormat::Csv => writeln!(
+                out,
+                "{:.6},{:.3},{},{},{}",
+                s.t_s,
+                s.latency_ms,
+                s.ok,
+                join(false, ";"),
+                join(true, ";"),
+            ),
             ReportFormat::Jsonl => {
-                // Hand-rolled: fields are two floats, a bool, and a float
-                // array — no serde derive needed on the hot sample type.
-                let recalls = s
-                    .recalls
-                    .iter()
-                    .map(|r| format!("{r:.4}"))
-                    .collect::<Vec<_>>()
-                    .join(",");
+                // Hand-rolled: fields are two floats, a bool, and two float
+                // arrays — no serde derive needed on the hot sample type.
                 writeln!(
                     out,
-                    r#"{{"t_s":{:.6},"latency_ms":{:.3},"ok":{},"recalls":[{}]}}"#,
-                    s.t_s, s.latency_ms, s.ok, recalls
+                    r#"{{"t_s":{:.6},"latency_ms":{:.3},"ok":{},"recalls_full":[{}],"recalls_short":[{}]}}"#,
+                    s.t_s,
+                    s.latency_ms,
+                    s.ok,
+                    join(false, ","),
+                    join(true, ","),
                 )
             }
         }
@@ -201,9 +213,17 @@ impl Recorder for FileRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::RecallSample;
 
-    fn sample(t_s: f64, latency_ms: f64, ok: bool, recalls: Vec<f64>) -> DispatchSample {
-        DispatchSample { t_s, latency_ms, ok, recalls }
+    /// `full` / `short` are the recall values for each bucket; the helper tags
+    /// them and concatenates into the one `recalls` vec a real dispatch carries.
+    fn sample(t_s: f64, latency_ms: f64, ok: bool, full: Vec<f64>, short: Vec<f64>) -> DispatchSample {
+        let recalls = full
+            .into_iter()
+            .map(|recall| RecallSample { recall, short: false })
+            .chain(short.into_iter().map(|recall| RecallSample { recall, short: true }))
+            .collect();
+        DispatchSample { t_s, latency_ms, ok, recalls, empty_ground_truth: 0, filter_overreturn: 0 }
     }
 
     fn run_recorder(cfg: &ReportConfig, samples: &[DispatchSample]) -> String {
@@ -225,14 +245,15 @@ mod tests {
         let text = run_recorder(
             &cfg,
             &[
-                sample(0.001, 12.5, true, vec![0.9, 1.0]),
-                sample(0.052, 8.25, false, vec![]),
+                // one full-depth (0.9) and one short (0.5) recall in the same dispatch
+                sample(0.001, 12.5, true, vec![0.9, 1.0], vec![0.5]),
+                sample(0.052, 8.25, false, vec![], vec![]),
             ],
         );
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "t_s,latency_ms,ok,recalls");
-        assert_eq!(lines[1], "0.001000,12.500,true,0.9000;1.0000");
-        assert_eq!(lines[2], "0.052000,8.250,false,");
+        assert_eq!(lines[0], "t_s,latency_ms,ok,recalls_full,recalls_short");
+        assert_eq!(lines[1], "0.001000,12.500,true,0.9000;1.0000,0.5000");
+        assert_eq!(lines[2], "0.052000,8.250,false,,");
         assert_eq!(lines.len(), 3);
     }
 
@@ -242,12 +263,13 @@ mod tests {
         let path = dir.path().join("ts.jsonl").to_string_lossy().into_owned();
         let cfg = ReportConfig { format: ReportFormat::Jsonl, path };
 
-        let text = run_recorder(&cfg, &[sample(1.5, 20.0, true, vec![0.5])]);
+        let text = run_recorder(&cfg, &[sample(1.5, 20.0, true, vec![0.5], vec![0.25])]);
         let row: serde_json::Value = serde_json::from_str(text.trim()).expect("valid json");
         assert_eq!(row["t_s"], 1.5);
         assert_eq!(row["latency_ms"], 20.0);
         assert_eq!(row["ok"], true);
-        assert_eq!(row["recalls"][0], 0.5);
+        assert_eq!(row["recalls_full"][0], 0.5);
+        assert_eq!(row["recalls_short"][0], 0.25);
     }
 
     #[test]

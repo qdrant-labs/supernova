@@ -223,7 +223,8 @@ written to `<output.path>/sweep_results.parquet`:
 | `data_layout.*`, `index_variant.*`, `search.*` | That point's flattened parameters (e.g. `index_variant.hnsw.m`) |
 | `reindex_seconds`, `search_seconds` | Wall-clock timing for that point's `reindex`/`storm` calls |
 | `ok`, `error` | Whether the point succeeded; the failure reason if not |
-| `requests`, `errors`, `qps`, `p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, `mean_recall`, `median_recall`, `min_recall` | `nova-storm`'s own summary fields, straight from its `--json` output |
+| `requests`, `errors`, `qps`, `p50_ms`, `p95_ms`, `p99_ms`, `max_ms` | `nova-storm`'s own summary fields, straight from its `--json` output |
+| `full_recall.mean`/`.n`, `short_recall.mean`/`.n`, `total_recall.mean`/`.n`, `empty_ground_truth`, `filter_overreturn` | `nova-storm`'s recall buckets, flattened from its `--json` output: `full` = queries with ≥`top_k` ground-truth ids (scored against `top_k`), `short` = fewer (scored against their own length), `total` = both; `empty_ground_truth` counts firings whose ground truth was present but empty (excluded from every bucket); `filter_overreturn` counts suspected filter leaks — firings where, with a filter configured, the vdb returned more ids than the (exhaustive) ground truth holds (visibility only — recall unchanged) |
 
 A failed `reindex`/`storm` call records an error row for the remaining
 points under it and moves on — it doesn't abort the whole sweep. A

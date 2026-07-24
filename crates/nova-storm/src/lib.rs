@@ -100,20 +100,20 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
             vectors.len(),
             query.source.ground_truth_column,
         );
-        // recall_at_k divides by top_k, so a ground-truth list shorter than
-        // top_k silently caps recall (e.g. bf's k=10 vs storm's top_k=100 caps
-        // every recall sample at 0.10) with no other signal — warn up front
-        // rather than let it read as a real search-quality regression.
+        // Ground-truth lists shorter than top_k are scored against their own
+        // length (not top_k) and land in the summary's separate `recall_short`
+        // bucket — so they no longer read as an artificial regression, but the
+        // split is worth flagging up front so the operator expects two buckets.
         let short = vectors
             .iter()
             .filter_map(|v| v.ground_truth.as_ref())
             .filter(|gt| (gt.len() as u64) < query.top_k)
             .count();
         if short > 0 {
-            tracing::warn!(
+            tracing::info!(
                 "{short}/{with_ground_truth} ground-truth lists hold fewer than top_k={} ids — \
-                 recall will read artificially low for those queries (the ground truth's own k \
-                 must be at least storm's top_k)",
+                 those queries are scored against their own ground-truth length and reported \
+                 separately as `recall_short`",
                 query.top_k,
             );
         }
@@ -129,7 +129,8 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         ProgressBar::hidden()
     };
 
-    let results = runner::run_storm(target, vectors, &load, query.top_k, recorder).await;
+    let results =
+        runner::run_storm(target, vectors, &load, query.top_k, query.filter.is_some(), recorder).await;
     spinner.finish_and_clear();
 
     Ok(results.summary())
