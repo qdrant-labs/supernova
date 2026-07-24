@@ -434,14 +434,30 @@ def load_queries_multivector(
         table = store.read_columns(f.read_path, cols)
         d = table.to_pydict()  # ORIGINAL values — payload/id keep their source form
         conv = convert_table_date_columns(table, q_date_fmts)
-        doc_offsets, flat = multivector_to_ragged(conv[qcfg.multivector_column])
+        # Decode the multivector column from the ORIGINAL table (date conversion
+        # only ever touches declared date columns, never a vector column — but
+        # reading it straight from `table` removes any doubt); `conv` feeds only
+        # the filter fields, which may be date-normalized.
+        doc_offsets, flat = multivector_to_ragged(table[qcfg.multivector_column])
         if flat.shape[1] > 0:
+            if dim and flat.shape[1] != dim:
+                raise ValueError(
+                    f"queries.{qcfg.multivector_column} token dim mismatch: file "
+                    f"{f.key!r} has D={flat.shape[1]} but an earlier file had D={dim} "
+                    "— every query file must share one token dimension"
+                )
             dim = flat.shape[1]
         tokens_parts.append(flat)
         counts_parts.append(np.diff(doc_offsets))
         n = len(doc_offsets) - 1
         if qcfg.id_column:
-            ids += [str(x) for x in d[qcfg.id_column]]
+            col_ids = d[qcfg.id_column]
+            if any(x is None for x in col_ids):
+                raise ValueError(
+                    f"queries.id_column {qcfg.id_column!r} has null value(s) in {f.key!r} "
+                    "— query ids must be present (a null would become the string 'None')"
+                )
+            ids += [str(x) for x in col_ids]
         else:
             ids += [make_point_id(f.key, r) for r in range(n)]
         for c in qcfg.payload_fields:
@@ -451,13 +467,23 @@ def load_queries_multivector(
 
     # A file whose queries are all zero-token decodes to a (0, 0) `flat`; drop
     # those empty shards before concat so the width is the real token dim, and
-    # fall back to a (0, dim) empty matrix if EVERY query is zero-token.
+    # fall back to a (0, dim) empty matrix if EVERY query is zero-token. Zero-
+    # token queries are NOT lost — their zero counts stay in `counts_parts`, so
+    # they keep their (zero-width) slot in `q_offsets` (and score -inf).
     nonempty = [t for t in tokens_parts if t.shape[0] > 0]
     flat_tokens = (
         np.concatenate(nonempty, axis=0) if nonempty else np.zeros((0, dim), np.float32)
     )
     counts = np.concatenate(counts_parts) if counts_parts else np.zeros(0, np.int64)
-    q_offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+    q_offsets = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
+    # Alignment invariants (cheap; a violation means a decode/loader bug upstream,
+    # which would otherwise misattribute one query's vectors to another's id).
+    n_q = len(q_offsets) - 1
+    assert len(ids) == n_q, f"query id count {len(ids)} != query count {n_q}"
+    assert int(q_offsets[-1]) == flat_tokens.shape[0], (
+        f"query offsets end at {int(q_offsets[-1])} but token matrix has "
+        f"{flat_tokens.shape[0]} rows"
+    )
     return flat_tokens, q_offsets, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
 
 

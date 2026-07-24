@@ -570,6 +570,69 @@ searches:
             assert abs(got[qi][di] - ref[qi][di]) < 1e-3
 
 
+def test_decoder_null_doc_with_physical_span_is_zero_token():
+    """A NULL outer entry must be a zero-token doc even if Arrow gives its slot
+    a non-empty physical offset span — the validity bitmap wins, not the
+    offsets. Regression for trusting offsets over the null mask."""
+    D = 2
+    inner = pa.ListArray.from_arrays(
+        pa.array([0, 2, 4, 6, 8], type=pa.int32()),
+        pa.array(np.arange(8, dtype=np.float32), type=pa.float32()),
+    )  # 4 tokens
+    # doc0 = tokens[0:2], doc1 = NULL but offsets claim [2:4], doc2 = tokens[4:4]
+    outer = pa.ListArray.from_arrays(
+        pa.array([0, 2, 4, 4], type=pa.int32()), inner, mask=pa.array([False, True, False]))
+    off, flat = multivector_to_ragged(pa.chunked_array([outer]))
+    assert (off[2] - off[1]) == 0, "null doc must be zero-token regardless of its span"
+    # the stray tokens the null slot physically carried are excluded
+    assert flat.shape[0] == 2 and off.tolist() == [0, 2, 2, 2]
+    assert np.array_equal(flat, np.arange(4, dtype=np.float32).reshape(2, 2))
+
+
+def test_decoder_rejects_dense_and_null_token_values():
+    dense = pa.array([[1.0, 2.0, 3.0]], type=pa.list_(pa.float32()))
+    with pytest.raises(TypeError, match="DENSE|list of token"):
+        multivector_to_ragged(pa.chunked_array([dense]))
+    # a null float inside a token vector must not silently become NaN
+    inner = pa.ListArray.from_arrays(pa.array([0, 2], type=pa.int32()),
+                                     pa.array([1.0, None], type=pa.float32()))
+    outer = pa.ListArray.from_arrays(pa.array([0, 1], type=pa.int32()), inner)
+    with pytest.raises(ValueError, match="null"):
+        multivector_to_ragged(pa.chunked_array([outer]))
+
+
+def test_cross_file_dim_mismatch_raises(tmp_path):
+    """Two query files with different token dims must fail with a clear message,
+    not a generic numpy concat error."""
+    def mv_dim(docs, d):  # dim-aware builder (the shared _mv_array hardcodes DIM)
+        tc = [len(x) for x in docs]; total = sum(tc)
+        flat = np.concatenate([x.reshape(-1) for x in docs]).astype(np.float32)
+        inner = pa.ListArray.from_arrays(pa.array(np.arange(0, total * d + 1, d, dtype=np.int32)),
+                                         pa.array(flat, type=pa.float32()))
+        off = np.concatenate([[0], np.cumsum(tc)]).astype(np.int32)
+        return pa.ListArray.from_arrays(pa.array(off), inner)
+    rng = np.random.default_rng(0)
+    cdir = tmp_path / "corpus"; cdir.mkdir()
+    pq.write_table(pa.table({"multivector_embedding": mv_dim([rng.standard_normal((2, DIM)).astype(np.float32)], DIM),
+                             "id": pa.array(["0"])}), str(cdir / "c0.parquet"))
+    qdir = tmp_path / "q"; qdir.mkdir()
+    pq.write_table(pa.table({"multivector_embedding": mv_dim([rng.standard_normal((2, DIM)).astype(np.float32)], DIM),
+                             "qid": pa.array(["0"])}), str(qdir / "q0.parquet"))
+    pq.write_table(pa.table({"multivector_embedding": mv_dim([rng.standard_normal((2, DIM + 1)).astype(np.float32)], DIM + 1),
+                             "qid": pa.array(["1"])}), str(qdir / "q1.parquet"))
+    out = tmp_path / "out"; out.mkdir()
+    cfg = f"""
+corpus: {{path: {cdir}, multivector_column: multivector_embedding, id_column: id}}
+queries: {{path: {qdir}, multivector_column: multivector_embedding, id_column: qid}}
+output: {{path: {out}}}
+params: {{io_workers: 1}}
+searches: [{{name: mv, k: 1, metric: dot, vector_type: multivector}}]
+"""
+    p = tmp_path / "cfg.yaml"; p.write_text(cfg)
+    with pytest.raises(ValueError, match="token dim mismatch"):
+        run_compute(load_config(str(p)))
+
+
 def test_decoder_all_null_and_empty_column():
     D = 4
     inner = pa.ListArray.from_arrays(pa.array([0], type=pa.int32()),
