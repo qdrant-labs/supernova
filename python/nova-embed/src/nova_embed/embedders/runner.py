@@ -25,6 +25,48 @@ logger = logging.getLogger(__name__)
 SKIP_RATE_WARN_THRESHOLD = 0.01
 
 
+def _detect_compute() -> dict:
+    """Best-effort hardware fingerprint for the manifest: instance type, region,
+    and GPU. So a run's output is self-describing for cost attribution /
+    reproducibility (the pipeline stats alone don't say what it ran on).
+
+    Returns {} off-cloud or on any failure — never blocks the run: short
+    timeouts, every exception swallowed. AWS EC2 metadata (IMDSv2) + torch GPU.
+    """
+    info: dict = {}
+    try:
+        import urllib.request
+
+        tok = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        token = urllib.request.urlopen(tok, timeout=0.5).read().decode()
+
+        def _imds(path: str) -> str:
+            req = urllib.request.Request(
+                f"http://169.254.169.254/latest/meta-data/{path}",
+                headers={"X-aws-ec2-metadata-token": token},
+            )
+            return urllib.request.urlopen(req, timeout=0.5).read().decode()
+
+        info["instance_type"] = _imds("instance-type")
+        info["region"] = _imds("placement/region")
+        info["availability_zone"] = _imds("placement/availability-zone")
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            info["gpu"] = torch.cuda.get_device_name(0)
+            info["gpu_count"] = torch.cuda.device_count()
+    except Exception:
+        pass
+    return info
+
+
 async def run_embedder(
     source: DatasetSource,
     engine: EmbeddingEngine,
@@ -184,6 +226,7 @@ async def run_embedder(
 
     manifest = {
         "source": source.source_name,
+        "compute": _detect_compute(),
         "embedders": [asdict(spec) for spec in engine.output_specs],
         "chunk_size": chunk_size,
         "chunking_strategy": chunking_strategy,
