@@ -1,5 +1,10 @@
 """
-File-sharded reader for HuggingFace datasets stored as native JSON Lines shards.
+File-sharded reader for HuggingFace **Hub** datasets stored as native JSON Lines
+shards. This is a Hub source, not a generic/local jsonl reader: it resolves
+files via `HfApi.list_repo_files` and fetches them with `hf_hub_download`
+(`dataset_name` is a Hub repo id, e.g. "MedRAG/pubmed"; `revision` pins a git
+rev). It does NOT read a local directory of `.jsonl` — hence the registry name
+`huggingface_jsonl` (parallel to the parquet source's `huggingface_parquet`).
 
 Unlike the parquet source (which exploits parquet footers to map a global row
 window to files with a handful of cheap HTTP requests), jsonl files carry NO
@@ -53,8 +58,8 @@ logger = logging.getLogger(__name__)
 _JSONL_SUFFIXES = (".jsonl", ".jsonl.gz")
 
 
-@SOURCES.register("jsonl", "huggingface_jsonl")
-class JsonlSource(DatasetSource):
+@SOURCES.register("huggingface_jsonl")
+class HuggingFaceJsonlSource(DatasetSource):
     def __init__(
         self,
         dataset_name: str,
@@ -183,7 +188,7 @@ class JsonlSource(DatasetSource):
 
     def get_total_rows(self) -> int:
         raise NotImplementedError(
-            "JsonlSource shards by file, not by row window: an exact row total "
+            "HuggingFaceJsonlSource shards by file, not by row window: an exact row total "
             "would require scanning the whole corpus (jsonl has no footer). The "
             "CLI's file-shard path does not call this."
         )

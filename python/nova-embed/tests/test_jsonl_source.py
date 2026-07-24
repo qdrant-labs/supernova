@@ -1,4 +1,4 @@
-"""JsonlSource: file-granular sharding + streaming/parse behavior.
+"""HuggingFaceJsonlSource: file-granular sharding + streaming/parse behavior.
 
 No network: HF API calls happen only in __init__, which these tests bypass
 (instances built via __new__, like test_hf_source.py). Streaming is exercised
@@ -18,7 +18,7 @@ from nova_embed.sources.base import (
     apply_record_projection,
     files_for_shard,
 )
-from nova_embed.sources.jsonl import JsonlSource
+from nova_embed.sources.jsonl import HuggingFaceJsonlSource
 
 
 # --- files_for_shard: the core sharding contract ---------------------------
@@ -72,8 +72,8 @@ def test_files_for_shard_rejects_bad_args():
 
 
 def _bare_source(paths, **attrs):
-    """A JsonlSource with attributes set directly (no HF __init__)."""
-    src = JsonlSource.__new__(JsonlSource)
+    """A HuggingFaceJsonlSource with attributes set directly (no HF __init__)."""
+    src = HuggingFaceJsonlSource.__new__(HuggingFaceJsonlSource)
     src.dataset_name = "org/data"
     src.revision = None
     src.render_columns = {}
