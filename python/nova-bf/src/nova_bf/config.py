@@ -55,6 +55,14 @@ class CorpusConfig(BaseModel):
     # of dense_column by a search whose `vector_type` is "sparse" —
     # same schema nova-embed writes and nova-load reads (see docs/embedding).
     sparse_column: str = "sparse_embedding"
+    # list<list<float32>> column (outer list = one doc, inner list = one D-dim
+    # token vector) read instead of dense_column by a search whose
+    # `vector_type` is "multivector" (ColBERT / late-interaction MaxSim) — the
+    # same schema nova-embed writes (see nova_embed.storage.writer's
+    # MULTIVECTOR_EMBEDDING_TYPE) and nova-load reads. Named to match the
+    # dense_/sparse_ convention above; nova-embed itself names the column after
+    # the output entry, so set this to that column when it differs.
+    multivector_column: str = "multivector_embedding"
     # If set, hit_ids are taken verbatim from this already-unique column (e.g.
     # fineweb's `id` = "<urn:uuid:...>") — transparent for public data, and
     # resolvable without reconstructing the loader's hashing. If unset (default),
@@ -95,6 +103,9 @@ class QueriesConfig(BaseModel):
     path: str
     dense_column: str = "dense_embedding"
     sparse_column: str = "sparse_embedding"
+    # list<list<float32>> query column for a multivector search — see
+    # CorpusConfig.multivector_column.
+    multivector_column: str = "multivector_embedding"
     # If set, use this column as the query id verbatim; otherwise derive
     # make_point_id(queries_file_key, row) — same scheme as the corpus.
     id_column: str | None = None
@@ -166,6 +177,30 @@ class ParamsConfig(BaseModel):
     # silent all-empty run downstream.
     dense_batch_size: int | None = Field(default=None, gt=0)
     sparse_batch_size: int | None = Field(default=None, gt=0)
+    # Multivector (MaxSim) has TWO memory axes, not one: the per-slice score
+    # matrix is `(block_query_tokens × corpus_doc_tokens)`, and BOTH the corpus
+    # rows (docs) and the queries are tiled to bound its peak. Unlike
+    # dense/sparse, the naive whole-file × all-queries product is
+    # token×token — it blows up far faster than a pooled-vector matmul, so
+    # tiling the query axis too is mandatory, not optional.
+    #   multivector_batch_size  = docs per corpus-row slice (bounds doc-token
+    #                             count per slice; None = whole file at once)
+    #   multivector_query_block = queries per query-axis tile — a WHOLE number
+    #                             of queries per block, never splitting one
+    #                             query's tokens across blocks (None = all
+    #                             queries at once)
+    # `gt=0` for the same reason dense/sparse have it (a non-positive step
+    # silently empties the batch loop — see dense_batch_size).
+    multivector_batch_size: int | None = Field(default=None, gt=0)
+    multivector_query_block: int | None = Field(default=None, gt=0)
+    # Optional convenience: instead of hand-tuning the two knobs above, give a
+    # target peak element count for the per-slice `(block_query_tokens ×
+    # doc_tokens)` score matrix and let the run derive both tile sizes from the
+    # corpus/query mean tokens-per-item (both measured cheaply at load). When
+    # set, it fills in whichever of `multivector_batch_size`/
+    # `multivector_query_block` you left as None; an explicitly-set knob always
+    # wins over the derived value. None (default) = no auto-derivation.
+    multivector_token_budget: int | None = Field(default=None, gt=0)
     # `merge` reduces the W per-rank partials in row-batches of this many queries,
     # streaming the result to disk so the full output never sits in RAM (that's what
     # let the old merge OOM at 1M queries). Peak host memory is ~(this × W × k)
@@ -429,15 +464,20 @@ class SearchSpec(BaseModel):
     name: str | None = None
     k: int = 1000
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
-    vector_type: Literal["dense", "sparse"] = "dense"
+    vector_type: Literal["dense", "sparse", "multivector"] = "dense"
     filter: Filter | None = None
 
     @model_validator(mode="after")
-    def _no_sparse_euclidean(self) -> "SearchSpec":
-        if self.vector_type == "sparse" and self.metric == "euclidean":
+    def _no_euclidean_for_non_dense(self) -> "SearchSpec":
+        # euclidean only makes sense on a single pooled vector per item. Sparse
+        # retrieval only ever uses dot/cosine; multivector MaxSim is a sum of
+        # per-token dot (or cosine) maxima — an L2 distance between two ragged
+        # token SETS has no MaxSim analog (and Qdrant's multivector comparator
+        # is dot/cosine MaxSim only).
+        if self.vector_type in ("sparse", "multivector") and self.metric == "euclidean":
             raise ValueError(
-                "metric='euclidean' is not supported with vector_type='sparse' "
-                "(sparse retrieval only ever uses dot/cosine) — use 'dot' or 'cosine'"
+                f"metric='euclidean' is not supported with vector_type="
+                f"'{self.vector_type}' — use 'dot' or 'cosine'"
                 + (f" (search {self.name!r})" if self.name else "")
             )
         return self

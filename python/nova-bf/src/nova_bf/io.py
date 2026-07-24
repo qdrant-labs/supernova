@@ -105,6 +105,43 @@ def dense_to_2d(col: pa.ChunkedArray) -> np.ndarray:
     return np.ascontiguousarray(flat.reshape(n, dim), dtype=np.float32)
 
 
+def multivector_to_ragged(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray]:
+    """A `list<list<float32>>` column (one doc = outer entry, one D-dim token
+    vector = inner entry) → `(doc_offsets, flat_tokens)`.
+
+    Same flatten-the-Arrow-buffer-once approach as `dense_to_2d`/
+    `sparse_to_coo_parts` — no per-row/per-token Python. `doc_offsets` is
+    length n+1 (token-index prefix sums; doc `i`'s tokens are rows
+    `doc_offsets[i]:doc_offsets[i+1]` of `flat_tokens`), `flat_tokens` is the
+    `(total_tokens, D)` float32 matrix of every token across every doc,
+    concatenated in doc order. This is the exact ragged analog of CSR's
+    `(row_offsets, values)`.
+
+    A null outer entry (nova-embed's `on_empty_input="null"`) or a non-null
+    but empty inner list both decode to a zero-width span (`doc_offsets[i] ==
+    doc_offsets[i+1]`) — i.e. a zero-token doc, which the compute path treats
+    as a non-candidate (`-inf`), the same way the sparse path treats a
+    zero-overlap doc. The outer/inner buffer offsets are honored explicitly so
+    a sliced Arrow array (buffer offset != 0) decodes correctly rather than
+    silently misaligning tokens to docs."""
+    col = col.combine_chunks()  # ChunkedArray -> a single ListArray
+    n = len(col)
+    if n == 0:
+        return np.zeros(1, dtype=np.int64), np.zeros((0, 0), dtype=np.float32)
+    outer_off = col.offsets.to_numpy(zero_copy_only=False).astype(np.int64)  # (n+1,), token indices
+    inner = col.values  # ListArray, one entry per token across all docs
+    tok_lo, tok_hi = int(outer_off[0]), int(outer_off[-1])
+    doc_offsets = (outer_off - tok_lo).astype(np.int64)
+    if tok_hi == tok_lo:
+        # every doc is null/empty — no tokens anywhere in this file
+        return doc_offsets, np.zeros((0, 0), dtype=np.float32)
+    inner_off = inner.offsets.to_numpy(zero_copy_only=False).astype(np.int64)
+    dim = int(inner_off[tok_lo + 1] - inner_off[tok_lo])  # uniform token width
+    val_lo, val_hi = int(inner_off[tok_lo]), int(inner_off[tok_hi])
+    flat = inner.values.to_numpy(zero_copy_only=False)[val_lo:val_hi]
+    return doc_offsets, np.ascontiguousarray(flat.reshape(tok_hi - tok_lo, dim), dtype=np.float32)
+
+
 def sparse_to_coo_parts(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """A `struct<indices: list<uint32>, values: list<float32>>` column → CSR parts.
 

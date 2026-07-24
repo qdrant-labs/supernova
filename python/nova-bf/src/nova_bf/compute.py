@@ -133,7 +133,7 @@ from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import _condition_mask, _match_any_membership, _static_first, evaluate
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
 from nova_bf.ids import make_point_id
-from nova_bf.io import ParquetFile, Store, dense_to_2d, sparse_to_coo_parts
+from nova_bf.io import ParquetFile, Store, dense_to_2d, multivector_to_ragged, sparse_to_coo_parts
 from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
 
 logger = logging.getLogger(__name__)
@@ -405,6 +405,76 @@ def _compact_sparse_rows(
     new_row_offsets = np.concatenate(([0], np.cumsum(np.diff(row_offsets)[orig_rows]))).astype(np.int64)
     new_norms = norms[orig_rows] if norms is not None else None
     return new_row_offsets, new_indices, new_values, new_norms, orig_rows
+
+
+def load_queries_multivector(
+    store: Store, qcfg, filter_cols: list[str] = (),
+) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, list], dict[str, np.ndarray]]:
+    """Multivector analog of `load_queries`/`load_queries_sparse`: reads the
+    `list<list<float32>>` column from every query file and stacks all queries'
+    token vectors into one flat `(total_query_tokens, D)` matrix plus a
+    length-`n_q+1` token-offset array (`doc_offsets` semantics, query side).
+    Queries are few, so holding every query token on the GPU at once is cheap;
+    the query axis is tiled at SCORE time (`multivector_query_block`), not
+    here. Returns `(flat_tokens, q_offsets, ids, payload, filter_vals)`."""
+    cols = [qcfg.multivector_column]
+    if qcfg.id_column:
+        cols.append(qcfg.id_column)
+    cols += [c for c in qcfg.payload_fields if c not in cols]
+    cols += [c for c in filter_cols if c not in cols]
+
+    tokens_parts: list[np.ndarray] = []
+    counts_parts: list[np.ndarray] = []  # tokens per query, per file
+    dim = 0
+    ids: list[str] = []
+    payload: dict[str, list] = {c: [] for c in qcfg.payload_fields}
+    filter_vals: dict[str, list] = {c: [] for c in filter_cols}
+    q_date_fmts = normalize_date_fields(qcfg.date_fields)
+    for f in store.list_parquets():
+        table = store.read_columns(f.read_path, cols)
+        d = table.to_pydict()  # ORIGINAL values — payload/id keep their source form
+        conv = convert_table_date_columns(table, q_date_fmts)
+        doc_offsets, flat = multivector_to_ragged(conv[qcfg.multivector_column])
+        if flat.shape[1] > 0:
+            dim = flat.shape[1]
+        tokens_parts.append(flat)
+        counts_parts.append(np.diff(doc_offsets))
+        n = len(doc_offsets) - 1
+        if qcfg.id_column:
+            ids += [str(x) for x in d[qcfg.id_column]]
+        else:
+            ids += [make_point_id(f.key, r) for r in range(n)]
+        for c in qcfg.payload_fields:
+            payload[c] += d[c]
+        for c in filter_cols:
+            filter_vals[c] += conv[c].to_pylist()
+
+    # A file whose queries are all zero-token decodes to a (0, 0) `flat`; drop
+    # those empty shards before concat so the width is the real token dim, and
+    # fall back to a (0, dim) empty matrix if EVERY query is zero-token.
+    nonempty = [t for t in tokens_parts if t.shape[0] > 0]
+    flat_tokens = (
+        np.concatenate(nonempty, axis=0) if nonempty else np.zeros((0, dim), np.float32)
+    )
+    counts = np.concatenate(counts_parts) if counts_parts else np.zeros(0, np.int64)
+    q_offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+    return flat_tokens, q_offsets, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
+
+
+def _compact_multivector_rows(
+    doc_offsets: np.ndarray, flat_tokens: np.ndarray, keep: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Row-level filter compaction for ragged multivector parts — the
+    token-granular analog of `_compact_sparse_rows`. Whole per-doc token spans
+    are gathered by offset; dropped docs' tokens are dropped too, but surviving
+    docs' TRUE file-row numbers are preserved via `orig_rows` (the same
+    invariant `make_point_id`/`id_column` resolution rely on). Returns
+    `(new_doc_offsets, new_flat_tokens, orig_rows)`."""
+    orig_rows = np.nonzero(keep)[0]
+    tok_keep = np.repeat(keep, np.diff(doc_offsets))
+    new_flat = flat_tokens[tok_keep]
+    new_doc_offsets = np.concatenate(([0], np.cumsum(np.diff(doc_offsets)[orig_rows]))).astype(np.int64)
+    return new_doc_offsets, new_flat, orig_rows
 
 
 def _remap_sparse_file(
@@ -803,6 +873,174 @@ def _concat_sparse_batches(batches: list[SparseCorpusBatch]) -> SparseCorpusBatc
     )
 
 
+@dataclass
+class MultiVectorQuery:
+    """The query side of a multivector (MaxSim) search, held on-device: every
+    query's token vectors stacked into one `(total_query_tokens, D)` matrix
+    (`flat`) plus a length-`n_q+1` token-offset array (`offsets`), so query `q`'s
+    tokens are `flat[offsets[q]:offsets[q+1]]`. This is what a spec's `Q` is for
+    a multivector search — passed through `_process_batch_group` unchanged to
+    `MultiVectorBatchSlice.score`, which tiles the query axis by whole queries
+    (`query_block`) to bound the per-slice score matrix. `n_q` is stored
+    explicitly because a trailing run of zero-token queries makes it
+    unrecoverable from `flat` alone."""
+
+    flat: object      # torch.Tensor (total_query_tokens, D)
+    offsets: object   # torch.Tensor (n_q + 1,) int64, on device
+    n_q: int
+    query_block: int | None  # queries per query-axis tile (None = all at once)
+
+
+def _segment_max_over_cols(P, col_group, n_groups: int):
+    """`P` is `(rows, n_cols)`; `col_group` maps each column to a group id in
+    `[0, n_groups)`. Returns `(rows, n_groups)` where entry `(r, g)` is the MAX
+    of `P[r, cols-in-group-g]`, or `-inf` for a group with no columns (a
+    zero-token doc — its `-inf` propagates through the later sum, marking it a
+    non-candidate exactly like the sparse no-overlap gate). Ragged segment-max
+    via `scatter_reduce_(amax)`, which runs on CPU and GPU alike."""
+    import torch
+
+    out = torch.full((P.shape[0], n_groups), float("-inf"), dtype=P.dtype, device=P.device)
+    idx = col_group.unsqueeze(0).expand(P.shape[0], -1)
+    out.scatter_reduce_(1, idx, P, reduce="amax", include_self=True)
+    return out
+
+
+class MultiVectorCorpusBatch:
+    """Decoded multivector corpus tokens for one file, ragged: `flat_tokens`
+    is `(total_tokens, D)` and `doc_offsets` (length `n_rows+1`) delimits each
+    doc's token span. Exposes the same `.n_rows`/`.nbytes`/`.compact`/
+    `.transfer` surface as `Dense`/`SparseCorpusBatch` so `run_compute`'s
+    per-file loop never branches on vector_type. `query_block` is carried
+    run-wide (like sparse `vocab`/`need_row_norms`) so `.transfer()` needs no
+    extra args and the slice knows how to tile the query axis."""
+
+    def __init__(self, doc_offsets: np.ndarray, flat_tokens: np.ndarray, query_block: int | None):
+        self.doc_offsets = doc_offsets
+        self.flat_tokens = flat_tokens
+        self.query_block = query_block
+
+    @property
+    def n_rows(self) -> int:
+        return len(self.doc_offsets) - 1
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.flat_tokens.nbytes)
+
+    def compact(self, keep: np.ndarray) -> tuple["MultiVectorCorpusBatch", np.ndarray]:
+        doc_offsets, flat_tokens, orig_rows = _compact_multivector_rows(
+            self.doc_offsets, self.flat_tokens, keep
+        )
+        return MultiVectorCorpusBatch(doc_offsets, flat_tokens, self.query_block), orig_rows
+
+    def transfer(self, r0: int, r1: int, device: str) -> "MultiVectorBatchSlice":
+        import torch
+
+        t0, t1 = int(self.doc_offsets[r0]), int(self.doc_offsets[r1])
+        # doc_offsets for this slice, rebased so the slice's first token is 0.
+        local_off = torch.from_numpy(
+            (self.doc_offsets[r0 : r1 + 1] - t0).astype(np.int64, copy=False)
+        ).to(device, non_blocking=True)
+        flat = torch.from_numpy(self.flat_tokens[t0:t1]).to(device, non_blocking=True)
+        return MultiVectorBatchSlice(flat, local_off, self.query_block)
+
+
+@dataclass
+class MultiVectorBatchSlice:
+    """One on-device slice of a multivector corpus batch. `score()` computes
+    the MaxSim score matrix `(n_q, n_rows)` — the SAME shape every other
+    slice type returns, so `_merge_topk`, the shared loop, and merge all work
+    unchanged.
+
+    MaxSim(q, d) = sum over q's tokens of (max over d's tokens of q_tok . d_tok).
+    Computed per query-axis tile (whole queries only — a query's tokens never
+    split across tiles) so the intermediate `(block_query_tokens ×
+    slice_doc_tokens)` product `P` stays bounded (see `params.
+    multivector_query_block` / `multivector_batch_size`): P is the ONLY
+    matmul-sized intermediate, and unlike the pooled dense/sparse paths it's
+    token×token, which is why the query axis MUST be tiled too. Two ragged
+    segment reductions fold P down: max over each doc's tokens
+    (`_segment_max_over_cols`), then sum over each query's tokens (an
+    `index_add_` straight into the output view). A zero-token doc's `-inf`
+    survives both, marking it a non-candidate.
+
+    `dot` (Qdrant's default) uses the raw tokens; `cosine` L2-normalizes every
+    token (query and corpus) FIRST — genuinely a separate matmul, not a
+    scalar rescale of the dot result, because normalizing changes each token's
+    per-token argmax. The scoring runs once per distinct metric via
+    `_process_batch_group`'s `score_cache`, so a dot-only run never pays the
+    cosine normalization."""
+
+    flat: object       # torch.Tensor (slice_total_tokens, D)
+    doc_offsets: object  # torch.Tensor (n_rows + 1,) int64, rebased to 0
+    query_block: int | None = None
+
+    @property
+    def n_rows(self) -> int:
+        return self.doc_offsets.shape[0] - 1
+
+    def score(self, Q: "MultiVectorQuery", metric: str, q_norms=None):
+        import torch
+        import torch.nn.functional as F
+
+        dev = self.flat.device
+        n_rows = self.n_rows
+        n_q = Q.n_q
+        out = torch.full((n_q, n_rows), float("-inf"), dtype=self.flat.dtype, device=dev)
+        if n_rows == 0 or self.flat.shape[0] == 0:
+            return out  # no corpus tokens in this slice — every doc a non-candidate
+
+        C = F.normalize(self.flat, dim=1) if metric == "cosine" else self.flat
+        # Each corpus token column -> its doc id, for the segment-max.
+        col_doc = torch.repeat_interleave(
+            torch.arange(n_rows, device=dev), self.doc_offsets.diff()
+        )
+        qoff = Q.offsets
+        block = Q.query_block or n_q
+        for qs in range(0, n_q, block):
+            qe = min(qs + block, n_q)
+            t0, t1 = int(qoff[qs]), int(qoff[qe])
+            if t1 == t0:
+                continue  # every query in this block is zero-token; leave -inf
+            Qb = Q.flat[t0:t1]
+            if metric == "cosine":
+                Qb = F.normalize(Qb, dim=1)
+            P = Qb @ C.T                                   # (block_q_tokens, slice_doc_tokens)
+            M = _segment_max_over_cols(P, col_doc, n_rows)  # (block_q_tokens, n_rows)
+            # Segment-SUM over each query's tokens, written STRAIGHT into this
+            # block's output rows (zeroed first): `index_add_` into the `out`
+            # view avoids a separate `(block_queries × n_rows)` temporary — at
+            # scale (n_q=100k, a large corpus batch) that temporary equals the
+            # output-slice size, a multi-GB transient on the GPU. Init 0, so a
+            # zero-token query (no rows land on it) stays 0; a non-candidate
+            # doc's `-inf` in `M` sums to `-inf`, surviving as a non-candidate.
+            row_q = torch.repeat_interleave(
+                torch.arange(qe - qs, device=dev), qoff[qs : qe + 1].diff()
+            )
+            dest = out[qs:qe]
+            dest.zero_()
+            dest.index_add_(0, row_q, M)
+        return out
+
+
+def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "MultiVectorCorpusBatch":
+    """Concatenate several files' (already union-compacted) multivector batches
+    into one — the ragged analog of `_concat_sparse_batches`. `flat_tokens` is a
+    plain per-token concatenation; `doc_offsets` are shifted by the running
+    token total and their duplicate leading `0` dropped, exactly as CSR
+    row_offsets are. `query_block` is fixed run-wide, so the first batch's copy
+    is authoritative."""
+    flat = np.concatenate([b.flat_tokens for b in batches], axis=0)
+    offsets_parts = [batches[0].doc_offsets]
+    running = int(batches[0].doc_offsets[-1])
+    for b in batches[1:]:
+        offsets_parts.append(b.doc_offsets[1:] + running)
+        running += int(b.doc_offsets[-1])
+    doc_offsets = np.concatenate(offsets_parts).astype(np.int64)
+    return MultiVectorCorpusBatch(doc_offsets, flat, batches[0].query_block)
+
+
 def _merge_topk(top_scores, top_enc, batch_scores, encoded_rows, k: int):
     """Fold one batch's `(n_q, n_candidate_rows)` score matrix into a spec's
     running `(top_scores, top_enc)` top-k state: top-k the batch on its own
@@ -833,6 +1071,39 @@ def _merge_topk(top_scores, top_enc, batch_scores, encoded_rows, k: int):
     new_top_scores, idx = torch.topk(merged_s, k=k, dim=1)
     del merged_s
     return new_top_scores, merged_e.gather(1, idx)
+
+
+def _sample_mean_doc_tokens(store: Store, mine: list, column: str) -> float:
+    """Mean tokens-per-doc from this worker's FIRST corpus file (a metadata-
+    cheap, single-file read) — used only to derive multivector tile sizes from
+    `multivector_token_budget`. Returns 1.0 if the worker has no files or the
+    sample is empty (a safe floor: it just makes the derived doc-tile larger)."""
+    if not mine:
+        return 1.0
+    table = store.read_columns(mine[0][1].read_path, [column])
+    doc_offsets, _ = multivector_to_ragged(table[column])
+    n = len(doc_offsets) - 1
+    total = int(doc_offsets[-1])
+    return total / n if n > 0 and total > 0 else 1.0
+
+
+def _resolve_multivector_tiles(
+    budget: int, mean_q_tokens: float, mean_doc_tokens: float,
+    configured_bs: int | None, configured_qb: int | None,
+) -> tuple[int | None, int | None]:
+    """Derive `(multivector_batch_size, multivector_query_block)` from a target
+    peak element count for the per-slice score matrix `P = (block_query_tokens
+    × slice_doc_tokens)`. Split geometrically — aim each axis near
+    `sqrt(budget)` elements — then convert tokens back to items via the two
+    means. An explicitly-configured knob is passed through untouched; only a
+    `None` knob is filled in. Every derived value is floored at 1 (a
+    zero/negative tile would empty the batch loop)."""
+    import math
+
+    axis = math.sqrt(max(1, budget))
+    bs = configured_bs if configured_bs is not None else max(1, int(axis / max(1e-9, mean_doc_tokens)))
+    qb = configured_qb if configured_qb is not None else max(1, int(axis / max(1e-9, mean_q_tokens)))
+    return bs, qb
 
 
 def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
@@ -1510,6 +1781,7 @@ def run_compute(
     _validate_query_filter_cols(qstore, query_filter_cols)
     Q_np_by_vt: dict[str, np.ndarray] = {}
     query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
+    mv_q_offsets = None  # multivector only: (n_q+1,) query-token offsets (see load_queries_multivector)
     # Sparse no-overlap gate state (see _zero_gate_file_ok/_QueryIndicator):
     # query-side flags fixed run-wide; the indicator holder is shared by every
     # file's batch and builds its CSR lazily, only if a signed file appears.
@@ -1535,6 +1807,19 @@ def run_compute(
             q_pos = Q_np[Q_np > 0]
             sparse_q_min_pos = float(q_pos.min()) if q_pos.size else float("inf")
             del q_pos
+        elif vt == "multivector":
+            # Q_np is the flat (total_query_tokens, D) token matrix — its
+            # `.shape[1]` is the token dim, keeping the dim log / consistency
+            # check below identical to dense. The per-query token offsets ride
+            # alongside in `mv_q_offsets`.
+            Q_np, mv_q_offsets, q_ids, q_payload, q_filter_vals = load_queries_multivector(
+                qstore, cfg.queries, query_filter_cols
+            )
+            if Q_np.shape[0] == 0 and len(q_ids) > 0:
+                logger.warning(
+                    "multivector queries have zero tokens total (every query decoded empty) — "
+                    "every corpus row will score 0; check queries.multivector_column is correct."
+                )
         else:
             Q_np, q_ids, q_payload, q_filter_vals = load_queries(qstore, cfg.queries, query_filter_cols)
         Q_np_by_vt[vt] = Q_np
@@ -1549,7 +1834,7 @@ def run_compute(
             # would silently let through and misattribute query N's dense vector
             # to query M's sparse vector (or id/payload) in the output.
             raise RuntimeError(
-                f"queries.{'sparse_column' if vt == 'sparse' else 'dense_column'} produced "
+                f"queries.{vt}_column produced "
                 f"query ids that don't match a different vector_type's load for the same "
                 f"query set (first mismatch at row "
                 f"{next((i for i, (a, b) in enumerate(zip(q_ids, query_ids)) if a != b), min(len(q_ids), len(query_ids)))}"
@@ -1590,6 +1875,28 @@ def run_compute(
         )
         mine = mine[:max_files]
 
+    # Multivector tile sizes: resolve the two knobs once. When
+    # `multivector_token_budget` is set it fills in whichever of
+    # `multivector_batch_size`/`multivector_query_block` was left None (an
+    # explicit knob always wins), deriving from the mean tokens-per-query (from
+    # the loaded queries) and mean tokens-per-doc (sampled cheaply from this
+    # worker's first corpus file). See `_resolve_multivector_tiles`.
+    mv_batch_size = cfg.params.multivector_batch_size
+    mv_query_block = cfg.params.multivector_query_block
+    if "multivector" in vts_needed and cfg.params.multivector_token_budget is not None:
+        mean_q_tok = float(mv_q_offsets[-1]) / max(1, n_q) if n_q else 1.0
+        mean_doc_tok = _sample_mean_doc_tokens(cstore, mine, cfg.corpus.multivector_column)
+        mv_batch_size, mv_query_block = _resolve_multivector_tiles(
+            cfg.params.multivector_token_budget, mean_q_tok, mean_doc_tok,
+            mv_batch_size, mv_query_block,
+        )
+        logger.info(
+            "multivector token_budget=%d -> batch_size=%s query_block=%s "
+            "(mean tokens/query=%.1f, tokens/doc=%.1f)",
+            cfg.params.multivector_token_budget, mv_batch_size, mv_query_block,
+            mean_q_tok, mean_doc_tok,
+        )
+
     # 3. per-spec GPU state: each spec gets its own running (top_scores, top_enc)
     #    pair, but every spec of the same vector_type shares ONE raw query
     #    matrix regardless of metric. A cosine spec divides its score matrix
@@ -1598,13 +1905,25 @@ def run_compute(
     #    double the biggest resident tensor on the GPU (n_q × vocab floats:
     #    7.2 GiB at 100k queries × 18k vocab, which is what OOM'd the
     #    dot+cosine fineweb run on a 24 GB A10G).
-    Q_gpu_by_vt = {
-        vt: torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device) for vt in vts_needed
-    }
+    Q_gpu_by_vt: dict[str, object] = {}
+    for vt in vts_needed:
+        flat = torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device)
+        if vt == "multivector":
+            # The token matrix + offsets + tile size, wrapped so a spec's `Q`
+            # carries everything `MultiVectorBatchSlice.score` needs.
+            Q_gpu_by_vt[vt] = MultiVectorQuery(
+                flat, torch.tensor(mv_q_offsets, dtype=torch.int64, device=device),
+                n_q, mv_query_block,
+            )
+        else:
+            Q_gpu_by_vt[vt] = flat
     q_norms_by_vt: dict[str, object] = {}
     spec_Q, spec_q_norms, spec_top_scores, spec_top_enc = [], [], [], []
     for s in specs:
-        if s.metric == "cosine":
+        # Multivector cosine normalizes each TOKEN inside score() (not a
+        # per-query scalar divide like dense/sparse), so it needs no `q_norms`
+        # — and Q here is a MultiVectorQuery, not a tensor with .norm().
+        if s.metric == "cosine" and s.vector_type != "multivector":
             if s.vector_type not in q_norms_by_vt:
                 # clamp matches F.normalize's eps — a zero query scores 0
                 # everywhere instead of NaN (and its no-overlap gate already
@@ -1666,7 +1985,11 @@ def run_compute(
     for i, s in enumerate(specs):
         vt_spec_idxs[s.vector_type].append(i)
 
-    vt_configured_batch = {"dense": cfg.params.dense_batch_size, "sparse": cfg.params.sparse_batch_size}
+    vt_configured_batch = {
+        "dense": cfg.params.dense_batch_size,
+        "sparse": cfg.params.sparse_batch_size,
+        "multivector": mv_batch_size,  # already merged with the token-budget derivation
+    }
     has_baseline: dict[str, bool] = {}
     vt_batch_size: dict[str, int | None] = {}
     vt_union_filters: dict[str, list[Filter]] = {}
@@ -1727,6 +2050,7 @@ def run_compute(
     # merge is commutative in the SCORES it produces, but not in which of
     # several EXACTLY tied candidates a run picks.
     dense_col, sparse_col = cfg.corpus.dense_column, cfg.corpus.sparse_column
+    multivector_col = cfg.corpus.multivector_column
     id_col = cfg.corpus.id_column  # None → derive make_point_id(file_key, row) at decode
     # Union of every spec's filter fields — read_cols below stays exactly (and only)
     # the columns some spec actually references, same guarantee the single-search
@@ -1736,6 +2060,7 @@ def run_compute(
     read_cols = list(dict.fromkeys(
         ([dense_col] if "dense" in vts_needed else [])
         + ([sparse_col] if "sparse" in vts_needed else [])
+        + ([multivector_col] if "multivector" in vts_needed else [])
         + ([id_col] if id_col else [])
         + filter_cols
     ))
@@ -1804,6 +2129,8 @@ def run_compute(
                 arrs: dict[str, object] = {}
                 if "dense" in vts_needed:
                     arrs["dense"] = dense_to_2d(table[dense_col])
+                if "multivector" in vts_needed:
+                    arrs["multivector"] = multivector_to_ragged(table[multivector_col])
                 if "sparse" in vts_needed:
                     sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[sparse_col])
                     # Norms and the zero-score gate BEFORE remap: both are
@@ -1923,6 +2250,16 @@ def run_compute(
                         batches["dense"], batch_orig_rows["dense"] = b.compact(
                             _union_keep(vt_union_filters["dense"], keeps)
                         )
+                if "multivector" in vts_needed:
+                    mv_offsets, mv_flat = arrs["multivector"]
+                    b = MultiVectorCorpusBatch(mv_offsets, mv_flat, mv_query_block)
+                    raw_stats["multivector"] = (b.n_rows, b.nbytes)
+                    if has_baseline["multivector"]:
+                        batches["multivector"], batch_orig_rows["multivector"] = b, None
+                    else:
+                        batches["multivector"], batch_orig_rows["multivector"] = b.compact(
+                            _union_keep(vt_union_filters["multivector"], keeps)
+                        )
                 if "sparse" in vts_needed:
                     sp_offsets, sp_idx, sp_val, sp_norms, sp_gate = arrs["sparse"]
                     b = SparseCorpusBatch(
@@ -2000,7 +2337,11 @@ def run_compute(
         buf = coalesce_buf[vt]
         if not buf:
             return 0.0
-        concat = _concat_dense_batches if vt == "dense" else _concat_sparse_batches
+        concat = {
+            "dense": _concat_dense_batches,
+            "sparse": _concat_sparse_batches,
+            "multivector": _concat_multivector_batches,
+        }[vt]
         combined_batch = concat([entry[1] for entry in buf])
         encoded_ids = np.concatenate([
             file_gidx * MAX_ROWS_PER_FILE + orig_rows for file_gidx, _, orig_rows, _ in buf
