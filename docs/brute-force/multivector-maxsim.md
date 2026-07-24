@@ -160,17 +160,44 @@ matmul-bound (irreducible exact-MaxSim FLOPs, optimally laid out) and the one
 non-trivial auxiliary reduction already uses the fastest available primitive.
 The only landed change is a memory reduction that is time-neutral here.
 
-### Likely GPU-specific findings (NOT validated on this box)
+### GPU validation — live A10G run (measured, not hypothesized)
 
-- The matmul will collapse to a small fraction on a GPU (cuBLAS / tensor-core
-  friendly), which will make the **segment-max the dominant cost on GPU**.
-- `scatter_reduce_(amax)` on GPU uses atomics with per-doc contention
-  (~tokens/doc-way). The **pad-to-max + dense `.amax(dim)`** variant — which
-  loses badly on CPU — has *no atomic contention* and may well **win on GPU**.
-  It is a good experiment to run on real hardware; it was deliberately **not**
-  landed here because it regresses 3× on CPU (the path tests and small runs use)
-  and cannot be validated without a GPU.
-- Prefer the **largest** `multivector_query_block` / `multivector_batch_size`
-  that fits VRAM: smaller query blocks add ~16% overhead (measured at block=4)
-  from extra Python-loop iterations and kernel launches, with no memory benefit
-  beyond the bound they enforce.
+Launched a single **g5.xlarge (NVIDIA A10G, 24 GB)** via SkyPilot, CUDA 13.0 /
+`torch 2.13.0+cu130`, ran the BRANCH (synced workdir, `PYTHONPATH=src` — never
+master), then tore the instance down.
+
+**Correctness on GPU — all green:** the 23 multivector unit tests (whose
+`run_compute` executes on `cuda`), the **2 live-Qdrant `MAX_SIM` parity tests**
+(dot + cosine, exact search), and the profiler's own dot+cosine × tilings
+spot-check (including a zero-token doc) all pass on the real GPU + CUDA path.
+
+**Component split at D=1024 — the CPU/GPU flip the hypotheses predicted:**
+
+| component | CPU (D=1024) | GPU A10G (D=1024) |
+|---|--:|--:|
+| matmul `Q @ C.T` | 94% | **65.7%** (13.5 ms) |
+| segment-max `scatter_reduce(amax)` | 6% | **34.1%** (7.0 ms) |
+| segment-sum `index_add_` | ~0% | 0.2% (0.04 ms) |
+
+cuBLAS collapses the matmul's share from 94% → 66%, so — as predicted —
+**segment-max becomes the prominent secondary cost on GPU** (34%).
+
+**The `pad-to-max + dense .amax` hypothesis: CONFIRMED on GPU.** It ran **6.03 ms
+vs scatter_reduce's 7.02 ms — ~14% faster** on the segment-max (bit-equivalent),
+the exact *opposite* of CPU (where it lost 3×). No atomic contention on GPU is
+the reason. **Still not landed as the default**, though: the win is ~14% of a
+34% component (~5% end-to-end), and the padded buffer is `block_q_tokens ×
+n_rows × max_tokens_per_doc` — fine here (`max_tok`=49, mean 40) but a real
+corpus with a long doc-length tail (mean 80, max 512) blows that buffer up ~6×
+and wastes the amax on mostly-`-inf` padding. `scatter_reduce` stays the robust
+default (no skew blowup, works on CPU + GPU); pad+amax is a good **opt-in / adaptive**
+follow-up for GPU runs on tight token-length distributions.
+
+**The removed host-sync guard — validated:** the `bool((counts==0).any())` guard
+(dropped in Round 3) cost **0.037 ms/call vs 0.026 ms/call** unconditional
+(~30% on that op) on GPU, confirming it was a real per-query-block device→host
+sync. Neutral on CPU, small but real win on GPU — the reason it was worth removing.
+
+**Tiling:** `query_block=None` (45 ms) is fastest; smaller blocks are marginally
+slower (48 ms at block=8) — same as CPU. The knobs are for memory-bounding only;
+prefer the largest that fits VRAM.
