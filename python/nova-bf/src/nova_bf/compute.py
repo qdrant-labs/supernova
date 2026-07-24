@@ -1002,7 +1002,7 @@ class MultiVectorBatchSlice:
             qe = min(qs + block, n_q)
             t0, t1 = int(qoff[qs]), int(qoff[qe])
             if t1 == t0:
-                continue  # every query in this block is zero-token; leave -inf
+                continue  # every query in this block is zero-token -> left -inf (see below)
             Qb = Q.flat[t0:t1]
             if metric == "cosine":
                 Qb = F.normalize(Qb, dim=1)
@@ -1012,15 +1012,28 @@ class MultiVectorBatchSlice:
             # block's output rows (zeroed first): `index_add_` into the `out`
             # view avoids a separate `(block_queries × n_rows)` temporary — at
             # scale (n_q=100k, a large corpus batch) that temporary equals the
-            # output-slice size, a multi-GB transient on the GPU. Init 0, so a
-            # zero-token query (no rows land on it) stays 0; a non-candidate
+            # output-slice size, a multi-GB transient on the GPU. A non-candidate
             # doc's `-inf` in `M` sums to `-inf`, surviving as a non-candidate.
-            row_q = torch.repeat_interleave(
-                torch.arange(qe - qs, device=dev), qoff[qs : qe + 1].diff()
-            )
+            counts = qoff[qs + 1 : qe + 1] - qoff[qs:qe]   # tokens per query in this block
+            row_q = torch.repeat_interleave(torch.arange(qe - qs, device=dev), counts)
             dest = out[qs:qe]
             dest.zero_()
             dest.index_add_(0, row_q, M)
+            # A ZERO-TOKEN query has no tokens to score, so it retrieves nothing:
+            # mark it a non-candidate (-inf) EVERYWHERE — identical to a whole
+            # zero-token block (the `continue` above) and to the sparse
+            # zero-support gate. Without this, a zero-token query sharing a block
+            # with a non-empty one would keep the `dest.zero_()` value (0.0
+            # against every doc) and its top-K would fill with arbitrary tied
+            # 0.0-score rows — AND the result would depend on how `query_block`
+            # happens to tile the query axis (a pure performance knob), breaking
+            # tiling-invariance. Qdrant rejects zero-token multivector queries
+            # outright; nova-bf instead returns them cleanly as "no hits".
+            # Unconditional (no `.any()` guard): when no query is zero-token the
+            # mask is all-False and this is a no-op scatter — cheaper than the
+            # `bool(...)` guard, which would force a device->host sync every
+            # query block on the GPU.
+            dest[counts == 0] = float("-inf")
         return out
 
 
@@ -1031,7 +1044,17 @@ def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "Mul
     token total and their duplicate leading `0` dropped, exactly as CSR
     row_offsets are. `query_block` is fixed run-wide, so the first batch's copy
     is authoritative."""
-    flat = np.concatenate([b.flat_tokens for b in batches], axis=0)
+    # Skip zero-ROW token arrays before concatenating: an all-zero-token corpus
+    # shard decodes to a width-0 `(0, 0)` `flat_tokens` (the decoder can't infer
+    # D with no tokens — see `multivector_to_ragged`), which would otherwise make
+    # `np.concatenate(..., axis=1-mismatch)` throw against real `(m, D)` shards.
+    # A zero-row array contributes no tokens anyway; its docs still exist as rows
+    # and ride along via `doc_offsets` below (they score `-inf`, non-candidates).
+    # This mirrors `load_queries_multivector`'s own `nonempty` guard on the query
+    # side. If EVERY part is empty the group has no tokens at all, so the width is
+    # irrelevant (`MultiVectorBatchSlice.score` short-circuits on 0 tokens).
+    flat_parts = [b.flat_tokens for b in batches if b.flat_tokens.shape[0] > 0]
+    flat = np.concatenate(flat_parts, axis=0) if flat_parts else batches[0].flat_tokens
     offsets_parts = [batches[0].doc_offsets]
     running = int(batches[0].doc_offsets[-1])
     for b in batches[1:]:
@@ -1884,6 +1907,13 @@ def run_compute(
     mv_batch_size = cfg.params.multivector_batch_size
     mv_query_block = cfg.params.multivector_query_block
     if "multivector" in vts_needed and cfg.params.multivector_token_budget is not None:
+        if mv_batch_size is not None and mv_query_block is not None:
+            logger.warning(
+                "multivector_token_budget=%d is set but BOTH multivector_batch_size "
+                "and multivector_query_block are also set explicitly — the budget has "
+                "nothing to derive and is ignored (explicit knobs win).",
+                cfg.params.multivector_token_budget,
+            )
         mean_q_tok = float(mv_q_offsets[-1]) / max(1, n_q) if n_q else 1.0
         mean_doc_tok = _sample_mean_doc_tokens(cstore, mine, cfg.corpus.multivector_column)
         mv_batch_size, mv_query_block = _resolve_multivector_tiles(

@@ -75,6 +75,25 @@ never pays it.
   `exact=True`, asserted to match nova-bf's top-K ids **and** scores (boundary-aware
   tolerance) for both dot and cosine. Skips cleanly without docker/`qdrant-client`.
 
+## Known, benign divergence from Qdrant (cosine, sub-normal magnitudes)
+
+Under `cosine`, nova-bf L2-normalizes every token down to a `1e-12` floor —
+the mathematically exact, scale-invariant cosine. Qdrant applies a **low-norm
+guard**: a token vector whose norm is above ~`1e-3` is normalized as expected,
+but below that Qdrant leaves it *unnormalized* and scores the raw dot instead
+(verified by a magnitude sweep on a live `MAX_SIM` cosine collection: a doc
+equal to the query direction scores `≈1.0` down to magnitude `1e-3`, then
+`≈magnitude` from `1e-4` on down). So for any token with norm in roughly
+`(0, 1e-3)` the two engines diverge — nova gives the true cosine, Qdrant gives
+~0.
+
+This never manifests on real data: dense/ColBERT token vectors have O(1)
+magnitudes, far above the guard. An *exactly*-zero token agrees (both → 0).
+`dot` is unaffected (no normalization). nova deliberately does **not** replicate
+Qdrant's threshold — it's undocumented, version-specific, and matching it would
+make nova less correct for the realistic case. The unit test
+`test_cosine_is_scale_invariant` pins nova's chosen semantics.
+
 ## Profiling & performance
 
 CPU-only box (no GPU here; `torch.cuda.is_available()` is False). Representative

@@ -54,12 +54,17 @@ def _mv_array(docs: list[np.ndarray], nulls: set[int] = frozenset()) -> pa.Array
 
 def _ref_maxsim(q: np.ndarray, d: np.ndarray, metric: str) -> float:
     """Reference MaxSim for one (query, doc) token-set pair — the definition,
-    written out literally. Zero-token doc -> non-candidate (-inf)."""
+    written out literally. A zero-token doc OR a zero-token query is a
+    non-candidate (-inf): a query with no tokens has nothing to score, so it
+    retrieves nothing (matching nova-bf and the sparse zero-support gate).
+    Cosine normalizes with the same 1e-12 floor `torch.nn.functional.normalize`
+    uses, so a zero-magnitude token becomes a zero vector (contributes 0), not a
+    0/0 NaN."""
     if len(d) == 0 or len(q) == 0:
-        return float("-inf") if len(d) == 0 else 0.0
+        return float("-inf")
     if metric == "cosine":
-        q = q / np.linalg.norm(q, axis=1, keepdims=True)
-        d = d / np.linalg.norm(d, axis=1, keepdims=True)
+        q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+        d = d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-12)
     return float(sum(max(float(qt @ dt) for dt in d) for qt in q))
 
 
@@ -286,6 +291,38 @@ searches:
 # ---------------------------------------------------------------------------
 # decoder unit tests
 # ---------------------------------------------------------------------------
+def test_cosine_is_scale_invariant(tmp_path):
+    """nova-bf's cosine MaxSim is the mathematically exact, scale-invariant
+    cosine: scaling any doc's (or query's) token magnitudes leaves the cosine
+    ranking and scores unchanged (normalization floor 1e-12). This pins the
+    intentional semantics that diverge from Qdrant's low-norm guard only for
+    sub-~1e-3-norm vectors (see docs/brute-force/multivector-maxsim.md) — a
+    regime real embeddings never reach."""
+    rng = np.random.default_rng(21)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    cdocs = [rng.standard_normal((int(rng.integers(1, 5)), DIM)).astype(np.float32) for _ in range(15)]
+    qdocs = [rng.standard_normal((3, DIM)).astype(np.float32) for _ in range(4)]
+
+    def run_with_scale(scale):
+        scaled = [d * scale for d in cdocs]
+        pq.write_table(pa.table({"multivector_embedding": _mv_array(scaled),
+                                 "id": pa.array([str(i) for i in range(len(scaled))])}),
+                       str(cdir / "c0.parquet"))
+        qpath = tmp_path / "q.parquet"
+        pq.write_table(pa.table({"multivector_embedding": _mv_array(qdocs),
+                                 "qid": pa.array([str(i) for i in range(len(qdocs))])}), str(qpath))
+        return _run(tmp_path, str(cdir), str(qpath), metric="cosine", k=10)
+
+    base = run_with_scale(1.0)
+    for scale in (0.01, 100.0):
+        got = run_with_scale(scale)
+        for qi in base:
+            assert list(got[qi].keys()) == list(base[qi].keys()), f"scale={scale} q{qi} ranking drift"
+            for di in base[qi]:
+                assert abs(got[qi][di] - base[qi][di]) < 1e-3, f"scale={scale} q{qi} d{di} score drift"
+
+
 def test_decoder_null_empty_and_slice():
     D = 3
     inner = pa.ListArray.from_arrays(
@@ -304,6 +341,208 @@ def test_decoder_null_empty_and_slice():
     off2, flat2 = multivector_to_ragged(pa.chunked_array([outer.slice(2, 2)]))
     assert off2.tolist() == [0, 1, 1]                # doc2 (1 tok), doc3 (empty)
     assert np.array_equal(flat2, np.array([[6.0, 7.0, 8.0]], np.float32))
+
+
+def test_zero_token_query_is_tiling_invariant_noncandidate(tmp_path):
+    """A zero-token (empty/null) query has nothing to score → it must retrieve
+    NOTHING (all -inf), identically regardless of how `query_block` tiles the
+    query axis. Regression for the bug where a zero-token query sharing a block
+    with a non-empty one scored 0.0 (candidate) while a whole zero-token block
+    scored -inf — making the GT depend on a pure performance knob."""
+    rng = np.random.default_rng(3)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    cdocs = [rng.standard_normal((int(rng.integers(1, 5)), DIM)).astype(np.float32) for _ in range(12)]
+    pq.write_table(pa.table({"multivector_embedding": _mv_array(cdocs),
+                             "id": pa.array([str(i) for i in range(12)])}),
+                   str(cdir / "c0.parquet"))
+    # queries: q0 non-empty, q1 ZERO-token, q2 non-empty, q3 zero-token
+    qdocs = [rng.standard_normal((3, DIM)).astype(np.float32),
+             np.zeros((0, DIM), np.float32),
+             rng.standard_normal((2, DIM)).astype(np.float32),
+             np.zeros((0, DIM), np.float32)]
+    qpath = tmp_path / "q.parquet"
+    pq.write_table(pa.table({"multivector_embedding": _mv_array(qdocs),
+                             "qid": pa.array([str(i) for i in range(4)])}), str(qpath))
+
+    runs = {qb: _run(tmp_path, str(cdir), str(qpath), metric="dot", k=12, qb=qb)
+            for qb in (None, 1, 2, 3, 4)}
+    # zero-token queries q1, q3 -> NO hits, in every tiling
+    for qb, got in runs.items():
+        assert got[1] == {}, f"qb={qb}: zero-token q1 should retrieve nothing, got {got[1]}"
+        assert got[3] == {}, f"qb={qb}: zero-token q3 should retrieve nothing, got {got[3]}"
+    # non-empty queries identical across all tilings
+    base = runs[None]
+    for qb, got in runs.items():
+        for qi in (0, 2):
+            assert list(got[qi].keys()) == list(base[qi].keys()), f"qb={qb} q{qi} ids drift"
+
+
+def test_all_empty_corpus_shard_coalesced(tmp_path):
+    """A corpus shard that is ENTIRELY zero-token docs must not crash a
+    coalesced run (uniform filter + multivector_batch_size set), and its docs
+    must be non-candidates. Regression for the `_concat_multivector_batches`
+    width-0 concat crash."""
+    rng = np.random.default_rng(5)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    # file 0: real docs (cat=a/b); file 1: ALL null/empty docs; file 2: real docs
+    def write(fi, docs, nulls, cats, base):
+        pq.write_table(pa.table({
+            "multivector_embedding": _mv_array(docs, nulls=nulls),
+            "id": pa.array([str(base + i) for i in range(len(docs))]),
+            "cat": pa.array(cats),
+        }), str(cdir / f"c{fi}.parquet"))
+    f0 = [rng.standard_normal((int(rng.integers(1, 5)), DIM)).astype(np.float32) for _ in range(5)]
+    write(0, f0, set(), ["a" if i % 2 else "b" for i in range(5)], 0)
+    f1 = [np.zeros((0, DIM), np.float32) for _ in range(4)]     # ALL empty (2 null, 2 empty-list)
+    write(1, f1, {0, 1}, ["a"] * 4, 5)
+    f2 = [rng.standard_normal((int(rng.integers(1, 5)), DIM)).astype(np.float32) for _ in range(6)]
+    write(2, f2, set(), ["a" if i % 2 else "b" for i in range(6)], 9)
+
+    qdocs = [rng.standard_normal((3, DIM)).astype(np.float32) for _ in range(4)]
+    qpath = tmp_path / "q.parquet"
+    pq.write_table(pa.table({"multivector_embedding": _mv_array(qdocs),
+                             "qid": pa.array([str(i) for i in range(4)])}), str(qpath))
+
+    filter_yaml = ("    filter:\n      must:\n        - field: cat\n          match: a\n")
+    # multivector_batch_size set -> coalescing path; k >= corpus so a candidate is
+    # missing ONLY if it's a non-candidate or filtered out.
+    got = _run(tmp_path, str(cdir), str(qpath), metric="dot", k=100, bs=8, filter_yaml=filter_yaml)
+    cdocs = f0 + f1 + f2
+    cats = (["a" if i % 2 else "b" for i in range(5)] + ["a"] * 4
+            + ["a" if i % 2 else "b" for i in range(6)])
+    empty_ids = {5, 6, 7, 8}
+    for qi in range(4):
+        assert not (set(got[qi]) & empty_ids), f"q{qi} surfaced empty-shard docs"
+        keep = {i for i, c in enumerate(cats) if c == "a"} - empty_ids
+        assert set(got[qi]) == keep, f"q{qi} candidate set mismatch"
+        ref = _ref_topk(qdocs, cdocs, "dot", 100,
+                        keep={i for i, c in enumerate(cats) if c == "a"})
+        for di in ref[qi]:
+            assert abs(got[qi][di] - ref[qi][di]) < 1e-3
+
+
+def test_coalescing_uniform_filter_parity(ds):
+    """Same as the uniform-filter test but WITH multivector_batch_size set, so
+    the cross-file coalescing path (`_flush_coalesce_group` +
+    `_concat_multivector_batches`) actually executes."""
+    filter_yaml = ("    filter:\n      must:\n        - field: lang\n          match: eng\n")
+    got = _run(ds["tmp"], ds["cdir"], ds["qpath"], metric="dot", k=8, bs=3, filter_yaml=filter_yaml)
+    ref = _ref_topk(ds["qdocs"], ds["cdocs"], "dot", 8,
+                    keep={i for i, l in enumerate(ds["langs"]) if l == "eng"})
+    for qi in ref:
+        assert list(got[qi].keys()) == list(ref[qi].keys())
+        for di in ref[qi]:
+            assert abs(got[qi][di] - ref[qi][di]) < 1e-3
+
+
+def test_multivector_and_dense_shared_run(tmp_path):
+    """A dense spec and a multivector spec in ONE run share corpus IO/decode —
+    each must still produce its own independent, correct ranking."""
+    rng = np.random.default_rng(11)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    M = 40
+    cdocs = [rng.standard_normal((int(rng.integers(1, 5)), DIM)).astype(np.float32) for _ in range(M)]
+    dense_c = rng.standard_normal((M, DIM)).astype(np.float32)
+    pq.write_table(pa.table({
+        "multivector_embedding": _mv_array(cdocs),
+        "dense_embedding": pa.array(dense_c.tolist(), type=pa.list_(pa.float32())),
+        "id": pa.array([str(i) for i in range(M)]),
+    }), str(cdir / "c0.parquet"))
+    NQ = 5
+    qmv = [rng.standard_normal((3, DIM)).astype(np.float32) for _ in range(NQ)]
+    dense_q = rng.standard_normal((NQ, DIM)).astype(np.float32)
+    qpath = tmp_path / "q.parquet"
+    pq.write_table(pa.table({
+        "multivector_embedding": _mv_array(qmv),
+        "dense_embedding": pa.array(dense_q.tolist(), type=pa.list_(pa.float32())),
+        "qid": pa.array([str(i) for i in range(NQ)]),
+    }), str(qpath))
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg_text = f"""
+corpus: {{path: {cdir}, multivector_column: multivector_embedding, dense_column: dense_embedding, id_column: id}}
+queries: {{path: {qpath}, multivector_column: multivector_embedding, dense_column: dense_embedding, id_column: qid}}
+output: {{path: {out}}}
+params: {{io_workers: 2, multivector_query_block: 2}}
+searches:
+  - {{name: mv, k: 10, metric: dot, vector_type: multivector}}
+  - {{name: dn, k: 10, metric: dot, vector_type: dense}}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(cfg_text)
+    res = run_compute(load_config(str(p)))
+    # multivector spec
+    tm = pq.read_table(res["mv"]).to_pydict()
+    gm = {int(q): {int(i): s for i, s in zip(hi, hs)}
+          for q, hi, hs in zip(tm["query_id"], tm["hit_ids"], tm["hit_scores"])}
+    rm = _ref_topk(qmv, cdocs, "dot", 10)
+    for qi in rm:
+        assert list(gm[qi].keys()) == list(rm[qi].keys())
+        for di in rm[qi]:
+            assert abs(gm[qi][di] - rm[qi][di]) < 1e-3
+    # dense spec: independent dot-product ranking
+    td = pq.read_table(res["dn"]).to_pydict()
+    gd = {int(q): [int(i) for i in hi] for q, hi in zip(td["query_id"], td["hit_ids"])}
+    for qi in range(NQ):
+        sc = dense_c @ dense_q[qi]
+        ref = [int(o) for o in np.argsort(-sc, kind="stable")[:10]]
+        assert gd[qi] == ref, f"dense q{qi} ranking mismatch"
+
+
+def test_per_query_filter_multivector(tmp_path):
+    """A per-query filter (`match_from_query`) with a multivector search — the
+    per-query cell-mask path — selects each query's own admissible docs."""
+    rng = np.random.default_rng(13)
+    cdir = tmp_path / "corpus"
+    cdir.mkdir()
+    M = 30
+    cdocs = [rng.standard_normal((int(rng.integers(1, 5)), DIM)).astype(np.float32) for _ in range(M)]
+    tenant = [i % 3 for i in range(M)]
+    pq.write_table(pa.table({
+        "multivector_embedding": _mv_array(cdocs),
+        "id": pa.array([str(i) for i in range(M)]),
+        "tenant": pa.array(tenant),
+    }), str(cdir / "c0.parquet"))
+    NQ = 4
+    qmv = [rng.standard_normal((3, DIM)).astype(np.float32) for _ in range(NQ)]
+    want_tenant = [0, 1, 2, 0]
+    qpath = tmp_path / "q.parquet"
+    pq.write_table(pa.table({
+        "multivector_embedding": _mv_array(qmv),
+        "qid": pa.array([str(i) for i in range(NQ)]),
+        "want": pa.array(want_tenant),
+    }), str(qpath))
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg_text = f"""
+corpus: {{path: {cdir}, multivector_column: multivector_embedding, id_column: id}}
+queries: {{path: {qpath}, multivector_column: multivector_embedding, id_column: qid}}
+output: {{path: {out}}}
+params: {{io_workers: 2}}
+searches:
+  - name: mv
+    k: 100
+    metric: dot
+    vector_type: multivector
+    filter:
+      must:
+        - field: tenant
+          match_from_query: want
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(cfg_text)
+    t = pq.read_table(run_compute(load_config(str(p)))["mv"]).to_pydict()
+    got = {int(q): {int(i): s for i, s in zip(hi, hs)}
+           for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
+    for qi in range(NQ):
+        keep = {i for i in range(M) if tenant[i] == want_tenant[qi]}
+        assert set(got[qi]) == keep, f"q{qi} tenant filter: got {set(got[qi])} want {keep}"
+        ref = _ref_topk(qmv, cdocs, "dot", 100, keep=keep)
+        for di in ref[qi]:
+            assert abs(got[qi][di] - ref[qi][di]) < 1e-3
 
 
 def test_decoder_all_null_and_empty_column():
