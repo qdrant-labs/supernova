@@ -196,8 +196,9 @@ def test_handcomputed_maxsim_exact():
     #   q0.d0 = 1, q0.d1 = 2  -> max 2
     #   q1.d0 = 2, q1.d1 = 0  -> max 2
     # MaxSim = 2 + 2 = 4
-    batch = MultiVectorCorpusBatch(np.array([0, 2], np.int64), d, None)
-    Q = MultiVectorQuery(torch.tensor(q), torch.tensor(np.array([0, 2], np.int64)), 1, None)
+    batch = MultiVectorCorpusBatch(np.array([0, 2], np.int64), d)
+    qoff = np.array([0, 2], np.int64)
+    Q = MultiVectorQuery(torch.tensor(q), torch.tensor(qoff), qoff, 1, None)
     sc = batch.transfer(0, 1, "cpu").score(Q, "dot")
     assert sc.shape == (1, 1)
     assert abs(float(sc[0, 0]) - 4.0) < 1e-6

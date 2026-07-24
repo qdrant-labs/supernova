@@ -909,10 +909,17 @@ class MultiVectorQuery:
     `MultiVectorBatchSlice.score`, which tiles the query axis by whole queries
     (`query_block`) to bound the per-slice score matrix. `n_q` is stored
     explicitly because a trailing run of zero-token queries makes it
-    unrecoverable from `flat` alone."""
+    unrecoverable from `flat` alone.
 
-    flat: object      # torch.Tensor (total_query_tokens, D)
-    offsets: object   # torch.Tensor (n_q + 1,) int64, on device
+    `offsets` (device) drives the on-device segment reductions; `offsets_cpu`
+    (the same values, host numpy) drives the Python block-loop slicing so
+    `int(offsets[qs])` never forces a per-block CUDA→CPU sync (see `score`).
+    This object is the SINGLE source of `query_block` — the corpus batch/slice
+    deliberately don't carry it (it's a query-axis concept, not a corpus one)."""
+
+    flat: object       # torch.Tensor (total_query_tokens, D)
+    offsets: object    # torch.Tensor (n_q + 1,) int64, ON DEVICE — for reductions
+    offsets_cpu: object  # np.ndarray (n_q + 1,) int64 — for host block-loop slicing (no sync)
     n_q: int
     query_block: int | None  # queries per query-axis tile (None = all at once)
 
@@ -937,14 +944,13 @@ class MultiVectorCorpusBatch:
     is `(total_tokens, D)` and `doc_offsets` (length `n_rows+1`) delimits each
     doc's token span. Exposes the same `.n_rows`/`.nbytes`/`.compact`/
     `.transfer` surface as `Dense`/`SparseCorpusBatch` so `run_compute`'s
-    per-file loop never branches on vector_type. `query_block` is carried
-    run-wide (like sparse `vocab`/`need_row_norms`) so `.transfer()` needs no
-    extra args and the slice knows how to tile the query axis."""
+    per-file loop never branches on vector_type. Query-axis tiling
+    (`query_block`) lives on the query object (`MultiVectorQuery`), NOT here —
+    a corpus batch has no business knowing how the query set is tiled."""
 
-    def __init__(self, doc_offsets: np.ndarray, flat_tokens: np.ndarray, query_block: int | None):
+    def __init__(self, doc_offsets: np.ndarray, flat_tokens: np.ndarray):
         self.doc_offsets = doc_offsets
         self.flat_tokens = flat_tokens
-        self.query_block = query_block
 
     @property
     def n_rows(self) -> int:
@@ -958,7 +964,7 @@ class MultiVectorCorpusBatch:
         doc_offsets, flat_tokens, orig_rows = _compact_multivector_rows(
             self.doc_offsets, self.flat_tokens, keep
         )
-        return MultiVectorCorpusBatch(doc_offsets, flat_tokens, self.query_block), orig_rows
+        return MultiVectorCorpusBatch(doc_offsets, flat_tokens), orig_rows
 
     def transfer(self, r0: int, r1: int, device: str) -> "MultiVectorBatchSlice":
         import torch
@@ -969,7 +975,7 @@ class MultiVectorCorpusBatch:
             (self.doc_offsets[r0 : r1 + 1] - t0).astype(np.int64, copy=False)
         ).to(device, non_blocking=True)
         flat = torch.from_numpy(self.flat_tokens[t0:t1]).to(device, non_blocking=True)
-        return MultiVectorBatchSlice(flat, local_off, self.query_block)
+        return MultiVectorBatchSlice(flat, local_off)
 
 
 @dataclass
@@ -1000,33 +1006,48 @@ class MultiVectorBatchSlice:
 
     flat: object       # torch.Tensor (slice_total_tokens, D)
     doc_offsets: object  # torch.Tensor (n_rows + 1,) int64, rebased to 0
-    query_block: int | None = None
 
     @property
     def n_rows(self) -> int:
         return self.doc_offsets.shape[0] - 1
 
     def score(self, Q: "MultiVectorQuery", metric: str, q_norms=None):
+        # `q_norms` is unused: it's the per-query cosine scalar the dense/sparse
+        # slices take, but multivector cosine normalizes each TOKEN (not a
+        # per-query rescale), so there's no scalar to apply. The parameter stays
+        # for the uniform `slice.score(Q, metric, q_norms)` interface the shared
+        # loop calls across every vector_type.
         import torch
         import torch.nn.functional as F
 
+        if metric not in ("dot", "cosine"):
+            raise ValueError(
+                f"multivector metric must be 'dot' or 'cosine', got {metric!r}"
+            )
         dev = self.flat.device
         n_rows = self.n_rows
         n_q = Q.n_q
         out = torch.full((n_q, n_rows), float("-inf"), dtype=self.flat.dtype, device=dev)
         if n_rows == 0 or self.flat.shape[0] == 0:
             return out  # no corpus tokens in this slice — every doc a non-candidate
+        if Q.flat.shape[0] and Q.flat.shape[1] != self.flat.shape[1]:
+            raise ValueError(
+                f"multivector token dim mismatch: query D={Q.flat.shape[1]} vs "
+                f"corpus D={self.flat.shape[1]} — the query and corpus multivector "
+                "columns must share one token dimension"
+            )
 
         C = F.normalize(self.flat, dim=1) if metric == "cosine" else self.flat
         # Each corpus token column -> its doc id, for the segment-max.
         col_doc = torch.repeat_interleave(
             torch.arange(n_rows, device=dev), self.doc_offsets.diff()
         )
-        qoff = Q.offsets
+        qoff = Q.offsets            # device — feeds the on-device reductions below
+        qoff_cpu = Q.offsets_cpu    # host — feeds the Python block-loop bounds (no CUDA sync)
         block = Q.query_block or n_q
         for qs in range(0, n_q, block):
             qe = min(qs + block, n_q)
-            t0, t1 = int(qoff[qs]), int(qoff[qe])
+            t0, t1 = int(qoff_cpu[qs]), int(qoff_cpu[qe])  # host read: no per-block device sync
             if t1 == t0:
                 continue  # every query in this block is zero-token -> left -inf (see below)
             Qb = Q.flat[t0:t1]
@@ -1068,8 +1089,7 @@ def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "Mul
     into one — the ragged analog of `_concat_sparse_batches`. `flat_tokens` is a
     plain per-token concatenation; `doc_offsets` are shifted by the running
     token total and their duplicate leading `0` dropped, exactly as CSR
-    row_offsets are. `query_block` is fixed run-wide, so the first batch's copy
-    is authoritative."""
+    row_offsets are."""
     # Skip zero-ROW token arrays before concatenating: an all-zero-token corpus
     # shard decodes to a width-0 `(0, 0)` `flat_tokens` (the decoder can't infer
     # D with no tokens — see `multivector_to_ragged`), which would otherwise make
@@ -1087,7 +1107,7 @@ def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "Mul
         offsets_parts.append(b.doc_offsets[1:] + running)
         running += int(b.doc_offsets[-1])
     doc_offsets = np.concatenate(offsets_parts).astype(np.int64)
-    return MultiVectorCorpusBatch(doc_offsets, flat, batches[0].query_block)
+    return MultiVectorCorpusBatch(doc_offsets, flat)
 
 
 def _merge_topk(top_scores, top_enc, batch_scores, encoded_rows, k: int):
@@ -1976,11 +1996,13 @@ def run_compute(
     for vt in vts_needed:
         flat = torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device)
         if vt == "multivector":
-            # The token matrix + offsets + tile size, wrapped so a spec's `Q`
-            # carries everything `MultiVectorBatchSlice.score` needs.
+            # The token matrix + offsets (device for reductions, host for the
+            # block-loop bounds) + tile size, wrapped so a spec's `Q` carries
+            # everything `MultiVectorBatchSlice.score` needs.
+            off_cpu = np.ascontiguousarray(mv_q_offsets, dtype=np.int64)
             Q_gpu_by_vt[vt] = MultiVectorQuery(
-                flat, torch.tensor(mv_q_offsets, dtype=torch.int64, device=device),
-                n_q, mv_query_block,
+                flat, torch.tensor(off_cpu, dtype=torch.int64, device=device),
+                off_cpu, n_q, mv_query_block,
             )
         else:
             Q_gpu_by_vt[vt] = flat
@@ -2319,7 +2341,7 @@ def run_compute(
                         )
                 if "multivector" in vts_needed:
                     mv_offsets, mv_flat = arrs["multivector"]
-                    b = MultiVectorCorpusBatch(mv_offsets, mv_flat, mv_query_block)
+                    b = MultiVectorCorpusBatch(mv_offsets, mv_flat)
                     raw_stats["multivector"] = (b.n_rows, b.nbytes)
                     if has_baseline["multivector"]:
                         batches["multivector"], batch_orig_rows["multivector"] = b, None
