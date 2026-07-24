@@ -105,6 +105,77 @@ def dense_to_2d(col: pa.ChunkedArray) -> np.ndarray:
     return np.ascontiguousarray(flat.reshape(n, dim), dtype=np.float32)
 
 
+def multivector_to_ragged(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray]:
+    """A `list<list<float32>>` column (one doc = outer entry, one D-dim token
+    vector = inner entry) → `(doc_offsets, flat_tokens)`.
+
+    Same flatten-the-Arrow-buffer-once approach as `dense_to_2d`/
+    `sparse_to_coo_parts` — no per-row/per-token Python. `doc_offsets` is
+    length n+1 (token-index prefix sums; doc `i`'s tokens are rows
+    `doc_offsets[i]:doc_offsets[i+1]` of `flat_tokens`), `flat_tokens` is the
+    `(total_tokens, D)` float32 matrix of every token across every doc,
+    concatenated in doc order. This is the exact ragged analog of CSR's
+    `(row_offsets, values)`.
+
+    A null outer entry (nova-embed's `on_empty_input="null"`) or a non-null
+    but empty inner list both decode to a zero-width span (`doc_offsets[i] ==
+    doc_offsets[i+1]`) — i.e. a zero-token doc, which the compute path treats
+    as a non-candidate (`-inf`), the same way the sparse path treats a
+    zero-overlap doc.
+
+    Robustness (all O(1) / O(n_docs), so the hot corpus path is unaffected):
+    - The validity bitmap, not the offsets, decides a null doc's token count.
+      Arrow does NOT guarantee a null list slot has equal adjacent offsets, so
+      trusting the offsets alone could count a null doc's stray physical span
+      as real tokens (nova-embed writes zero-span nulls, so this only guards
+      against arrays from other producers / some slice+concat paths).
+    - Buffer offsets (outer/inner) are honored so a sliced Arrow array (logical
+      offset != 0) decodes correctly rather than misaligning tokens to docs.
+    - Wrong-shape input fails loudly: a dense `list<float32>` column, or token
+      floats containing nulls (which would silently become NaN and poison
+      scoring), raise a clear error instead of an obscure one downstream.
+
+    The token width D is taken from the first token; per-token width variance
+    is left to `reshape` to catch (an O(total_tokens) uniformity scan would tax
+    the corpus path, and nova-embed emits a uniform width by construction)."""
+    col = col.combine_chunks()  # ChunkedArray -> a single ListArray
+    n = len(col)
+    if n == 0:
+        return np.zeros(1, dtype=np.int64), np.zeros((0, 0), dtype=np.float32)
+    if not (pa.types.is_list(col.type) or pa.types.is_large_list(col.type)):
+        raise TypeError(f"multivector column must be a list of token vectors, got {col.type}")
+    inner = col.values  # child ListArray: one entry per token across all docs
+    if not (pa.types.is_list(inner.type) or pa.types.is_large_list(inner.type)):
+        raise TypeError(
+            f"multivector column must nest list<float32> token vectors; inner type is "
+            f"{inner.type} (a flat list<float32> is a DENSE vector — use vector_type=dense)"
+        )
+    outer_off = col.offsets.to_numpy(zero_copy_only=False).astype(np.int64)  # (n+1,), token indices
+    lengths = np.diff(outer_off)  # physical span (token count) per doc
+    interspersed = False
+    if col.null_count:
+        valid = np.asarray(col.is_valid())  # (n,) bool
+        interspersed = not bool((lengths[~valid] == 0).all())  # a null slot carrying real tokens?
+        lengths = np.where(valid, lengths, 0)  # a null doc is always zero-token
+    doc_offsets = np.concatenate(([0], np.cumsum(lengths, dtype=np.int64)))
+    if int(doc_offsets[-1]) == 0:
+        # every doc null/empty — no tokens, so D is unknowable from the data
+        return doc_offsets, np.zeros((0, 0), dtype=np.float32)
+    if inner.values.null_count:  # O(1) when there's no validity bitmap (the norm)
+        raise ValueError(
+            "multivector token values contain nulls — a token vector must be fully "
+            "populated float32 (a null would decode to NaN and poison scoring)"
+        )
+    inner_off = inner.offsets.to_numpy(zero_copy_only=False).astype(np.int64)
+    tok_lo, tok_hi = int(outer_off[0]), int(outer_off[-1])
+    dim = int(inner_off[tok_lo + 1] - inner_off[tok_lo])  # token width, from the first token
+    val_lo, val_hi = int(inner_off[tok_lo]), int(inner_off[tok_hi])
+    phys = inner.values.to_numpy(zero_copy_only=False)[val_lo:val_hi].reshape(tok_hi - tok_lo, dim)
+    if interspersed:  # rare: drop the stray tokens a null slot physically carried
+        phys = phys[np.repeat(valid, np.diff(outer_off))]
+    return doc_offsets, np.ascontiguousarray(phys, dtype=np.float32)
+
+
 def sparse_to_coo_parts(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """A `struct<indices: list<uint32>, values: list<float32>>` column → CSR parts.
 
