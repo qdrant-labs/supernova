@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 
 from typing import Any
 
@@ -35,10 +36,30 @@ def _set_path(d: dict, dotted_key: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
+def _render_value(value: Any) -> str:
+    """Flatten a value into a name fragment. Scalars render as-is; dict/list
+    values (e.g. Milvus `index_params`, Elastic `index_options`) render as
+    their key-values joined, NOT their Python repr — the repr's `{`, `'`, and
+    spaces are illegal in ES index / Milvus collection names (and any name that
+    feeds those), which this segment becomes part of on the `data_layouts`
+    axis. Order-preserving so the fragment is deterministic."""
+    if isinstance(value, dict):
+        return "_".join(f"{k}{_render_value(v)}" for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return "_".join(_render_value(v) for v in value)
+    return str(value)
+
+
 def _name_segment(dotted_key: str, value: Any) -> str | None:
+    """A single `<leaf><value>` name fragment, sanitized to `[A-Za-z0-9_]` so
+    the assembled `_name` is valid everywhere it's used — ES index names,
+    Milvus collection names, and generated temp filenames. Any run of other
+    characters collapses to a single `_`; clean scalar names (e.g.
+    `distancecosine`, `m8`) are unchanged."""
     if value is None:
         return None
-    return f"{dotted_key.rsplit('.', 1)[-1]}{value}"
+    leaf = dotted_key.rsplit(".", 1)[-1]
+    return re.sub(r"[^A-Za-z0-9]+", "_", f"{leaf}{_render_value(value)}").strip("_")
 
 
 def expand_grid(grid: dict[str, list]) -> list[dict]:

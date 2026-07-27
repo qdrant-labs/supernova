@@ -2,6 +2,7 @@ import hashlib
 import os
 import uuid
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -26,20 +27,63 @@ def _sparse_value(v):
     return None if v is None else {"indices": v.indices, "values": v.values}
 
 
-def _multivector_value(v):
-    # Embedders may keep .vectors as a 2D ndarray for efficient downstream math;
-    # pyarrow needs a list-of-1D-arrays here, so flatten per row.
-    if v is None:
-        return None
-    vectors = v.vectors
-    return vectors.tolist() if hasattr(vectors, "tolist") else vectors
-
-
 _KIND_TO_ARROW = {
     OutputKind.DENSE: (DENSE_EMBEDDING_TYPE, _dense_value),
     OutputKind.SPARSE: (SPARSE_EMBEDDING_TYPE, _sparse_value),
-    OutputKind.MULTIVECTOR: (MULTIVECTOR_EMBEDDING_TYPE, _multivector_value),
 }
+
+
+def _build_multivector_array(records, name: str) -> pa.Array:
+    """Build a ``list<list<float32>>`` column from per-record ``(n_tokens, dim)``
+    float32 ndarrays WITHOUT going through Python lists.
+
+    The obvious ``ndarray.tolist()`` (which we used to do) reifies every float as
+    a ~28-byte Python float object — an ~8x blow-up over the raw float32 buffer —
+    and the whole ``flush_threshold`` batch is materialised at once, so a
+    multivector (colbert) flush OOM-kills the worker (each record is ~1.3 MB raw
+    but ~11 MB as Python floats; a 2k-record flush is ~2.7 GB raw vs ~22 GB).
+
+    Instead we concatenate the raw float32 buffers (near zero-copy into Arrow)
+    and hand-build the two nested offset layers: inner list = one 1024-vector per
+    token, outer list = one record. ``None`` (empty-input policy = null) becomes a
+    null outer entry. Result is byte-identical to the old path (verified in
+    tests) at ~1x the raw size.
+    """
+    arrays: list[np.ndarray | None] = []
+    for r in records:
+        v = r.embeddings.get(name)
+        arrays.append(None if v is None else np.asarray(v.vectors, dtype=np.float32))
+
+    non_null = [a for a in arrays if a is not None]
+    dim = int(non_null[0].shape[1]) if non_null else 1
+    total_tokens = int(sum(a.shape[0] for a in non_null))
+    flat = (
+        np.concatenate([a.reshape(-1) for a in non_null])
+        if non_null
+        else np.empty(0, dtype=np.float32)
+    )
+
+    # inner: list<float32>, one entry per token, each exactly `dim` floats
+    inner = pa.ListArray.from_arrays(
+        pa.array(np.arange(0, total_tokens * dim + 1, dim, dtype=np.int32)),
+        pa.array(flat, type=pa.float32()),
+    )
+
+    # outer: list<list<float32>>, one entry per record; null where the record's
+    # multivector is None (offsets stay flat across a null so it spans nothing)
+    outer_offsets = np.zeros(len(arrays) + 1, dtype=np.int32)
+    has_null = False
+    cum = 0
+    for i, a in enumerate(arrays):
+        if a is None:
+            has_null = True
+        else:
+            cum += a.shape[0]
+        outer_offsets[i + 1] = cum
+    mask = (
+        pa.array([a is None for a in arrays], type=pa.bool_()) if has_null else None
+    )
+    return pa.ListArray.from_arrays(pa.array(outer_offsets), inner, mask=mask)
 
 
 def _content_uuid(path: str) -> uuid.UUID:
@@ -103,10 +147,17 @@ def write_batch(
         fields.append(pa.field(col, arr.type))
 
     for spec in output_specs:
-        arrow_type, convert = _KIND_TO_ARROW[OutputKind(spec.kind)]
-        values = [convert(r.embeddings.get(spec.name)) for r in records]
-        arrays.append(pa.array(values, type=arrow_type))
-        fields.append(pa.field(spec.column, arrow_type))
+        kind = OutputKind(spec.kind)
+        if kind == OutputKind.MULTIVECTOR:
+            # numpy-native build — a per-value .tolist() here OOMs the flush (see
+            # _build_multivector_array). Type is MULTIVECTOR_EMBEDDING_TYPE.
+            arrays.append(_build_multivector_array(records, spec.name))
+            fields.append(pa.field(spec.column, MULTIVECTOR_EMBEDDING_TYPE))
+        else:
+            arrow_type, convert = _KIND_TO_ARROW[kind]
+            values = [convert(r.embeddings.get(spec.name)) for r in records]
+            arrays.append(pa.array(values, type=arrow_type))
+            fields.append(pa.field(spec.column, arrow_type))
 
     table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
     pq.write_table(table, path, compression="snappy", row_group_size=row_group_size)

@@ -246,9 +246,14 @@ by `nova bf` (or equivalent); `nova sweep` never invokes `nova bf` itself.
 nova sweep <config.yaml> [--skip-insert] [--cleanup] [--dry-run]
 ```
 
+- `target.type` is **required** and selects the backend: `qdrant`, `milvus`,
+  or `elastic` (same three as `nova-load`/`nova-storm`). Each carries its own
+  `target:` fields and search-param vocabulary (`{hnsw_ef, exact,
+  quantization}` / `{ef, nprobe}` / `{num_candidates}`); see the Sweep
+  overview's "Target backends" section.
 - The config declares three cartesian-grid axes — `data_layouts` (structural,
   forces a fresh `nova-load run`), `index_variants` (patched in place via
-  `nova-load reindex`, no reload), `searches` (storm-only, no Qdrant-side
+  `nova-load reindex`, no reload), `searches` (storm-only, no store-side
   change) — expanded and swept as **one collection per `data_layouts` entry,
   reused across every `index_variant`**, never a new collection per variant.
   The base collection name is now required explicitly in the config via
@@ -256,7 +261,10 @@ nova sweep <config.yaml> [--skip-insert] [--cleanup] [--dry-run]
 - `index_variants` are walked in an order chosen to minimize rebuild cost
   (HNSW changes grouped together, quantization changes absorb the frequent
   transitions — small-scale empirical testing showed quantization changes
-  reindex meaningfully faster), not declaration order.
+  reindex meaningfully faster), not declaration order. This cost sort keys off
+  Qdrant's `hnsw.*` fields only; for Milvus/Elastic it is a no-op and variants
+  run in declaration order (relevant for Elastic, where HNSW `m` may only
+  increase across in-place reindexes).
 - If a sweep's target collection already exists, the run **errors and exits
   immediately** rather than guessing what to do with it — pass `--skip-insert`
   to reuse it as-is (skips that data_layout's insert phase entirely), or set

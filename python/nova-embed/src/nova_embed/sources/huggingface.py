@@ -11,48 +11,21 @@ from offset 0).
 
 from __future__ import annotations
 
-import fnmatch
 import logging
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
-from nova_embed.sources.base import DatasetSource, files_in_window
+from nova_embed.sources.base import (
+    DatasetSource,
+    SOURCE_FILE_COLUMN,
+    SOURCE_ROW_COLUMN,
+    apply_record_projection,
+    files_in_window,
+    filter_paths,
+)
 from nova_embed.models import Record
 from nova_embed.registry import SOURCES
-
-# Provenance columns stamped onto each row when include_provenance=True.
-SOURCE_FILE_COLUMN = "source_file_name"
-SOURCE_ROW_COLUMN = "source_row_number"
-
-
-def _filter_paths(paths: list[str], pattern: str | list[str] | None) -> list[str]:
-    """
-    Apply a path filter to a list of HF parquet paths.
-
-    Patterns:
-      - None: pass-through.
-      - "regex:<expr>": treat <expr> as a Python regex (re.search).
-      - any other string: glob (fnmatch).
-      - list of patterns: union (a path matches if it matches any pattern).
-    """
-    if pattern is None:
-        return list(paths)
-    if isinstance(pattern, list):
-        out: list[str] = []
-        seen: set[str] = set()
-        for sub in pattern:
-            for p in _filter_paths(paths, sub):
-                if p not in seen:
-                    seen.add(p)
-                    out.append(p)
-        return out
-    if pattern.startswith("regex:"):
-        rx = re.compile(pattern[len("regex:") :])
-        return [p for p in paths if rx.search(p)]
-    return fnmatch.filter(paths, pattern)
-
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +116,7 @@ class HuggingFaceSource(DatasetSource):
         # otherwise fall back to filtering by split name when it appears in paths
         # (e.g. "train/0.parquet" or "data/train-...").
         if path_filter is not None:
-            parquet_paths = _filter_paths(all_parquets, path_filter)
+            parquet_paths = filter_paths(all_parquets, path_filter)
             if not parquet_paths:
                 raise ValueError(
                     f"path_filter={path_filter!r} matched 0 files in {dataset_name}. "
@@ -517,9 +490,4 @@ class HuggingFaceSource(DatasetSource):
             done()
 
     def format_record(self, row: dict) -> Record:
-        # render derived columns from the FULL row, then apply exclusions — a
-        # template may reference a column the user excludes from the output.
-        rendered = {name: tpl.format(**row) for name, tpl in self.render_columns.items()}
-        columns = {k: v for k, v in row.items() if k not in self.exclude_columns}
-        columns.update(rendered)
-        return Record(row=columns)
+        return apply_record_projection(row, self.render_columns, self.exclude_columns)
