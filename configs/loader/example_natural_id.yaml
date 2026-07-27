@@ -1,0 +1,49 @@
+# Load config using a NATURAL id from the data instead of minted point ids.
+#
+# By default the loader synthesizes deterministic point ids from provenance:
+#   id_expression: "vf_point_id(filename, file_row_number)"
+# When the dataset already carries a unique id column (here: `embedding_id`),
+# point ids can come straight from it — `id_expression` is any DuckDB SQL
+# expression, and a bare column name is the trivial one. Pair this with
+# configs/brute_force/example_natural_id.yaml: brute-force hit_ids and Qdrant
+# point ids then both come verbatim from `embedding_id`, so recall can be
+# scored by comparing id sets directly, with no reconstruction of the
+# loader's hashing.
+#
+# Constraints on a natural id:
+#   * Qdrant accepts ONLY unsigned integers or UUIDs as point ids. A UUID/GUID
+#     or integer column works as-is; an arbitrary string does not — derive one
+#     instead (e.g. "vf_uuid_from_hex(md5(embedding_id))"), but note nova-bf
+#     can't reproduce a derived id (its id_column is verbatim-only).
+#   * Qdrant canonicalizes UUIDs to lowercase-hyphenated form. If the column
+#     may contain uppercase GUIDs, normalize at load ("lower(embedding_id)")
+#     so ids compare equal to brute-force hit_ids.
+#   * The column must be truly unique: a duplicate id is a silent
+#     overwrite-on-upsert, not an error.
+
+datasource:
+  type: local
+  path: /tmp/listings_bge-m3
+  id_expression: embedding_id     # the natural id column, used verbatim
+  # id_expression: "lower(embedding_id)"   # if the GUIDs may be uppercase
+  payload_fields:
+    embedding_id: embedding_id    # keep the id in the payload too — resolvable
+                                  # from search results without id round-trips
+    text: text
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+
+vectorstore:
+  type: qdrant
+  collection_name: listings_bge-m3
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  upsert_wait: false
+
+loader:
+  batch_size: 256
+  concurrency: 4

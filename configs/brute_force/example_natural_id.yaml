@@ -1,0 +1,41 @@
+# Brute-force config using a NATURAL id from the data instead of derived ids.
+#
+# By default hit_ids are derived as make_point_id(corpus_file, row), matching
+# the point ids the loader synthesizes at ingest. When the dataset carries its
+# own unique id column (here: `embedding_id`), set `id_column` and hit_ids are
+# taken verbatim from it instead. Pair this with
+# configs/loader/example_natural_id.yaml (id_expression: embedding_id): Qdrant
+# point ids and brute-force hit_ids then both come verbatim from the same
+# column, so recall is a direct id-set comparison.
+#
+# Cost note: unlike make_point_id (a pure function of file+row, recomputed only
+# for the final K hits), a real id column is read alongside the dense vectors
+# and kept in RAM per file for this worker's corpus slice — budget
+# ~(slice_rows × id_size) of host memory.
+
+corpus:
+  path: /tmp/listings_bge-m3
+  dense_column: dense_embedding
+  id_column: embedding_id         # hit_ids come from this column, verbatim
+
+queries:
+  path: /tmp/listings_bge-m3/queries.parquet
+  dense_column: dense_embedding
+  # The query side has the same knob — use the queries file's own id column,
+  # or omit to derive make_point_id(queries_file, row).
+  id_column: embedding_id
+  payload_fields:
+    - text
+
+output:
+  path: /tmp/listings_bge-m3/eval
+
+params:
+  io_workers: 16
+  io_thread_count: 0
+
+searches:
+  - name: dense
+    vector_type: dense
+    metric: cosine
+    k: 1000
