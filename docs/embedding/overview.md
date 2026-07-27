@@ -155,3 +155,15 @@ nova embed configs/embedder/my_dataset.yaml
 ```
 
 The local runner uses async workers with a priority queue buffer to ensure ordered output. Good for development and small datasets.
+
+(`nova embed <config>` is shorthand for the default subcommand, `nova embed run <config>`.)
+
+## Predicting throughput and cost
+
+Before committing GPUs, predict what a config will do — texts/s, GPU-hours, and dollars, computed from the dataset's token distribution and the model's size. No GPU needed:
+
+```bash
+nova embed predict configs/embedder/my_dataset.yaml --gpu h100 --num-gpus 8
+```
+
+See [Throughput Prediction](throughput-prediction.md) for the method, an annotated example report, and the full flag reference.

@@ -26,7 +26,7 @@ embedders:
     model: BAAI/bge-m3
     input_column: text
     modality: text
-    batch_size: 1
+    batch_size: 64
     dtype: float16              # bge_m3 supports float16 | float32
 
   - name: bge_m3_sparse
@@ -35,7 +35,7 @@ embedders:
     model: BAAI/bge-m3
     input_column: text
     modality: text
-    batch_size: 1
+    batch_size: 64
     dtype: float16
 
   - name: bge_m3_multivector
@@ -44,7 +44,7 @@ embedders:
     model: BAAI/bge-m3
     input_column: text
     modality: text
-    batch_size: 1             # smaller than the others would also fuse (min wins)
+    batch_size: 64             # smaller than the others would also fuse (min wins)
     dtype: float16
     # pooling:                  # optionally derive a dense column from the
     #   type: mean              # multivector output — works on fused entries too

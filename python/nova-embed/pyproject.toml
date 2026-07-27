@@ -61,7 +61,7 @@ vllm = [
 # Exposes `nova-embed` on PATH, so `nova embed ...` dispatches here just like a
 # Rust `nova-<cmd>` binary would.
 [project.scripts]
-nova-embed = "nova_embed.cli.run_embedder:embed"
+nova-embed = "nova_embed.cli:cli"
 
 [build-system]
 requires = ["hatchling"]

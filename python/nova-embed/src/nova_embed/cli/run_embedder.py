@@ -90,6 +90,7 @@ def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | Non
     click.echo("=" * 70)
 
 
+@click.command(name="run", help="Embed a dataset locally (the default command).")
 def _print_file_partition(source, jobs: int, num_jobs: int | None) -> None:
     """Dry-run partition for a file-sharded source: files per rank, no download."""
     files = [p for p, _ in source.list_files()]
