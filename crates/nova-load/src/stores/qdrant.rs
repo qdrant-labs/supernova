@@ -804,7 +804,7 @@ impl VectorStore for QdrantStore {
         Ok(())
     }
 
-    async fn enable_indexing(&self) -> Result<(), StoreError> {
+    async fn enable_indexing(&self, _schema: &CollectionSchema) -> Result<(), StoreError> {
         let configured = self
             .params
             .optimizers

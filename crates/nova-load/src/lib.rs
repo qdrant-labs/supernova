@@ -56,7 +56,7 @@ pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
 
     let dims = resolve_dims(&config.datasource, &config.vectors).await?;
-    create_collection(store.as_ref(), &config.vectors, dims).await?;
+    let schema = create_collection(store.as_ref(), &config.vectors, dims).await?;
     store.ensure_payload_indexes(&config.datasource.reader().payload_fields).await?;
     store.defer_indexing().await?;
 
@@ -218,6 +218,16 @@ async fn resolve_dims(
     };
     let sample = tokio::task::spawn_blocking(move || read_job.run()).await??;
     Ok(engine::infer_dims(&sample, vectors))
+}
+
+async fn create_collection(
+    store: &dyn VectorStore,
+    vectors: &HashMap<String, VectorSpec>,
+    dims: HashMap<String, u64>,
+) -> Result<CollectionSchema, LoadError> {
+    let schema = CollectionSchema { vectors: vectors.clone(), dims };
+    store.ensure_collection(&schema).await?;
+    Ok(schema)
 }
 
 async fn finish_indexing(
