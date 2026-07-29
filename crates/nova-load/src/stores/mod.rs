@@ -113,6 +113,17 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
     /// backend-agnostic [`CollectionSchema`].
     async fn ensure_collection(&self, schema: &CollectionSchema) -> Result<(), StoreError>;
 
+    /// Ensure payload indexes according to backend-specific config, using the
+    /// resolved payload field names from the datasource config.
+    ///
+    /// Default is a no-op so backends opt in explicitly.
+    async fn ensure_payload_indexes(
+        &self,
+        _payload_fields: &HashMap<String, String>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Upsert a batch of points.
     async fn upsert_batch(&self, points: Vec<Point>) -> Result<(), StoreError>;
 

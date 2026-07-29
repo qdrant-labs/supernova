@@ -1,11 +1,13 @@
+pub mod checkpoint;
 pub mod config;
 pub mod engine;
 pub mod plan;
 pub mod sources;
 pub mod stores;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -16,6 +18,8 @@ use config::{LoadConfig, LoaderConfig, VectorSpec};
 use plan::Partition;
 use sources::{DataSource, DataSourceConfig, FileRef};
 use stores::{CollectionSchema, Point, StoreError, VectorStore};
+
+use crate::checkpoint::{CheckpointMeta, CheckpointState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -31,6 +35,14 @@ pub enum LoadError {
     NoFilesToPrepare,
     #[error("aborting: {skipped} file(s) failed after retries, exceeding loader.max_failed_files={max}")]
     TooManyFailedFiles { skipped: u64, max: usize },
+    #[error(transparent)]
+    Checkpoint(#[from] checkpoint::CheckpointError),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoadRuntimeOptions {
+    pub resume: bool,
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,8 +56,8 @@ pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
 
     let dims = resolve_dims(&config.datasource, &config.vectors).await?;
-    let schema = CollectionSchema { vectors: config.vectors.clone(), dims };
-    store.ensure_collection(&schema).await?;
+    create_collection(store.as_ref(), &config.vectors, dims).await?;
+    store.ensure_payload_indexes(&config.datasource.reader().payload_fields).await?;
     store.defer_indexing().await?;
 
     // `load_files` lists + partitions internally.
@@ -57,6 +69,7 @@ pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
         &config.loader,
         all_files,
         Partition::single(),
+        &LoadRuntimeOptions::default(),
     )
     .await?;
 
@@ -73,8 +86,8 @@ pub async fn prepare(config: LoadConfig) -> Result<(), LoadError> {
     // No file listing — dims come from sampling one file (or explicit config),
     // so prepare doesn't pay to enumerate a huge corpus.
     let dims = resolve_dims(&config.datasource, &config.vectors).await?;
-    let schema = CollectionSchema { vectors: config.vectors.clone(), dims };
-    store.ensure_collection(&schema).await?;
+    create_collection(store.as_ref(), &config.vectors, dims).await?;
+    store.ensure_payload_indexes(&config.datasource.reader().payload_fields).await?;
     store.defer_indexing().await?;
     tracing::info!("prepared collection on {store}");
     Ok(())
@@ -82,7 +95,11 @@ pub async fn prepare(config: LoadConfig) -> Result<(), LoadError> {
 
 /// Worker step: load this worker's slice of the files. Assumes the collection
 /// already exists (run `prepare` first) and does NOT manage indexing.
-pub async fn load(config: LoadConfig, partition: Partition) -> Result<(), LoadError> {
+pub async fn load(
+    config: LoadConfig,
+    partition: Partition,
+    runtime: LoadRuntimeOptions,
+) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
     let all_files = config.datasource.list_files().await?;
     let n = load_files(
@@ -92,6 +109,7 @@ pub async fn load(config: LoadConfig, partition: Partition) -> Result<(), LoadEr
         &config.loader,
         all_files,
         partition,
+        &runtime,
     )
     .await?;
     tracing::info!("worker {}/{} done: {n} points", partition.rank, partition.num_jobs);
@@ -261,6 +279,7 @@ async fn load_files(
     loader: &LoaderConfig,
     all_files: Vec<FileRef>,
     partition: Partition,
+    runtime: &LoadRuntimeOptions,
 ) -> Result<u64, LoadError> {
     let batch_size = loader.batch_size.max(1);
     let concurrency = loader.concurrency.max(1);
@@ -272,7 +291,7 @@ async fn load_files(
     let payload = datasource.reader().payload_fields.clone();
 
     let total_files = all_files.len();
-    let files = plan::partition(&all_files, partition);
+    let mut files = plan::partition(&all_files, partition);
     if files.is_empty() {
         tracing::warn!(
             "worker {}/{} has no files of {total_files} to load (more workers than files?)",
@@ -287,6 +306,27 @@ async fn load_files(
         partition.num_jobs,
         files.len(),
     );
+
+    let mut checkpoint_ctx =
+        maybe_init_checkpoint(datasource, vectors, loader, partition, runtime, &files)?;
+    if let Some(ctx) = checkpoint_ctx.as_mut() {
+        let (pending, resumed) = filter_pending_files(files, &ctx.state.completed_files);
+        files = pending;
+        if resumed > 0 {
+            tracing::info!(
+                "resume: skipping {resumed} already-completed file(s) from checkpoint `{}`",
+                ctx.path.display()
+            );
+        }
+        if files.is_empty() {
+            tracing::info!(
+                "resume: worker {}/{} has no pending files left to process",
+                partition.rank,
+                partition.num_jobs
+            );
+            return Ok(0);
+        }
+    }
 
     // Progress + a live aggregate upsert rate (points/sec across all the
     // concurrent in-flight upserts). On a TTY this is a pretty bar; on a headless
@@ -335,7 +375,12 @@ async fn load_files(
                 let mut attempt = 0u32;
                 loop {
                     match fetch_and_read(datasource, file, vectors, payload, id_expression).await {
-                        Ok(points) => return Ok::<Vec<Point>, (String, LoadError)>(points),
+                        Ok(points) => {
+                            return Ok::<(String, Vec<Point>), (String, LoadError)>((
+                                file.key.clone(),
+                                points,
+                            ));
+                        }
                         Err(err) => {
                             attempt += 1;
                             if attempt > file_retries as u32 {
@@ -367,7 +412,7 @@ async fn load_files(
 
     let mut skipped = 0u64;
     while let Some(outcome) = reads.next().await {
-        let points = match outcome {
+        let (key, points) = match outcome {
             Ok(points) => points,
             Err((key, err)) => {
                 tracing::warn!(
@@ -438,6 +483,14 @@ async fn load_files(
             .await?;
 
         total += points.len() as u64;
+        if let Some(ctx) = checkpoint_ctx.as_mut() {
+            ctx.state.completed_files.insert(key);
+            ctx.completed_since_flush += 1;
+            if ctx.completed_since_flush >= ctx.flush_every_files {
+                checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
+                ctx.completed_since_flush = 0;
+            }
+        }
         progress.inc(1);
     }
 
@@ -453,7 +506,149 @@ async fn load_files(
             file_retries,
         );
     }
+    if let Some(ctx) = checkpoint_ctx.as_mut() {
+        checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
+    }
     Ok(total)
+}
+
+struct CheckpointContext {
+    path: PathBuf,
+    meta: CheckpointMeta,
+    state: CheckpointState,
+    flush_every_files: usize,
+    completed_since_flush: usize,
+}
+
+fn maybe_init_checkpoint(
+    datasource: &DataSourceConfig,
+    vectors: &HashMap<String, VectorSpec>,
+    loader: &LoaderConfig,
+    partition: Partition,
+    runtime: &LoadRuntimeOptions,
+    assigned_files: &[FileRef],
+) -> Result<Option<CheckpointContext>, LoadError> {
+    let cfg = loader.checkpoint.as_ref();
+    let enabled = runtime.resume
+        || runtime.checkpoint_path.is_some()
+        || cfg.is_some_and(|c| c.enabled);
+    if !enabled {
+        return Ok(None);
+    }
+
+    let meta = CheckpointMeta {
+        rank: partition.rank,
+        num_jobs: partition.num_jobs,
+        datasource_identity: datasource_identity(datasource),
+        config_fingerprint: config_fingerprint(datasource, vectors, loader),
+    };
+    let path = match &runtime.checkpoint_path {
+        Some(path) => checkpoint::scoped_path(path, partition.rank, partition.num_jobs),
+        None => checkpoint::default_checkpoint_path(
+            cfg.and_then(|c| c.path_prefix.as_deref()),
+            &meta,
+        ),
+    };
+    let state = checkpoint::load_for_run(&path, &meta, runtime.resume)?;
+
+    let assigned: BTreeSet<String> = assigned_files.iter().map(|f| f.key.clone()).collect();
+    let unknown = state
+        .completed_files
+        .iter()
+        .filter(|k| !assigned.contains(*k))
+        .count();
+    if unknown > 0 {
+        tracing::warn!(
+            "checkpoint `{}` has {unknown} completed file(s) not in this worker partition",
+            path.display()
+        );
+    }
+
+    Ok(Some(CheckpointContext {
+        path,
+        meta,
+        state,
+        flush_every_files: cfg.map_or(1, |c| c.flush_every_files.max(1)),
+        completed_since_flush: 0,
+    }))
+}
+
+fn datasource_identity(datasource: &DataSourceConfig) -> String {
+    match datasource {
+        DataSourceConfig::Local(c) => {
+            let mut out = format!("local:path={}", c.path);
+            if let Some(list) = &c.file_list {
+                out.push_str(&format!(":file_list={}", normalize_list(list)));
+            }
+            out
+        }
+        DataSourceConfig::S3(c) => {
+            let mut out = format!("s3:path={}", c.path);
+            if let Some(list) = &c.file_list {
+                out.push_str(&format!(":file_list={}", normalize_list(list)));
+            }
+            if let Some(catalog) = &c.catalog {
+                out.push_str(&format!(":catalog={catalog}"));
+            }
+            out
+        }
+    }
+}
+
+fn config_fingerprint(
+    datasource: &DataSourceConfig,
+    vectors: &HashMap<String, VectorSpec>,
+    loader: &LoaderConfig,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("source={};", datasource_identity(datasource)));
+
+    let mut vector_names = vectors.keys().cloned().collect::<Vec<_>>();
+    vector_names.sort();
+    for name in vector_names {
+        if let Some(v) = vectors.get(&name) {
+            out.push_str(&format!(
+                "vec:{name}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?};",
+                v.kind,
+                v.column,
+                v.size,
+                v.distance,
+                v.comparator,
+                v.datatype,
+                v.on_disk,
+                v.modifier
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "loader:{}:{}:{}:{}:{}:{:?};",
+        loader.batch_size,
+        loader.concurrency,
+        loader.file_look_ahead,
+        loader.file_retries,
+        loader.upsert_retries,
+        loader.max_failed_files
+    ));
+    out
+}
+
+fn normalize_list(list: &[String]) -> String {
+    let mut v = list.to_vec();
+    v.sort();
+    v.join(",")
+}
+
+fn filter_pending_files(
+    files: Vec<FileRef>,
+    completed: &BTreeSet<String>,
+) -> (Vec<FileRef>, usize) {
+    let total = files.len();
+    let pending = files
+        .into_iter()
+        .filter(|f| !completed.contains(&f.key))
+        .collect::<Vec<_>>();
+    let skipped = total - pending.len();
+    (pending, skipped)
 }
 
 /// Human-readable byte count (e.g. `2.4 MB`).
@@ -469,5 +664,48 @@ fn human_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refs(keys: &[&str]) -> Vec<FileRef> {
+        keys.iter()
+            .map(|k| FileRef {
+                key: (*k).to_string(),
+                size: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn filter_pending_files_skips_completed_entries() {
+        let files = refs(&["a.parquet", "b.parquet", "c.parquet"]);
+        let completed = BTreeSet::from([
+            "a.parquet".to_string(),
+            "c.parquet".to_string(),
+            "outside.parquet".to_string(),
+        ]);
+
+        let (pending, skipped) = filter_pending_files(files, &completed);
+        let keys = pending.into_iter().map(|f| f.key).collect::<Vec<_>>();
+
+        assert_eq!(keys, vec!["b.parquet".to_string()]);
+        assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn normalize_list_is_stable_and_sorted() {
+        let list = vec![
+            "z/train.parquet".to_string(),
+            "a/train.parquet".to_string(),
+            "m/train.parquet".to_string(),
+        ];
+        assert_eq!(
+            normalize_list(&list),
+            "a/train.parquet,m/train.parquet,z/train.parquet"
+        );
     }
 }

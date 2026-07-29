@@ -1,0 +1,157 @@
+# FineWeb ~100M probe config (workers)
+# Worker-compatible (no payload_indexes), derived from 300m worker config.
+# HNSW is kept in memory: hnsw.on_disk=false
+
+datasource:
+  type: s3
+  path: s3://fineweb-gte-with-payloads/resharded/
+  download_timeout_secs: 600
+  id_expression: vf_point_id(filename, file_row_number)
+  file_list:
+  - 00/train-part0__0047.parquet
+  - 00/train-part0__0166.parquet
+  - 00/train-part0__0200.parquet
+  - 00/train-part0__0258.parquet
+  - 00/train-part0__0673.parquet
+  - 00/train-part0__0755.parquet
+  - 00/train-part0__0871.parquet
+  - 00/train-part0__0912.parquet
+  - 00/train-part0__0916.parquet
+  - 00/train-part0__1170.parquet
+  - 00/train-part0__1333.parquet
+  - 00/train-part0__1478.parquet
+  - 00/train-part0__1640.parquet
+  - 00/train-part0__1695.parquet
+  - 00/train-part0__1863.parquet
+  - 00/train-part0__1874.parquet
+  - 00/train-part0__1917.parquet
+  - 00/train-part0__2199.parquet
+  - 00/train-part0__2295.parquet
+  - 00/train-part0__2323.parquet
+  - 00/train-part0__2334.parquet
+  - 00/train-part0__2416.parquet
+  - 00/train-part0__2432.parquet
+  - 00/train-part0__2514.parquet
+  - 00/train-part0__2603.parquet
+  - 00/train-part0__2658.parquet
+  - 00/train-part0__2978.parquet
+  - 00/train-part0__3016.parquet
+  - 00/train-part0__3051.parquet
+  - 00/train-part0__3266.parquet
+  - 00/train-part0__3272.parquet
+  - 00/train-part0__3293.parquet
+  - 00/train-part0__3429.parquet
+  - 00/train-part0__3768.parquet
+  - 00/train-part0__3873.parquet
+  - 00/train-part0__3946.parquet
+  - 00/train-part0__4048.parquet
+  - 00/train-part0__4082.parquet
+  - 00/train-part0__4205.parquet
+  - 00/train-part0__4228.parquet
+  - 00/train-part0__4315.parquet
+  - 00/train-part0__4331.parquet
+  - 00/train-part0__4332.parquet
+  - 00/train-part0__4493.parquet
+  - 00/train-part0__4528.parquet
+  - 00/train-part0__4934.parquet
+  - 00/train-part0__5002.parquet
+  - 00/train-part0__5006.parquet
+  - 00/train-part0__5083.parquet
+  - 00/train-part0__5185.parquet
+  - 00/train-part0__5445.parquet
+  - 00/train-part0__5486.parquet
+  - 00/train-part0__5610.parquet
+  - 00/train-part0__5722.parquet
+  - 00/train-part0__5827.parquet
+  - 00/train-part0__5917.parquet
+  - 00/train-part0__6008.parquet
+  - 00/train-part0__6016.parquet
+  - 00/train-part0__6033.parquet
+  - 00/train-part0__6331.parquet
+  - 00/train-part0__6438.parquet
+  - 00/train-part0__6462.parquet
+  - 00/train-part0__6572.parquet
+  - 00/train-part0__6692.parquet
+  - 00/train-part0__6802.parquet
+  - 00/train-part0__6892.parquet
+  - 00/train-part0__7019.parquet
+  - 00/train-part0__7491.parquet
+  - 00/train-part0__7494.parquet
+  - 00/train-part0__7559.parquet
+  - 00/train-part0__7561.parquet
+  - 00/train-part0__7567.parquet
+  - 00/train-part0__7618.parquet
+  - 00/train-part0__7701.parquet
+  - 00/train-part0__7732.parquet
+  - 00/train-part0__7860.parquet
+  - 00/train-part0__8178.parquet
+  - 00/train-part0__8193.parquet
+  - 00/train-part0__8209.parquet
+  - 00/train-part0__8246.parquet
+  - 00/train-part0__8370.parquet
+  - 00/train-part0__8384.parquet
+  - 00/train-part0__8516.parquet
+  - 00/train-part0__8517.parquet
+  - 00/train-part0__8530.parquet
+  - 00/train-part0__8580.parquet
+  - 00/train-part0__8644.parquet
+  - 00/train-part0__8684.parquet
+  - 00/train-part0__8895.parquet
+  - 00/train-part0__9068.parquet
+  - 00/train-part0__9136.parquet
+  - 00/train-part0__9212.parquet
+  - 00/train-part0__9227.parquet
+  - 00/train-part0__9240.parquet
+  - 00/train-part0__9305.parquet
+  - 00/train-part0__9394.parquet
+  - 00/train-part0__9473.parquet
+  - 00/train-part0__9498.parquet
+  - 00/train-part0__9506.parquet
+  - 00/train-part0__9592.parquet
+  - 00/train-part0__9622.parquet
+  payload_fields:
+    id: id
+    text: text
+    url: url
+    dump: dump
+    date: date
+    language: language
+    language_score: language_score
+    token_count: token_count
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 768
+    datatype: float16
+vectorstore:
+  type: qdrant
+  collection_name: fineweb_gte_100m_probe
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  upsert_wait: false
+  params:
+    recreate: false
+    shard_number: 12
+    on_disk_payload: true
+    hnsw:
+      m: 16
+      ef_construct: 100
+      on_disk: false
+    quantization:
+      type: turbo
+      bits: 4
+      always_ram: true
+    optimizers:
+      indexing_threshold: 0
+      max_segment_size_kb: 2097152
+      flush_interval_sec: 5
+loader:
+  # Steadier profile: reduce burst pressure and smooth write queue growth.
+  batch_size: 192
+  concurrency: 4
+  file_look_ahead: 1
+  file_retries: 6
+  upsert_retries: 8
+  max_failed_files: 5

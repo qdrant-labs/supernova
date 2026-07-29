@@ -1,0 +1,69 @@
+# FineWeb 10B full-ingest config (7-node c4d-standard-384 rollout).
+#
+# Run:
+#   nova load inspect configs/loader/fineweb_10b_full.yaml --num-jobs 1 --job-rank 0
+#   nova dist load configs/loader/fineweb_10b_full.yaml --num-jobs 7
+#   nova dist load configs/loader/fineweb_10b_full.yaml --finalize
+
+datasource:
+  type: s3
+  path: s3://fineweb-gte-with-payloads/resharded/
+  # Optional startup accelerator: if set, nova-load reads shard keys from this
+  # parquet catalog instead of listing S3.
+  # Keep empty to fall back to normal S3 listing.
+  catalog: ${FINEWEB_S3_CATALOG:-}
+  download_timeout_secs: 600
+  duckdb_memory_limit: 16GB
+  duckdb_threads: 16
+  id_expression: "vf_point_id(filename, file_row_number)"
+  payload_fields:
+    id: id
+    text: text
+    url: url
+    dump: dump
+    date: date
+    language: language
+    language_score: language_score
+    token_count: token_count
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 768
+    datatype: float16
+
+vectorstore:
+  type: qdrant
+  collection_name: fineweb_gte_10b_dense_v1
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  upsert_wait: false
+  params:
+    recreate: false
+    shard_number: 28
+    on_disk_payload: true
+    hnsw:
+      m: 16
+      ef_construct: 100
+      on_disk: false
+    quantization:
+      type: turbo
+      bits: 4
+      always_ram: true
+    payload_indexes:
+      mode: all
+    optimizers:
+      indexing_threshold: 0
+      max_segment_size_kb: 4194304
+      flush_interval_sec: 5
+
+loader:
+  # Steadier profile for long-running 10B ingest to avoid sustained queue spikes.
+  batch_size: 384
+  concurrency: 12
+  file_look_ahead: 2
+  file_retries: 6
+  upsert_retries: 8
+  max_failed_files: 20

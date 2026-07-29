@@ -69,6 +69,71 @@ nova load load    configs/loader/test.yaml --num-jobs 50 --job-rank $RANK
 nova load finalize configs/loader/test.yaml
 ```
 
+Resume a distributed worker from its last completed file:
+
+```bash
+nova load load configs/loader/test.yaml --num-jobs 50 --job-rank $RANK --resume
+```
+
+By default, checkpoints are persisted under `.nova-load-checkpoints/` on each
+worker. You can override the location per run:
+
+```bash
+nova load load configs/loader/test.yaml --num-jobs 50 --job-rank $RANK \
+  --resume --checkpoint-path /mnt/checkpoints/load.json
+```
+
+Recovery drill (interrupted distributed load):
+
+```bash
+# 1) Create/defer once (safe to rerun with recreate:false)
+nova load prepare configs/loader/test.yaml
+
+# 2) Launch workers
+for RANK in $(seq 0 49); do
+  nova load load configs/loader/test.yaml --num-jobs 50 --job-rank $RANK --resume &
+done
+
+# 3) Simulate interruption and restart workers (same num-jobs/job-rank)
+pkill -f "nova-load load"
+for RANK in $(seq 0 49); do
+  nova load load configs/loader/test.yaml --num-jobs 50 --job-rank $RANK --resume &
+done
+
+# 4) Finalize once after all workers complete
+nova load finalize configs/loader/test.yaml
+```
+
+### Faster S3 startup with a catalog
+
+For very large S3 prefixes, startup can spend significant time listing objects.
+`nova-load` supports an optional local parquet catalog to skip S3 listing and
+start partitioning immediately.
+
+Add this under `datasource` in a loader config:
+
+```yaml
+datasource:
+  type: s3
+  path: s3://your-bucket/your-prefix/
+  catalog: /path/to/catalog_all_with_payload.parquet
+```
+
+Catalog columns:
+
+- Path column (first match): `relative_path` (preferred), `path`, or `filename`
+- Optional size column: `file_size` or `size`
+
+Notes:
+
+- This speeds up **file discovery/planning** (inspect/prepare/load startup), not
+  the per-worker S3 download + upsert throughput.
+- Catalog paths are normalized against `datasource.path` prefix.
+- On SkyPilot, `datasource.catalog` must point to a file present on each worker.
+- Concrete examples:
+  - `configs/loader/fineweb_10b_full_with_catalog.yaml` (repo-local path)
+  - `configs/loader/fineweb_10b_full_with_catalog_env.yaml` (worker env path)
+
 You can run that yourself on any fleet, or let **`nova dist`** drive SkyPilot for
 you (`make dist` to install it). It provisions a pool and submits the ranked jobs.
 Compute (resources + how a worker installs the tool) has sensible built-in
