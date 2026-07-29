@@ -573,6 +573,9 @@ fn datasource_identity(datasource: &DataSourceConfig) -> String {
             if let Some(list) = &c.file_list {
                 out.push_str(&format!(":file_list={}", normalize_list(list)));
             }
+            if let Some(catalog) = &c.catalog {
+                out.push_str(&format!(":catalog={catalog}"));
+            }
             out
         }
     }

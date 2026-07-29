@@ -116,4 +116,5 @@ Notes:
 - Updated steady-state loader defaults for future runs:
   - `configs/loader/fineweb_100m_probe_workers.yaml`
   - `configs/loader/fineweb_10b_full.yaml`
+- Added optional S3 catalog-backed file discovery in `nova-load` (`datasource.catalog`) to reduce startup/listing overhead on huge prefixes.
 

@@ -1,17 +1,22 @@
-# FineWeb 10B full-ingest config (7-node c4d-standard-384 rollout).
+# FineWeb 10B full-ingest config using local parquet catalog for fast startup.
+#
+# This variant points to the current repo-local catalog path:
+#   ./thirdparty/qdrant-fineweb-gte-10b/tools/ten-billion/data/catalog_all_with_payload.parquet
+#
+# NOTE:
+# - Great for local/controller runs where this path exists.
+# - For distributed SkyPilot workers, use the env-based variant below or ensure
+#   the same path exists on every worker.
 #
 # Run:
-#   nova load inspect configs/loader/fineweb_10b_full.yaml --num-jobs 1 --job-rank 0
-#   nova dist load configs/loader/fineweb_10b_full.yaml --num-jobs 7
-#   nova dist load configs/loader/fineweb_10b_full.yaml --finalize
+#   nova load inspect configs/loader/fineweb_10b_full_with_catalog.yaml --num-jobs 1 --job-rank 0
+#   nova dist load configs/loader/fineweb_10b_full_with_catalog.yaml --num-jobs 7
+#   nova dist load configs/loader/fineweb_10b_full_with_catalog.yaml --finalize
 
 datasource:
   type: s3
   path: s3://fineweb-gte-with-payloads/resharded/
-  # Optional startup accelerator: if set, nova-load reads shard keys from this
-  # parquet catalog instead of listing S3.
-  # Keep empty to fall back to normal S3 listing.
-  catalog: ${FINEWEB_S3_CATALOG:-}
+  catalog: /home/mvasquez/workspace/supernova/thirdparty/qdrant-fineweb-gte-10b/tools/ten-billion/data/catalog_all_with_payload.parquet
   download_timeout_secs: 600
   duckdb_memory_limit: 16GB
   duckdb_threads: 16
@@ -67,3 +72,4 @@ loader:
   file_retries: 6
   upsert_retries: 8
   max_failed_files: 20
+

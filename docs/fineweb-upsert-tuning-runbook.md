@@ -61,6 +61,33 @@ These values are intended to reduce burst pressure while preserving good sustain
    - increase `batch_size` modestly (e.g., `384 -> 512`) before increasing `concurrency`.
 5. Keep retries elevated for long runs due to transient S3/network blips.
 
+## Catalog-Based File Discovery (New)
+
+For very large S3 prefixes, startup can be dominated by `ListObjects`. Supernova
+now supports optional catalog-backed shard discovery for S3 datasources:
+
+- Config key: `datasource.catalog`
+- Expected parquet path column names (first match):
+  - `relative_path` (preferred)
+  - `path`
+  - `filename`
+- Optional size columns:
+  - `file_size`
+  - `size`
+
+Behavior:
+
+- If `catalog` is set and non-empty, `nova-load` reads file keys from the local
+  catalog parquet and skips S3 listing.
+- If `catalog` is empty/unset, behavior is unchanged (normal S3 listing).
+- Keys are normalized against `datasource.path` prefix, so relative catalog
+  paths become full source keys.
+
+Operational note for SkyPilot workers:
+
+- `datasource.catalog` must point to a file that exists on worker nodes
+  (e.g. staged/mounted there). A controller-local path is not enough.
+
 ## Suggested Decision Rules
 
 - **Stable zone**: queue oscillates but does not trend up for long windows; point count slope remains smooth.

@@ -9,6 +9,8 @@
 # datasource:
 #   type: s3
 #   path: s3://qdrant--vectorforge/mteb_tweets/all-MiniLM-L6-v2
+#   # Optional local parquet catalog to skip S3 listing (faster startup on huge prefixes).
+#   # catalog: /path/to/catalog_all_with_payload.parquet
 #   id_expression: "vf_point_id(filename, file_row_number)"
 #   payload_fields:
 #     text: text

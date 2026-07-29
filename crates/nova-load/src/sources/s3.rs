@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use duckdb::Connection;
 use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
@@ -18,6 +19,20 @@ pub struct S3Config {
     /// Explicit keys (relative to the prefix) instead of listing the prefix.
     #[serde(default)]
     pub file_list: Option<Vec<String>>,
+    /// Optional local parquet catalog with shard paths (e.g. built once by an
+    /// external indexer). When set, `list_files` reads this catalog instead of
+    /// listing S3, which avoids slow `ListObjects` over very large prefixes.
+    ///
+    /// Expected path column names (first match wins):
+    /// - `relative_path` (preferred)
+    /// - `path`
+    /// - `filename`
+    ///
+    /// Optional size column names:
+    /// - `file_size`
+    /// - `size`
+    #[serde(default)]
+    pub catalog: Option<String>,
     /// Per-file S3 download timeout, in seconds. object_store defaults this to
     /// 30s covering the WHOLE request (headers + body), which is far too short
     /// for multi-GB parquet under load contention — the body stream aborts as
@@ -79,11 +94,65 @@ impl S3Config {
             .build()
             .map_err(|e| SourceError::List(format!("build S3 client for `{bucket}`: {e}")))
     }
+
+    fn files_from_catalog(&self) -> Result<Vec<FileRef>> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| SourceError::List("catalog path not configured".to_string()))?;
+        let catalog = catalog.trim();
+        if catalog.is_empty() {
+            return Err(SourceError::List("catalog path is empty".to_string()));
+        }
+        let (_, prefix) = self.bucket_prefix()?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| SourceError::List(format!("open duckdb for catalog `{catalog}`: {e}")))?;
+
+        let path_cols = ["relative_path", "path", "filename"];
+        let size_cols = ["file_size", "size"];
+        let mut files = None;
+        for path_col in path_cols {
+            // Try with size columns first, then without size.
+            for size_col in size_cols {
+                if let Ok(v) = read_catalog_rows(&conn, catalog, path_col, Some(size_col), prefix) {
+                    files = Some(v);
+                    break;
+                }
+            }
+            if files.is_none()
+                && let Ok(v) = read_catalog_rows(&conn, catalog, path_col, None, prefix)
+            {
+                files = Some(v);
+            }
+            if files.is_some() {
+                break;
+            }
+        }
+
+        let mut files = files.ok_or_else(|| {
+            SourceError::List(format!(
+                "catalog `{catalog}` missing supported path column; expected one of: {}",
+                path_cols.join(", ")
+            ))
+        })?;
+        if files.is_empty() {
+            return Err(SourceError::List(format!("catalog `{catalog}` has no rows")));
+        }
+        files.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(files)
+    }
 }
 
 #[async_trait]
 impl DataSource for S3Config {
     async fn list_files(&self) -> Result<Vec<FileRef>> {
+        if self
+            .catalog
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty())
+        {
+            return self.files_from_catalog();
+        }
         let store = self.store()?;
         let (_, prefix) = self.bucket_prefix()?;
 
@@ -188,6 +257,75 @@ impl DataSource for S3Config {
     }
 }
 
+fn read_catalog_rows(
+    conn: &Connection,
+    catalog: &str,
+    path_col: &str,
+    size_col: Option<&str>,
+    prefix: Option<&str>,
+) -> Result<Vec<FileRef>> {
+    let catalog = esc_str(catalog);
+    let path_col_q = quote_ident(path_col);
+    let sql = match size_col {
+        Some(size_col) => format!(
+            "SELECT CAST({path_col_q} AS VARCHAR) AS p, CAST({} AS BIGINT) AS s \
+             FROM read_parquet('{catalog}')",
+            quote_ident(size_col)
+        ),
+        None => format!("SELECT CAST({path_col_q} AS VARCHAR) AS p FROM read_parquet('{catalog}')"),
+    };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| SourceError::List(format!("read catalog query failed: {e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| SourceError::List(format!("read catalog rows failed: {e}")))?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| SourceError::List(format!("iterate catalog rows failed: {e}")))?
+    {
+        let rel: String = row
+            .get(0)
+            .map_err(|e| SourceError::List(format!("read catalog path value failed: {e}")))?;
+        let key = catalog_key_to_s3_key(prefix, &rel);
+        let size = if size_col.is_some() {
+            row.get::<usize, Option<i64>>(1)
+                .map_err(|e| SourceError::List(format!("read catalog size value failed: {e}")))?
+                .map(|v| v as u64)
+        } else {
+            None
+        };
+        out.push(FileRef { key, size });
+    }
+    Ok(out)
+}
+
+fn catalog_key_to_s3_key(prefix: Option<&str>, rel: &str) -> String {
+    let rel = rel.trim_start_matches('/');
+    match prefix {
+        Some(p) if !p.is_empty() => {
+            let p = p.trim_end_matches('/');
+            if rel == p || rel.starts_with(&format!("{p}/")) {
+                rel.to_string()
+            } else {
+                format!("{p}/{rel}")
+            }
+        }
+        _ => rel.to_string(),
+    }
+}
+
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn esc_str(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Join an optional prefix with a key, avoiding a double slash.
 fn join(prefix: Option<&str>, name: &str) -> String {
     match prefix {
@@ -199,11 +337,13 @@ fn join(prefix: Option<&str>, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn cfg(path: &str) -> S3Config {
         S3Config {
             path: path.to_string(),
             file_list: None,
+            catalog: None,
             download_timeout_secs: default_download_timeout_secs(),
             reader: serde_yaml::from_str("id_expression: row_id").unwrap(),
         }
@@ -233,5 +373,57 @@ mod tests {
             }
             _ => panic!("expected s3 datasource"),
         }
+    }
+
+    #[test]
+    fn catalog_key_prefix_join_is_stable() {
+        assert_eq!(
+            catalog_key_to_s3_key(Some("resharded"), "00/train.parquet"),
+            "resharded/00/train.parquet"
+        );
+        assert_eq!(
+            catalog_key_to_s3_key(Some("resharded"), "resharded/00/train.parquet"),
+            "resharded/00/train.parquet"
+        );
+        assert_eq!(
+            catalog_key_to_s3_key(Some("resharded/"), "/00/train.parquet"),
+            "resharded/00/train.parquet"
+        );
+        assert_eq!(
+            catalog_key_to_s3_key(None, "/00/train.parquet"),
+            "00/train.parquet"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_files_reads_local_catalog_when_configured() {
+        let dir = tempdir().unwrap();
+        let catalog_path = dir.path().join("catalog.parquet");
+        let catalog_sql_path = esc_str(catalog_path.to_string_lossy().as_ref());
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT '00/train-part0__0001.parquet' AS relative_path, 123::BIGINT AS file_size
+                UNION ALL
+                SELECT '00/train-part0__0002.parquet' AS relative_path, 456::BIGINT AS file_size
+            ) TO '{catalog_sql_path}' (FORMAT PARQUET);"
+        ))
+        .unwrap();
+
+        let cfg = S3Config {
+            path: "s3://example-bucket/resharded".to_string(),
+            file_list: None,
+            catalog: Some(catalog_path.to_string_lossy().to_string()),
+            download_timeout_secs: default_download_timeout_secs(),
+            reader: serde_yaml::from_str("id_expression: row_id").unwrap(),
+        };
+
+        let files = cfg.list_files().await.unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].key, "resharded/00/train-part0__0001.parquet");
+        assert_eq!(files[0].size, Some(123));
+        assert_eq!(files[1].key, "resharded/00/train-part0__0002.parquet");
+        assert_eq!(files[1].size, Some(456));
     }
 }
