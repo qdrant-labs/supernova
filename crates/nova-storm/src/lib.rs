@@ -32,7 +32,12 @@ use runner::Summary;
 /// Run a storm end to end: load the query set, connect the target, drive the
 /// load profile, and return this worker's latency summary.
 pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
-    let StormConfig { target, query, load, report } = config;
+    let StormConfig {
+        target,
+        query,
+        load,
+        report,
+    } = config;
 
     // Open the time-series sink FIRST: begin() creating the file (or a db
     // sink its tables) is exactly the step that fails on a bad path, and it
@@ -55,6 +60,21 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
             "no query vectors loaded from {:?} (column {:?})",
             query.source.uri, query.source.column
         )));
+    }
+    if (load.operation_mix.upsert > 0.0 || load.operation_mix.delete > 0.0)
+        && query.source.id_column.is_none()
+    {
+        return Err(StormError::Other(
+            "load.operation_mix.upsert/delete requires query.source.id_column".to_string(),
+        ));
+    }
+    if load.operation_mix.upsert > 0.0 || load.operation_mix.delete > 0.0 {
+        let missing_ids = vectors.iter().filter(|v| v.id.is_none()).count();
+        if missing_ids > 0 {
+            return Err(StormError::Other(format!(
+                "{missing_ids} query rows have null ids in query.source.id_column; mutation ops require non-null ids"
+            )));
+        }
     }
     let with_ground_truth = vectors.iter().filter(|v| v.ground_truth.is_some()).count();
 
@@ -83,7 +103,10 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
             load.target_rps, load.batch_size, load.concurrency
         )
     } else {
-        format!("closed-loop concurrency={} batch_size={}", load.concurrency, load.batch_size)
+        format!(
+            "closed-loop concurrency={} batch_size={}",
+            load.concurrency, load.batch_size
+        )
     };
     tracing::info!(
         target = %target,
@@ -129,8 +152,15 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         ProgressBar::hidden()
     };
 
-    let results =
-        runner::run_storm(target, vectors, &load, query.top_k, query.filter.is_some(), recorder).await;
+    let results = runner::run_storm(
+        target,
+        vectors,
+        &load,
+        query.top_k,
+        query.filter.is_some(),
+        recorder,
+    )
+    .await;
     spinner.finish_and_clear();
 
     Ok(results.summary())

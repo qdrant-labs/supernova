@@ -17,6 +17,8 @@ pub enum TargetError {
     /// Backend-agnostic failure, e.g. a config the backend can't honour.
     #[error("{0}")]
     Other(String),
+    #[error("operation `{operation}` is not supported by target `{target}`")]
+    UnsupportedOperation { operation: String, target: String },
 }
 
 impl From<qdrant_client::QdrantError> for TargetError {

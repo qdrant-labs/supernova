@@ -1,0 +1,88 @@
+<section class="panel">
+  <h2>Supernova Operations</h2>
+  <p class="subtitle">Run `nova load` / `nova storm` workflows from the dashboard.</p>
+</section>
+
+<section class="panel">
+  <h3>Qdrant Collections</h3>
+  <button type="button" class="btn btn-primary btn-sm" (click)="refreshCollections()">Refresh</button>
+  <ul class="mt-3 mb-0">
+    @for (name of collections(); track name) {
+      <li>{{ name }}</li>
+    }
+  </ul>
+</section>
+
+<section class="panel">
+  <h3>Submit Load Job</h3>
+  <textarea
+    class="form-control"
+    [ngModel]="loadConfigYaml()"
+    (ngModelChange)="loadConfigYaml.set($event)"
+    rows="8"
+    placeholder="Paste nova-load YAML config here"
+  ></textarea>
+  <button type="button" class="btn btn-primary mt-2" (click)="submitLoad()">Submit `load run`</button>
+</section>
+
+<section class="panel">
+  <h3>Submit Storm Job</h3>
+  <textarea
+    class="form-control"
+    [ngModel]="stormConfigYaml()"
+    (ngModelChange)="stormConfigYaml.set($event)"
+    rows="8"
+    placeholder="Paste nova-storm YAML config here"
+  ></textarea>
+  <button type="button" class="btn btn-primary mt-2" (click)="submitStorm()">Submit `storm run`</button>
+</section>
+
+<section class="panel">
+  <h3>Jobs</h3>
+  <div class="actions">
+    <button type="button" class="btn btn-secondary btn-sm" (click)="refreshJobs()">Refresh Jobs</button>
+    <input
+      class="form-control form-control-sm"
+      type="text"
+      [ngModel]="selectedJobId()"
+      (ngModelChange)="selectedJobId.set($event)"
+      placeholder="Job ID"
+    />
+    <button type="button" class="btn btn-outline-primary btn-sm" (click)="openJob()">Open Job</button>
+  </div>
+  <table class="table table-sm mt-3 mb-0">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Kind</th>
+        <th>Status</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      @for (job of jobs(); track job.id) {
+        <tr>
+          <td><code>{{ job.id }}</code></td>
+          <td>{{ job.kind }}</td>
+          <td>{{ job.status }}</td>
+          <td>
+            <button type="button" class="btn btn-outline-danger btn-sm" (click)="cancelJob(job.id)">Cancel</button>
+          </td>
+        </tr>
+      }
+    </tbody>
+  </table>
+</section>
+
+@if (selectedJob()) {
+  <section class="panel">
+    <h3>Selected Job</h3>
+    <pre>{{ selectedJob() | json }}</pre>
+  </section>
+}
+
+@if (error()) {
+  <section class="alert alert-warning" role="alert">
+    {{ error() }}
+  </section>
+}

@@ -1,11 +1,12 @@
 # supernova — install the polyglot CLI and its sub-tools.
 #
-#   make all      install the `nova` dispatcher + every sub-tool (embed, load, storm, inspect, bf, dist, sweep)
+#   make all      install the `nova` dispatcher + every sub-tool (embed, load, storm, inspect, web, bf, dist, sweep)
 #   make cli      just the `nova` dispatcher (zero deps, instant)
 #   make embed    the `nova embed` Python tool (heavy: torch, sentence-transformers)
 #   make load     the `nova load` Rust binary
 #   make storm    the `nova storm` Rust binary
 #   make inspect  the `nova inspect` Rust binary (count vectors + parquet schema)
+#   make web      the `nova web` Rust service (Axum API + Angular static hosting)
 #   make bf       the `nova bf` Python tool (brute-force ground truth; torch)
 #   make dist     the `nova dist` orchestrator (SkyPilot; controller-side only)
 #   make sweep    the `nova sweep` parameter-sweep orchestrator (controller-side only)
@@ -15,11 +16,11 @@
 # Sub-tools follow the git model: each installs a `nova-<cmd>` on PATH, and the
 # `nova` dispatcher execs it. Install only the ones you need.
 
-.PHONY: all cli embed load storm inspect bf dist sweep docs docs-build test clean
+.PHONY: all cli embed load storm inspect web bf dist sweep docs docs-build test clean
 
-all: cli embed load storm inspect bf dist sweep
+all: cli embed load storm inspect web bf dist sweep
 	@echo
-	@echo "✓ installed nova + embed/load/storm/inspect/bf/dist/sweep. Check with: nova --help"
+	@echo "✓ installed nova + embed/load/storm/inspect/web/bf/dist/sweep. Check with: nova --help"
 
 # The `nova` dispatcher (root pyproject). Zero deps — installs anywhere instantly.
 cli:
@@ -45,6 +46,10 @@ storm:
 # `nova inspect` — Rust binary, into ~/.cargo/bin.
 inspect:
 	cargo install --path crates/nova-inspect
+
+# `nova web` — Rust web service (Axum).
+web:
+	cargo install --path crates/nova-web
 
 # `nova bf` — Python brute-force ground truth. `[compute]` pulls torch (GPU);
 # drop the extra for a controller that only runs `nova bf merge`.

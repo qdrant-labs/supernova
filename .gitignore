@@ -1,4 +1,6 @@
-target/
+target
+data
+thirdparty
 
 # Cargo lockfile handling
 # Keep Cargo.lock for applications; ignore for libraries if you prefer reproducible deps via Cargo.toml only
@@ -29,6 +31,7 @@ venv/
 env/
 build/
 dist/
+node_modules/
 *.egg-info/
 .mypy_cache/
 .pytest_cache/

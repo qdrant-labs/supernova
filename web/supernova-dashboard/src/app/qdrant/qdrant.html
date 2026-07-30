@@ -1,0 +1,10 @@
+<p>qdrant works!</p>
+<button type="button" class="btn btn-primary" (click)="loadCollections()">Get Collections</button>
+@if (error()) {
+  <div class="alert alert-warning mt-3" role="alert">{{ error() }}</div>
+}
+@if (collections().length > 0) {
+  @for (collection of collections(); track collection) {
+    <p>{{ collection }}</p>
+  }
+}

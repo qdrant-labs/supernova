@@ -1,0 +1,27 @@
+<nav class="navbar navbar-expand-lg navbar-light bg-light border-bottom">
+  <div class="container-fluid">
+    <a class="navbar-brand d-flex align-items-center gap-2" href="#">
+      <img src="https://qdrant.tech/favicon/favicon.ico" alt="Qdrant" style="width: 30px; height: 30px;">
+      Supernova Dashboard
+    </a>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarSupportedContent">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+    <div class="collapse navbar-collapse" id="navbarSupportedContent">
+      <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+        <li class="nav-item"><a [routerLink]="['/home']" [routerLinkActive]="['active']" class="nav-link">Home</a></li>
+        <li class="nav-item"><a [routerLink]="['/perf']" [routerLinkActive]="['active']" class="nav-link">Performance</a></li>
+        <li class="nav-item"><a [routerLink]="['/qdrant']" [routerLinkActive]="['active']" class="nav-link">Qdrant</a></li>
+        <li class="nav-item"><a [routerLink]="['/data']" [routerLinkActive]="['active']" class="nav-link">Data</a></li>
+        <li class="nav-item"><a [routerLink]="['/visual']" [routerLinkActive]="['active']" class="nav-link">Visual</a></li>
+        <li class="nav-item"><a [routerLink]="['/user']" [routerLinkActive]="['active']" class="nav-link">User</a></li>
+        <li class="nav-item"><a [routerLink]="['/dev/cursor']" [routerLinkActive]="['active']" class="nav-link">Cursor Dev</a></li>
+        <li class="nav-item"><a [routerLink]="['/supernova']" [routerLinkActive]="['active']" class="nav-link">Supernova</a></li>
+      </ul>
+    </div>
+  </div>
+</nav>
+
+<main class="container py-4">
+  <router-outlet></router-outlet>
+</main>

@@ -62,6 +62,8 @@ nova load finalize <config>                          # master: re-enable + await
 nova load reindex  <config>                          # patch HNSW/quantization/optimizers on an existing collection
 nova load delete   <config>                          # delete the collection if it exists
 nova load inspect  <config> [--num-jobs N --job-rank R]  # dry inspection (config + file slice)
+nova load catalog-build --input DIR --output catalog.parquet [--resume]  # build catalog for datasource.catalog
+nova load catalog-merge --inputs c1.parquet c2.parquet --output catalog.parquet  # merge catalogs
 ```
 
 - **`run`** is the single-machine shorthand for `prepare` + `load` + `finalize`.
@@ -78,6 +80,10 @@ nova load inspect  <config> [--num-jobs N --job-rank R]  # dry inspection (confi
   the full knob list, including all quantization methods.
 - **`delete`** drops the collection if it exists (a no-op otherwise) — handy for
   clearing out a variant between `reindex` sweeps.
+- **`catalog-build`** creates a local parquet catalog (`relative_path`, optional
+  `file_size`) so S3 datasource startup can skip object listing.
+- **`catalog-merge`** combines catalog parquet files into one (fails on duplicate
+  `relative_path` entries).
 
 Files are partitioned by a deterministic stride, point ids are content-addressed
 (`vf_point_id`), and HNSW indexing is deferred during the bulk load and built
@@ -113,7 +119,10 @@ worker runs the same profile, so total offered load ≈ `num_workers × {concurr
 or rps} × batch_size`.
 
 ```bash
-nova storm <config> [--json]
+nova storm <config> [--json]                       # legacy shorthand for `run`
+nova storm run <config> [--json]                   # explicit run form
+nova storm report --inputs run1.json run2.json     # merge/compare summaries
+nova storm report --inputs locust_stats.csv        # ingest Locust CSV too
 ```
 
 The target backend is chosen by the config's `target.type` — `qdrant` (always
@@ -134,14 +143,88 @@ batched round-trip per dispatch — Qdrant `query_batch`, Milvus batched search,
 or an Elasticsearch `_msearch`) — not a special case at `1`, just the default.
 `rps` paces *dispatches*, not individual queries.
 
+`load.operation_mix` optionally routes dispatches across `query`, `upsert`, and
+`delete` using relative weights (default `query: 1`, `upsert: 0`, `delete: 0`).
+When `upsert` or `delete` is enabled, set `query.source.id_column` so each
+sampled row has a stable point id for mutation operations.
+
 Prints a latency summary at the end: requests/errors (dispatch counts),
 `batch_size`, `requests_per_sec` (dispatch rate) and `qps` (actual query
 throughput, `= requests_per_sec × batch_size`), p50/p95/p99/max latency (per
 dispatch), and recall stats (per query) if `ground_truth_column` is configured.
 `--json` prints that same summary as a single JSON line instead of the table —
-for a caller (e.g. a future `nova sweep`) that parses the result rather than
-scraping formatted text. All logging goes to stderr, so stdout is exactly one
-line with `--json` (safe to pipe straight into `jq` or a script).
+for a caller (e.g. `nova sweep`) that parses the result rather than scraping
+formatted text. All logging goes to stderr, so stdout is exactly one line with
+`--json` (safe to pipe straight into `jq` or a script).
+
+`nova storm report` normalizes benchmarking artifacts into one contract:
+
+- `nova storm --json` output files (`Summary` objects).
+- Locust stats CSV exports (expects an `Aggregated` row).
+
+It prints a comparison table (`source`, request/error counts, throughput, p50/p95/p99/max, recall when available) plus a rollup line. Use `--json` for machine-readable stdout and `--output-json <path>` to save the normalized report (`schema_version: 1`).
+
+## nova web
+
+Serve the `supernova-dashboard` SPA and expose async HTTP APIs for `nova load`,
+`nova storm`, and `nova dist` orchestration.
+
+```bash
+nova web
+```
+
+`nova web` is provided by the `nova-web` Rust binary. In this repository, run it
+with:
+
+```bash
+cargo run -p nova-web
+```
+
+Environment variables:
+
+| Variable | Meaning |
+|------|---------|
+| `PORT` | HTTP listen port (default `8080`) |
+| `DIST_DIR` | Directory of built frontend assets (default `web/supernova-dashboard/dist/supernova-dashboard/browser`) |
+| `QDRANT_URL` / `QDRANT_API_KEY` | Used by helper routes such as collection listing and random query |
+| `NOVA_DIST_BIN` | Alternate executable for dist orchestration (default `nova`) |
+
+Core endpoints:
+
+| Endpoint | Purpose |
+|------|---------|
+| `GET /health` | Liveness check |
+| `POST /api/v1/load/run` | Launch `nova load run` job |
+| `POST /api/v1/load/prepare` | Launch `nova load prepare` job |
+| `POST /api/v1/load/load` | Launch `nova load load` job |
+| `POST /api/v1/load/finalize` | Launch `nova load finalize` job |
+| `POST /api/v1/load/reindex` | Launch `nova load reindex` job |
+| `POST /api/v1/load/delete` | Launch `nova load delete` job |
+| `POST /api/v1/load/inspect` | Launch `nova load inspect` job |
+| `POST /api/v1/storm/run` | Launch `nova storm` benchmark job |
+| `POST /api/v1/storm/report` | Build storm report from input files |
+| `POST /api/v1/dist/load` | Launch `nova dist load` orchestration job |
+| `POST /api/v1/dist/storm` | Launch `nova dist storm` orchestration job |
+| `GET /api/v1/jobs` | List job status/result metadata |
+| `GET /api/v1/jobs/{job_id}` | Get one job status/result |
+| `POST /api/v1/jobs/{job_id}/cancel` | Cancel a running job |
+
+Request payload patterns:
+
+- `load/*` and `storm/run`: pass either `config_path` or `config_yaml`.
+- `storm/report`: use `inputs` array and optional `output_json`.
+- `dist/load`: supports `resources`, `num_jobs`, `pool_name`, `dry_run`,
+  `finalize`, and catalog build/staging flags.
+- `dist/storm`: supports `resources`, `num_jobs`, `pool_name`, `dry_run`,
+  `stage_query_source`, and `query_source_remote_dir`.
+
+Example:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/dist/load \
+  -H 'content-type: application/json' \
+  -d '{"config_path":"configs/loader/test.yaml","num_jobs":4,"dry_run":true}'
+```
 
 ### Search-time tuning (`query.search_params`)
 

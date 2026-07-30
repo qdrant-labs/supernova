@@ -29,9 +29,51 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep_until};
 
-use crate::config::LoadProfile;
+use crate::config::{LoadProfile, OperationMix};
 use crate::queries::QueryVector;
-use crate::targets::QueryTarget;
+use crate::targets::{MutationPoint, QueryTarget};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    Query,
+    Upsert,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+struct OperationChooser {
+    slots: Vec<OperationKind>,
+}
+
+impl OperationChooser {
+    fn new(mix: &OperationMix) -> Self {
+        let mut weighted: Vec<(OperationKind, usize)> = Vec::new();
+        let sum = mix.query.max(0.0) + mix.upsert.max(0.0) + mix.delete.max(0.0);
+        let to_slots = |w: f64| -> usize {
+            if w <= 0.0 || sum <= 0.0 {
+                0
+            } else {
+                ((w / sum) * 100.0).round().max(1.0) as usize
+            }
+        };
+        weighted.push((OperationKind::Query, to_slots(mix.query)));
+        weighted.push((OperationKind::Upsert, to_slots(mix.upsert)));
+        weighted.push((OperationKind::Delete, to_slots(mix.delete)));
+        let mut slots = Vec::new();
+        for (kind, n) in weighted {
+            slots.extend(std::iter::repeat_n(kind, n));
+        }
+        if slots.is_empty() {
+            slots.push(OperationKind::Query);
+        }
+        Self { slots }
+    }
+
+    fn pick(&self, dispatch_idx: usize) -> OperationKind {
+        self.slots[dispatch_idx % self.slots.len()]
+    }
+}
 
 /// One worker's raw measurements. Latencies (and recalls, if ground truth is
 /// configured) are kept as full samples — not pre-aggregated — so a fleet merge
@@ -75,11 +117,17 @@ pub struct StormResults {
     /// `n_err` (failed dispatches): a dropped sample was a *successful* (or
     /// failed) dispatch whose row simply never reached the sink.
     pub dropped_samples: u64,
+    pub query_requests: u64,
+    pub upsert_requests: u64,
+    pub delete_requests: u64,
+    pub query_errors: u64,
+    pub upsert_errors: u64,
+    pub delete_errors: u64,
 }
 
 /// Aggregated stats for THIS worker. Fleet-wide stats must merge raw samples
 /// from every worker, not average these.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
     /// Batch dispatches (round-trips), not individual queries.
     pub requests: u64,
@@ -121,12 +169,24 @@ pub struct Summary {
     /// when the filtered ground truth is the EXHAUSTIVE match set (bf found all
     /// matching docs, i.e. wasn't itself capped). `0` when it never happened.
     pub filter_overreturn: u64,
+    #[serde(default)]
+    pub query_requests: u64,
+    #[serde(default)]
+    pub upsert_requests: u64,
+    #[serde(default)]
+    pub delete_requests: u64,
+    #[serde(default)]
+    pub query_errors: u64,
+    #[serde(default)]
+    pub upsert_errors: u64,
+    #[serde(default)]
+    pub delete_errors: u64,
 }
 
 /// One recall bucket's headline: how many queries fell in it and their mean
 /// recall. Count travels with the mean so a mean over 3 queries can't be read
 /// as if it were over 3000.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RecallBucket {
     pub n: u64,
     pub mean: f64,
@@ -135,8 +195,10 @@ pub struct RecallBucket {
 impl RecallBucket {
     /// `None` for an empty slice — an absent bucket, not a `0.0` mean.
     fn from(recalls: &[f64]) -> Option<Self> {
-        (!recalls.is_empty())
-            .then(|| RecallBucket { n: recalls.len() as u64, mean: recalls.iter().sum::<f64>() / recalls.len() as f64 })
+        (!recalls.is_empty()).then(|| RecallBucket {
+            n: recalls.len() as u64,
+            mean: recalls.iter().sum::<f64>() / recalls.len() as f64,
+        })
     }
 }
 
@@ -156,11 +218,25 @@ impl StormResults {
         ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         // Split the per-query recall samples into the full-depth and short
         // buckets; `total` scores every ground-truthed query together.
-        let full: Vec<f64> = self.recalls.iter().filter(|s| !s.short).map(|s| s.recall).collect();
-        let short: Vec<f64> = self.recalls.iter().filter(|s| s.short).map(|s| s.recall).collect();
+        let full: Vec<f64> = self
+            .recalls
+            .iter()
+            .filter(|s| !s.short)
+            .map(|s| s.recall)
+            .collect();
+        let short: Vec<f64> = self
+            .recalls
+            .iter()
+            .filter(|s| s.short)
+            .map(|s| s.recall)
+            .collect();
         let all: Vec<f64> = self.recalls.iter().map(|s| s.recall).collect();
         let total = self.n_ok + self.n_err;
-        let requests_per_sec = if self.wall_s > 0.0 { total as f64 / self.wall_s } else { 0.0 };
+        let requests_per_sec = if self.wall_s > 0.0 {
+            total as f64 / self.wall_s
+        } else {
+            0.0
+        };
         Summary {
             requests: total,
             errors: self.n_err,
@@ -176,6 +252,12 @@ impl StormResults {
             total_recall: RecallBucket::from(&all),
             empty_ground_truth: self.empty_ground_truth,
             filter_overreturn: self.filter_overreturn,
+            query_requests: self.query_requests,
+            upsert_requests: self.upsert_requests,
+            delete_requests: self.delete_requests,
+            query_errors: self.query_errors,
+            upsert_errors: self.upsert_errors,
+            delete_errors: self.delete_errors,
         }
     }
 }
@@ -205,12 +287,26 @@ impl std::fmt::Display for Summary {
         // Only when it actually happened — a 0 here is the norm and would just
         // be noise next to the recall means.
         if self.empty_ground_truth > 0 {
-            lines.push(format!("{:>16}: {}", "recall_empty_gt", self.empty_ground_truth));
+            lines.push(format!(
+                "{:>16}: {}",
+                "recall_empty_gt", self.empty_ground_truth
+            ));
         }
         // Suspected filter leaks — visibility only, recall above is unaffected.
         // Shown when it happened.
         if self.filter_overreturn > 0 {
-            lines.push(format!("{:>16}: {}", "filter_overreturn", self.filter_overreturn));
+            lines.push(format!(
+                "{:>16}: {}",
+                "filter_overreturn", self.filter_overreturn
+            ));
+        }
+        if self.upsert_requests > 0 || self.delete_requests > 0 {
+            lines.push(format!("{:>16}: {}", "query_requests", self.query_requests));
+            lines.push(format!("{:>16}: {}", "upsert_requests", self.upsert_requests));
+            lines.push(format!("{:>16}: {}", "delete_requests", self.delete_requests));
+            lines.push(format!("{:>16}: {}", "query_errors", self.query_errors));
+            lines.push(format!("{:>16}: {}", "upsert_errors", self.upsert_errors));
+            lines.push(format!("{:>16}: {}", "delete_errors", self.delete_errors));
         }
         write!(f, "{}", lines.join("\n"))
     }
@@ -248,7 +344,11 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
 /// `returned` is deduped before counting hits — a target that ever repeated an
 /// id within one query's results must not let that repeat count twice, which
 /// would push recall above the `1.0` ceiling a fraction is supposed to have.
-fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> Option<RecallSample> {
+fn recall_at_k(
+    returned: &[String],
+    ground_truth: &HashSet<String>,
+    k: u64,
+) -> Option<RecallSample> {
     let truth_len = ground_truth.len() as u64;
     if truth_len == 0 {
         return None;
@@ -262,7 +362,10 @@ fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> O
         .count();
     let short = truth_len < k;
     let denom = if short { truth_len } else { k };
-    Some(RecallSample { recall: hits as f64 / denom as f64, short })
+    Some(RecallSample {
+        recall: hits as f64 / denom as f64,
+        short,
+    })
 }
 
 /// One batch dispatch's observation forwarded from a worker to the collector
@@ -276,6 +379,7 @@ pub struct DispatchSample {
     /// same moment the latency sample exists) in the worker — not at collector
     /// receive time, which could lag behind under load.
     pub t_s: f64,
+    pub operation: OperationKind,
     pub latency_ms: f64,
     pub ok: bool,
     /// A query contributes no entry here (not a `0.0` entry) when it had no
@@ -343,12 +447,50 @@ fn dispatch_sample(
     }
     DispatchSample {
         t_s: started.elapsed().as_secs_f64(),
+        operation: OperationKind::Query,
         latency_ms: out.latency.as_secs_f64() * 1000.0,
         ok: out.ok,
         recalls,
         empty_ground_truth,
         filter_overreturn,
     }
+}
+
+fn mutation_dispatch_sample(
+    operation: OperationKind,
+    started: Instant,
+    latency: Duration,
+    ok: bool,
+) -> DispatchSample {
+    DispatchSample {
+        t_s: started.elapsed().as_secs_f64(),
+        operation,
+        latency_ms: latency.as_secs_f64() * 1000.0,
+        ok,
+        recalls: Vec::new(),
+        empty_ground_truth: 0,
+        filter_overreturn: 0,
+    }
+}
+
+fn build_mutation_points(
+    idxs: &[usize],
+    vectors: &[QueryVector],
+) -> Result<Vec<MutationPoint>, String> {
+    idxs.iter()
+        .map(|&i| {
+            let Some(id) = vectors[i].id.clone() else {
+                return Err(
+                    "operation_mix upsert/delete requires query.source.id_column with non-null values"
+                        .to_string(),
+                );
+            };
+            Ok(MutationPoint {
+                id,
+                vector: vectors[i].vector.clone(),
+            })
+        })
+        .collect()
 }
 
 /// The batch-of-`batch_size` indices into a round-robin `vectors` set of
@@ -383,6 +525,7 @@ pub async fn run_storm(
 ) -> StormResults {
     let vectors = Arc::new(vectors);
     let (tx, mut rx) = mpsc::unbounded_channel::<DispatchSample>();
+    let chooser = Arc::new(OperationChooser::new(&profile.operation_mix));
 
     // Hand the (already-`begin()`-ed) recorder to a dedicated OS thread so its
     // blocking writes never land on a runtime worker — see `report::spawn_writer`
@@ -411,6 +554,12 @@ pub async fn run_storm(
         let mut n_ok = 0u64;
         let mut n_err = 0u64;
         let mut dropped = 0u64;
+        let mut query_requests = 0u64;
+        let mut upsert_requests = 0u64;
+        let mut delete_requests = 0u64;
+        let mut query_errors = 0u64;
+        let mut upsert_errors = 0u64;
+        let mut delete_errors = 0u64;
         while let Some(s) = rx.recv().await {
             // Accumulate first — copying the fields the summary needs — so `s`
             // is still owned to hand to the writer without a clone.
@@ -422,6 +571,26 @@ pub async fn run_storm(
                 n_ok += 1;
             } else {
                 n_err += 1;
+            }
+            match s.operation {
+                OperationKind::Query => {
+                    query_requests += 1;
+                    if !s.ok {
+                        query_errors += 1;
+                    }
+                }
+                OperationKind::Upsert => {
+                    upsert_requests += 1;
+                    if !s.ok {
+                        upsert_errors += 1;
+                    }
+                }
+                OperationKind::Delete => {
+                    delete_requests += 1;
+                    if !s.ok {
+                        delete_errors += 1;
+                    }
+                }
             }
             if let Some(wtx) = writer_tx.as_ref() {
                 match wtx.try_send(s) {
@@ -437,7 +606,21 @@ pub async fn run_storm(
         }
         // Drop the sender so the writer thread's `recv` ends and it runs finish().
         drop(writer_tx);
-        (latencies, recalls, empty_gt, over_gt, n_ok, n_err, dropped)
+        (
+            latencies,
+            recalls,
+            empty_gt,
+            over_gt,
+            n_ok,
+            n_err,
+            dropped,
+            query_requests,
+            upsert_requests,
+            delete_requests,
+            query_errors,
+            upsert_errors,
+            delete_errors,
+        )
     });
 
     let started = Instant::now();
@@ -445,17 +628,55 @@ pub async fn run_storm(
     let batch_size = profile.batch_size.max(1);
 
     if profile.target_rps > 0.0 {
-        run_paced(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx).await;
+        run_paced(
+            &target, &vectors, profile, started, stop_at, top_k, filtered, &tx,
+            &chooser,
+        )
+        .await;
     } else {
-        run_closed_loop(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx).await;
+        run_closed_loop(
+            &target, &vectors, profile, started, stop_at, top_k, filtered, &tx,
+            &chooser,
+        )
+        .await;
     }
 
     // Drop the last sender so the collector's `recv` loop ends.
     drop(tx);
     let wall_s = started.elapsed().as_secs_f64();
 
-    let (latencies_ms, recalls, empty_ground_truth, filter_overreturn, n_ok, n_err, dropped_samples) =
-        collector.await.unwrap_or_default();
+    let (
+        latencies_ms,
+        recalls,
+        empty_ground_truth,
+        filter_overreturn,
+        n_ok,
+        n_err,
+        dropped_samples,
+        query_requests,
+        upsert_requests,
+        delete_requests,
+        query_errors,
+        upsert_errors,
+        delete_errors,
+    ) = match collector.await {
+        Ok(v) => v,
+        Err(_) => (
+            Vec::new(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
+    };
     // Join the writer thread so its `finish()` (final flush) completes before we
     // return — otherwise a caller reading the file back could race the flush.
     // Cheap: the load is done and the channel is closed, so the thread is already
@@ -482,6 +703,12 @@ pub async fn run_storm(
         wall_s,
         batch_size,
         dropped_samples,
+        query_requests,
+        upsert_requests,
+        delete_requests,
+        query_errors,
+        upsert_errors,
+        delete_errors,
     }
 }
 
@@ -496,10 +723,12 @@ async fn run_closed_loop(
     top_k: u64,
     filtered: bool,
     tx: &mpsc::UnboundedSender<DispatchSample>,
+    chooser: &Arc<OperationChooser>,
 ) {
     let n = vectors.len();
     let batch_size = profile.batch_size.max(1);
     let cursor = Arc::new(AtomicUsize::new(0));
+    let dispatch_idx = Arc::new(AtomicUsize::new(0));
     let mut workers = JoinSet::new();
 
     for _ in 0..profile.concurrency.max(1) {
@@ -507,14 +736,52 @@ async fn run_closed_loop(
         let vectors = vectors.clone();
         let tx = tx.clone();
         let cursor = cursor.clone();
+        let dispatch_idx = dispatch_idx.clone();
+        let chooser = chooser.clone();
         workers.spawn(async move {
             while Instant::now() < stop_at {
                 // fetch_add wraps far below usize::MAX over any real run.
                 let start = cursor.fetch_add(batch_size, Ordering::Relaxed) % n;
                 let idxs = batch_indices(start, batch_size, n);
-                let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
-                let out = target.query_batch(&queries).await;
-                let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, filtered, started));
+                let op = chooser.pick(dispatch_idx.fetch_add(1, Ordering::Relaxed));
+                match op {
+                    OperationKind::Query => {
+                        let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
+                        let out = target.query_batch(&queries).await;
+                        let _ = tx.send(dispatch_sample(
+                            &out, &idxs, &vectors, top_k, filtered, started,
+                        ));
+                    }
+                    OperationKind::Upsert => {
+                        let t0 = Instant::now();
+                        let ok = match build_mutation_points(&idxs, &vectors) {
+                            Ok(points) => target.upsert_batch(&points).await.is_ok(),
+                            Err(_) => false,
+                        };
+                        let _ = tx.send(mutation_dispatch_sample(
+                            OperationKind::Upsert,
+                            started,
+                            t0.elapsed(),
+                            ok,
+                        ));
+                    }
+                    OperationKind::Delete => {
+                        let t0 = Instant::now();
+                        let ok = match build_mutation_points(&idxs, &vectors) {
+                            Ok(points) => {
+                                let ids = points.into_iter().map(|p| p.id).collect::<Vec<_>>();
+                                target.delete_batch(&ids).await.is_ok()
+                            }
+                            Err(_) => false,
+                        };
+                        let _ = tx.send(mutation_dispatch_sample(
+                            OperationKind::Delete,
+                            started,
+                            t0.elapsed(),
+                            ok,
+                        ));
+                    }
+                }
             }
         });
     }
@@ -536,6 +803,7 @@ async fn run_paced(
     top_k: u64,
     filtered: bool,
     tx: &mpsc::UnboundedSender<DispatchSample>,
+    chooser: &Arc<OperationChooser>,
 ) {
     let n = vectors.len();
     let batch_size = profile.batch_size.max(1);
@@ -543,13 +811,18 @@ async fn run_paced(
     let sem = Arc::new(Semaphore::new(profile.concurrency.max(1)));
     let mut inflight = JoinSet::new();
     let mut idx = 0usize;
+    let mut dispatch_idx = 0usize;
     // Fixed virtual schedule: each launch is pinned to `next`, which only ever
     // advances by `interval`. Falling behind admits the next launch immediately
     // (sleep_until is already in the past), so the average tracks target.
     let mut next = Instant::now();
 
     while Instant::now() < stop_at {
-        let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore not closed");
         // acquire may have blocked; re-check the deadline before launching.
         if Instant::now() >= stop_at {
             break;
@@ -557,13 +830,50 @@ async fn run_paced(
         let start = idx % n;
         idx += batch_size;
         let idxs = batch_indices(start, batch_size, n);
+        let op = chooser.pick(dispatch_idx);
+        dispatch_idx += 1;
         let target = target.clone();
         let vectors = vectors.clone();
         let tx = tx.clone();
         inflight.spawn(async move {
-            let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
-            let out = target.query_batch(&queries).await;
-            let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, filtered, started));
+            match op {
+                OperationKind::Query => {
+                    let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
+                    let out = target.query_batch(&queries).await;
+                    let _ = tx.send(dispatch_sample(
+                        &out, &idxs, &vectors, top_k, filtered, started,
+                    ));
+                }
+                OperationKind::Upsert => {
+                    let t0 = Instant::now();
+                    let ok = match build_mutation_points(&idxs, &vectors) {
+                        Ok(points) => target.upsert_batch(&points).await.is_ok(),
+                        Err(_) => false,
+                    };
+                    let _ = tx.send(mutation_dispatch_sample(
+                        OperationKind::Upsert,
+                        started,
+                        t0.elapsed(),
+                        ok,
+                    ));
+                }
+                OperationKind::Delete => {
+                    let t0 = Instant::now();
+                    let ok = match build_mutation_points(&idxs, &vectors) {
+                        Ok(points) => {
+                            let ids = points.into_iter().map(|p| p.id).collect::<Vec<_>>();
+                            target.delete_batch(&ids).await.is_ok()
+                        }
+                        Err(_) => false,
+                    };
+                    let _ = tx.send(mutation_dispatch_sample(
+                        OperationKind::Delete,
+                        started,
+                        t0.elapsed(),
+                        ok,
+                    ));
+                }
+            }
             drop(permit); // release the in-flight slot
         });
 
@@ -622,9 +932,38 @@ mod tests {
         }
     }
 
+    struct MixedTarget;
+
+    impl std::fmt::Display for MixedTarget {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "mixed-mock")
+        }
+    }
+
+    #[async_trait]
+    impl QueryTarget for MixedTarget {
+        async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
+            BatchOutcome {
+                latency: Duration::from_micros(100),
+                ok: true,
+                ids: vec![Some(vec![]); queries.len()],
+                error: None,
+            }
+        }
+
+        async fn upsert_batch(&self, _points: &[MutationPoint]) -> Result<(), crate::errors::TargetError> {
+            Ok(())
+        }
+
+        async fn delete_batch(&self, _ids: &[String]) -> Result<(), crate::errors::TargetError> {
+            Ok(())
+        }
+    }
+
     fn vectors() -> Vec<QueryVector> {
         (0..16)
             .map(|i| QueryVector {
+                id: None,
                 vector: vec![i as f32; 4],
                 ground_truth: None,
                 filter_values: HashMap::new(),
@@ -634,7 +973,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_loop_fires_many_and_records_each() {
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 4,
+            duration_s: 0.2,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results = run_storm(target, vectors(), &profile, 10, false, None).await;
         let summary = results.summary();
@@ -655,7 +1000,13 @@ mod tests {
     async fn paced_does_not_overshoot_target_rps() {
         let target_rps = 200.0;
         let duration_s = 0.5;
-        let profile = LoadProfile { concurrency: 16, duration_s, target_rps, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 16,
+            duration_s,
+            target_rps,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results = run_storm(target, vectors(), &profile, 10, false, None).await;
         let summary = results.summary();
@@ -673,6 +1024,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operation_mix_tracks_query_upsert_delete_counts() {
+        let vectors: Vec<QueryVector> = (0..24)
+            .map(|i| QueryVector {
+                id: Some(format!("id-{i}")),
+                vector: vec![i as f32; 4],
+                ground_truth: None,
+                filter_values: HashMap::new(),
+            })
+            .collect();
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.2,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix {
+                query: 1.0,
+                upsert: 1.0,
+                delete: 1.0,
+            },
+        };
+        let results = run_storm(Arc::new(MixedTarget), vectors, &profile, 10, false, None).await;
+        let summary = results.summary();
+        assert!(summary.query_requests > 0);
+        assert!(summary.upsert_requests > 0);
+        assert!(summary.delete_requests > 0);
+        assert_eq!(
+            summary.requests,
+            summary.query_requests + summary.upsert_requests + summary.delete_requests
+        );
+        assert_eq!(summary.errors, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recall_is_computed_only_for_queries_with_ground_truth() {
         // MockTarget always "returns" exactly these 2 ids, regardless of query.
         let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
@@ -680,9 +1064,15 @@ mod tests {
         // (recall@4 = 1/4 = 0.25 each); the other half have none.
         let vectors: Vec<QueryVector> = (0..10)
             .map(|i| QueryVector {
+                id: None,
                 vector: vec![i as f32; 4],
                 ground_truth: if i % 2 == 0 {
-                    Some(HashSet::from(["a".to_string(), "z".into(), "y".into(), "x".into()]))
+                    Some(HashSet::from([
+                        "a".to_string(),
+                        "z".into(),
+                        "y".into(),
+                        "x".into(),
+                    ]))
                 } else {
                     None
                 },
@@ -690,7 +1080,13 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
         let results = run_storm(target, vectors, &profile, 4, false, None).await;
         let summary = results.summary();
 
@@ -698,7 +1094,12 @@ mod tests {
         // computed against a query that had no ground truth. Ground truth is 4
         // ids at k=4, so all samples are full-depth (not short).
         assert!(!results.recalls.is_empty());
-        assert!(results.recalls.iter().all(|s| !s.short && (s.recall - 0.25).abs() < 1e-9));
+        assert!(
+            results
+                .recalls
+                .iter()
+                .all(|s| !s.short && (s.recall - 0.25).abs() < 1e-9)
+        );
         let full = summary.full_recall.expect("full-depth queries present");
         assert!((full.mean - 0.25).abs() < 1e-9);
         assert!(summary.short_recall.is_none()); // no short ground truth in this run
@@ -714,16 +1115,26 @@ mod tests {
         // mean_recall=0.0 -- that would read as "search is bad" when the real
         // finding is "every request errored," which `errors`/`requests_per_sec`
         // already surface distinctly.
-        let target = Arc::new(MockTarget { ids: vec![], fail: true });
+        let target = Arc::new(MockTarget {
+            ids: vec![],
+            fail: true,
+        });
         let vectors: Vec<QueryVector> = (0..8)
             .map(|i| QueryVector {
+                id: None,
                 vector: vec![i as f32; 4],
                 ground_truth: Some(HashSet::from(["a".to_string()])),
                 filter_values: HashMap::new(),
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
         let results = run_storm(target, vectors, &profile, 1, false, None).await;
         let summary = results.summary();
 
@@ -741,6 +1152,7 @@ mod tests {
         let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
         let vectors: Vec<QueryVector> = (0..10)
             .map(|i| QueryVector {
+                id: None,
                 vector: vec![i as f32; 4],
                 // even: real ground truth (recall@2 = 1/2); odd: present-but-empty.
                 ground_truth: Some(if i % 2 == 0 {
@@ -752,7 +1164,13 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
         let results = run_storm(target, vectors, &profile, 2, false, None).await;
         let summary = results.summary();
 
@@ -760,7 +1178,12 @@ mod tests {
         assert!(summary.empty_ground_truth > 0);
         // ...and never leaked into a recall bucket: every recorded sample is the
         // 0.5 from the real-ground-truth queries, none a 0.0 or NaN.
-        assert!(results.recalls.iter().all(|s| (s.recall - 0.5).abs() < 1e-9));
+        assert!(
+            results
+                .recalls
+                .iter()
+                .all(|s| (s.recall - 0.5).abs() < 1e-9)
+        );
         assert!((summary.total_recall.unwrap().mean - 0.5).abs() < 1e-9);
     }
 
@@ -773,13 +1196,20 @@ mod tests {
         let vectors = || -> Vec<QueryVector> {
             (0..8)
                 .map(|i| QueryVector {
+                    id: None,
                     vector: vec![i as f32; 4],
                     ground_truth: Some(HashSet::from(["a".to_string()])), // 1 id, "a" is a hit
                     filter_values: HashMap::new(),
                 })
                 .collect()
         };
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
 
         // With a filter: every firing over-returned relative to its 1-id ground
         // truth, so it's counted...
@@ -789,7 +1219,12 @@ mod tests {
         assert!(fs.filter_overreturn > 0);
         assert_eq!(fs.filter_overreturn, fs.total_recall.unwrap().n);
         // ...but recall is untouched: short bucket, 1 hit / 1 gt id = 1.0.
-        assert!(filtered.recalls.iter().all(|s| s.short && (s.recall - 1.0).abs() < 1e-9));
+        assert!(
+            filtered
+                .recalls
+                .iter()
+                .all(|s| s.short && (s.recall - 1.0).abs() < 1e-9)
+        );
         assert_eq!(fs.empty_ground_truth, 0); // a different signal
 
         // Same over-return WITHOUT a filter -> not a leak, count stays 0, while
@@ -798,14 +1233,23 @@ mod tests {
         let unfiltered = run_storm(target, vectors(), &profile, 5, false, None).await;
         let us = unfiltered.summary();
         assert_eq!(us.filter_overreturn, 0);
-        assert!(unfiltered.recalls.iter().all(|s| (s.recall - 1.0).abs() < 1e-9));
+        assert!(
+            unfiltered
+                .recalls
+                .iter()
+                .all(|s| (s.recall - 1.0).abs() < 1e-9)
+        );
     }
 
     #[test]
     fn recall_at_k_full_depth_divides_by_k_and_is_not_short() {
         let returned = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let ground_truth =
-            HashSet::from(["a".to_string(), "b".to_string(), "z".to_string(), "y".to_string()]);
+        let ground_truth = HashSet::from([
+            "a".to_string(),
+            "b".to_string(),
+            "z".to_string(),
+            "y".to_string(),
+        ]);
         // gt has 4 ids (>= k), so denominator is k, not gt len or returned len.
         // 2 of the 3 returned ids are in ground_truth, k=4 -> 2/4.
         let r = recall_at_k(&returned, &ground_truth, 4).unwrap();
@@ -847,7 +1291,10 @@ mod tests {
         // fraction that's supposed to be capped at 1.0).
         let returned = vec!["a".to_string(), "a".to_string(), "a".to_string()];
         let ground_truth = HashSet::from(["a".to_string(), "b".to_string()]);
-        assert_eq!(recall_at_k(&returned, &ground_truth, 2).unwrap().recall, 0.5);
+        assert_eq!(
+            recall_at_k(&returned, &ground_truth, 2).unwrap().recall,
+            0.5
+        );
     }
 
     #[test]
@@ -875,6 +1322,12 @@ mod tests {
             total_recall: None,
             empty_ground_truth: 0,
             filter_overreturn: 0,
+            query_requests: 10,
+            upsert_requests: 0,
+            delete_requests: 0,
+            query_errors: 0,
+            upsert_errors: 0,
+            delete_errors: 0,
         };
         assert!(!base.to_string().contains("recall"));
 
@@ -894,11 +1347,17 @@ mod tests {
         assert!(!s.contains("filter_overreturn")); // 0 -> line stays absent
 
         // A non-zero empty-ground-truth count prints its own line.
-        let with_empty = Summary { empty_ground_truth: 3, ..base };
+        let with_empty = Summary {
+            empty_ground_truth: 3,
+            ..base
+        };
         assert!(with_empty.to_string().contains("recall_empty_gt: 3"));
 
         // A non-zero returned-over-ground-truth count prints its own line.
-        let with_over = Summary { filter_overreturn: 7, ..base };
+        let with_over = Summary {
+            filter_overreturn: 7,
+            ..base
+        };
         assert!(with_over.to_string().contains("filter_overreturn: 7"));
     }
 
@@ -919,6 +1378,12 @@ mod tests {
             total_recall: Some(RecallBucket { n: 8, mean: 0.87 }),
             empty_ground_truth: 5,
             filter_overreturn: 3,
+            query_requests: 10,
+            upsert_requests: 0,
+            delete_requests: 0,
+            query_errors: 1,
+            upsert_errors: 0,
+            delete_errors: 0,
         };
         let json = serde_json::to_string(&summary).expect("serializes");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
@@ -952,23 +1417,49 @@ mod tests {
                     .iter()
                     .map(|q| {
                         Some(match q.vector[0] as i64 {
-                            0 => vec![], // 0/2 in ground truth -> recall 0.0
-                            1 => vec!["a".to_string()], // 1/2 -> recall 0.5
+                            0 => vec![],                                 // 0/2 in ground truth -> recall 0.0
+                            1 => vec!["a".to_string()],                  // 1/2 -> recall 0.5
                             _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
                         })
                     })
                     .collect();
-                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None }
+                BatchOutcome {
+                    latency: Duration::from_micros(100),
+                    ok: true,
+                    ids,
+                    error: None,
+                }
             }
         }
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
         let vectors = vec![
-            QueryVector { vector: vec![0.0], ground_truth: gt.clone(), filter_values: HashMap::new() },
-            QueryVector { vector: vec![1.0], ground_truth: gt.clone(), filter_values: HashMap::new() },
-            QueryVector { vector: vec![2.0], ground_truth: gt, filter_values: HashMap::new() },
+            QueryVector {
+                id: None,
+                vector: vec![0.0],
+                ground_truth: gt.clone(),
+                filter_values: HashMap::new(),
+            },
+            QueryVector {
+                id: None,
+                vector: vec![1.0],
+                ground_truth: gt.clone(),
+                filter_values: HashMap::new(),
+            },
+            QueryVector {
+                id: None,
+                vector: vec![2.0],
+                ground_truth: gt,
+                filter_values: HashMap::new(),
+            },
         ];
         // duration long enough to cycle through all 3 at concurrency=1 several times
-        let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 1,
+            duration_s: 0.1,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
         let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2, false, None).await;
 
         // Only asserts the pipeline actually produced all 3 distinct values --
@@ -979,9 +1470,24 @@ mod tests {
         // `summary_aggregates_recall_buckets_correctly` below. gt is 2 ids at
         // k=2, so every sample is full-depth (not short).
         assert!(results.recalls.iter().all(|s| !s.short));
-        assert!(results.recalls.iter().any(|s| (s.recall - 0.0).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|s| (s.recall - 0.5).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|s| (s.recall - 1.0).abs() < 1e-9));
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 0.0).abs() < 1e-9)
+        );
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 0.5).abs() < 1e-9)
+        );
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 1.0).abs() < 1e-9)
+        );
     }
 
     #[test]
@@ -994,9 +1500,18 @@ mod tests {
         let results = StormResults {
             latencies_ms: vec![1.0, 2.0, 3.0],
             recalls: vec![
-                RecallSample { recall: 0.5, short: false },
-                RecallSample { recall: 1.0, short: false },
-                RecallSample { recall: 0.4, short: true },
+                RecallSample {
+                    recall: 0.5,
+                    short: false,
+                },
+                RecallSample {
+                    recall: 1.0,
+                    short: false,
+                },
+                RecallSample {
+                    recall: 0.4,
+                    short: true,
+                },
             ],
             empty_ground_truth: 2,
             filter_overreturn: 0,
@@ -1005,6 +1520,12 @@ mod tests {
             wall_s: 1.0,
             batch_size: 1,
             dropped_samples: 0,
+            query_requests: 3,
+            upsert_requests: 0,
+            delete_requests: 0,
+            query_errors: 0,
+            upsert_errors: 0,
+            delete_errors: 0,
         };
         let summary = results.summary();
 
@@ -1027,11 +1548,20 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ts.csv").to_string_lossy().into_owned();
-        let cfg = ReportConfig { format: ReportFormat::Csv, path: path.clone() };
+        let cfg = ReportConfig {
+            format: ReportFormat::Csv,
+            path: path.clone(),
+        };
         let mut recorder = cfg.build();
         recorder.begin().expect("begin");
 
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 4,
+            duration_s: 0.2,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results = run_storm(target, vectors(), &profile, 10, false, Some(recorder)).await;
         let summary = results.summary();
@@ -1043,7 +1573,10 @@ mod tests {
         // raw run, minus any samples dropped when the writer queue was full
         // (with an instant mock target the load loop can briefly outrun the
         // writer; the summary still counts every dispatch).
-        assert_eq!(lines.len() as u64, 1 + summary.requests - results.dropped_samples);
+        assert_eq!(
+            lines.len() as u64,
+            1 + summary.requests - results.dropped_samples
+        );
         // timestamps are on the run's time axis: non-negative, within the
         // window (plus scheduling slack), and present on every row
         for line in &lines[1..] {
@@ -1070,15 +1603,34 @@ mod tests {
             }
         }
 
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile {
+            concurrency: 4,
+            duration_s: 0.2,
+            target_rps: 0.0,
+            batch_size: 1,
+            operation_mix: OperationMix::default(),
+        };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results =
-            run_storm(target, vectors(), &profile, 10, false, Some(Box::new(FailingRecorder))).await;
+        let results = run_storm(
+            target,
+            vectors(),
+            &profile,
+            10,
+            false,
+            Some(Box::new(FailingRecorder)),
+        )
+        .await;
         let summary = results.summary();
 
         // Load ran to completion despite the sink failing on the very first row.
-        assert!(summary.requests > 0, "the load test must complete even with a dead sink");
-        assert_eq!(summary.errors, 0, "dispatch errors are unrelated to sink failure");
+        assert!(
+            summary.requests > 0,
+            "the load test must complete even with a dead sink"
+        );
+        assert_eq!(
+            summary.errors, 0,
+            "dispatch errors are unrelated to sink failure"
+        );
     }
 
     #[test]
@@ -1119,30 +1671,62 @@ mod tests {
                         })
                     })
                     .collect();
-                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None }
+                BatchOutcome {
+                    latency: Duration::from_micros(100),
+                    ok: true,
+                    ids,
+                    error: None,
+                }
             }
         }
 
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
         let vectors: Vec<QueryVector> = (0..9)
             .map(|i| QueryVector {
+                id: None,
                 vector: vec![i as f32],
                 ground_truth: gt.clone(),
                 filter_values: HashMap::new(),
             })
             .collect();
         let batch_size = 3;
-        let profile = LoadProfile { concurrency: 1, duration_s: 0.15, target_rps: 0.0, batch_size };
-        let target = Arc::new(BatchCapturingTarget { call_lens: std::sync::Mutex::new(Vec::new()) });
+        let profile = LoadProfile {
+            concurrency: 1,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size,
+            operation_mix: OperationMix::default(),
+        };
+        let target = Arc::new(BatchCapturingTarget {
+            call_lens: std::sync::Mutex::new(Vec::new()),
+        });
         let results = run_storm(target.clone(), vectors, &profile, 2, false, None).await;
 
         let call_lens = target.call_lens.lock().unwrap();
         assert!(!call_lens.is_empty());
-        assert!(call_lens.iter().all(|&len| len == batch_size), "{call_lens:?}");
+        assert!(
+            call_lens.iter().all(|&len| len == batch_size),
+            "{call_lens:?}"
+        );
 
-        assert!(results.recalls.iter().any(|s| (s.recall - 0.0).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|s| (s.recall - 0.5).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|s| (s.recall - 1.0).abs() < 1e-9));
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 0.0).abs() < 1e-9)
+        );
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 0.5).abs() < 1e-9)
+        );
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 1.0).abs() < 1e-9)
+        );
         assert_eq!(results.summary().batch_size, batch_size);
     }
 }

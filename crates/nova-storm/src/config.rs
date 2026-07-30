@@ -43,6 +43,12 @@ impl StormConfig {
         if cfg.load.batch_size == 0 {
             return Err(ConfigError::ZeroBatchSize);
         }
+        if cfg.load.operation_mix.query <= 0.0
+            && cfg.load.operation_mix.upsert <= 0.0
+            && cfg.load.operation_mix.delete <= 0.0
+        {
+            return Err(ConfigError::EmptyOperationMix);
+        }
         if let Some(filter) = &cfg.query.filter {
             filter.validate()?;
         }
@@ -52,8 +58,10 @@ impl StormConfig {
     /// Read and parse a config file, expanding `${VAR}` references.
     pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let yaml = std::fs::read_to_string(path)
-            .map_err(|source| ConfigError::Read { path: path.display().to_string(), source })?;
+        let yaml = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
         Self::from_yaml(&yaml)
     }
 }
@@ -99,6 +107,10 @@ pub struct QueryConfig {
 pub struct QuerySource {
     pub uri: String,
     pub column: String,
+    /// Optional point-id column used when mutation ops are enabled in
+    /// `load.operation_mix` (upsert/delete need stable ids).
+    #[serde(default)]
+    pub id_column: Option<String>,
     /// How many query vectors to load and cycle through.
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -132,6 +144,9 @@ pub struct LoadProfile {
     /// of size 1 by default, so existing configs behave identically.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Relative dispatch mix across operation types. Default is query-only.
+    #[serde(default)]
+    pub operation_mix: OperationMix,
 }
 
 impl Default for LoadProfile {
@@ -141,6 +156,28 @@ impl Default for LoadProfile {
             duration_s: default_duration(),
             target_rps: 0.0,
             batch_size: default_batch_size(),
+            operation_mix: OperationMix::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationMix {
+    #[serde(default = "default_query_weight")]
+    pub query: f64,
+    #[serde(default)]
+    pub upsert: f64,
+    #[serde(default)]
+    pub delete: f64,
+}
+
+impl Default for OperationMix {
+    fn default() -> Self {
+        Self {
+            query: default_query_weight(),
+            upsert: 0.0,
+            delete: 0.0,
         }
     }
 }
@@ -160,14 +197,22 @@ fn default_duration() -> f64 {
 fn default_batch_size() -> usize {
     1
 }
+fn default_query_weight() -> f64 {
+    1.0
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file `{path}`: {source}")]
-    Read { path: String, source: std::io::Error },
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("config YAML is invalid: {0}")]
     Yaml(#[from] serde_yaml::Error),
-    #[error("environment variable `{0}` referenced in config is not set; set it or supply a default with `${{{0}:-...}}`")]
+    #[error(
+        "environment variable `{0}` referenced in config is not set; set it or supply a default with `${{{0}:-...}}`"
+    )]
     MissingEnvVar(String),
     #[error("unterminated `${{` placeholder in config (missing closing `}}`)")]
     UnterminatedPlaceholder,
@@ -175,6 +220,8 @@ pub enum ConfigError {
     ZeroTopK,
     #[error("load.batch_size must be greater than 0")]
     ZeroBatchSize,
+    #[error("load.operation_mix must have at least one positive weight")]
+    EmptyOperationMix,
     #[error(
         "filter condition on `{field}` must set exactly one of `match`, `range`, `match_text`, \
          `match_from_query`, `range_from_query`, or `match_text_from_query`"
@@ -184,7 +231,9 @@ pub enum ConfigError {
     FilterConditionBlankMatchText { field: String },
     #[error("filter condition on `{field}` range needs at least one of gt/gte/lt/lte")]
     FilterConditionEmptyRange { field: String },
-    #[error("filter condition on `{field}` has an empty `match: []` list — it would never match anything")]
+    #[error(
+        "filter condition on `{field}` has an empty `match: []` list — it would never match anything"
+    )]
     FilterConditionEmptyMatchAny { field: String },
 }
 
@@ -265,9 +314,13 @@ load:
         assert_eq!(cfg.query.top_k, 10);
         assert!(!cfg.query.with_payload); // default: ids/scores only
         assert_eq!(cfg.query.source.limit, 1000);
+        assert_eq!(cfg.query.source.id_column, None);
         assert_eq!(cfg.load.concurrency, 8);
         assert_eq!(cfg.load.target_rps, 75.0); // `rps` -> target_rps
         assert_eq!(cfg.load.batch_size, 16);
+        assert_eq!(cfg.load.operation_mix.query, 1.0);
+        assert_eq!(cfg.load.operation_mix.upsert, 0.0);
+        assert_eq!(cfg.load.operation_mix.delete, 0.0);
     }
 
     #[test]
@@ -286,6 +339,9 @@ query:
         assert_eq!(cfg.load.concurrency, 32);
         assert_eq!(cfg.load.target_rps, 0.0);
         assert_eq!(cfg.load.batch_size, 1);
+        assert_eq!(cfg.load.operation_mix.query, 1.0);
+        assert_eq!(cfg.load.operation_mix.upsert, 0.0);
+        assert_eq!(cfg.load.operation_mix.delete, 0.0);
         assert_eq!(cfg.query.top_k, 10);
         assert_eq!(cfg.query.source.ground_truth_column, None);
     }
@@ -303,7 +359,10 @@ query:
     uri: /tmp/q.parquet
     column: embedding
 "#;
-        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::ZeroTopK));
+        assert!(matches!(
+            StormConfig::from_yaml(yaml).unwrap_err(),
+            ConfigError::ZeroTopK
+        ));
     }
 
     #[test]
@@ -320,7 +379,10 @@ query:
 load:
   batch_size: 0
 "#;
-        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::ZeroBatchSize));
+        assert!(matches!(
+            StormConfig::from_yaml(yaml).unwrap_err(),
+            ConfigError::ZeroBatchSize
+        ));
     }
 
     #[test]
@@ -339,7 +401,10 @@ load:
 "#;
         // `qps` was replaced by `rps` with no back-compat alias -- an old config
         // using it now hits `deny_unknown_fields` like any other typo'd key.
-        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::Yaml(_)));
+        assert!(matches!(
+            StormConfig::from_yaml(yaml).unwrap_err(),
+            ConfigError::Yaml(_)
+        ));
     }
 
     #[test]
@@ -383,7 +448,10 @@ query:
 
         // unknown format dies at parse time like any other config typo
         let bad = format!("{base}report:\n  format: sqlite\n  path: /tmp/ts.db\n");
-        assert!(matches!(StormConfig::from_yaml(&bad).unwrap_err(), ConfigError::Yaml(_)));
+        assert!(matches!(
+            StormConfig::from_yaml(&bad).unwrap_err(),
+            ConfigError::Yaml(_)
+        ));
     }
 
     #[test]
@@ -400,12 +468,65 @@ query:
     ground_truth_column: hit_ids
 "#;
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        assert_eq!(cfg.query.source.ground_truth_column.as_deref(), Some("hit_ids"));
+        assert_eq!(
+            cfg.query.source.ground_truth_column.as_deref(),
+            Some("hit_ids")
+        );
+    }
+
+    #[test]
+    fn parses_id_column_and_operation_mix() {
+        let yaml = r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+    id_column: id
+load:
+  operation_mix:
+    query: 2
+    upsert: 1
+    delete: 1
+"#;
+        let cfg = StormConfig::from_yaml(yaml).expect("parses");
+        assert_eq!(cfg.query.source.id_column.as_deref(), Some("id"));
+        assert_eq!(cfg.load.operation_mix.query, 2.0);
+        assert_eq!(cfg.load.operation_mix.upsert, 1.0);
+        assert_eq!(cfg.load.operation_mix.delete, 1.0);
+    }
+
+    #[test]
+    fn rejects_empty_operation_mix() {
+        let yaml = r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+load:
+  operation_mix:
+    query: 0
+    upsert: 0
+    delete: 0
+"#;
+        assert!(matches!(
+            StormConfig::from_yaml(yaml).unwrap_err(),
+            ConfigError::EmptyOperationMix
+        ));
     }
 
     fn expand(input: &str, vars: &[(&str, &str)]) -> Result<String, ConfigError> {
-        let map: std::collections::HashMap<String, String> =
-            vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         expand_env_with(input, |k| map.get(k).cloned())
     }
 
@@ -413,6 +534,9 @@ query:
     fn expands_and_defaults() {
         assert_eq!(expand("url: ${U}", &[("U", "x")]).unwrap(), "url: x");
         assert_eq!(expand("url: ${U:-fallback}", &[]).unwrap(), "url: fallback");
-        assert!(matches!(expand("${NOPE}", &[]).unwrap_err(), ConfigError::MissingEnvVar(_)));
+        assert!(matches!(
+            expand("${NOPE}", &[]).unwrap_err(),
+            ConfigError::MissingEnvVar(_)
+        ));
     }
 }

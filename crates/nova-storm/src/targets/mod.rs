@@ -19,11 +19,11 @@ use crate::config::QueryConfig;
 use crate::errors::TargetError;
 use crate::queries::QueryVector;
 
-pub mod qdrant;
 #[cfg(feature = "elastic")]
 pub mod elastic;
 #[cfg(feature = "milvus")]
 pub mod milvus;
+pub mod qdrant;
 
 /// Outcome of a single batch dispatch (one `query_batch` round-trip, covering
 /// `vectors.len()` queries). A failure is recorded here (`ok = false`) rather
@@ -46,6 +46,13 @@ pub struct BatchOutcome {
     pub error: Option<String>,
 }
 
+/// Minimal upsert payload for mutation-mix runs.
+#[derive(Debug, Clone)]
+pub struct MutationPoint {
+    pub id: String,
+    pub vector: Vec<f32>,
+}
+
 /// A backend a storm sends queries to. `Display` is the name used in logs
 /// (e.g. `qdrant(products)`).
 #[async_trait]
@@ -57,6 +64,22 @@ pub trait QueryTarget: Send + Sync + std::fmt::Display {
     /// (`filter_values`) alongside its vector. A single-element slice is not
     /// a special case — it's the default (`LoadProfile::batch_size == 1`).
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome;
+
+    /// Upsert one batch of points (used when load.operation_mix.upsert > 0).
+    async fn upsert_batch(&self, _points: &[MutationPoint]) -> Result<(), TargetError> {
+        Err(TargetError::UnsupportedOperation {
+            operation: "upsert".to_string(),
+            target: self.to_string(),
+        })
+    }
+
+    /// Delete one batch of point ids (used when load.operation_mix.delete > 0).
+    async fn delete_batch(&self, _ids: &[String]) -> Result<(), TargetError> {
+        Err(TargetError::UnsupportedOperation {
+            operation: "delete".to_string(),
+            target: self.to_string(),
+        })
+    }
 
     /// Tear down connections. Default: nothing (clients close on drop).
     async fn close(&self) -> Result<(), TargetError> {

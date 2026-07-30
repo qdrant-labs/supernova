@@ -102,6 +102,45 @@ separate command you run once the workers are done (spot workers can't be
 reliably awaited from the launch call). Files are partitioned by a deterministic
 stride, so workers never coordinate.
 
+Bounded AWS smoke recipe (20k points with TurboQuant 4-bit):
+
+```bash
+# optional: point sky CLI at a remote API server
+sky api login -e https://skypilot.mavcode.io
+
+export QDRANT_URL=https://qdrant-hybrid-cloud-grpc.mavcode.io
+export QDRANT_API_KEY=...
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...
+
+# phase 1 + phase 2 (single worker bounded to 20k points)
+nova dist load configs/loader/fineweb_20k_smoke_hybrid_cloud_turbo4.yaml \
+  --resources configs/skypilot/load.yaml \
+  --catalog ./thirdparty/ten-billion/data/catalog_all_with_payload.parquet \
+  --num-jobs 1
+
+# phase 3
+nova dist load configs/loader/fineweb_20k_smoke_hybrid_cloud_turbo4.yaml --finalize
+```
+
+`max_points` in loader config is applied per worker. Keep `num_jobs: 1` when you
+want exactly 20k total points.
+
+If your config uses `datasource.catalog: ${FINEWEB_S3_CATALOG}`, `--catalog`
+stages a local catalog parquet into worker mounts and exports
+`FINEWEB_S3_CATALOG` automatically.
+
+You can also build the catalog on the controller right before fan-out:
+
+```bash
+nova dist load configs/loader/fineweb_10b_full_with_catalog_env.yaml \
+  --build-catalog-input /data/fineweb-gte/resharded \
+  --build-catalog-output ./data/catalog_all_with_payload.parquet \
+  --build-catalog-resume \
+  --num-jobs 7
+```
+
 ### bf
 
 Two phases, like `load` — fan out the GPU `compute` workers (each scans a corpus
@@ -127,6 +166,12 @@ offered load ≈ `num_jobs × (concurrency or rps) × batch_size`.
 
 ```bash
 nova dist storm configs/storm/test.yaml --num-jobs 10
+
+# If the storm config points at a local parquet/dir, stage it to workers and
+# rewrite query.source.uri in a generated staged config:
+nova dist storm configs/storm/test.yaml \
+    --num-jobs 10 \
+    --stage-query-source ./data/prepared/shared.parquet
 ```
 
 ## Inspect before launching

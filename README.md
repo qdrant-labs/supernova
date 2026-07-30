@@ -4,8 +4,8 @@
 
 # supernova
 
-Generate massive pre-embedded datasets, load them into vector databases, and
-load-test the result — at scale.
+Generate massive pre-embedded datasets, load them into vector databases,
+load-test the result, and expose core workflows via web APIs.
 
 ## Install
 
@@ -13,7 +13,7 @@ Requirements: [uv](https://docs.astral.sh/uv/), and [Rust](https://rustup.rs/)
 (`cargo`) for the `load` / `storm` tools.
 
 ```bash
-make all        # nova dispatcher + embed + load + storm + dist
+make all        # nova dispatcher + embed + load + storm + web + dist
 ```
 
 Or install just what you need:
@@ -23,13 +23,14 @@ make cli        # the `nova` dispatcher only (zero deps, instant)
 make embed      # nova embed   (heavy: torch, sentence-transformers)
 make load       # nova load    (Rust binary)
 make storm      # nova storm    (Rust binary)
+make web        # nova web     (Rust web service: Axum + dashboard assets)
 make dist       # nova dist    (SkyPilot orchestration; controller-side)
 ```
 
 Make sure your tool dirs are on `PATH` so `nova` can find the sub-tools:
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH"          # Rust binaries (nova-load, nova-storm)
+export PATH="$HOME/.cargo/bin:$PATH"          # Rust binaries (nova-load, nova-storm, nova-web)
 # and your uv/pip user-scripts dir for nova / nova-embed, e.g.
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -146,6 +147,37 @@ nova dist load  configs/loader/test.yaml  --finalize        # after workers fini
 nova dist storm configs/storm/test.yaml   --num-jobs 10
 ```
 
+## Web Service
+
+`nova-web` exposes `nova load` and `nova storm` workflows as async jobs over HTTP
+and serves the rebranded Angular dashboard (`supernova-dashboard`) static assets.
+It also supports SkyPilot orchestration via `nova dist` passthrough job endpoints.
+
+```bash
+# build dashboard assets
+cd web/supernova-dashboard
+npm install
+npm run build
+
+# run web service from repo root
+cd ../..
+cargo run -p nova-web
+```
+
+Environment:
+- `PORT` (default `8080`)
+- `DIST_DIR` (default `web/supernova-dashboard/dist/supernova-dashboard/browser`)
+- `QDRANT_URL` / `QDRANT_API_KEY` for Qdrant helper endpoints
+- `NOVA_DIST_BIN` (default `nova`) if `nova dist` is installed under another name
+
+Core endpoints:
+- `POST /api/v1/load/run`
+- `POST /api/v1/storm/run`
+- `POST /api/v1/storm/report`
+- `POST /api/v1/dist/load`
+- `POST /api/v1/dist/storm`
+- `GET /api/v1/jobs`
+
 To override, drop a `~/.nova/skypilot/<tool>.yaml` or pass `--resources my.yaml`
 — merged by key over the defaults, so you can change just `setup:` (e.g. a dev
 build) and keep the default resources. Add `--dry-run` to inspect the generated
@@ -159,11 +191,13 @@ supernova/
 ├── src/cli/                # git-style dispatch: nova <cmd> -> nova-<cmd>
 ├── crates/                 # Rust tools
 │   ├── nova-load/          #   nova load
-│   └── nova-storm/         #   nova storm
+│   ├── nova-storm/         #   nova storm
+│   └── nova-web/           #   nova web
 ├── python/
 │   ├── nova-embed/         # nova embed (ML pipeline; [embed] extra)
 │   └── nova-dist/          # nova dist  (SkyPilot orchestration)
 ├── configs/                # example YAML configs (+ skypilot/ resource templates)
+├── web/supernova-dashboard/# Angular frontend served by nova-web
 ├── docs/                   # zensical docs site
 └── Makefile
 ```

@@ -82,7 +82,9 @@ impl RangeFromQuery {
 
     /// Every queries column named by a bound on this condition.
     fn columns(&self) -> impl Iterator<Item = &str> {
-        [&self.gt, &self.gte, &self.lt, &self.lte].into_iter().filter_map(|c| c.as_deref())
+        [&self.gt, &self.gte, &self.lt, &self.lte]
+            .into_iter()
+            .filter_map(|c| c.as_deref())
     }
 }
 
@@ -129,12 +131,16 @@ impl FilterCondition {
         .filter(|&s| s)
         .count();
         if set_count != 1 {
-            return Err(ConfigError::FilterConditionNotExactlyOne { field: self.field.clone() });
+            return Err(ConfigError::FilterConditionNotExactlyOne {
+                field: self.field.clone(),
+            });
         }
         if let Some(text) = &self.match_text
             && text.trim().is_empty()
         {
-            return Err(ConfigError::FilterConditionBlankMatchText { field: self.field.clone() });
+            return Err(ConfigError::FilterConditionBlankMatchText {
+                field: self.field.clone(),
+            });
         }
         // An empty `match: []` is vacuously "matches nothing" (Qdrant's own
         // MatchAny with zero values never matches) — silently accepting it
@@ -143,17 +149,23 @@ impl FilterCondition {
         if let Some(MatchSpec::Any(values)) = &self.r#match
             && values.is_empty()
         {
-            return Err(ConfigError::FilterConditionEmptyMatchAny { field: self.field.clone() });
+            return Err(ConfigError::FilterConditionEmptyMatchAny {
+                field: self.field.clone(),
+            });
         }
         if let Some(range) = &self.range
             && !range.has_bound()
         {
-            return Err(ConfigError::FilterConditionEmptyRange { field: self.field.clone() });
+            return Err(ConfigError::FilterConditionEmptyRange {
+                field: self.field.clone(),
+            });
         }
         if let Some(range) = &self.range_from_query
             && !range.has_bound()
         {
-            return Err(ConfigError::FilterConditionEmptyRange { field: self.field.clone() });
+            return Err(ConfigError::FilterConditionEmptyRange {
+                field: self.field.clone(),
+            });
         }
         Ok(())
     }
@@ -203,12 +215,16 @@ impl Filter {
     /// this stands in for what `pydantic`'s `@model_validator` does for
     /// `nova-bf`'s equivalent config.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.all_conditions().try_for_each(FilterCondition::validate)
+        self.all_conditions()
+            .try_for_each(FilterCondition::validate)
     }
 
     /// Every condition in this filter, across all three groups.
     fn all_conditions(&self) -> impl Iterator<Item = &FilterCondition> {
-        self.must.iter().chain(self.should.iter()).chain(self.must_not.iter())
+        self.must
+            .iter()
+            .chain(self.should.iter())
+            .chain(self.must_not.iter())
     }
 
     /// Every QUERIES column referenced by a per-query condition anywhere in
@@ -216,7 +232,9 @@ impl Filter {
     /// columns some per-query condition actually references (see
     /// `queries::load_query_vectors`).
     pub fn query_fields(&self) -> BTreeSet<&str> {
-        self.all_conditions().flat_map(FilterCondition::query_columns).collect()
+        self.all_conditions()
+            .flat_map(FilterCondition::query_columns)
+            .collect()
     }
 
     /// Does any condition in this filter vary per query?
@@ -257,8 +275,7 @@ mod tests {
 
     #[test]
     fn parses_static_match_range_and_text() {
-        let f = de(
-            r#"
+        let f = de(r#"
 must:
   - field: category
     match: shoes
@@ -272,12 +289,14 @@ should:
 must_not:
   - field: tag
     match: [discontinued, recalled]
-"#,
-        );
+"#);
         assert_eq!(f.must.len(), 2);
         assert_eq!(f.should.len(), 1);
         assert_eq!(f.must_not.len(), 1);
-        assert_eq!(f.must[0].r#match, Some(MatchSpec::One(MatchValue::Str("shoes".into()))));
+        assert_eq!(
+            f.must[0].r#match,
+            Some(MatchSpec::One(MatchValue::Str("shoes".into())))
+        );
         assert!(!f.is_per_query());
         assert!(f.query_fields().is_empty());
         f.validate().expect("valid");
@@ -285,8 +304,7 @@ must_not:
 
     #[test]
     fn parses_per_query_variants_and_collects_query_fields() {
-        let f = de(
-            r#"
+        let f = de(r#"
 must:
   - field: text
     match_text_from_query: keyword_phrase
@@ -296,12 +314,16 @@ must:
     range_from_query:
       lt: max_budget
       gte: min_budget
-"#,
-        );
+"#);
         assert!(f.is_per_query());
         assert_eq!(
             f.query_fields(),
-            BTreeSet::from(["keyword_phrase", "tenant_column", "max_budget", "min_budget"])
+            BTreeSet::from([
+                "keyword_phrase",
+                "tenant_column",
+                "max_budget",
+                "min_budget"
+            ])
         );
         f.validate().expect("valid");
     }

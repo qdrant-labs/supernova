@@ -1,0 +1,30 @@
+[package]
+name = "nova-web"
+version = "0.0.1"
+edition = "2024"
+repository = "https://github.com/qdrant-labs/supernova"
+
+[[bin]]
+name = "nova-web"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+qdrant-client = { workspace = true }
+walkdir = "2"
+mime_guess = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+nova-load = { path = "../nova-load" }
+nova-storm = { path = "../nova-storm" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = "0.5"

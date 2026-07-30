@@ -1,0 +1,12 @@
+resources:
+  cloud: gcp
+  instance_type: n2-standard-16
+  use_spot: false
+  disk_size: 200
+
+setup: |
+  set -e
+  command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  . "$HOME/.cargo/env"
+  cargo install --git https://github.com/qdrant-labs/supernova nova-load
+  sudo install -m 0755 "$HOME/.cargo/bin/nova-load" /usr/local/bin/nova-load

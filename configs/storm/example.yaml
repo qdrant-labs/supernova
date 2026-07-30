@@ -63,6 +63,9 @@ query:
     # via DuckDB. Each row's `column` is one query vector.
     uri: s3://qdrant--vectorforge/fiqa/bge-m3/queries.parquet
     column: dense_embedding
+    # Required when using mutation mixes (upsert/delete) so storm can map each
+    # sampled vector row to a stable point id.
+    # id_column: id
     limit: 5000                     # load this many vectors and cycle through them
     # For recall@k, name a list<string> column of known-correct top-k ids (e.g.
     # `nova bf`'s `hit_ids`), read from the same row as the vector. Ids are
@@ -89,6 +92,13 @@ load:
   # individual queries — actual query throughput is `rps * batch_size` (see
   # the `qps` field in the printed summary).
   # rps: 500
+
+  # Optional mixed-operation traffic profile. Weights are relative; any weight
+  # <= 0 disables that operation. Default is query-only.
+  # operation_mix:
+  #   query: 8
+  #   upsert: 1
+  #   delete: 1
 
 # Optional: per-dispatch TIME-SERIES output, for plotting transient behavior
 # (acute load, the cluster re-optimizing mid-run) that the end-of-run summary

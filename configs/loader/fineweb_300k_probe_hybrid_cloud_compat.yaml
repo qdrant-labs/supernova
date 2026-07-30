@@ -1,0 +1,51 @@
+# SkyPilot smoke probe against hybrid-cloud Qdrant for older nova-load schema.
+datasource:
+  type: s3
+  path: s3://fineweb-gte-with-payloads/resharded/
+  download_timeout_secs: 600
+  id_expression: "vf_point_id(filename, file_row_number)"
+  file_list:
+    - 00/train-part0__5185.parquet
+  payload_fields:
+    id: id
+    text: text
+    url: url
+    dump: dump
+    date: date
+    language: language
+    language_score: language_score
+    token_count: token_count
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 768
+    datatype: float16
+
+vectorstore:
+  type: qdrant
+  collection_name: fineweb_gte_300k_probe_hybrid_cloud_compat
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  upsert_wait: true
+  params:
+    recreate: true
+    on_disk_payload: true
+    hnsw:
+      m: 16
+      ef_construct: 100
+      on_disk: true
+    optimizers:
+      indexing_threshold: 0
+      max_segment_size_kb: 3840000
+      flush_interval_sec: 5
+
+loader:
+  batch_size: 64
+  concurrency: 2
+  file_look_ahead: 1
+  file_retries: 5
+  upsert_retries: 5
+  max_failed_files: 1

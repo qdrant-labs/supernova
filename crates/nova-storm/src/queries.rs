@@ -33,6 +33,9 @@ use crate::filter::{Filter, FilterFieldValue};
 /// load time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryVector {
+    /// Optional point id for this row. Required when mutation ops
+    /// (`load.operation_mix.upsert/delete`) are enabled.
+    pub id: Option<String>,
     pub vector: Vec<f32>,
     /// `None` when `ground_truth_column` isn't configured, or when this row's
     /// value is SQL NULL — either way, just "no known-correct answer for this
@@ -70,18 +73,25 @@ pub fn load_query_vectors(
     conn.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
     configure_s3(&conn)?;
 
-    let filter_columns: Vec<&str> =
-        filter.map(|f| f.query_fields().into_iter().collect()).unwrap_or_default();
+    let filter_columns: Vec<&str> = filter
+        .map(|f| f.query_fields().into_iter().collect())
+        .unwrap_or_default();
 
     // Config is operator-authored (trusted). Columns are quoted so names with
     // odd characters survive. `cols` is the single source of truth for both the
     // SQL projection and "how many/which columns to read per row" below.
     let mut cols: Vec<&str> = vec![source.column.as_str()];
+    cols.extend(source.id_column.as_deref());
+    let has_id = source.id_column.is_some();
     cols.extend(source.ground_truth_column.as_deref());
     let has_gt = source.ground_truth_column.is_some();
     cols.extend(filter_columns.iter().copied());
 
-    let projection = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let projection = cols
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
         "SELECT {projection} FROM read_parquet('{uri}') WHERE \"{col}\" IS NOT NULL LIMIT {limit}",
         uri = source.uri,
@@ -92,13 +102,37 @@ pub fn load_query_vectors(
     let n_cols = cols.len();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], move |row| {
-        (0..n_cols).map(|i| row.get::<_, Value>(i)).collect::<duckdb::Result<Vec<_>>>()
+        (0..n_cols)
+            .map(|i| row.get::<_, Value>(i))
+            .collect::<duckdb::Result<Vec<_>>>()
     })?;
 
     let mut out = Vec::new();
     for row in rows {
         let mut values = row?.into_iter();
         let vector = values.next().expect("vector column always present");
+        let id = if has_id {
+            match values.next() {
+                Some(Value::Text(s)) => Some(s),
+                Some(Value::TinyInt(v)) => Some(v.to_string()),
+                Some(Value::SmallInt(v)) => Some(v.to_string()),
+                Some(Value::Int(v)) => Some(v.to_string()),
+                Some(Value::BigInt(v)) => Some(v.to_string()),
+                Some(Value::HugeInt(v)) => Some(v.to_string()),
+                Some(Value::UTinyInt(v)) => Some(v.to_string()),
+                Some(Value::USmallInt(v)) => Some(v.to_string()),
+                Some(Value::UInt(v)) => Some(v.to_string()),
+                Some(Value::UBigInt(v)) => Some(v.to_string()),
+                Some(Value::Null) | None => None,
+                Some(other) => {
+                    return Err(QueryLoadError::Other(format!(
+                        "id column is not text/integer: {other:?}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         let ground_truth = if has_gt { values.next() } else { None };
         let ground_truth = match ground_truth {
             None | Some(Value::Null) => None,
@@ -118,7 +152,12 @@ pub fn load_query_vectors(
             filter_values.insert((*name).to_string(), filter_field_value(value)?);
         }
 
-        out.push(QueryVector { vector: float_list(vector)?, ground_truth, filter_values });
+        out.push(QueryVector {
+            id,
+            vector: float_list(vector)?,
+            ground_truth,
+            filter_values,
+        });
     }
     Ok(out)
 }
@@ -153,7 +192,9 @@ fn float_list(value: Value) -> Result<Vec<f32>, QueryLoadError> {
             .map(float)
             .collect::<Option<_>>()
             .ok_or_else(|| QueryLoadError::Other("query column is not a list of floats".into())),
-        _ => Err(QueryLoadError::Other("query column is not a list of floats".into())),
+        _ => Err(QueryLoadError::Other(
+            "query column is not a list of floats".into(),
+        )),
     }
 }
 
@@ -261,13 +302,24 @@ fn filter_field_list_value(xs: &[Value]) -> Result<FilterFieldValue, QueryLoadEr
         ));
     }
     if xs.iter().all(is_integer_value) {
-        return xs.iter().map(int_value).collect::<Option<Vec<_>>>().map(FilterFieldValue::IntList).ok_or_else(
-            || QueryLoadError::Other("filter column list has an integer value out of range for i64".into()),
-        );
+        return xs
+            .iter()
+            .map(int_value)
+            .collect::<Option<Vec<_>>>()
+            .map(FilterFieldValue::IntList)
+            .ok_or_else(|| {
+                QueryLoadError::Other(
+                    "filter column list has an integer value out of range for i64".into(),
+                )
+            });
     }
-    xs.iter().map(numeric).collect::<Option<Vec<_>>>().map(FilterFieldValue::NumList).ok_or_else(|| {
-        QueryLoadError::Other("filter column list is neither all-text nor all-numeric".into())
-    })
+    xs.iter()
+        .map(numeric)
+        .collect::<Option<Vec<_>>>()
+        .map(FilterFieldValue::NumList)
+        .ok_or_else(|| {
+            QueryLoadError::Other("filter column list is neither all-text nor all-numeric".into())
+        })
 }
 
 /// Coerce a DuckDB `LIST`/`ARRAY` of ids into a `Vec<String>` — the same
@@ -282,9 +334,13 @@ fn string_list(value: Value) -> Result<Vec<String>, QueryLoadError> {
             .map(id_string)
             .collect::<Option<_>>()
             .ok_or_else(|| {
-                QueryLoadError::Other("ground_truth column is not a list of strings or integers".into())
+                QueryLoadError::Other(
+                    "ground_truth column is not a list of strings or integers".into(),
+                )
             }),
-        _ => Err(QueryLoadError::Other("ground_truth column is not a list of strings or integers".into())),
+        _ => Err(QueryLoadError::Other(
+            "ground_truth column is not a list of strings or integers".into(),
+        )),
     }
 }
 
@@ -340,6 +396,7 @@ mod tests {
         QuerySource {
             uri,
             column: "embedding".into(),
+            id_column: None,
             limit: 10,
             ground_truth_column: ground_truth_column.map(str::to_string),
         }
@@ -484,8 +541,7 @@ mod tests {
 
         let filter =
             parse_filter("must:\n  - field: tenant_id\n    match_from_query: tenant_column\n");
-        let result =
-            load_query_vectors(&source(file.display().to_string(), None), Some(&filter));
+        let result = load_query_vectors(&source(file.display().to_string(), None), Some(&filter));
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -517,7 +573,10 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(vectors[0].filter_values.get("tenant_column"), Some(&FilterFieldValue::Int(BIG)));
+        assert_eq!(
+            vectors[0].filter_values.get("tenant_column"),
+            Some(&FilterFieldValue::Int(BIG))
+        );
     }
 
     #[test]
@@ -540,6 +599,9 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(vectors[0].filter_values.get("max_budget"), Some(&FilterFieldValue::Num(42.5)));
+        assert_eq!(
+            vectors[0].filter_values.get("max_budget"),
+            Some(&FilterFieldValue::Num(42.5))
+        );
     }
 }

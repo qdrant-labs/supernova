@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 import click
+import yaml
 
 from nova_dist import sky
 
@@ -38,6 +39,8 @@ def _fanout(
     num_jobs: int,
     pool_name: str | None, dry_run: bool, run_cmd: str,
     env_extra: list[str],
+    extra_file_mounts: dict[str, str] | None = None,
+    extra_runtime_envs: dict[str, str] | None = None,
     dry_run_extra=None,
 ) -> None:
     """
@@ -48,6 +51,8 @@ def _fanout(
     pool = pool_name or f"nova-{tool}-{Path(config).stem}"
     run_dir = sky.make_run_dir(pool)
     file_mounts, remote_cfg = sky.stage_config(run_dir, config)
+    if extra_file_mounts:
+        file_mounts.update(extra_file_mounts)
 
     # `run_cmd` is a template referencing {cfg} and {n}.
     cmd = run_cmd.format(cfg=remote_cfg, n=num_jobs)
@@ -65,6 +70,8 @@ def _fanout(
         return
 
     envs = sky.forward_env(config, env_extra)
+    if extra_runtime_envs:
+        envs.update(extra_runtime_envs)
     sky.launch_pool_and_jobs(pool, pool_path, job_path, num_jobs, envs)
     sky.print_monitor(pool)
 
@@ -76,6 +83,26 @@ def _run_local(binary: str, args: list[str]) -> None:
     exe = _resolve_binary(binary)
     click.echo(f"local: {exe} {' '.join(args)}")
     subprocess.run([exe, *args], check=True)
+
+
+def _stage_catalog_for_workers(config: str, catalog_source: str, remote_dir: str) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Copy a local catalog parquet into a run-local staging dir and return:
+      - file mounts (remote_dir -> local_dir)
+      - runtime envs (FINEWEB_S3_CATALOG -> remote parquet path)
+    """
+    src = Path(catalog_source)
+    if not src.exists():
+        raise click.UsageError(f"catalog file not found: {src}")
+    run_dir = sky.make_run_dir(f"catalog-{Path(config).stem}")
+    local_dir = run_dir / "catalog"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    dst = local_dir / src.name
+    shutil.copy(src, dst)
+    mounted_dir = remote_dir.rstrip("/") or "/catalog"
+    remote_path = f"{mounted_dir}/{src.name}"
+    click.echo(f"catalog: local={src} -> worker={remote_path} (env FINEWEB_S3_CATALOG)")
+    return {mounted_dir: str(local_dir)}, {"FINEWEB_S3_CATALOG": remote_path}
 
 
 def _embed_partition_preview(config: str, num_jobs: int) -> None:
@@ -93,6 +120,49 @@ def _embed_partition_preview(config: str, num_jobs: int) -> None:
             "  (nova-embed not installed on this controller — run `make embed` to "
             "see the per-worker file/row estimate)"
         )
+
+
+def _stage_storm_query_source(
+    *,
+    config: str,
+    query_source_path: str,
+    remote_dir: str,
+) -> tuple[str, dict[str, str]]:
+    """
+    Stage a local parquet file/dir for nova-storm workers and rewrite
+    `query.source.uri` in a generated config copy.
+    """
+    src = Path(query_source_path).expanduser().resolve()
+    if not src.exists():
+        raise click.UsageError(f"storm query source not found: {src}")
+
+    run_dir = sky.make_run_dir(f"storm-src-{Path(config).stem}")
+    mount_local = run_dir / "query_source_mount"
+    mount_local.mkdir(parents=True, exist_ok=True)
+    dst = mount_local / src.name
+    if src.is_dir():
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    else:
+        shutil.copy(src, dst)
+
+    cfg_data = yaml.safe_load(Path(config).read_text())
+    if not isinstance(cfg_data, dict):
+        raise click.UsageError("storm config must be a YAML mapping")
+    query = cfg_data.get("query")
+    if not isinstance(query, dict):
+        raise click.UsageError("storm config is missing `query:` block")
+    source = query.get("source")
+    if not isinstance(source, dict):
+        raise click.UsageError("storm config is missing `query.source:` block")
+
+    mounted_dir = remote_dir.rstrip("/") or "/storm-workload"
+    remote_uri = f"{mounted_dir}/{src.name}"
+    source["uri"] = remote_uri
+
+    staged_cfg = run_dir / "storm_staged_query_source.yaml"
+    staged_cfg.write_text(yaml.safe_dump(cfg_data, sort_keys=False))
+    click.echo(f"storm query source: local={src} -> worker={remote_uri}")
+    return str(staged_cfg), {mounted_dir: str(mount_local)}
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -134,7 +204,24 @@ def embed(config, resources, num_jobs, pool_name, dry_run):
 @click.option("--pool-name", default=None)
 @click.option("--dry-run", is_flag=True)
 @click.option("--finalize", is_flag=True, help="Re-enable + await indexing on the controller (run after all workers finish). Does not launch a fleet.")
-def load(config, resources, num_jobs, pool_name, dry_run, finalize):
+@click.option("--catalog", "catalog_path", default=None, help="Local parquet catalog file to stage to workers and expose as FINEWEB_S3_CATALOG.")
+@click.option("--catalog-remote-dir", default="/catalog", show_default=True, help="Remote mount directory for staged catalog file(s).")
+@click.option("--build-catalog-input", default=None, help="Build catalog locally from this parquet root before launching workers.")
+@click.option("--build-catalog-output", default=None, help="Output parquet path for --build-catalog-input.")
+@click.option("--build-catalog-resume", is_flag=True, help="Resume catalog build when used with --build-catalog-input.")
+def load(
+    config,
+    resources,
+    num_jobs,
+    pool_name,
+    dry_run,
+    finalize,
+    catalog_path,
+    catalog_remote_dir,
+    build_catalog_input,
+    build_catalog_output,
+    build_catalog_resume,
+):
     """
     Load pre-embedded parquet across a pool.
 
@@ -147,6 +234,30 @@ def load(config, resources, num_jobs, pool_name, dry_run, finalize):
         return
     if num_jobs is None:
         raise click.UsageError("--num-jobs is required (unless --finalize).")
+    if build_catalog_input and not build_catalog_output:
+        raise click.UsageError("--build-catalog-output is required with --build-catalog-input.")
+
+    if build_catalog_input and not dry_run:
+        args = [
+            "catalog-build",
+            "--input",
+            build_catalog_input,
+            "--output",
+            build_catalog_output,
+        ]
+        if build_catalog_resume:
+            args.append("--resume")
+        _run_local("nova-load", args)
+
+    catalog_source = build_catalog_output if build_catalog_input else catalog_path
+    extra_mounts = None
+    extra_envs = None
+    if catalog_source:
+        extra_mounts, extra_envs = _stage_catalog_for_workers(
+            config=config,
+            catalog_source=catalog_source,
+            remote_dir=catalog_remote_dir,
+        )
 
     # 1. Master creates the collection + defers indexing.
     if not dry_run:
@@ -158,6 +269,8 @@ def load(config, resources, num_jobs, pool_name, dry_run, finalize):
         "load", config, resources, num_jobs, pool_name, dry_run,
         run_cmd="nova-load load {cfg} --num-jobs {n} --job-rank $SKYPILOT_JOB_RANK",
         env_extra=["QDRANT_URL", "QDRANT_API_KEY"],
+        extra_file_mounts=extra_mounts,
+        extra_runtime_envs=extra_envs,
     )
 
     if not dry_run:
@@ -167,14 +280,48 @@ def load(config, resources, num_jobs, pool_name, dry_run, finalize):
 
 @main.command()
 @_common
-def storm(config, resources, num_jobs, pool_name, dry_run):
+@click.option(
+    "--stage-query-source",
+    default=None,
+    help="Stage this local parquet file/dir to workers and rewrite query.source.uri to the mounted path.",
+)
+@click.option(
+    "--query-source-remote-dir",
+    default="/storm-workload",
+    show_default=True,
+    help="Remote mount directory used with --stage-query-source.",
+)
+def storm(
+    config,
+    resources,
+    num_jobs,
+    pool_name,
+    dry_run,
+    stage_query_source,
+    query_source_remote_dir,
+):
     """
     Load-test a vector store with `num_jobs` replicated workers (not sliced).
     """
+    cfg_for_fanout = config
+    extra_mounts = None
+    if stage_query_source:
+        cfg_for_fanout, extra_mounts = _stage_storm_query_source(
+            config=config,
+            query_source_path=stage_query_source,
+            remote_dir=query_source_remote_dir,
+        )
+
     _fanout(
-        "storm", config, resources, num_jobs, pool_name, dry_run,
+        "storm",
+        cfg_for_fanout,
+        resources,
+        num_jobs,
+        pool_name,
+        dry_run,
         run_cmd="nova-storm {cfg}",
         env_extra=["QDRANT_URL", "QDRANT_API_KEY"],
+        extra_file_mounts=extra_mounts,
     )
 
 

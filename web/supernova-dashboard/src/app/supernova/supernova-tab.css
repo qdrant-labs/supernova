@@ -1,0 +1,28 @@
+.panel {
+  background: #ffffff;
+  border: 1px solid #dee2e6;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.subtitle {
+  margin: 0;
+  color: #6b7280;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.actions input {
+  max-width: 420px;
+}
+
+pre {
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+}

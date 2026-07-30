@@ -1,0 +1,32 @@
+<section class="container py-4">
+  <h1>Cursor Dev Loop</h1>
+  <p class="text-muted">{{ status() }}</p>
+
+  <div class="mb-3">
+    <label class="form-label" for="cursorPrompt">Prompt</label>
+    <textarea
+      id="cursorPrompt"
+      class="form-control"
+      rows="4"
+      [ngModel]="prompt()"
+      (ngModelChange)="prompt.set($event)"
+      placeholder="Ask the local Cursor agent to update this Angular app..."
+    ></textarea>
+  </div>
+
+  <div class="d-flex gap-2 mb-4">
+    <button type="button" class="btn btn-primary" [disabled]="busy()" (click)="sendPrompt()">
+      Send
+    </button>
+    <button type="button" class="btn btn-outline-secondary" (click)="refreshStatus()">
+      Refresh status
+    </button>
+  </div>
+
+  @if (response()) {
+    <div class="card">
+      <div class="card-header">Agent response</div>
+      <pre class="card-body mb-0">{{ response() }}</pre>
+    </div>
+  }
+</section>

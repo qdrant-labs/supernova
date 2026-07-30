@@ -1,0 +1,67 @@
+datasource:
+  type: s3
+  path: s3://fineweb-gte-with-payloads/resharded/
+  download_timeout_secs: 600
+  id_expression: "vf_point_id(filename, file_row_number)"
+  file_list:
+    - 00/train-part0__5185.parquet
+  payload_fields:
+    id: id
+    text: text
+    url: url
+    dump: dump
+    date: date
+    language: language
+    language_score: language_score
+    token_count: token_count
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 768
+    datatype: float16
+
+vectorstore:
+  type: qdrant
+  collection_name: fineweb_gte_20k_smoke_hybrid_cloud_turbo4
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  upsert_wait: true
+  params:
+    recreate: true
+    on_disk_payload: true
+    quantization:
+      type: turbo
+      bits: 4
+      always_ram: true
+    payload_indexes:
+      mode: all
+      wait: true
+      field_types:
+        id: keyword
+        text: text
+        url: keyword
+        dump: keyword
+        date: keyword
+        language: keyword
+        language_score: float
+        token_count: integer
+    hnsw:
+      m: 16
+      ef_construct: 100
+      on_disk: true
+    optimizers:
+      indexing_threshold: 0
+      max_segment_size_kb: 3840000
+      flush_interval_sec: 5
+
+loader:
+  batch_size: 8
+  concurrency: 1
+  file_look_ahead: 1
+  file_retries: 5
+  upsert_retries: 5
+  max_failed_files: 1
+  max_points: 20000

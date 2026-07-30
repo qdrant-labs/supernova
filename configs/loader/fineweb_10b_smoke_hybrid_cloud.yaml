@@ -1,0 +1,61 @@
+datasource:
+  type: local
+  path: ./data
+  id_expression: "vf_point_id(regexp_replace(filename, '^\\./data/', ''), file_row_number)"
+  file_list:
+    - 00/train-part0__0047.parquet
+  payload_fields:
+    id: id
+    text: text
+    url: url
+    dump: dump
+    date: date
+    language: language
+    language_score: language_score
+    token_count: token_count
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 768
+    datatype: float16
+
+vectorstore:
+  type: qdrant
+  collection_name: fineweb_gte_10b_hybrid_cloud_smoke
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  upsert_wait: true
+  params:
+    recreate: true
+    on_disk_payload: true
+    payload_indexes:
+      mode: all
+      wait: true
+      field_types:
+        id: keyword
+        text: text
+        url: keyword
+        dump: keyword
+        date: keyword
+        language: keyword
+        language_score: float
+        token_count: integer
+    hnsw:
+      m: 16
+      ef_construct: 100
+      on_disk: true
+    optimizers:
+      indexing_threshold: 0
+      max_segment_size_kb: 3840000
+      flush_interval_sec: 5
+
+loader:
+  batch_size: 8
+  concurrency: 1
+  file_look_ahead: 1
+  file_retries: 3
+  upsert_retries: 3
+  max_failed_files: 1

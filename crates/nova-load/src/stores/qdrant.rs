@@ -95,8 +95,8 @@ pub struct QdrantParams {
 #[serde(rename_all = "snake_case")]
 pub enum PayloadIndexMode {
     #[default]
-    None,
     All,
+    None,
     Specific,
 }
 
@@ -104,8 +104,8 @@ pub enum PayloadIndexMode {
 #[serde(deny_unknown_fields)]
 pub struct PayloadIndexConfig {
     /// Index creation policy:
+    /// - all: create indexes for every configured payload field (default)
     /// - none: do not create payload indexes
-    /// - all: create indexes for every configured payload field
     /// - specific: create indexes only for `fields`
     #[serde(default)]
     pub mode: PayloadIndexMode,
@@ -731,12 +731,15 @@ impl VectorStore for QdrantStore {
         &self,
         payload_fields: &HashMap<String, String>,
     ) -> Result<(), StoreError> {
-        let Some(cfg) = self.params.payload_indexes.as_ref() else {
-            return Ok(());
-        };
+        // Default behavior is to pre-create indexes for every configured payload
+        // field, unless the config explicitly opts out (`mode: none`).
+        let cfg = self.params.payload_indexes.clone().unwrap_or(PayloadIndexConfig {
+            mode: PayloadIndexMode::All,
+            ..PayloadIndexConfig::default()
+        });
 
         let planned =
-            plan_payload_indexes(cfg, payload_fields).map_err(|e| StoreError::Other(e.to_string()))?;
+            plan_payload_indexes(&cfg, payload_fields).map_err(|e| StoreError::Other(e.to_string()))?;
         if planned.is_empty() {
             return Ok(());
         }

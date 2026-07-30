@@ -171,7 +171,12 @@ impl fmt::Display for ElasticTarget {
 
 /// A whole-batch failure outcome (no per-query ids).
 fn fail(started: Instant, n: usize, error: String) -> BatchOutcome {
-    BatchOutcome { latency: started.elapsed(), ok: false, ids: vec![None; n], error: Some(error) }
+    BatchOutcome {
+        latency: started.elapsed(),
+        ok: false,
+        ids: vec![None; n],
+        error: Some(error),
+    }
 }
 
 #[async_trait]
@@ -179,7 +184,12 @@ impl QueryTarget for ElasticTarget {
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+            return BatchOutcome {
+                latency: started.elapsed(),
+                ok: true,
+                ids: Vec::new(),
+                error: None,
+            };
         }
 
         // What to return in `_source`. To match Qdrant's `with_payload` (payload
@@ -208,7 +218,13 @@ impl QueryTarget for ElasticTarget {
             body.push(json!({ "knn": knn, "_source": source, "size": self.top_k }).into());
         }
 
-        let resp = match self.client.msearch(MsearchParts::None).body(body).send().await {
+        let resp = match self
+            .client
+            .msearch(MsearchParts::None)
+            .body(body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => return fail(started, queries.len(), e.to_string()),
         };
@@ -218,7 +234,11 @@ impl QueryTarget for ElasticTarget {
         let status = resp.status_code();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
-            return fail(started, queries.len(), format!("msearch HTTP {status}: {detail}"));
+            return fail(
+                started,
+                queries.len(),
+                format!("msearch HTTP {status}: {detail}"),
+            );
         }
         let val: Value = match resp.json().await {
             Ok(v) => v,
@@ -226,7 +246,11 @@ impl QueryTarget for ElasticTarget {
         };
 
         let Some(responses) = val["responses"].as_array() else {
-            return fail(started, queries.len(), format!("msearch: no `responses` array: {val}"));
+            return fail(
+                started,
+                queries.len(),
+                format!("msearch: no `responses` array: {val}"),
+            );
         };
         // A count mismatch means responses can't be zipped positionally against
         // the submitted queries — treat as failure (as the Qdrant target does).
@@ -234,7 +258,11 @@ impl QueryTarget for ElasticTarget {
             return fail(
                 started,
                 queries.len(),
-                format!("msearch returned {} responses for {} queries", responses.len(), queries.len()),
+                format!(
+                    "msearch returned {} responses for {} queries",
+                    responses.len(),
+                    queries.len()
+                ),
             );
         }
 
@@ -245,21 +273,36 @@ impl QueryTarget for ElasticTarget {
             // malformed result (a silent understated/zero recall would look like
             // an engine problem, not the infra failure it is).
             if let Some(err) = r.get("error").filter(|e| !e.is_null()) {
-                return fail(started, queries.len(), format!("msearch item {i} error: {err}"));
+                return fail(
+                    started,
+                    queries.len(),
+                    format!("msearch item {i} error: {err}"),
+                );
             }
             if r["timed_out"].as_bool().unwrap_or(false) {
-                return fail(started, queries.len(), format!("msearch item {i} timed out: {r}"));
+                return fail(
+                    started,
+                    queries.len(),
+                    format!("msearch item {i} timed out: {r}"),
+                );
             }
             let failed_shards = r["_shards"]["failed"].as_u64().unwrap_or(0);
             if failed_shards > 0 {
                 return fail(
                     started,
                     queries.len(),
-                    format!("msearch item {i}: {failed_shards} failed shard(s): {}", r["_shards"]),
+                    format!(
+                        "msearch item {i}: {failed_shards} failed shard(s): {}",
+                        r["_shards"]
+                    ),
                 );
             }
             let Some(hits) = r["hits"]["hits"].as_array() else {
-                return fail(started, queries.len(), format!("msearch item {i}: no `hits.hits` array: {r}"));
+                return fail(
+                    started,
+                    queries.len(),
+                    format!("msearch item {i}: no `hits.hits` array: {r}"),
+                );
             };
 
             if self.collect_ids {
@@ -280,6 +323,11 @@ impl QueryTarget for ElasticTarget {
             }
         }
 
-        BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+        BatchOutcome {
+            latency: started.elapsed(),
+            ok: true,
+            ids,
+            error: None,
+        }
     }
 }

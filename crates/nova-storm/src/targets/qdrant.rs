@@ -6,18 +6,22 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
+use qdrant_client::qdrant::Filter as QdrantFilter;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::{
-    Condition, QuantizationSearchParams, QueryBatchPointsBuilder, QueryPointsBuilder, Range as QdrantRange,
-    ScoredPoint, SearchParams,
+    Condition, DeletePointsBuilder, PointStruct, PointsIdsList, QuantizationSearchParams,
+    QueryBatchPointsBuilder, QueryPointsBuilder, Range as QdrantRange, ScoredPoint, SearchParams,
+    UpsertPointsBuilder, Vector,
 };
-use qdrant_client::qdrant::Filter as QdrantFilter;
 use serde::Deserialize;
 
-use super::{BatchOutcome, QueryTarget};
+use super::{BatchOutcome, MutationPoint, QueryTarget};
 use crate::config::QueryConfig;
 use crate::errors::TargetError;
-use crate::filter::{Filter, FilterCondition, FilterFieldValue, MatchSpec, MatchValue, RangeCondition, RangeFromQuery};
+use crate::filter::{
+    Filter, FilterCondition, FilterFieldValue, MatchSpec, MatchValue, RangeCondition,
+    RangeFromQuery,
+};
 use crate::queries::QueryVector;
 
 /// Qdrant's server-side search-time tuning (`query.search_params` for a
@@ -89,7 +93,11 @@ pub struct QdrantTarget {
 
 impl From<&QuantizationSearchParamsConfig> for QuantizationSearchParams {
     fn from(q: &QuantizationSearchParamsConfig) -> Self {
-        QuantizationSearchParams { ignore: q.ignore, rescore: q.rescore, oversampling: q.oversampling }
+        QuantizationSearchParams {
+            ignore: q.ignore,
+            rescore: q.rescore,
+            oversampling: q.oversampling,
+        }
     }
 }
 
@@ -146,7 +154,8 @@ impl QdrantConfig {
                 // caller that hand-builds one (skipping `from_yaml`) would
                 // otherwise reach `to_qdrant_condition`'s per-query lookups
                 // with a shape `Filter::validate` was supposed to rule out.
-                f.validate().map_err(|e| TargetError::Other(e.to_string()))?;
+                f.validate()
+                    .map_err(|e| TargetError::Other(e.to_string()))?;
                 if f.is_per_query() {
                     // A per-query filter defers ITS OWN `_from_query` leaves
                     // to request time (they need real data to translate) —
@@ -199,6 +208,17 @@ impl QdrantTarget {
             None => Ok(None),
         }
     }
+
+    fn mutation_point(&self, point: &MutationPoint) -> PointStruct {
+        let payload = qdrant_client::Payload::default();
+        if let Some(name) = &self.vector_name {
+            let vectors: HashMap<String, Vector> =
+                [(name.clone(), point.vector.clone().into())].into_iter().collect();
+            PointStruct::new(point.id.clone(), vectors, payload)
+        } else {
+            PointStruct::new(point.id.clone(), point.vector.clone(), payload)
+        }
+    }
 }
 
 /// Translate a backend-agnostic [`Filter`] into a Qdrant [`QdrantFilter`].
@@ -210,7 +230,10 @@ fn to_qdrant_filter(
     query_values: Option<&HashMap<String, FilterFieldValue>>,
 ) -> Result<QdrantFilter, TargetError> {
     let group = |conds: &[FilterCondition]| -> Result<Vec<Condition>, TargetError> {
-        conds.iter().map(|c| to_qdrant_condition(c, query_values)).collect()
+        conds
+            .iter()
+            .map(|c| to_qdrant_condition(c, query_values))
+            .collect()
     };
     Ok(QdrantFilter {
         must: group(&filter.must)?,
@@ -250,7 +273,9 @@ fn resolve_query_value<'a>(
     col: &str,
 ) -> Result<&'a FilterFieldValue, TargetError> {
     query_values.get(col).ok_or_else(|| {
-        TargetError::Other(format!("filter column `{col}` missing from the query's filter_values"))
+        TargetError::Other(format!(
+            "filter column `{col}` missing from the query's filter_values"
+        ))
     })
 }
 
@@ -276,7 +301,9 @@ fn to_qdrant_condition(
     // for a filter with no per-query condition). Return an `Err` rather than
     // panic if that invariant is ever violated (e.g. a hand-built config).
     let query_values = query_values.ok_or_else(|| {
-        TargetError::Other("per-query filter translation requires resolved query_values".to_string())
+        TargetError::Other(
+            "per-query filter translation requires resolved query_values".to_string(),
+        )
     })?;
 
     if let Some(col) = &cond.match_from_query {
@@ -305,7 +332,12 @@ fn to_qdrant_condition(
 }
 
 fn to_qdrant_range(range: &RangeCondition) -> QdrantRange {
-    QdrantRange { gt: range.gt, gte: range.gte, lt: range.lt, lte: range.lte }
+    QdrantRange {
+        gt: range.gt,
+        gte: range.gte,
+        lt: range.lt,
+        lte: range.lte,
+    }
 }
 
 /// Translate a `match`/`match_from_query` value. Qdrant's own match condition
@@ -326,14 +358,28 @@ fn to_qdrant_match_condition(field: &str, spec: &MatchSpec) -> Result<Condition,
 /// bool, no float, no mixed-type list.
 fn to_qdrant_match_any(field: &str, values: &[MatchValue]) -> Result<Condition, TargetError> {
     if values.iter().all(|v| matches!(v, MatchValue::Int(_))) {
-        let ints =
-            values.iter().map(|v| if let MatchValue::Int(i) = v { *i } else { unreachable!() }).collect::<Vec<_>>();
+        let ints = values
+            .iter()
+            .map(|v| {
+                if let MatchValue::Int(i) = v {
+                    *i
+                } else {
+                    unreachable!()
+                }
+            })
+            .collect::<Vec<_>>();
         return Ok(Condition::matches(field, ints));
     }
     if values.iter().all(|v| matches!(v, MatchValue::Str(_))) {
         let strs = values
             .iter()
-            .map(|v| if let MatchValue::Str(s) = v { s.clone() } else { unreachable!() })
+            .map(|v| {
+                if let MatchValue::Str(s) = v {
+                    s.clone()
+                } else {
+                    unreachable!()
+                }
+            })
             .collect::<Vec<_>>();
         return Ok(Condition::matches(field, strs));
     }
@@ -357,7 +403,10 @@ fn float_match_error(field: &str, value: f64) -> TargetError {
 /// same constraint [`to_qdrant_match_condition`] enforces for a literal, just
 /// discovered from data instead of config; this path is only reached for a
 /// genuinely float/decimal-typed queries column.
-fn to_qdrant_match_from_value(field: &str, value: &FilterFieldValue) -> Result<Condition, TargetError> {
+fn to_qdrant_match_from_value(
+    field: &str,
+    value: &FilterFieldValue,
+) -> Result<Condition, TargetError> {
     match value {
         FilterFieldValue::Text(s) => Ok(Condition::matches(field, s.clone())),
         FilterFieldValue::Int(i) => Ok(Condition::matches(field, *i)),
@@ -410,7 +459,12 @@ fn to_qdrant_range_from_query(
     };
     Ok(Condition::range(
         field,
-        QdrantRange { gt: bound(&range.gt)?, gte: bound(&range.gte)?, lt: bound(&range.lt)?, lte: bound(&range.lte)? },
+        QdrantRange {
+            gt: bound(&range.gt)?,
+            gte: bound(&range.gte)?,
+            lt: bound(&range.lt)?,
+            lte: bound(&range.lte)?,
+        },
     ))
 }
 
@@ -446,7 +500,12 @@ impl QueryTarget for QdrantTarget {
         // skew this dispatch's contribution to the run's latency percentiles.
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+            return BatchOutcome {
+                latency: started.elapsed(),
+                ok: true,
+                ids: Vec::new(),
+                error: None,
+            };
         }
         let query_points: Vec<_> = match queries
             .iter()
@@ -531,7 +590,12 @@ impl QueryTarget for QdrantTarget {
                     }
                     ids.push(Some(query_ids));
                 }
-                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+                BatchOutcome {
+                    latency: started.elapsed(),
+                    ok: true,
+                    ids,
+                    error: None,
+                }
             }
             Err(e) => BatchOutcome {
                 latency: started.elapsed(),
@@ -540,6 +604,30 @@ impl QueryTarget for QdrantTarget {
                 error: Some(e.to_string()),
             },
         }
+    }
+
+    async fn upsert_batch(&self, points: &[MutationPoint]) -> Result<(), TargetError> {
+        let points = points
+            .iter()
+            .map(|p| self.mutation_point(p))
+            .collect::<Vec<_>>();
+        self.client
+            .upsert_points(UpsertPointsBuilder::new(self.collection_name.as_str(), points).wait(true))
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_batch(&self, ids: &[String]) -> Result<(), TargetError> {
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(self.collection_name.as_str())
+                    .points(PointsIdsList {
+                        ids: ids.iter().cloned().map(Into::into).collect(),
+                    })
+                    .wait(true),
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -583,10 +671,17 @@ mod tests {
 
     #[test]
     fn point_id_string_formats_uuid_and_num() {
-        let uuid = PointId { point_id_options: Some(PointIdOptions::Uuid("abc-123".into())) };
-        assert_eq!(point_id_string(&scored(Some(uuid))), Some("abc-123".to_string()));
+        let uuid = PointId {
+            point_id_options: Some(PointIdOptions::Uuid("abc-123".into())),
+        };
+        assert_eq!(
+            point_id_string(&scored(Some(uuid))),
+            Some("abc-123".to_string())
+        );
 
-        let num = PointId { point_id_options: Some(PointIdOptions::Num(42)) };
+        let num = PointId {
+            point_id_options: Some(PointIdOptions::Num(42)),
+        };
         assert_eq!(point_id_string(&scored(Some(num))), Some("42".to_string()));
 
         assert_eq!(point_id_string(&scored(None)), None);
@@ -604,7 +699,9 @@ mod tests {
     #[test]
     fn search_params_absent_by_default() {
         let cfg = cfg(); // no search_params block
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(target.search_params.is_none());
     }
 
@@ -614,7 +711,9 @@ mod tests {
                     query:\n  vector_name: dense\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n\
                     \x20 search_params:\n    hnsw_ef: 128\n    exact: false\n    quantization:\n      ignore: false\n      rescore: true\n      oversampling: 2.5\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         let params = target.search_params.expect("search_params should be Some");
         assert_eq!(params.hnsw_ef, Some(128));
         assert_eq!(params.exact, Some(false));
@@ -628,8 +727,7 @@ mod tests {
         // `let ... else` so this stays exhaustive whether or not the optional
         // `elastic`/`milvus` variants are compiled in.
         #[allow(irrefutable_let_patterns)]
-        let crate::targets::TargetConfig::Qdrant(c) = target
-        else {
+        let crate::targets::TargetConfig::Qdrant(c) = target else {
             panic!("expected a qdrant target config");
         };
         c
@@ -638,13 +736,17 @@ mod tests {
     #[test]
     fn collect_ids_follows_ground_truth_column_config() {
         let cfg = cfg(); // no ground_truth_column
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(!target.collect_ids);
 
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n    ground_truth_column: hit_ids\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(target.collect_ids);
     }
 
@@ -660,8 +762,16 @@ mod tests {
             Some(qdrant_client::qdrant::condition::ConditionOneOf::Field(_))
         ));
 
-        to_qdrant_condition(&cond("field: price\nrange:\n  gte: 10.0\n  lt: 100.0\n"), None).unwrap();
-        to_qdrant_condition(&cond("field: description\nmatch_text: waterproof hiking\n"), None).unwrap();
+        to_qdrant_condition(
+            &cond("field: price\nrange:\n  gte: 10.0\n  lt: 100.0\n"),
+            None,
+        )
+        .unwrap();
+        to_qdrant_condition(
+            &cond("field: description\nmatch_text: waterproof hiking\n"),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -687,9 +797,15 @@ mod tests {
     #[test]
     fn translates_per_query_variants_from_resolved_values() {
         let values = HashMap::from([
-            ("tenant_column".to_string(), FilterFieldValue::Text("acme".to_string())),
+            (
+                "tenant_column".to_string(),
+                FilterFieldValue::Text("acme".to_string()),
+            ),
             ("max_budget".to_string(), FilterFieldValue::Num(42.0)),
-            ("phrase_column".to_string(), FilterFieldValue::Text("waterproof hiking".to_string())),
+            (
+                "phrase_column".to_string(),
+                FilterFieldValue::Text("waterproof hiking".to_string()),
+            ),
         ]);
 
         to_qdrant_condition(
@@ -712,8 +828,11 @@ mod tests {
     #[test]
     fn rejects_non_integer_per_query_match_value() {
         let values = HashMap::from([("budget_column".to_string(), FilterFieldValue::Num(9.5))]);
-        let err = to_qdrant_condition(&cond("field: budget\nmatch_from_query: budget_column\n"), Some(&values))
-            .unwrap_err();
+        let err = to_qdrant_condition(
+            &cond("field: budget\nmatch_from_query: budget_column\n"),
+            Some(&values),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("non-integer"));
     }
 
@@ -734,7 +853,9 @@ mod tests {
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n  filter:\n    must:\n      - field: category\n        match: shoes\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(target.static_filter.is_some());
         assert!(target.per_query_filter.is_none());
     }
@@ -744,7 +865,9 @@ mod tests {
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n  filter:\n    must:\n      - field: tenant_id\n        match_from_query: tenant_column\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(target.static_filter.is_none());
         assert!(target.per_query_filter.is_some());
     }
@@ -765,14 +888,19 @@ mod tests {
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n  filter:\n    must:\n      - field: tenant_id\n        match_from_query: tenant_column\n      - field: price\n        match: 9.99\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let err = qdrant_config(cfg.target).into_target(&cfg.query).map(|_| ()).unwrap_err();
+        let err = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.to_string().contains("float"));
     }
 
     #[test]
     fn rejects_blank_match_text_from_query_value() {
-        let values =
-            HashMap::from([("phrase_column".to_string(), FilterFieldValue::Text("   ".to_string()))]);
+        let values = HashMap::from([(
+            "phrase_column".to_string(),
+            FilterFieldValue::Text("   ".to_string()),
+        )]);
         let err = to_qdrant_condition(
             &cond("field: description\nmatch_text_from_query: phrase_column\n"),
             Some(&values),
@@ -784,11 +912,24 @@ mod tests {
     #[test]
     fn translates_exact_integer_and_int_list_from_query_values() {
         let values = HashMap::from([
-            ("tenant_column".to_string(), FilterFieldValue::Int(9_007_199_254_740_993)),
-            ("codes_column".to_string(), FilterFieldValue::IntList(vec![1, 2, 3])),
+            (
+                "tenant_column".to_string(),
+                FilterFieldValue::Int(9_007_199_254_740_993),
+            ),
+            (
+                "codes_column".to_string(),
+                FilterFieldValue::IntList(vec![1, 2, 3]),
+            ),
         ]);
-        to_qdrant_condition(&cond("field: tenant_id\nmatch_from_query: tenant_column\n"), Some(&values))
-            .unwrap();
-        to_qdrant_condition(&cond("field: code\nmatch_from_query: codes_column\n"), Some(&values)).unwrap();
+        to_qdrant_condition(
+            &cond("field: tenant_id\nmatch_from_query: tenant_column\n"),
+            Some(&values),
+        )
+        .unwrap();
+        to_qdrant_condition(
+            &cond("field: code\nmatch_from_query: codes_column\n"),
+            Some(&values),
+        )
+        .unwrap();
     }
 }

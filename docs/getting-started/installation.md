@@ -7,7 +7,7 @@ once, then add only the sub-tools you need.
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) — for the Python pieces (`nova`, `nova embed`)
-- [Rust / cargo](https://rustup.rs/) — for the Rust tools (`nova load`, `nova storm`)
+- [Rust / cargo](https://rustup.rs/) — for the Rust tools (`nova load`, `nova storm`, `nova web`)
 - Python 3.11+
 
 ## The fast path
@@ -21,7 +21,7 @@ make all
 install dirs on your `PATH` so `nova` can find the sub-tools:
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH"     # Rust binaries: nova-load, nova-storm
+export PATH="$HOME/.cargo/bin:$PATH"     # Rust binaries: nova-load, nova-storm, nova-web
 export PATH="$HOME/.local/bin:$PATH"     # uv/pip user scripts: nova, nova-embed
 ```
 
@@ -41,6 +41,7 @@ Each `make` target maps to one tool. Install only what a given machine needs.
 | `make embed` | Python ML stack (torch, sentence-transformers, …) | `nova embed` |
 | `make load`  | Rust binary → `~/.cargo/bin` | `nova load` |
 | `make storm` | Rust binary → `~/.cargo/bin` | `nova storm` |
+| `make web`   | Rust web service binary → `~/.cargo/bin` | `nova web` |
 
 ## Environment variables
 
@@ -64,6 +65,15 @@ Set the variables relevant to your workflow. Configs reference them with
 | `AWS_SESSION_TOKEN` | S3 via AWS SSO (temporary credentials) |
 | `AWS_REGION` | S3 region (defaults to `us-east-1`) |
 
+### Web service (`nova web`)
+
+| Variable | Required for |
+|----------|-------------|
+| `PORT` | HTTP listen port (default `8080`) |
+| `DIST_DIR` | Static frontend build output directory |
+| `NOVA_DIST_BIN` | Alternate path/name for `nova` when using `/api/v1/dist/*` |
+| `QDRANT_URL` / `QDRANT_API_KEY` | Qdrant helper endpoints in the dashboard API |
+
 ## Distributed
 
 There's nothing extra to install for distributed runs. Each tool shards itself
@@ -78,4 +88,5 @@ nova --help
 nova embed --help
 nova load --help     # subcommands: run / prepare / load / finalize / inspect
 nova storm --help
+nova web --help
 ```

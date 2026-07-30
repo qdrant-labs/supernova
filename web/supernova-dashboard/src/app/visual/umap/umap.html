@@ -1,0 +1,84 @@
+<section class="container py-4">
+  <h1>UMAP Visualization</h1>
+  <p class="text-muted">{{ status() }}</p>
+
+  @if (error()) {
+    <div class="alert alert-warning" role="alert">{{ error() }}</div>
+  }
+
+  <div class="row g-3 mb-4">
+    <div class="col-md-4">
+      <label class="form-label" for="collectionSelect">Collection</label>
+      <select
+        id="collectionSelect"
+        class="form-select"
+        [ngModel]="selectedCollection()"
+        (ngModelChange)="selectedCollection.set($event)"
+      >
+        @for (collection of collections(); track collection) {
+          <option [value]="collection">{{ collection }}</option>
+        }
+      </select>
+    </div>
+
+    <div class="col-md-2">
+      <label class="form-label" for="pointLimit">Point limit</label>
+      <input
+        id="pointLimit"
+        type="number"
+        class="form-control"
+        min="10"
+        max="10000"
+        [ngModel]="pointLimit()"
+        (ngModelChange)="pointLimit.set(+$event)"
+      />
+    </div>
+
+    <div class="col-md-2">
+      <label class="form-label" for="nNeighbors">nNeighbors</label>
+      <input
+        id="nNeighbors"
+        type="number"
+        class="form-control"
+        min="2"
+        max="100"
+        [ngModel]="nNeighbors()"
+        (ngModelChange)="nNeighbors.set(+$event)"
+      />
+    </div>
+
+    <div class="col-md-2">
+      <label class="form-label" for="minDist">minDist</label>
+      <input
+        id="minDist"
+        type="number"
+        class="form-control"
+        min="0"
+        max="1"
+        step="0.01"
+        [ngModel]="minDist()"
+        (ngModelChange)="minDist.set(+$event)"
+      />
+    </div>
+
+    <div class="col-md-2 d-flex align-items-end">
+      <button type="button" class="btn btn-primary w-100" [disabled]="busy()" (click)="computeUmap()">
+        Compute UMAP
+      </button>
+    </div>
+  </div>
+
+  @if (busy() && progress() > 0) {
+    <div class="progress mb-3" role="progressbar" [attr.aria-valuenow]="progress()" aria-valuemin="0" aria-valuemax="100">
+      <div class="progress-bar" [style.width.%]="progress()">{{ progress() }}%</div>
+    </div>
+  }
+
+  @if (pointCount() > 0) {
+    <p class="text-muted mb-2">Plotted points: {{ pointCount() }}</p>
+  }
+
+  <div #chartContainer class="umap-chart">
+    <svg></svg>
+  </div>
+</section>

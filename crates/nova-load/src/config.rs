@@ -38,6 +38,17 @@ pub struct LoaderConfig {
     /// usually means the store is down or misconfigured, so it aborts the run.
     #[serde(default = "default_upsert_retries")]
     pub upsert_retries: usize,
+    /// Optional cap on points to ingest per worker/run. `None` means unlimited.
+    #[serde(default)]
+    pub max_points: Option<u64>,
+    /// Optional number of rows to skip from the start of this worker's file
+    /// stream before ingesting points.
+    #[serde(default)]
+    pub row_offset: Option<u64>,
+    /// Optional deterministic shuffle seed applied to this worker's assigned
+    /// file list before loading.
+    #[serde(default)]
+    pub file_seed: Option<u64>,
     /// Abort the whole run if more than this many files are skipped after
     /// exhausting their retries. `None` (default) skips every failing file and
     /// keeps going; set a ceiling to fail fast on a systemic problem instead of
@@ -57,6 +68,9 @@ impl Default for LoaderConfig {
             file_look_ahead: default_file_look_ahead(),
             file_retries: default_file_retries(),
             upsert_retries: default_upsert_retries(),
+            max_points: None,
+            row_offset: None,
+            file_seed: None,
             max_failed_files: None,
             checkpoint: None,
         }
@@ -434,5 +448,41 @@ mod tests {
             expand("x: ${UNCLOSED", &[]).unwrap_err(),
             ConfigError::UnterminatedPlaceholder
         ));
+    }
+
+    #[test]
+    fn loader_defaults_include_unbounded_ingest() {
+        let loader = LoaderConfig::default();
+        assert_eq!(loader.max_points, None);
+        assert_eq!(loader.row_offset, None);
+        assert_eq!(loader.file_seed, None);
+    }
+
+    #[test]
+    fn loader_accepts_bounded_ingest_fields() {
+        let cfg: LoadConfig = serde_yaml::from_str(
+            r#"
+datasource:
+  type: local
+  path: ./data
+  id_expression: row_id
+vectorstore:
+  type: qdrant
+  url: http://localhost:6334
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    size: 768
+loader:
+  max_points: 20000
+  row_offset: 1000
+  file_seed: 71
+"#,
+        )
+        .expect("config should parse");
+        assert_eq!(cfg.loader.max_points, Some(20_000));
+        assert_eq!(cfg.loader.row_offset, Some(1_000));
+        assert_eq!(cfg.loader.file_seed, Some(71));
     }
 }

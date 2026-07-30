@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+use nova_load::catalog;
 use nova_load::config::LoadConfig;
 use nova_load::plan::Partition;
 
@@ -33,6 +34,10 @@ enum Command {
     Delete(RunArgs),
     /// Inspect the config and the file list without connecting or loading.
     Inspect(LoadArgs),
+    /// Build a local parquet catalog for faster S3 startup.
+    CatalogBuild(CatalogBuildArgs),
+    /// Merge one or more catalog parquet files into one.
+    CatalogMerge(CatalogMergeArgs),
 }
 
 /// Args for phases that act on the whole dataset (no partitioning).
@@ -59,6 +64,29 @@ struct LoadArgs {
     /// Optional checkpoint file path override.
     #[arg(long)]
     checkpoint_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CatalogBuildArgs {
+    /// Root directory containing parquet files.
+    #[arg(long)]
+    input: PathBuf,
+    /// Output parquet catalog file.
+    #[arg(long, default_value = "./data/catalog.parquet")]
+    output: PathBuf,
+    /// Resume by loading existing output and adding newly discovered shards.
+    #[arg(long, default_value_t = false)]
+    resume: bool,
+}
+
+#[derive(Debug, Args)]
+struct CatalogMergeArgs {
+    /// Catalog parquet files or directories containing catalog parquet files.
+    #[arg(long, required = true, num_args = 1..)]
+    inputs: Vec<PathBuf>,
+    /// Output merged catalog parquet file.
+    #[arg(long, default_value = "./data/catalog.parquet")]
+    output: PathBuf,
 }
 
 impl LoadArgs {
@@ -119,6 +147,28 @@ async fn run(command: Command) -> Result<(), ExitCode> {
                 ExitCode::FAILURE
             })?;
             nova_load::inspect(load_config(&a.config)?, partition).await
+        }
+        Command::CatalogBuild(a) => {
+            let count = catalog::build_catalog(&a.input, &a.output, a.resume).map_err(|e| {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            })?;
+            eprintln!(
+                "catalog build complete: {count} parquet path(s) -> {}",
+                a.output.display()
+            );
+            Ok(())
+        }
+        Command::CatalogMerge(a) => {
+            let count = catalog::merge_catalogs(&a.inputs, &a.output).map_err(|e| {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            })?;
+            eprintln!(
+                "catalog merge complete: {count} parquet path(s) -> {}",
+                a.output.display()
+            );
+            Ok(())
         }
     };
 

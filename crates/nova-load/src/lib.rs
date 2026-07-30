@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod checkpoint;
 pub mod config;
 pub mod engine;
@@ -13,6 +14,9 @@ use std::time::{Duration, Instant};
 
 use futures::{StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::SeedableRng;
+use rand::seq::SliceRandom;
+use rand::rngs::StdRng;
 
 use config::{LoadConfig, LoaderConfig, VectorSpec};
 use plan::Partition;
@@ -35,6 +39,8 @@ pub enum LoadError {
     NoFilesToPrepare,
     #[error("aborting: {skipped} file(s) failed after retries, exceeding loader.max_failed_files={max}")]
     TooManyFailedFiles { skipped: u64, max: usize },
+    #[error("invalid loader options: {0}")]
+    InvalidOptions(String),
     #[error(transparent)]
     Checkpoint(#[from] checkpoint::CheckpointError),
 }
@@ -297,11 +303,22 @@ async fn load_files(
     let file_retries = loader.file_retries;
     let upsert_retries = loader.upsert_retries;
     let max_failed_files = loader.max_failed_files;
+    let max_points = loader.max_points;
+    let row_offset = loader.row_offset.unwrap_or(0);
+    let file_seed = loader.file_seed;
     let id_expression = datasource.reader().id_expression.clone();
     let payload = datasource.reader().payload_fields.clone();
 
+    if runtime.resume && row_offset > 0 {
+        return Err(LoadError::InvalidOptions(
+            "loader.row_offset cannot be used with --resume; checkpoint resume is file-based and \
+             incompatible with row-level offsets".to_string(),
+        ));
+    }
+
     let total_files = all_files.len();
     let mut files = plan::partition(&all_files, partition);
+    shuffle_files(&mut files, file_seed);
     if files.is_empty() {
         tracing::warn!(
             "worker {}/{} has no files of {total_files} to load (more workers than files?)",
@@ -420,8 +437,15 @@ async fn load_files(
     let points_done = &points_done;
     let rate_window = &rate_window;
 
+    let mut points_budget = max_points;
+    let mut remaining_row_offset = row_offset;
+    let mut bounded_stop = false;
     let mut skipped = 0u64;
     while let Some(outcome) = reads.next().await {
+        if points_budget == Some(0) {
+            bounded_stop = true;
+            break;
+        }
         let (key, points) = match outcome {
             Ok(points) => points,
             Err((key, err)) => {
@@ -439,6 +463,21 @@ async fn load_files(
                 continue;
             }
         };
+
+        let (points, partial_file_due_to_budget) =
+            slice_for_offset_and_budget(points, &mut remaining_row_offset, &mut points_budget);
+        if points.is_empty() {
+            if let Some(ctx) = checkpoint_ctx.as_mut() {
+                ctx.state.completed_files.insert(key);
+                ctx.completed_since_flush += 1;
+                if ctx.completed_since_flush >= ctx.flush_every_files {
+                    checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
+                    ctx.completed_since_flush = 0;
+                }
+            }
+            progress.inc(1);
+            continue;
+        }
 
         // Upsert this file's batches with up to `concurrency` requests in flight.
         // `buffer_unordered` is the idiomatic bounded-concurrency primitive — a
@@ -493,15 +532,24 @@ async fn load_files(
             .await?;
 
         total += points.len() as u64;
+        points_budget = points_budget.map(|remaining| remaining.saturating_sub(points.len() as u64));
+        if let Some(0) = points_budget {
+            bounded_stop = true;
+        }
         if let Some(ctx) = checkpoint_ctx.as_mut() {
-            ctx.state.completed_files.insert(key);
-            ctx.completed_since_flush += 1;
-            if ctx.completed_since_flush >= ctx.flush_every_files {
-                checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
-                ctx.completed_since_flush = 0;
+            if !partial_file_due_to_budget {
+                ctx.state.completed_files.insert(key);
+                ctx.completed_since_flush += 1;
+                if ctx.completed_since_flush >= ctx.flush_every_files {
+                    checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
+                    ctx.completed_since_flush = 0;
+                }
             }
         }
         progress.inc(1);
+        if bounded_stop {
+            break;
+        }
     }
 
     let avg = total as f64 / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
@@ -516,10 +564,46 @@ async fn load_files(
             file_retries,
         );
     }
+    if bounded_stop {
+        tracing::info!(
+            "stopped early due to loader.max_points={:?}; loaded {total} point(s) this run",
+            max_points
+        );
+    }
     if let Some(ctx) = checkpoint_ctx.as_mut() {
         checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
     }
     Ok(total)
+}
+
+fn shuffle_files(files: &mut [FileRef], seed: Option<u64>) {
+    if let Some(seed) = seed {
+        let mut rng = StdRng::seed_from_u64(seed);
+        files.shuffle(&mut rng);
+    }
+}
+
+fn slice_for_offset_and_budget<T>(
+    mut items: Vec<T>,
+    remaining_row_offset: &mut u64,
+    points_budget: &mut Option<u64>,
+) -> (Vec<T>, bool) {
+    if *remaining_row_offset > 0 {
+        let skip = (*remaining_row_offset).min(items.len() as u64) as usize;
+        if skip > 0 {
+            items.drain(0..skip);
+            *remaining_row_offset -= skip as u64;
+        }
+    }
+
+    let mut partial_file_due_to_budget = false;
+    if let Some(remaining) = *points_budget
+        && (items.len() as u64) > remaining
+    {
+        items.truncate(remaining as usize);
+        partial_file_due_to_budget = true;
+    }
+    (items, partial_file_due_to_budget)
 }
 
 struct CheckpointContext {
@@ -631,13 +715,16 @@ fn config_fingerprint(
         }
     }
     out.push_str(&format!(
-        "loader:{}:{}:{}:{}:{}:{:?};",
+        "loader:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?};",
         loader.batch_size,
         loader.concurrency,
         loader.file_look_ahead,
         loader.file_retries,
         loader.upsert_retries,
-        loader.max_failed_files
+        loader.max_failed_files,
+        loader.max_points,
+        loader.row_offset,
+        loader.file_seed
     ));
     out
 }
@@ -717,5 +804,39 @@ mod tests {
             normalize_list(&list),
             "a/train.parquet,m/train.parquet,z/train.parquet"
         );
+    }
+
+    #[test]
+    fn shuffle_files_is_deterministic_for_same_seed() {
+        let base = refs(&["a.parquet", "b.parquet", "c.parquet", "d.parquet"]);
+        let mut first = base.clone();
+        let mut second = base;
+        shuffle_files(&mut first, Some(42));
+        shuffle_files(&mut second, Some(42));
+        assert_eq!(
+            first.iter().map(|f| f.key.clone()).collect::<Vec<_>>(),
+            second.iter().map(|f| f.key.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn slice_for_offset_and_budget_skips_and_truncates() {
+        let mut offset = 2u64;
+        let mut budget = Some(3u64);
+        let (out, partial) = slice_for_offset_and_budget(vec![1, 2, 3, 4, 5, 6], &mut offset, &mut budget);
+        assert_eq!(out, vec![3, 4, 5]);
+        assert!(partial);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn slice_for_offset_and_budget_skips_whole_file_when_needed() {
+        let mut offset = 10u64;
+        let mut budget = Some(5u64);
+        let (out, partial) = slice_for_offset_and_budget(vec![1, 2, 3], &mut offset, &mut budget);
+        assert!(out.is_empty());
+        assert!(!partial);
+        assert_eq!(offset, 7);
+        assert_eq!(budget, Some(5));
     }
 }

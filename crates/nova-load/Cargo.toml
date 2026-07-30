@@ -29,6 +29,7 @@ tempfile = { workspace = true }
 object_store = { workspace = true }
 futures = { workspace = true }
 indicatif = { workspace = true }
+rand = "0.8"
 
 # Metrics sink (postgres compiled in so one binary serves stdout + postgres
 # configs; the backend is chosen at runtime from metrics.type).

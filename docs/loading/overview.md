@@ -67,6 +67,50 @@ datasource:
 
 Reads all parquet files matching `{path}/**/*.parquet`.
 
+For very large prefixes, use a local parquet catalog to skip S3 listing at
+startup:
+
+```yaml
+datasource:
+  type: s3
+  path: s3://my-bucket/my-prefix/
+  catalog: /path/to/catalog.parquet
+```
+
+Supported catalog path columns (first match wins):
+- `relative_path` (preferred)
+- `path`
+- `filename`
+
+Optional size columns:
+- `file_size`
+- `size`
+
+Build a catalog from a local shard tree:
+
+```bash
+nova-load catalog-build \
+  --input /data/fineweb-gte/resharded \
+  --output ./data/catalog.parquet
+```
+
+Resume a previously started build:
+
+```bash
+nova-load catalog-build \
+  --input /data/fineweb-gte/resharded \
+  --output ./data/catalog.parquet \
+  --resume
+```
+
+Merge multiple catalogs:
+
+```bash
+nova-load catalog-merge \
+  --inputs ./data/catalog_001.parquet ./data/catalog_002.parquet \
+  --output ./data/catalog.parquet
+```
+
 ### HuggingFace
 
 Streams directly from HuggingFace Hub via DuckDB's `hf://` protocol.
@@ -227,9 +271,41 @@ on the same store via `reindex`), not an apples-to-apples cross-system benchmark
 
 | Parameter | Default | Guidance |
 |-----------|---------|----------|
-| `batch_size` | 1000 | Points per upsert call. Larger = fewer HTTP calls; 1000 is good for 768-1024 dim vectors. |
-| `concurrency` | 8 | In-flight upsert batches. Lower if the store times out. |
+| `batch_size` | 256 | Points per upsert call. Raise carefully when proxies/gateways enforce request-size limits. |
+| `concurrency` | `available_cpus - 1` | In-flight upsert batches. Lower if the store times out. |
 | `file_look_ahead` | 2 | Files downloaded + read ahead of the uploader. Higher = more overlap, more RAM/disk. |
-| `file_retries` | 3 | Per-file download+read retries (exponential backoff) before the file is skipped. |
-| `upsert_retries` | 3 | Per-batch upsert retries (exponential backoff) before the run aborts. |
+| `file_retries` | 5 | Per-file download+read retries (exponential backoff) before the file is skipped. |
+| `upsert_retries` | 5 | Per-batch upsert retries (exponential backoff) before the run aborts. |
 | `max_failed_files` | _(none)_ | Abort once more than this many files are skipped. Unset = skip every failing file and finish. |
+| `max_points` | _(none)_ | Optional per-worker cap on ingested points. Useful for bounded smoke/probe loads (e.g. exactly 20k points per worker). |
+| `row_offset` | `0` | Optional per-worker row skip before ingest begins. Useful for manual chunking; do not combine with `--resume`. |
+| `file_seed` | _(none)_ | Optional deterministic file shuffle seed, applied after worker partitioning. |
+
+## Bounded smoke loads
+
+For capped smoke runs, set a point budget directly in loader config instead of
+creating a one-off sliced parquet:
+
+```yaml
+loader:
+  batch_size: 8
+  concurrency: 1
+  max_points: 20000
+```
+
+Use `vectorstore.params.quantization` for TurboQuant 4-bit in the same config:
+
+```yaml
+vectorstore:
+  params:
+    quantization:
+      type: turbo
+      bits: 4
+      always_ram: true
+```
+
+Reference config: `configs/loader/fineweb_20k_smoke_hybrid_cloud_turbo4.yaml`.
+For distributed behavior, remember `max_points` is enforced **per worker**.
+
+For metric strategy and a Grafana-ready panel/query template, see
+[Qdrant ingest metrics](qdrant-ingest-metrics.md).

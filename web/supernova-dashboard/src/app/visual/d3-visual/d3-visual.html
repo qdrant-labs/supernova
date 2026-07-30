@@ -1,0 +1,229 @@
+<section class="container py-4">
+  <h1>Force Graph</h1>
+  <p class="text-muted">{{ status() }}</p>
+
+  @if (error()) {
+    <div class="alert alert-warning" role="alert">{{ error() }}</div>
+  }
+
+  <div class="row g-3 mb-4">
+    <div class="col-md-4">
+      <label class="form-label" for="collectionSelect">Collection</label>
+      <select
+        id="collectionSelect"
+        class="form-select"
+        [ngModel]="selectedCollection()"
+        (ngModelChange)="selectedCollection.set($event)"
+      >
+        @for (collection of collections(); track collection) {
+          <option [value]="collection">{{ collection }}</option>
+        }
+      </select>
+    </div>
+
+    <div class="col-md-2">
+      <label class="form-label" for="resultLimit">Result limit</label>
+      <input
+        id="resultLimit"
+        type="number"
+        class="form-control"
+        min="5"
+        max="200"
+        [ngModel]="resultLimit()"
+        (ngModelChange)="resultLimit.set(+$event)"
+      />
+    </div>
+
+    <div class="col-md-2">
+      <label class="form-label" for="minSimilarity">Min link similarity</label>
+      <input
+        id="minSimilarity"
+        type="number"
+        class="form-control"
+        min="0"
+        max="1"
+        step="0.05"
+        [ngModel]="minSimilarity()"
+        (ngModelChange)="minSimilarity.set(+$event)"
+      />
+    </div>
+
+    <div class="col-md-2 d-flex align-items-end">
+      <button type="button" class="btn btn-primary w-100" [disabled]="busy()" (click)="runQuery()">
+        Random query
+      </button>
+    </div>
+  </div>
+
+  @if (nodeCount() > 0) {
+    <p class="text-muted mb-2">
+      Nodes: {{ nodeCount() }}, links: {{ linkCount() }}
+    </p>
+  }
+
+  <div class="force-params card mb-3">
+    <div class="card-header d-flex justify-content-between align-items-center py-2">
+      <span class="fw-semibold">Force parameters</span>
+      <button
+        type="button"
+        class="btn btn-sm btn-outline-secondary"
+        (click)="resetForceParams()"
+        [disabled]="!nodeCount()"
+      >
+        Reset to auto
+      </button>
+    </div>
+    <div class="card-body">
+      <p class="text-muted small mb-3">
+        Multipliers adjust the default centered layout. Increase charge or radial spread to push nodes outward; boundary pull is off by default.
+      </p>
+      <div class="row g-3 mb-3">
+        <div class="col-12">
+          <div class="form-check">
+            <input
+              id="labelsOnHoverOnly"
+              type="checkbox"
+              class="form-check-input"
+              [ngModel]="labelsOnHoverOnly()"
+              (ngModelChange)="labelsOnHoverOnly.set($event); onLabelsOnHoverOnlyChange()"
+            />
+            <label class="form-check-label" for="labelsOnHoverOnly">
+              Show node labels on hover only
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="row g-3">
+        <div class="col-md-6 col-lg-4">
+          <label class="form-label" for="chargeMultiplier">
+            Charge repulsion ({{ chargeMultiplier() | number: '1.2-2' }}×)
+          </label>
+          <input
+            id="chargeMultiplier"
+            type="range"
+            class="form-range"
+            min="0.2"
+            max="3"
+            step="0.05"
+            [ngModel]="chargeMultiplier()"
+            (ngModelChange)="chargeMultiplier.set(+$event); onForceParamChange()"
+            [disabled]="!nodeCount()"
+          />
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <label class="form-label" for="linkDistanceMultiplier">
+            Link distance ({{ linkDistanceMultiplier() | number: '1.2-2' }}×)
+          </label>
+          <input
+            id="linkDistanceMultiplier"
+            type="range"
+            class="form-range"
+            min="0.2"
+            max="3"
+            step="0.05"
+            [ngModel]="linkDistanceMultiplier()"
+            (ngModelChange)="linkDistanceMultiplier.set(+$event); onForceParamChange()"
+            [disabled]="!nodeCount()"
+          />
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <label class="form-label" for="linkStrengthMultiplier">
+            Link strength ({{ linkStrengthMultiplier() | number: '1.2-2' }}×)
+          </label>
+          <input
+            id="linkStrengthMultiplier"
+            type="range"
+            class="form-range"
+            min="0"
+            max="3"
+            step="0.05"
+            [ngModel]="linkStrengthMultiplier()"
+            (ngModelChange)="linkStrengthMultiplier.set(+$event); onForceParamChange()"
+            [disabled]="!nodeCount()"
+          />
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <label class="form-label" for="collisionMultiplier">
+            Collision radius ({{ collisionMultiplier() | number: '1.2-2' }}×)
+          </label>
+          <input
+            id="collisionMultiplier"
+            type="range"
+            class="form-range"
+            min="0.2"
+            max="3"
+            step="0.05"
+            [ngModel]="collisionMultiplier()"
+            (ngModelChange)="collisionMultiplier.set(+$event); onForceParamChange()"
+            [disabled]="!nodeCount()"
+          />
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <label class="form-label" for="boundaryStrengthMultiplier">
+            Center / boundary pull ({{ boundaryStrengthMultiplier() | number: '1.2-2' }}×)
+          </label>
+          <input
+            id="boundaryStrengthMultiplier"
+            type="range"
+            class="form-range"
+            min="0"
+            max="3"
+            step="0.05"
+            [ngModel]="boundaryStrengthMultiplier()"
+            (ngModelChange)="boundaryStrengthMultiplier.set(+$event); onForceParamChange()"
+            [disabled]="!nodeCount()"
+          />
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <label class="form-label" for="radialStrengthMultiplier">
+            Radial spread ({{ radialStrengthMultiplier() | number: '1.2-2' }}×)
+          </label>
+          <input
+            id="radialStrengthMultiplier"
+            type="range"
+            class="form-range"
+            min="0"
+            max="3"
+            step="0.05"
+            [ngModel]="radialStrengthMultiplier()"
+            (ngModelChange)="radialStrengthMultiplier.set(+$event); onForceParamChange()"
+            [disabled]="!nodeCount()"
+          />
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <label class="form-label" for="radialRadiusMultiplier">
+            Radial radius ({{ radialRadiusMultiplier() | number: '1.2-2' }}×)
+          </label>
+          <input
+            id="radialRadiusMultiplier"
+            type="range"
+            class="form-range"
+            min="0.2"
+            max="2"
+            step="0.05"
+            [ngModel]="radialRadiusMultiplier()"
+            (ngModelChange)="radialRadiusMultiplier.set(+$event); onForceParamChange()"
+            [disabled]="!nodeCount()"
+          />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div #graphPanel class="graph-panel" [class.graph-panel--maximized]="isMaximized()">
+    <div class="graph-panel__toolbar">
+      <button
+        type="button"
+        class="btn btn-sm btn-outline-secondary"
+        (click)="toggleMaximize()"
+        [attr.aria-pressed]="isMaximized()"
+        [attr.aria-label]="isMaximized() ? 'Exit full view' : 'Maximize graph panel'"
+      >
+        {{ isMaximized() ? 'Exit full view' : 'Full view' }}
+      </button>
+    </div>
+    <div #graphContainer class="force-graph">
+      <svg></svg>
+    </div>
+  </div>
+</section>

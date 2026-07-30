@@ -1,6 +1,11 @@
 # Quickstart
 
-Embed a dataset, load it into Qdrant, and load-test it. In this example. We embed the `mteb/tweet_sentiment_extraction` dataset with a sentence-transformer. This is a small dataset, and we want to embed the `text` field. The embedding is stored in parquet files, which are then loaded into a Qdrant collection. Finally, we load-test the collection with queries drawn from the same dataset.
+Embed a dataset, load it into Qdrant, load-test it, then run the new web service
+for API-driven operations. In this example, we embed the
+`mteb/tweet_sentiment_extraction` dataset with a sentence-transformer. This is a
+small dataset, and we embed the `text` field. The embedding is stored in parquet
+files, which are then loaded into a Qdrant collection. Finally, we load-test the
+collection with queries drawn from the same dataset and start `nova web`.
 
 ## 1. Embed a dataset
 
@@ -137,6 +142,44 @@ nova storm configs/storm/my_dataset.yaml
 ```
 
 It prints a latency summary (p50/p95/p99, throughput) at the end.
+
+## 4. Run the web service (`nova web`)
+
+Build the Angular frontend once, then start the Axum backend:
+
+```bash
+cd web/supernova-dashboard
+npm install
+npm run build
+
+cd ../..
+cargo run -p nova-web
+```
+
+Open `http://localhost:8080` to use the dashboard.
+
+Useful API endpoints:
+
+```bash
+curl -s http://localhost:8080/health
+curl -s http://localhost:8080/api/v1/jobs
+```
+
+Submit a `nova load run` job by passing config path or inline YAML:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/load/run \
+  -H 'content-type: application/json' \
+  -d '{"config_path":"configs/loader/my_dataset.yaml"}'
+```
+
+Distributed orchestration via SkyPilot is also exposed:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/dist/storm \
+  -H 'content-type: application/json' \
+  -d '{"config_path":"configs/storm/my_dataset.yaml","num_jobs":4,"dry_run":true}'
+```
 
 ## Distributed
 

@@ -65,7 +65,10 @@ pub struct MilvusSearchParams {
 enum Transport {
     /// L2 / IP via the gRPC SDK, carrying a live loaded collection handle.
     /// Boxed: `Collection` is large relative to the `Rest` variant.
-    Sdk { collection: Box<Collection>, metric: MetricType },
+    Sdk {
+        collection: Box<Collection>,
+        metric: MetricType,
+    },
     /// COSINE via REST (the SDK enum can't express cosine).
     Rest,
 }
@@ -107,11 +110,15 @@ async fn rest_post(
     let status = resp.status();
     if !status.is_success() {
         let detail = resp.text().await.unwrap_or_default();
-        return Err(TargetError::Other(format!("milvus REST {path} HTTP {status}: {detail}")));
+        return Err(TargetError::Other(format!(
+            "milvus REST {path} HTTP {status}: {detail}"
+        )));
     }
     let body: Value = resp.json().await.map_err(to_other)?;
     if body.get("code").and_then(Value::as_i64) != Some(0) {
-        return Err(TargetError::Other(format!("milvus REST {path} failed: {body}")));
+        return Err(TargetError::Other(format!(
+            "milvus REST {path} failed: {body}"
+        )));
     }
     Ok(body.get("data").cloned().unwrap_or(Value::Null))
 }
@@ -129,7 +136,14 @@ async fn detect_metric(
     field: &str,
 ) -> Result<String, TargetError> {
     let names: Vec<String> = serde_json::from_value(
-        rest_post(http, base, token, "indexes/list", json!({ "collectionName": collection })).await?,
+        rest_post(
+            http,
+            base,
+            token,
+            "indexes/list",
+            json!({ "collectionName": collection }),
+        )
+        .await?,
     )
     .map_err(to_other)?;
     for index_name in names {
@@ -142,13 +156,21 @@ async fn detect_metric(
         )
         .await?;
         let descs = described.as_array().ok_or_else(|| {
-            TargetError::Other(format!("milvus index describe is not an array: {described}"))
+            TargetError::Other(format!(
+                "milvus index describe is not an array: {described}"
+            ))
         })?;
         for d in descs {
             if d.get("fieldName").and_then(Value::as_str) == Some(field) {
-                return d.get("metricType").and_then(Value::as_str).map(str::to_string).ok_or_else(
-                    || TargetError::Other(format!("milvus index for field `{field}` has no metricType")),
-                );
+                return d
+                    .get("metricType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        TargetError::Other(format!(
+                            "milvus index for field `{field}` has no metricType"
+                        ))
+                    });
             }
         }
     }
@@ -167,7 +189,14 @@ async fn ensure_loaded(
 ) -> Result<(), TargetError> {
     const POLL: Duration = Duration::from_secs(1);
     const TIMEOUT: Duration = Duration::from_secs(300);
-    rest_post(http, base, token, "collections/load", json!({ "collectionName": collection })).await?;
+    rest_post(
+        http,
+        base,
+        token,
+        "collections/load",
+        json!({ "collectionName": collection }),
+    )
+    .await?;
     let start = Instant::now();
     loop {
         let d = rest_post(
@@ -180,10 +209,9 @@ async fn ensure_loaded(
         .await?;
         // Milvus 2.4 REST reports `LoadStateLoaded`; accept `loaded` too (and
         // case-insensitively) so an API-version change doesn't spin to timeout.
-        if d.get("load")
-            .and_then(Value::as_str)
-            .is_some_and(|s| s.eq_ignore_ascii_case("LoadStateLoaded") || s.eq_ignore_ascii_case("loaded"))
-        {
+        if d.get("load").and_then(Value::as_str).is_some_and(|s| {
+            s.eq_ignore_ascii_case("LoadStateLoaded") || s.eq_ignore_ascii_case("loaded")
+        }) {
             return Ok(());
         }
         if start.elapsed() >= TIMEOUT {
@@ -232,8 +260,9 @@ impl MilvusConfig {
             ));
         }
         // Milvus caps top_k at 16384; guard the u64→i32 conversion regardless.
-        let top_k = i32::try_from(query.top_k)
-            .map_err(|_| TargetError::Other(format!("milvus top_k {} exceeds i32::MAX", query.top_k)))?;
+        let top_k = i32::try_from(query.top_k).map_err(|_| {
+            TargetError::Other(format!("milvus top_k {} exceeds i32::MAX", query.top_k))
+        })?;
 
         let rest_base = self.url.trim_end_matches('/').to_string();
         // Basic auth needs both parts; one without the other is a config error
@@ -242,10 +271,14 @@ impl MilvusConfig {
             (Some(u), Some(p)) => Some(format!("{u}:{p}")),
             (None, None) => None,
             (Some(_), None) => {
-                return Err(TargetError::Other("milvus username set without password".to_string()));
+                return Err(TargetError::Other(
+                    "milvus username set without password".to_string(),
+                ));
             }
             (None, Some(_)) => {
-                return Err(TargetError::Other("milvus password set without username".to_string()));
+                return Err(TargetError::Other(
+                    "milvus password set without username".to_string(),
+                ));
             }
         };
         // A per-request timeout so a single hung HTTP call can't block past the
@@ -259,8 +292,14 @@ impl MilvusConfig {
         // Load the collection (search requires it), then decide the transport
         // from the metric of the index on the field we'll actually query.
         ensure_loaded(&http, &rest_base, &auth_token, &collection_name).await?;
-        let metric =
-            detect_metric(&http, &rest_base, &auth_token, &collection_name, &vector_field).await?;
+        let metric = detect_metric(
+            &http,
+            &rest_base,
+            &auth_token,
+            &collection_name,
+            &vector_field,
+        )
+        .await?;
 
         let transport = match metric.to_uppercase().as_str() {
             "COSINE" => {
@@ -281,13 +320,19 @@ impl MilvusConfig {
                     builder = builder.password(p);
                 }
                 let client = builder.build().await.map_err(to_other)?;
-                let collection = client.get_collection(&collection_name).await.map_err(to_other)?;
+                let collection = client
+                    .get_collection(&collection_name)
+                    .await
+                    .map_err(to_other)?;
                 let metric = if metric.eq_ignore_ascii_case("L2") {
                     MetricType::L2
                 } else {
                     MetricType::IP
                 };
-                Transport::Sdk { collection: Box::new(collection), metric }
+                Transport::Sdk {
+                    collection: Box::new(collection),
+                    metric,
+                }
             }
             other => {
                 return Err(TargetError::Other(format!(
@@ -319,7 +364,12 @@ impl fmt::Display for MilvusTarget {
 
 /// A whole-batch failure outcome (no per-query ids).
 fn fail(started: Instant, n: usize, error: String) -> BatchOutcome {
-    BatchOutcome { latency: started.elapsed(), ok: false, ids: vec![None; n], error: Some(error) }
+    BatchOutcome {
+        latency: started.elapsed(),
+        ok: false,
+        ids: vec![None; n],
+        error: Some(error),
+    }
 }
 
 /// One SDK-returned id as a plain string (varchar → itself, int → decimal).
@@ -360,21 +410,34 @@ impl MilvusTarget {
         queries: &[&QueryVector],
         started: Instant,
     ) -> BatchOutcome {
-        let data: Vec<MValue> =
-            queries.iter().map(|q| MValue::FloatArray(Cow::Borrowed(q.vector.as_slice()))).collect();
+        let data: Vec<MValue> = queries
+            .iter()
+            .map(|q| MValue::FloatArray(Cow::Borrowed(q.vector.as_slice())))
+            .collect();
         let mut option = SearchOption::new();
         for (k, v) in self.search_param_pairs() {
             option.add_param(k, json!(v));
         }
         let out_fields: Vec<String> = Vec::new();
         match collection
-            .search(data, self.vector_field.as_str(), self.top_k, metric, out_fields, &option)
+            .search(
+                data,
+                self.vector_field.as_str(),
+                self.top_k,
+                metric,
+                out_fields,
+                &option,
+            )
             .await
         {
             Ok(results) if results.len() != queries.len() => fail(
                 started,
                 queries.len(),
-                format!("search returned {} results for {} queries", results.len(), queries.len()),
+                format!(
+                    "search returned {} results for {} queries",
+                    results.len(),
+                    queries.len()
+                ),
             ),
             Ok(results) => {
                 if !self.collect_ids {
@@ -395,14 +458,20 @@ impl MilvusTarget {
                             return fail(
                                 started,
                                 queries.len(),
-                                "milvus search returned an id that isn't a string or int".to_string(),
+                                "milvus search returned an id that isn't a string or int"
+                                    .to_string(),
                             );
                         };
                         q.push(s);
                     }
                     ids.push(Some(q));
                 }
-                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+                BatchOutcome {
+                    latency: started.elapsed(),
+                    ok: true,
+                    ids,
+                    error: None,
+                }
             }
             Err(e) => fail(started, queries.len(), e.to_string()),
         }
@@ -417,8 +486,11 @@ impl MilvusTarget {
             "limit": self.top_k,
             "outputFields": [],
         });
-        let params: serde_json::Map<String, Value> =
-            self.search_param_pairs().into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        let params: serde_json::Map<String, Value> = self
+            .search_param_pairs()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect();
         if !params.is_empty() {
             body["searchParams"] = json!({ "params": Value::Object(params) });
         }
@@ -436,7 +508,11 @@ impl MilvusTarget {
             Err(e) => return fail(started, queries.len(), e.to_string()),
         };
         let Some(arr) = data.as_array() else {
-            return fail(started, queries.len(), format!("milvus REST search: `data` not an array: {data}"));
+            return fail(
+                started,
+                queries.len(),
+                format!("milvus REST search: `data` not an array: {data}"),
+            );
         };
 
         // The REST response is a FLAT list of hits across all query vectors, in
@@ -483,7 +559,12 @@ impl MilvusTarget {
             }
             ids.push(Some(q));
         }
-        BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+        BatchOutcome {
+            latency: started.elapsed(),
+            ok: true,
+            ids,
+            error: None,
+        }
     }
 }
 
@@ -492,7 +573,12 @@ impl QueryTarget for MilvusTarget {
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+            return BatchOutcome {
+                latency: started.elapsed(),
+                ok: true,
+                ids: Vec::new(),
+                error: None,
+            };
         }
         match &self.transport {
             Transport::Sdk { collection, metric } => {

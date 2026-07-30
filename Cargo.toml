@@ -4,6 +4,7 @@ members = [
     "crates/nova-storm",
     "crates/nova-load",
     "crates/nova-inspect",
+    "crates/nova-web",
 ]
 version = "0.0.9"
 
