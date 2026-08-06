@@ -26,21 +26,17 @@ class ParquetFile:
     key: str        # loader-consistent filename used for id derivation
 
 
-# Parallel ranged-GET download tuning for LARGE remote parquet files (see
-# Store.read_columns). One S3 HTTP connection sustains only ~30-90 MB/s, and a
-# reader can only parallelize along a file's internal structure (row groups /
-# column chunks). Files written with a large flush threshold (e.g. pubmed's
-# 3,000-record shards) hold ~ONE row group, and an embedding read touches ~one
-# giant column chunk — so the read degenerates into a single sequential
-# stream that no IO thread pool can speed up (measured ~22 MB/s in-region).
-# Downloading the whole object as many concurrent byte ranges FIRST (the
-# `aws s3 cp` strategy), then parsing from memory, restores NIC-rate
-# throughput regardless of parquet internals (measured 10.6x on pubmed's
-# 4.3 GB single-row-group shards). OPT-IN via `Store(uri, ranged_get=True)`
-# — wired to `params.io_ranged_get` in the compute config — and even then
-# only for s3:// files of at least _RANGED_GET_MIN_BYTES (below that the
-# normal reader is already fine). Local reads are always untouched. Costs
-# one file's raw wire bytes of extra RAM while that file is parsed.
+# Parallel ranged-read tuning for LARGE parquet files (see Store.read_columns).
+# A reader can only parallelize along a file's internal structure (row groups /
+# column chunks). Files written with ~ONE row group cause the download to read
+# one giant column chunk — so the read degenerates into a single sequential stream
+# that no IO thread pool can speed up. Fetching the whole file as many
+# concurrent byte ranges FIRST (the `aws s3 cp` strategy), then parsing from
+# memory, sidesteps that regardless of parquet internals, on s3 and POSIX roots
+# alike. OPT-IN via `Store(uri, ranged_get=True)` — wired to
+# `params.io_ranged_get` in the compute config — and even then only for files
+# of at least _RANGED_GET_MIN_BYTES (below that the normal reader is already
+# fine). Costs one file's raw bytes of extra RAM while that file is parsed.
 _RANGED_GET_BYTES = 64 * 1024 * 1024
 _RANGED_GET_CONCURRENCY = 24
 _RANGED_GET_MIN_BYTES = 256 * 1024 * 1024
@@ -63,8 +59,8 @@ class Store:
     def __init__(self, uri: str, ranged_get: bool = False):
         self.uri = uri
         self.is_s3 = _is_s3(uri)
-        # Opt-in parallel ranged-GET downloads for large s3 objects (see the
-        # module comment above _RANGED_GET_BYTES). Ignored for local roots.
+        # Opt-in parallel ranged reads for large files
+        # (see the module comment above _RANGED_GET_BYTES).
         self.ranged_get = ranged_get
         self.fs, self.root = _fs_and_path(uri)
 
@@ -95,7 +91,7 @@ class Store:
         return out
 
     def read_columns(self, read_path: str, columns: list[str] | None) -> pa.Table:
-        if self.is_s3 and self.ranged_get:
+        if self.ranged_get:
             size = self.fs.get_file_info(read_path).size
             if size is not None and size >= _RANGED_GET_MIN_BYTES:
                 return pq.read_table(
@@ -105,15 +101,17 @@ class Store:
         return pq.read_table(read_path, filesystem=self.fs, columns=columns)
 
     def _ranged_download(self, read_path: str, size: int):
-        """The whole object via _RANGED_GET_CONCURRENCY concurrent byte-range
+        """The whole file via _RANGED_GET_CONCURRENCY concurrent byte-range
         reads into one buffer (see the module comment above the constants).
-        `read_at` is documented thread-safe on one Arrow file handle, releases
-        the GIL during network IO, and a failed range re-raises out of the
-        pool — the reader thread's existing try/except turns that into a loud
-        run failure, same as any other read error. The raw buffer is dropped
-        as soon as `read_columns` finishes parsing (parquet decompression
-        copies out of it), so peak memory adds one file's wire size only
-        while that file is being parsed."""
+        Built from FileSystem API (`open_input_file`/`read_at`), so it runs
+        unchanged on s3 and on POSIX roots.
+
+        `read_at` is documented thread-safe on one Arrow file handle and a
+        failed range re-raises out of the pool — the reader thread's existing
+        try/except turns that into a loud run failure, same as any other read
+        error. The raw buffer is dropped as soon as `read_columns` finishes
+        parsing (parquet decompression copies out of it), so peak memory adds
+        one file's raw size only while that file is being parsed."""
         data = np.empty(size, dtype=np.uint8)
         view = memoryview(data)
         with self.fs.open_input_file(read_path) as f:
