@@ -45,8 +45,24 @@ params:
   # (a smaller batch can't fill any search's top-K). One value per vector_type,
   # run-wide — every search of a vector_type ends up sharing one GPU pass over
   # the corpus, so this isn't a per-search setting.
+  # Parallel byte-range S3 downloads for large corpus/query files. Enable for
+  # corpora written with a large flush threshold (~one row group per file),
+  # where a read is otherwise a single ~22-60 MB/s S3 stream; costs one file's
+  # raw bytes of extra host RAM while parsing. OFF by default.
+  # io_ranged_get: false
   # dense_batch_size: 4096
   # sparse_batch_size: 4096
+  # MaxSim implementation: torch (established/reference), triton_reduce
+  # (cuBLAS matmul + fused Triton ragged reduction, requires CUDA), or auto
+  # (triton_reduce when compatible, torch otherwise).
+  # multivector_kernel: torch
+  # Bound the ACTUAL ragged query-token x document-token product. Explicit
+  # query/document counts become upper bounds; whole documents are packed up
+  # to this element budget. One oversized document runs alone.
+  # multivector_token_budget: 170000000
+  # CUDA-only: overlap the next multivector slice's pinned H2D transfer with
+  # current-slice scoring and top-k. Slice and merge order remain unchanged.
+  # multivector_double_buffer: false
   # merge_batch_size: null
   # merge_prefetch: false
 

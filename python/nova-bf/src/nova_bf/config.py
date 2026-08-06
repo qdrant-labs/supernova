@@ -177,12 +177,10 @@ class ParamsConfig(BaseModel):
     # silent all-empty run downstream.
     dense_batch_size: int | None = Field(default=None, gt=0)
     sparse_batch_size: int | None = Field(default=None, gt=0)
-    # Multivector (MaxSim) has TWO memory axes, not one: the per-slice score
-    # matrix is `(block_query_tokens × corpus_doc_tokens)`, and BOTH the corpus
-    # rows (docs) and the queries are tiled to bound its peak. Unlike
-    # dense/sparse, the naive whole-file × all-queries product is
-    # token×token — it blows up far faster than a pooled-vector matmul, so
-    # tiling the query axis too is mandatory, not optional.
+    # The multivector (MaxSim) implementations (torch and triton_reduce) have
+    # TWO memory axes: their intermediate is `(block_query_tokens ×
+    # corpus_doc_tokens)`, so both corpus rows and queries are tiled to bound
+    # the peak.
     #   multivector_batch_size  = docs per corpus-row slice (bounds doc-token
     #                             count per slice; None = whole file at once)
     #   multivector_query_block = queries per query-axis tile — a WHOLE number
@@ -193,14 +191,26 @@ class ParamsConfig(BaseModel):
     # silently empties the batch loop — see dense_batch_size).
     multivector_batch_size: int | None = Field(default=None, gt=0)
     multivector_query_block: int | None = Field(default=None, gt=0)
-    # Optional convenience: instead of hand-tuning the two knobs above, give a
-    # target peak element count for the per-slice `(block_query_tokens ×
-    # doc_tokens)` score matrix and let the run derive both tile sizes from the
-    # corpus/query mean tokens-per-item (both measured cheaply at load). When
-    # set, it fills in whichever of `multivector_batch_size`/
-    # `multivector_query_block` you left as None; an explicitly-set knob always
-    # wins over the derived value. None (default) = no auto-derivation.
+    # MaxSim implementation. `torch` is the established matmul + segmented
+    # reduction path. `triton_reduce` retains the cuBLAS FP32 matmul but
+    # fuses the ragged max/sum reduction (requires CUDA + Triton, fails
+    # clearly otherwise). `auto` selects `triton_reduce` on a compatible CUDA
+    # run and otherwise falls back to torch. (A fully fused `triton` backend
+    # was removed after measuring ~4x slower than triton_reduce — see
+    # docs/brute-force/multivector-maxsim.md.)
+    multivector_kernel: Literal["torch", "triton_reduce", "auto"] = "torch"
+    # Target element count for each materialized `(block_query_tokens ×
+    # slice_doc_tokens)` score matrix. It still derives either item-count knob
+    # left unset, but is also enforced against the ACTUAL ragged query/document
+    # offsets: explicit batch/query counts become upper bounds, not permission
+    # to exceed this token-product budget. One over-budget document is processed
+    # alone so every row still makes progress.
     multivector_token_budget: int | None = Field(default=None, gt=0)
+    # CUDA-only ordered transfer prefetch for multivector slices. The next
+    # packed ragged slice is copied through pinned host staging on a dedicated
+    # CUDA stream while the current slice's GEMM/reduction/top-k work runs.
+    # CPU and non-multivector paths remain synchronous.
+    multivector_double_buffer: bool = False
     # Allow TF32 tensor-core matmuls on Ampere+ GPUs (CUDA only — a no-op on
     # CPU). OFF by default so ground truth stays bit-for-bit f32, matching
     # Qdrant's f32 scoring exactly. When on, the score matmul runs in TF32

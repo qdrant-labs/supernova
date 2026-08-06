@@ -22,7 +22,7 @@ pytest.importorskip("torch")  # the compute phase needs torch (install nova-bf[d
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from nova_bf.compute import run_compute
+from nova_bf.compute import MultiVectorQuery, _ragged_batch_ranges, run_compute
 from nova_bf.config import load_config
 from nova_bf.io import multivector_to_ragged
 
@@ -204,6 +204,78 @@ def test_handcomputed_maxsim_exact():
     assert abs(float(sc[0, 0]) - 4.0) < 1e-6
 
 
+def test_auto_kernel_falls_back_to_torch_on_cpu():
+    """`auto` is safe on controller/CPU test environments without Triton CUDA."""
+    import torch
+    from nova_bf.compute import MultiVectorCorpusBatch, MultiVectorQuery
+
+    docs = np.array([[1.0, 0.0], [0.0, 2.0]], np.float32)
+    queries = np.array([[1.0, 1.0], [2.0, 0.0]], np.float32)
+    qoff = np.array([0, 2], np.int64)
+    batch = MultiVectorCorpusBatch(np.array([0, 2], np.int64), docs)
+    Q = MultiVectorQuery(
+        torch.tensor(queries), torch.tensor(qoff), qoff, 1, None, "auto"
+    )
+    score = batch.transfer(0, 1, "cpu").score(Q, "dot")
+    assert float(score[0, 0]) == 4.0
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="requires a CUDA GPU"
+)
+@pytest.mark.parametrize("metric", ["dot", "cosine"])
+@pytest.mark.parametrize("dim", [8, 33, 1024])
+@pytest.mark.parametrize("kernel", ["triton_reduce", "auto"])
+def test_fused_triton_matches_torch_ragged(metric, dim, kernel):
+    """Cross-check the fused reducer over empty, multi-tile, and tail shapes.
+
+    D=33 exercises a masked K tail; query/document lengths around 16 exercise
+    both exact tile boundaries and ragged tails; D=1024 is the PubMed BGE-M3
+    production shape.  This test is intentionally CUDA-only and is expected to
+    run in the later SkyPilot validation job.
+    """
+    import torch
+    from nova_bf.compute import MultiVectorBatchSlice, MultiVectorQuery
+
+    rng = np.random.default_rng(91 + dim)
+    query_lengths = np.array([0, 1, 15, 16, 17, 33], dtype=np.int64)
+    document_lengths = np.array([0, 1, 15, 16, 17, 35], dtype=np.int64)
+    query_offsets = np.concatenate(([0], np.cumsum(query_lengths))).astype(np.int64)
+    document_offsets = np.concatenate(([0], np.cumsum(document_lengths))).astype(np.int64)
+    query_flat = torch.tensor(
+        rng.standard_normal((int(query_offsets[-1]), dim)).astype(np.float32),
+        device="cuda",
+    )
+    document_flat = torch.tensor(
+        rng.standard_normal((int(document_offsets[-1]), dim)).astype(np.float32),
+        device="cuda",
+    )
+    query_offsets_gpu = torch.tensor(query_offsets, dtype=torch.int64, device="cuda")
+    document_offsets_gpu = torch.tensor(
+        document_offsets, dtype=torch.int64, device="cuda"
+    )
+    corpus = MultiVectorBatchSlice(document_flat, document_offsets_gpu)
+    reference_query = MultiVectorQuery(
+        query_flat, query_offsets_gpu, query_offsets, len(query_lengths), 2, "torch"
+    )
+    fused_query = MultiVectorQuery(
+        query_flat, query_offsets_gpu, query_offsets, len(query_lengths), 2, kernel
+    )
+
+    reference = corpus.score(reference_query, metric)
+    fused = corpus.score(fused_query, metric)
+    assert torch.equal(torch.isneginf(fused), torch.isneginf(reference))
+    finite = torch.isfinite(reference)
+    assert torch.allclose(fused[finite], reference[finite], rtol=1e-4, atol=1e-3)
+    # Random continuous inputs make ties vanishingly unlikely; pin equivalent
+    # ranking as well as equivalent scores for every non-empty query.
+    for query_index in range(1, len(query_lengths)):
+        assert torch.equal(
+            torch.argsort(fused[query_index], descending=True),
+            torch.argsort(reference[query_index], descending=True),
+        )
+
+
 @pytest.mark.parametrize("metric", ["dot", "cosine"])
 @pytest.mark.parametrize("bs,qb", [(None, None), (1, 1), (3, 2), (2, 4), (1000, 1000)])
 def test_tiling_invariance(ds, metric, bs, qb):
@@ -287,6 +359,59 @@ searches:
     ref = _ref_topk(ds["qdocs"], ds["cdocs"], "dot", 8)
     for qi in ref:
         assert list(got[qi].keys()) == list(ref[qi].keys())
+
+
+def test_ragged_batch_ranges_enforce_actual_tokens_and_make_progress():
+    lengths = np.array([0, 3, 0, 7, 1, 10], dtype=np.int64)
+    offsets = np.concatenate(([0], np.cumsum(lengths)))
+    ranges = _ragged_batch_ranges(offsets, max_rows=4, max_tokens=8)
+    assert ranges == [(0, 3), (3, 5), (5, 6)]
+    assert [int(offsets[b] - offsets[a]) for a, b in ranges] == [3, 8, 10]
+    # The last document exceeds the budget by itself and must still advance.
+    assert all(b > a for a, b in ranges)
+
+
+def test_query_max_block_tokens_uses_actual_ragged_lengths():
+    import torch
+
+    lengths = np.array([1, 9, 2, 8, 3], dtype=np.int64)
+    offsets = np.concatenate(([0], np.cumsum(lengths)))
+    query = MultiVectorQuery(
+        torch.empty((int(offsets[-1]), 2)),
+        torch.tensor(offsets),
+        offsets,
+        len(lengths),
+        2,
+        "torch",
+    )
+    assert query.max_block_tokens == 10
+
+
+def test_double_buffer_flag_falls_back_exactly_on_cpu(ds):
+    out = ds["tmp"] / "out_double_buffer"
+    out.mkdir(exist_ok=True)
+    cfg_text = f"""
+corpus: {{path: {ds["cdir"]}, multivector_column: multivector_embedding, id_column: id}}
+queries: {{path: {ds["qpath"]}, multivector_column: multivector_embedding, id_column: qid}}
+output: {{path: {out}}}
+params:
+  io_workers: 2
+  multivector_batch_size: 1000
+  multivector_query_block: 2
+  multivector_token_budget: 64
+  multivector_double_buffer: true
+searches:
+  - {{name: mv, k: 8, metric: dot, vector_type: multivector}}
+"""
+    path = ds["tmp"] / "cfg_double_buffer.yaml"
+    path.write_text(cfg_text)
+    table = pq.read_table(run_compute(load_config(str(path)))["mv"]).to_pydict()
+    got = {
+        int(q): [int(i) for i in hit_ids]
+        for q, hit_ids in zip(table["query_id"], table["hit_ids"])
+    }
+    ref = _ref_topk(ds["qdocs"], ds["cdocs"], "dot", 8)
+    assert got == {query_id: list(scores) for query_id, scores in ref.items()}
 
 
 # ---------------------------------------------------------------------------
