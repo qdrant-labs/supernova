@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::{
-    Condition, QuantizationSearchParams, QueryBatchPointsBuilder, QueryPointsBuilder, Range as QdrantRange,
-    ScoredPoint, SearchParams,
+    Condition, DatetimeRange, QuantizationSearchParams, Query, QueryBatchPointsBuilder,
+    QueryPointsBuilder, Range as QdrantRange, ScoredPoint, SearchParams, Timestamp, VectorInput,
 };
 use qdrant_client::qdrant::Filter as QdrantFilter;
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use super::{BatchOutcome, QueryTarget};
 use crate::config::QueryConfig;
 use crate::errors::TargetError;
 use crate::filter::{Filter, FilterCondition, FilterFieldValue, MatchSpec, MatchValue, RangeCondition, RangeFromQuery};
-use crate::queries::QueryVector;
+use crate::queries::{QueryVector, VectorData};
 
 /// Qdrant's server-side search-time tuning (`query.search_params` for a
 /// `qdrant` target). All fields optional; the server applies its own defaults
@@ -308,6 +308,19 @@ fn to_qdrant_range(range: &RangeCondition) -> QdrantRange {
     QdrantRange { gt: range.gt, gte: range.gte, lt: range.lt, lte: range.lte }
 }
 
+/// A query's nearest-neighbour input in either modality. Dense stays the
+/// plain float vector it always was; sparse becomes qdrant's paired
+/// indices/values input (dot-scored server-side — qdrant sparse has no other
+/// metric). `query.vector_name` ("using") rides separately on the builder.
+fn query_input(vector: &VectorData) -> Query {
+    match vector {
+        VectorData::Dense(v) => Query::new_nearest(v.clone()),
+        VectorData::Sparse { indices, values } => {
+            Query::new_nearest(VectorInput::new_sparse(indices.clone(), values.clone()))
+        }
+    }
+}
+
 /// Translate a `match`/`match_from_query` value. Qdrant's own match condition
 /// has no float variant (only keyword/integer/bool, plus `MatchAny` lists of
 /// integers or keywords) — a `MatchValue::Float` is rejected here, not at
@@ -380,15 +393,26 @@ fn to_qdrant_match_from_value(field: &str, value: &FilterFieldValue) -> Result<C
     }
 }
 
+/// A `range_from_query` condition translates to one of TWO qdrant conditions,
+/// decided by the DATA: numeric column values build the f64 `Range` they
+/// always did; text values are parsed as RFC3339 datetimes and build a
+/// `DatetimeRange` (qdrant's datetime-indexed fields — e.g. fineweb's `date`
+/// — take timestamps on the gRPC wire, not strings). Mixing the two kinds
+/// across one condition's bounds is rejected: a range over one field is over
+/// one type.
 fn to_qdrant_range_from_query(
     field: &str,
     range: &RangeFromQuery,
     query_values: &HashMap<String, FilterFieldValue>,
 ) -> Result<Condition, TargetError> {
-    let bound = |col: &Option<String>| -> Result<Option<f64>, TargetError> {
+    enum Bound {
+        Num(f64),
+        Datetime(Timestamp),
+    }
+    let bound = |col: &Option<String>| -> Result<Option<Bound>, TargetError> {
         let Some(name) = col else { return Ok(None) };
         match resolve_query_value(query_values, name)? {
-            FilterFieldValue::Num(n) => Ok(Some(*n)),
+            FilterFieldValue::Num(n) => Ok(Some(Bound::Num(*n))),
             // Qdrant range bounds are f64; reject an integer that can't round-trip
             // exactly (|i| > 2^53) rather than silently shifting the bound.
             FilterFieldValue::Int(i) => {
@@ -401,17 +425,65 @@ fn to_qdrant_range_from_query(
                          can't be represented exactly as an f64 range bound"
                     )));
                 }
-                Ok(Some(f))
+                Ok(Some(Bound::Num(f)))
             }
+            FilterFieldValue::Text(s) => Ok(Some(Bound::Datetime(parse_datetime_bound(field, name, s)?))),
             _ => Err(TargetError::Other(format!(
-                "filter condition on `{field}`: `range_from_query` column `{name}` must be numeric"
+                "filter condition on `{field}`: `range_from_query` column `{name}` must be numeric \
+                 or an RFC3339 datetime string"
             ))),
         }
     };
-    Ok(Condition::range(
+
+    let (gt, gte, lt, lte) = (bound(&range.gt)?, bound(&range.gte)?, bound(&range.lt)?, bound(&range.lte)?);
+    let any_datetime = [&gt, &gte, &lt, &lte].iter().any(|b| matches!(b, Some(Bound::Datetime(_))));
+    if !any_datetime {
+        let num = |b: Option<Bound>| b.map(|b| if let Bound::Num(n) = b { n } else { unreachable!() });
+        return Ok(Condition::range(
+            field,
+            QdrantRange { gt: num(gt), gte: num(gte), lt: num(lt), lte: num(lte), ..Default::default() },
+        ));
+    }
+    let ts = |b: Option<Bound>| -> Result<Option<Timestamp>, TargetError> {
+        match b {
+            None => Ok(None),
+            Some(Bound::Datetime(t)) => Ok(Some(t)),
+            Some(Bound::Num(_)) => Err(TargetError::Other(format!(
+                "filter condition on `{field}`: `range_from_query` mixes datetime and numeric \
+                 bounds — one range condition is over one field of one type"
+            ))),
+        }
+    };
+    Ok(Condition::datetime_range(
         field,
-        QdrantRange { gt: bound(&range.gt)?, gte: bound(&range.gte)?, lt: bound(&range.lt)?, lte: bound(&range.lte)? },
+        DatetimeRange { gt: ts(gt)?, gte: ts(gte)?, lt: ts(lt)?, lte: ts(lte)?, ..Default::default() },
     ))
+}
+
+/// One datetime string as the `Timestamp` qdrant's gRPC `DatetimeRange`
+/// carries (re-exported by qdrant-client, so it always matches qdrant's own
+/// prost version). Parsing lives in [`crate::datetime`] — shared with the
+/// loader, which VALIDATES and normalizes every range-bound value at load
+/// time, so by the time a value reaches this per-dispatch path it is
+/// canonical RFC3339 and cannot fail. The error context here covers direct
+/// library callers that skip the loader.
+fn parse_datetime_bound(field: &str, column: &str, raw: &str) -> Result<Timestamp, TargetError> {
+    let parsed = crate::datetime::parse_datetime_utc(raw).map_err(|e| {
+        TargetError::Other(format!(
+            "filter condition on `{field}`: `range_from_query` column `{column}` value `{raw}` is \
+             not a recognized datetime — accepted forms are RFC3339 (offsets and pre-1970 dates \
+             included), `YYYY-MM-DD HH:MM:SS[+HH]`, and date-only `YYYY-MM-DD`, all read as UTC \
+             when offsetless: {e}"
+        ))
+    })?;
+    let total_nanos = parsed.unix_timestamp_nanos();
+    // Timestamp is (seconds, nanos 0..1e9); euclidean split keeps pre-1970
+    // values well-formed (e.g. 1969-12-31T23:59:59.5Z -> seconds=-1, nanos=5e8).
+    Ok(Timestamp {
+        seconds: total_nanos.div_euclid(1_000_000_000) as i64,
+        nanos: total_nanos.rem_euclid(1_000_000_000) as i32,
+        ..Default::default()
+    })
 }
 
 /// 2^63 = i64::MAX+1 — the first f64 above the i64 range (i64::MAX itself isn't
@@ -452,7 +524,7 @@ impl QueryTarget for QdrantTarget {
             .iter()
             .map(|q| {
                 let mut builder = QueryPointsBuilder::new(&self.collection_name)
-                    .query(q.vector.to_vec())
+                    .query(query_input(&q.vector))
                     .limit(self.top_k)
                     .with_payload(self.with_payload);
                 if let Some(name) = &self.vector_name {
@@ -790,5 +862,176 @@ mod tests {
         to_qdrant_condition(&cond("field: tenant_id\nmatch_from_query: tenant_column\n"), Some(&values))
             .unwrap();
         to_qdrant_condition(&cond("field: code\nmatch_from_query: codes_column\n"), Some(&values)).unwrap();
+    }
+
+    // ---------------------------------------------------------------- sparse
+
+    #[test]
+    fn query_input_builds_dense_and_sparse() {
+        use crate::queries::VectorData;
+
+        let dense = query_input(&VectorData::Dense(vec![0.1, 0.2]));
+        assert_eq!(dense, Query::new_nearest(vec![0.1, 0.2]));
+
+        let sparse =
+            query_input(&VectorData::Sparse { indices: vec![7, 42], values: vec![0.5, 0.25] });
+        assert_eq!(
+            sparse,
+            Query::new_nearest(VectorInput::new_sparse(vec![7u32, 42], vec![0.5f32, 0.25]))
+        );
+        // The two modalities must not collapse into the same wire shape.
+        assert_ne!(sparse, Query::new_nearest(vec![0.5f32, 0.25]));
+    }
+
+    // ------------------------------------------------------------- datetime
+
+    /// `2017-09-19T11:23:19Z` / `2018-05-28T09:22:20Z` — real fineweb `date`
+    /// values, epoch seconds computed independently.
+    const T1: (&str, i64) = ("2017-09-19T11:23:19Z", 1_505_820_199);
+    const T2: (&str, i64) = ("2018-05-28T09:22:20Z", 1_527_499_340);
+
+    fn datetime_values() -> HashMap<String, FilterFieldValue> {
+        HashMap::from([
+            ("date_gte".to_string(), FilterFieldValue::Text(T1.0.to_string())),
+            ("date_lt".to_string(), FilterFieldValue::Text(T2.0.to_string())),
+            ("ls_gte".to_string(), FilterFieldValue::Num(0.5)),
+        ])
+    }
+
+    #[test]
+    fn text_range_bounds_become_a_datetime_range() {
+        let condition = to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gte: date_gte\n  lt: date_lt\n"),
+            Some(&datetime_values()),
+        )
+        .unwrap();
+        let expected = Condition::datetime_range(
+            "date",
+            DatetimeRange {
+                gt: None,
+                gte: Some(Timestamp { seconds: T1.1, nanos: 0 }),
+                lt: Some(Timestamp { seconds: T2.1, nanos: 0 }),
+                lte: None,
+            },
+        );
+        assert_eq!(condition, expected);
+    }
+
+    #[test]
+    fn numeric_range_bounds_still_become_a_numeric_range() {
+        let condition = to_qdrant_condition(
+            &cond("field: language_score\nrange_from_query:\n  gte: ls_gte\n"),
+            Some(&datetime_values()),
+        )
+        .unwrap();
+        let expected = Condition::range(
+            "language_score",
+            QdrantRange { gt: None, gte: Some(0.5), lt: None, lte: None },
+        );
+        assert_eq!(condition, expected);
+    }
+
+    #[test]
+    fn mixed_datetime_and_numeric_bounds_are_rejected() {
+        let err = to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gte: date_gte\n  lt: ls_gte\n"),
+            Some(&datetime_values()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mixes datetime and numeric"), "{err}");
+    }
+
+    #[test]
+    fn a_non_datetime_string_bound_is_a_clear_error() {
+        let values = HashMap::from([(
+            "date_gte".to_string(),
+            FilterFieldValue::Text("last tuesday".to_string()),
+        )]);
+        let err = to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gte: date_gte\n"),
+            Some(&values),
+        )
+        .unwrap_err();
+        // Must be the datetime PARSER's message, not the generic "must be
+        // numeric or..." fallback — a mutation deleting the Text arm entirely
+        // was shown to survive a looser "RFC3339" substring.
+        assert!(err.to_string().contains("not a recognized datetime"), "{err}");
+    }
+
+    /// One helper: the condition `field: date / range_from_query: gte: col`
+    /// translated against a single text value.
+    fn datetime_gte(value: &str) -> Result<Condition, TargetError> {
+        let values =
+            HashMap::from([("col".to_string(), FilterFieldValue::Text(value.to_string()))]);
+        to_qdrant_condition(&cond("field: date\nrange_from_query:\n  gte: col\n"), Some(&values))
+    }
+
+    fn gte_timestamp(condition: Condition) -> Timestamp {
+        use qdrant_client::qdrant::condition::ConditionOneOf;
+        let ConditionOneOf::Field(f) = condition.condition_one_of.expect("field condition") else {
+            panic!("not a field condition")
+        };
+        f.datetime_range.expect("datetime range").gte.expect("gte bound set")
+    }
+
+    #[test]
+    fn pre_1970_datetimes_are_accepted_with_negative_seconds() {
+        let ts = gte_timestamp(datetime_gte("1969-12-31T23:59:59Z").unwrap());
+        assert_eq!((ts.seconds, ts.nanos), (-1, 0));
+        // fractional pre-1970: euclidean split keeps nanos in 0..1e9
+        let ts = gte_timestamp(datetime_gte("1969-12-31T23:59:59.5Z").unwrap());
+        assert_eq!((ts.seconds, ts.nanos), (-1, 500_000_000));
+    }
+
+    #[test]
+    fn nonzero_utc_offsets_are_accepted_and_normalized() {
+        // 12:00 at +02:00 == 10:00Z
+        let plus2 = gte_timestamp(datetime_gte("2017-09-19T12:00:00+02:00").unwrap());
+        let utc = gte_timestamp(datetime_gte("2017-09-19T10:00:00Z").unwrap());
+        assert_eq!(plus2, utc);
+    }
+
+    #[test]
+    fn fractional_seconds_carry_into_nanos() {
+        let ts = gte_timestamp(datetime_gte("2017-09-19T11:23:19.123Z").unwrap());
+        assert_eq!((ts.seconds, ts.nanos), (T1.1, 123_000_000));
+    }
+
+    #[test]
+    fn duckdb_space_separated_form_is_read_as_utc() {
+        let space = gte_timestamp(datetime_gte("2017-09-19 11:23:19").unwrap());
+        assert_eq!((space.seconds, space.nanos), (T1.1, 0));
+        // and with an explicit offset after the space form
+        let off = gte_timestamp(datetime_gte("2017-09-19 13:23:19+02:00").unwrap());
+        assert_eq!(off.seconds, T1.1);
+    }
+
+    #[test]
+    fn whitespace_padding_is_trimmed() {
+        let ts = gte_timestamp(datetime_gte("  2017-09-19T11:23:19Z  ").unwrap());
+        assert_eq!(ts.seconds, T1.1);
+    }
+
+    #[test]
+    fn all_four_datetime_bounds_translate() {
+        let values = HashMap::from([
+            ("a".to_string(), FilterFieldValue::Text(T1.0.to_string())),
+            ("b".to_string(), FilterFieldValue::Text(T2.0.to_string())),
+        ]);
+        let condition = to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gt: a\n  gte: a\n  lt: b\n  lte: b\n"),
+            Some(&values),
+        )
+        .unwrap();
+        let expected = Condition::datetime_range(
+            "date",
+            DatetimeRange {
+                gt: Some(Timestamp { seconds: T1.1, nanos: 0 }),
+                gte: Some(Timestamp { seconds: T1.1, nanos: 0 }),
+                lt: Some(Timestamp { seconds: T2.1, nanos: 0 }),
+                lte: Some(Timestamp { seconds: T2.1, nanos: 0 }),
+            },
+        );
+        assert_eq!(condition, expected);
     }
 }

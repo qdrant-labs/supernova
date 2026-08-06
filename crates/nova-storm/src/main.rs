@@ -57,6 +57,19 @@ async fn main() -> ExitCode {
                 println!("{summary}");
                 println!("{}", "=".repeat(50));
             }
+            // Dispatch errors are findings, not crashes — a run with SOME
+            // failures still measured something and exits 0. But a run where
+            // EVERY dispatch failed (wrong dimension, missing collection,
+            // absent sparse vector) measured nothing, and a scripted caller
+            // gating on the exit code must not read it as a passing run.
+            if summary.requests > 0 && summary.errors == summary.requests {
+                eprintln!(
+                    "error: all {} dispatches failed — nothing was measured (see the first-error \
+                     warn above for the cause)",
+                    summary.requests
+                );
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {

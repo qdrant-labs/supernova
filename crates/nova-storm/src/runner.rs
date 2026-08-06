@@ -305,6 +305,26 @@ pub struct DispatchSample {
     pub filter_overreturn: u64,
 }
 
+/// Errors are *counted* in the summary, but a count alone ("errors: 9869")
+/// sends the operator log-hunting for a cause the target already reported.
+/// Surface the first error message of the run, once — under load every
+/// dispatch usually fails the same way, so one message carries the story
+/// without turning a failing run into a log flood. The flag is PER-RUN
+/// (created in `run_storm`, threaded through the load loops), not a
+/// process-global: a library caller running several storms in one process
+/// gets each run's own first error, and test runs stay order-independent.
+/// Returns whether THIS call did the logging, so the exactly-once contract is
+/// directly testable.
+fn report_first_error(error_reported: &std::sync::atomic::AtomicBool, error: &str) -> bool {
+    let first = !error_reported.swap(true, Ordering::Relaxed);
+    if first {
+        tracing::warn!(
+            "first failed dispatch of the run (further failures are only counted): {error}"
+        );
+    }
+    first
+}
+
 /// Build a [`DispatchSample`] from a completed batch dispatch, applying the
 /// "only score recall on success" rule above per-query within the batch.
 /// `idxs[i]` is the vectors-index the i-th slot in `out.ids` corresponds to.
@@ -319,7 +339,12 @@ fn dispatch_sample(
     top_k: u64,
     filtered: bool,
     started: Instant,
+    error_reported: &std::sync::atomic::AtomicBool,
 ) -> DispatchSample {
+    if let Some(error) = &out.error {
+        report_first_error(error_reported, error);
+    }
+
     // A query scores recall only when the dispatch returned ids for it AND it
     // had ground truth. `recall_at_k` returning `None` there means the ground
     // truth was present but empty — count those separately rather than lose them.
@@ -443,11 +468,15 @@ pub async fn run_storm(
     let started = Instant::now();
     let stop_at = started + Duration::from_secs_f64(profile.duration_s);
     let batch_size = profile.batch_size.max(1);
+    // Per-run "first error already logged" flag — see `dispatch_sample`.
+    let error_reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     if profile.target_rps > 0.0 {
-        run_paced(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx).await;
+        run_paced(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx, &error_reported)
+            .await;
     } else {
-        run_closed_loop(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx).await;
+        run_closed_loop(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx, &error_reported)
+            .await;
     }
 
     // Drop the last sender so the collector's `recv` loop ends.
@@ -487,6 +516,7 @@ pub async fn run_storm(
 
 /// Hold `concurrency` requests in flight until the window closes; each task
 /// fires the next query the instant its previous one returns.
+#[allow(clippy::too_many_arguments)]
 async fn run_closed_loop(
     target: &Arc<dyn QueryTarget>,
     vectors: &Arc<Vec<QueryVector>>,
@@ -496,6 +526,7 @@ async fn run_closed_loop(
     top_k: u64,
     filtered: bool,
     tx: &mpsc::UnboundedSender<DispatchSample>,
+    error_reported: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     let n = vectors.len();
     let batch_size = profile.batch_size.max(1);
@@ -507,6 +538,7 @@ async fn run_closed_loop(
         let vectors = vectors.clone();
         let tx = tx.clone();
         let cursor = cursor.clone();
+        let error_reported = error_reported.clone();
         workers.spawn(async move {
             while Instant::now() < stop_at {
                 // fetch_add wraps far below usize::MAX over any real run.
@@ -514,7 +546,9 @@ async fn run_closed_loop(
                 let idxs = batch_indices(start, batch_size, n);
                 let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
                 let out = target.query_batch(&queries).await;
-                let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, filtered, started));
+                let _ = tx.send(dispatch_sample(
+                    &out, &idxs, &vectors, top_k, filtered, started, &error_reported,
+                ));
             }
         });
     }
@@ -527,6 +561,7 @@ async fn run_closed_loop(
 /// requests as a safety valve — when the cluster can't keep up the cap fills,
 /// `acquire` stalls the dispatcher, and the achieved rate sags below target
 /// (which is the finding, not an error).
+#[allow(clippy::too_many_arguments)]
 async fn run_paced(
     target: &Arc<dyn QueryTarget>,
     vectors: &Arc<Vec<QueryVector>>,
@@ -536,6 +571,7 @@ async fn run_paced(
     top_k: u64,
     filtered: bool,
     tx: &mpsc::UnboundedSender<DispatchSample>,
+    error_reported: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     let n = vectors.len();
     let batch_size = profile.batch_size.max(1);
@@ -560,10 +596,13 @@ async fn run_paced(
         let target = target.clone();
         let vectors = vectors.clone();
         let tx = tx.clone();
+        let error_reported = error_reported.clone();
         inflight.spawn(async move {
             let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
             let out = target.query_batch(&queries).await;
-            let _ = tx.send(dispatch_sample(&out, &idxs, &vectors, top_k, filtered, started));
+            let _ = tx.send(dispatch_sample(
+                &out, &idxs, &vectors, top_k, filtered, started, &error_reported,
+            ));
             drop(permit); // release the in-flight slot
         });
 
@@ -625,7 +664,7 @@ mod tests {
     fn vectors() -> Vec<QueryVector> {
         (0..16)
             .map(|i| QueryVector {
-                vector: vec![i as f32; 4],
+                vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                 ground_truth: None,
                 filter_values: HashMap::new(),
             })
@@ -680,7 +719,7 @@ mod tests {
         // (recall@4 = 1/4 = 0.25 each); the other half have none.
         let vectors: Vec<QueryVector> = (0..10)
             .map(|i| QueryVector {
-                vector: vec![i as f32; 4],
+                vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                 ground_truth: if i % 2 == 0 {
                     Some(HashSet::from(["a".to_string(), "z".into(), "y".into(), "x".into()]))
                 } else {
@@ -717,7 +756,7 @@ mod tests {
         let target = Arc::new(MockTarget { ids: vec![], fail: true });
         let vectors: Vec<QueryVector> = (0..8)
             .map(|i| QueryVector {
-                vector: vec![i as f32; 4],
+                vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                 ground_truth: Some(HashSet::from(["a".to_string()])),
                 filter_values: HashMap::new(),
             })
@@ -741,7 +780,7 @@ mod tests {
         let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
         let vectors: Vec<QueryVector> = (0..10)
             .map(|i| QueryVector {
-                vector: vec![i as f32; 4],
+                vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                 // even: real ground truth (recall@2 = 1/2); odd: present-but-empty.
                 ground_truth: Some(if i % 2 == 0 {
                     HashSet::from(["a".to_string(), "zzz".into()])
@@ -773,7 +812,7 @@ mod tests {
         let vectors = || -> Vec<QueryVector> {
             (0..8)
                 .map(|i| QueryVector {
-                    vector: vec![i as f32; 4],
+                    vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                     ground_truth: Some(HashSet::from(["a".to_string()])), // 1 id, "a" is a hit
                     filter_values: HashMap::new(),
                 })
@@ -951,7 +990,7 @@ mod tests {
                 let ids = queries
                     .iter()
                     .map(|q| {
-                        Some(match q.vector[0] as i64 {
+                        Some(match q.vector.as_dense().expect("test queries are dense")[0] as i64 {
                             0 => vec![], // 0/2 in ground truth -> recall 0.0
                             1 => vec!["a".to_string()], // 1/2 -> recall 0.5
                             _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
@@ -963,9 +1002,9 @@ mod tests {
         }
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
         let vectors = vec![
-            QueryVector { vector: vec![0.0], ground_truth: gt.clone(), filter_values: HashMap::new() },
-            QueryVector { vector: vec![1.0], ground_truth: gt.clone(), filter_values: HashMap::new() },
-            QueryVector { vector: vec![2.0], ground_truth: gt, filter_values: HashMap::new() },
+            QueryVector { vector: crate::queries::VectorData::Dense(vec![0.0]), ground_truth: gt.clone(), filter_values: HashMap::new() },
+            QueryVector { vector: crate::queries::VectorData::Dense(vec![1.0]), ground_truth: gt.clone(), filter_values: HashMap::new() },
+            QueryVector { vector: crate::queries::VectorData::Dense(vec![2.0]), ground_truth: gt, filter_values: HashMap::new() },
         ];
         // duration long enough to cycle through all 3 at concurrency=1 several times
         let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1 };
@@ -1126,7 +1165,7 @@ mod tests {
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
         let vectors: Vec<QueryVector> = (0..9)
             .map(|i| QueryVector {
-                vector: vec![i as f32],
+                vector: crate::queries::VectorData::Dense(vec![i as f32]),
                 ground_truth: gt.clone(),
                 filter_values: HashMap::new(),
             })
@@ -1144,5 +1183,18 @@ mod tests {
         assert!(results.recalls.iter().any(|s| (s.recall - 0.5).abs() < 1e-9));
         assert!(results.recalls.iter().any(|s| (s.recall - 1.0).abs() < 1e-9));
         assert_eq!(results.summary().batch_size, batch_size);
+    }
+
+    #[test]
+    fn first_error_is_reported_exactly_once_per_flag() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        assert!(report_first_error(&flag, "boom")); // first: logs
+        assert!(!report_first_error(&flag, "boom")); // second: counted only
+        assert!(!report_first_error(&flag, "different")); // still counted only
+
+        // a NEW flag (a new run) reports again — per-run, not per-process
+        let fresh = AtomicBool::new(false);
+        assert!(report_first_error(&fresh, "next run's error"));
     }
 }

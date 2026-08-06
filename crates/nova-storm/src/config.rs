@@ -33,7 +33,16 @@ impl StormConfig {
     /// Parse from YAML text, expanding `${VAR}` references first.
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigError> {
         let expanded = expand_env(yaml)?;
-        let cfg: Self = serde_yaml::from_str(&expanded)?;
+        let mut cfg: Self = serde_yaml::from_str(&expanded)?;
+        // Normalize the vector name once: trim padding (` sparse ` would pass
+        // validation but fail at dispatch with the untrimmed name) and treat a
+        // blank as absent for BOTH modalities.
+        cfg.query.vector_name = cfg
+            .query
+            .vector_name
+            .take()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty());
         // A `.limit(0)` query returns nothing and, if `ground_truth_column` is
         // set, divides recall by 0 (NaN) — reject at config time rather than
         // silently corrupting the summary.
@@ -42,6 +51,23 @@ impl StormConfig {
         }
         if cfg.load.batch_size == 0 {
             return Err(ConfigError::ZeroBatchSize);
+        }
+        // Sparse vectors are named in every backend that has them, so a sparse
+        // query with no `vector_name` (blank normalized to None above) can
+        // only ever fail at dispatch time -- reject it here where the fix is
+        // obvious.
+        if cfg.query.vector_type == VectorType::Sparse && cfg.query.vector_name.is_none() {
+            return Err(ConfigError::SparseRequiresVectorName);
+        }
+        // Only the qdrant target speaks sparse. Rejected here rather than
+        // per-dispatch: the per-dispatch guards fail in MICROSECONDS (no
+        // network round-trip), so a sparse config against a dense-only target
+        // would otherwise spin every worker flat-out for the whole duration,
+        // accumulate millions of ~0ms latency samples, and still exit 0.
+        if cfg.query.vector_type == VectorType::Sparse
+            && !matches!(cfg.target, crate::targets::TargetConfig::Qdrant(_))
+        {
+            return Err(ConfigError::SparseTargetUnsupported);
         }
         if let Some(filter) = &cfg.query.filter {
             filter.validate()?;
@@ -58,6 +84,17 @@ impl StormConfig {
     }
 }
 
+/// Whether the query column holds dense vectors (a `list<float>`) or sparse
+/// ones (a `struct{indices: list<int>, values: list<float>}` — the shape
+/// `nova embed`'s sparse output uses.  Mirrors `nova bf`'s per-set `vector_type` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorType {
+    #[default]
+    Dense,
+    Sparse,
+}
+
 /// What to query with: the named vector, how many neighbours, and where the
 /// query vectors are read from.
 #[derive(Debug, Deserialize)]
@@ -66,6 +103,11 @@ pub struct QueryConfig {
     /// Named vector to search (`None` for a single-vector collection).
     #[serde(default)]
     pub vector_name: Option<String>,
+    /// Dense (default) or sparse queries — see [`VectorType`]. Sparse always
+    /// requires `vector_name` (sparse vectors are named in every backend that
+    /// has them), and only the qdrant target supports it today.
+    #[serde(default)]
+    pub vector_type: VectorType,
     #[serde(default = "default_top_k")]
     pub top_k: u64,
     /// Ask the server to return each hit's full payload. Default `false`
@@ -175,6 +217,16 @@ pub enum ConfigError {
     ZeroTopK,
     #[error("load.batch_size must be greater than 0")]
     ZeroBatchSize,
+    #[error(
+        "query.vector_type is `sparse` but query.vector_name is not set — sparse vectors are \
+         always named; set vector_name to the collection's sparse vector (e.g. `sparse`)"
+    )]
+    SparseRequiresVectorName,
+    #[error(
+        "query.vector_type is `sparse` but the target does not support sparse queries — only \
+         the qdrant target speaks sparse today"
+    )]
+    SparseTargetUnsupported,
     #[error(
         "filter condition on `{field}` must set exactly one of `match`, `range`, `match_text`, \
          `match_from_query`, `range_from_query`, or `match_text_from_query`"
@@ -401,6 +453,79 @@ query:
 "#;
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
         assert_eq!(cfg.query.source.ground_truth_column.as_deref(), Some("hit_ids"));
+    }
+
+    /// A minimal valid config with `extra` spliced into the `query` section.
+    fn yaml_with_query_extras(extra: &str) -> String {
+        format!(
+            "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
+             query:\n{extra}  source:\n    uri: /tmp/q.parquet\n    column: embedding\n"
+        )
+    }
+
+    #[test]
+    fn vector_type_defaults_to_dense() {
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras("")).expect("parses");
+        assert_eq!(cfg.query.vector_type, VectorType::Dense);
+    }
+
+    #[test]
+    fn parses_sparse_vector_type_with_name() {
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras(
+            "  vector_name: sparse\n  vector_type: sparse\n",
+        ))
+        .expect("parses");
+        assert_eq!(cfg.query.vector_type, VectorType::Sparse);
+        assert_eq!(cfg.query.vector_name.as_deref(), Some("sparse"));
+    }
+
+    #[test]
+    fn sparse_without_vector_name_is_rejected() {
+        let err = StormConfig::from_yaml(&yaml_with_query_extras("  vector_type: sparse\n"))
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::SparseRequiresVectorName));
+    }
+
+    #[test]
+    fn blank_vector_name_is_rejected_for_sparse() {
+        let err = StormConfig::from_yaml(&yaml_with_query_extras(
+            "  vector_name: \"  \"\n  vector_type: sparse\n",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::SparseRequiresVectorName));
+    }
+
+    // Sparse against a dense-only target is rejected at CONFIG time (a
+    // per-dispatch guard fails in microseconds, so it would otherwise spin a
+    // full-duration ~0ms error loop and still exit 0). The elastic/milvus
+    // variants only exist under their features, so the negative case is
+    // feature-gated; the qdrant-passes case runs always.
+    #[cfg(feature = "elastic")]
+    #[test]
+    fn sparse_against_a_dense_only_target_is_rejected() {
+        let yaml = "target:\n  type: elastic\n  url: http://localhost:9200\n  index_name: c\n\
+             query:\n  vector_name: sparse\n  vector_type: sparse\n  source:\n    uri: /tmp/q.parquet\n    column: e\n";
+        let err = StormConfig::from_yaml(yaml).unwrap_err();
+        assert!(matches!(err, ConfigError::SparseTargetUnsupported));
+    }
+
+    #[test]
+    fn vector_name_is_trimmed_and_blank_means_absent() {
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras(
+            "  vector_name: \" sparse \"\n  vector_type: sparse\n",
+        ))
+        .expect("parses");
+        assert_eq!(cfg.query.vector_name.as_deref(), Some("sparse")); // padding gone
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras("  vector_name: \"  \"\n"))
+            .expect("parses");
+        assert_eq!(cfg.query.vector_name, None); // blank dense name -> absent
+    }
+
+    #[test]
+    fn unknown_vector_type_is_rejected() {
+        let err = StormConfig::from_yaml(&yaml_with_query_extras("  vector_type: hybrid\n"))
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::Yaml(_)));
     }
 
     fn expand(input: &str, vars: &[(&str, &str)]) -> Result<String, ConfigError> {

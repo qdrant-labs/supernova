@@ -32,6 +32,14 @@ duckdb = { workspace = true }
 # Target backends. Qdrant is always built in; elastic/milvus are optional (off by
 # default), mirroring nova-load's feature gating.
 qdrant-client = { workspace = true }
+# Datetime range filters: RFC3339 query-file values -> the Timestamp qdrant's
+# gRPC DatetimeRange carries. The Timestamp type itself comes from
+# qdrant-client's own re-export (qdrant_client::qdrant::Timestamp), so it
+# tracks qdrant's prost version automatically — no coupled prost-types pin.
+# `time` (not humantime) because full RFC3339 is required: humantime rejects
+# pre-1970 dates, nonzero UTC offsets, and lowercase t/z, all of which are
+# valid RFC3339 and appear in real corpora.
+time = { version = "0.3", features = ["parsing", "formatting"] }
 elasticsearch = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 milvus = { workspace = true, optional = true }

@@ -196,10 +196,16 @@ impl QueryTarget for ElasticTarget {
         // `num_candidates` is omitted when unset so ES applies its own default.
         let mut body: Vec<JsonBody<Value>> = Vec::with_capacity(queries.len() * 2);
         for q in queries {
+            // Dense-only target: guard at the point of use, so no separate
+            // check can drift out of sync — a sparse query is a per-dispatch
+            // data error, never a panic.
+            let Some(dense) = q.vector.as_dense() else {
+                return fail(started, queries.len(), "the elastic target does not support sparse queries".to_string());
+            };
             body.push(json!({ "index": self.index_name }).into());
             let mut knn = json!({
                 "field": self.vector_field,
-                "query_vector": q.vector,
+                "query_vector": dense,
                 "k": self.top_k,
             });
             if let Some(nc) = self.num_candidates {

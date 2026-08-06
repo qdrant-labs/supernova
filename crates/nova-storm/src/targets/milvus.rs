@@ -360,8 +360,16 @@ impl MilvusTarget {
         queries: &[&QueryVector],
         started: Instant,
     ) -> BatchOutcome {
-        let data: Vec<MValue> =
-            queries.iter().map(|q| MValue::FloatArray(Cow::Borrowed(q.vector.as_slice()))).collect();
+        // Dense-only transport: the guard lives HERE, next to the use, so a
+        // future call site (warm-up probe, retry path) cannot bypass it and
+        // panic — a sparse query is a per-dispatch data error, never a crash.
+        let Some(data) = queries
+            .iter()
+            .map(|q| q.vector.as_dense().map(|v| MValue::FloatArray(Cow::Borrowed(v))))
+            .collect::<Option<Vec<MValue>>>()
+        else {
+            return fail(started, queries.len(), "the milvus target does not support sparse queries".to_string());
+        };
         let mut option = SearchOption::new();
         for (k, v) in self.search_param_pairs() {
             option.add_param(k, json!(v));
@@ -409,7 +417,14 @@ impl MilvusTarget {
     }
 
     async fn search_rest(&self, queries: &[&QueryVector], started: Instant) -> BatchOutcome {
-        let vectors: Vec<&Vec<f32>> = queries.iter().map(|q| &q.vector).collect();
+        // Same in-place dense-only guard as `search_sdk` — see the note there.
+        let Some(vectors) = queries
+            .iter()
+            .map(|q| q.vector.as_dense())
+            .collect::<Option<Vec<&[f32]>>>()
+        else {
+            return fail(started, queries.len(), "the milvus target does not support sparse queries".to_string());
+        };
         let mut body = json!({
             "collectionName": self.collection_name,
             "data": vectors,
