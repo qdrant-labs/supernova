@@ -90,6 +90,28 @@ def test_params_dense_and_sparse_batch_size_fields_work():
     assert cfg.params.sparse_batch_size == 2048
 
 
+def test_params_multivector_kernel_values():
+    assert ParamsConfig().multivector_kernel == "torch"
+    for value in ("torch", "triton_reduce", "auto"):
+        assert ParamsConfig(multivector_kernel=value).multivector_kernel == value
+    with pytest.raises(ValidationError):
+        ParamsConfig(multivector_kernel="cuda")
+    # the fully fused backend was removed — a config still naming it must fail
+    # loudly at load time, not silently fall back
+    with pytest.raises(ValidationError):
+        ParamsConfig(multivector_kernel="triton")
+
+
+def test_params_multivector_double_buffer():
+    assert ParamsConfig().multivector_double_buffer is False
+    assert ParamsConfig(multivector_double_buffer=True).multivector_double_buffer is True
+
+
+def test_params_io_ranged_get():
+    assert ParamsConfig().io_ranged_get is False
+    assert ParamsConfig(io_ranged_get=True).io_ranged_get is True
+
+
 def test_params_run_level_fields_still_work():
     cfg = BruteForceConfig(**_base(
         params=ParamsConfig(io_workers=32, io_thread_count=64, merge_prefetch=True),

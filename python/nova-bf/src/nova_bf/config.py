@@ -148,6 +148,14 @@ class ParamsConfig(BaseModel):
     # pool-bound; if it stays flat you're network-bound. Applied via
     # pa.set_io_thread_count() once at startup.
     io_thread_count: int = 0
+    # Opt-in: download each large s3 corpus/queries parquet as MANY concurrent
+    # byte ranges before parsing (the `aws s3 cp` strategy). Files written with
+    # a large flush threshold hold ~ONE row group, so a single-column read
+    # degenerates into one sequential S3 stream (~22 MB/s measured in-region on
+    # pubmed's 4.3 GB shards) that `io_thread_count` cannot speed up; this
+    # restores NIC-rate reads (measured 10.6x) at the cost of one file's raw
+    # bytes of extra host RAM while that file is parsed. OFF by default.
+    io_ranged_get: bool = False
     # Bounds the per-file score matrix (`queries × rows`) for dense/sparse
     # searches respectively — a big file (or large query set) can otherwise
     # OOM the GPU; set this to score in row-batches instead of the whole file
