@@ -530,6 +530,13 @@ async fn run_closed_loop(
 ) {
     let n = vectors.len();
     let batch_size = profile.batch_size.max(1);
+    // Fixed-work mode (`passes > 0`): the run ends when every query has been
+    // fired exactly `passes` times, wall clock be damned — `duration_s` is
+    // ignored. The shared cursor is an absolute query-firing counter; a worker
+    // claims a batch by advancing it, trims the final batch to the remaining
+    // budget, and stops once the budget is spent.
+    let total_firings = profile.passes.checked_mul(n).unwrap_or(usize::MAX);
+    let fixed_work = profile.passes > 0;
     let cursor = Arc::new(AtomicUsize::new(0));
     let mut workers = JoinSet::new();
 
@@ -540,10 +547,21 @@ async fn run_closed_loop(
         let cursor = cursor.clone();
         let error_reported = error_reported.clone();
         workers.spawn(async move {
-            while Instant::now() < stop_at {
+            loop {
+                if !fixed_work && Instant::now() >= stop_at {
+                    break;
+                }
                 // fetch_add wraps far below usize::MAX over any real run.
-                let start = cursor.fetch_add(batch_size, Ordering::Relaxed) % n;
-                let idxs = batch_indices(start, batch_size, n);
+                let claimed = cursor.fetch_add(batch_size, Ordering::Relaxed);
+                let size = if fixed_work {
+                    if claimed >= total_firings {
+                        break;
+                    }
+                    batch_size.min(total_firings - claimed)
+                } else {
+                    batch_size
+                };
+                let idxs = batch_indices(claimed % n, size, n);
                 let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
                 let out = target.query_batch(&queries).await;
                 let _ = tx.send(dispatch_sample(
@@ -579,20 +597,32 @@ async fn run_paced(
     let sem = Arc::new(Semaphore::new(profile.concurrency.max(1)));
     let mut inflight = JoinSet::new();
     let mut idx = 0usize;
+    // Fixed-work mode: stop after every query has been launched `passes`
+    // times (still on the paced schedule); `duration_s` is ignored.
+    let total_firings = profile.passes.checked_mul(n).unwrap_or(usize::MAX);
+    let fixed_work = profile.passes > 0;
     // Fixed virtual schedule: each launch is pinned to `next`, which only ever
     // advances by `interval`. Falling behind admits the next launch immediately
     // (sleep_until is already in the past), so the average tracks target.
     let mut next = Instant::now();
 
-    while Instant::now() < stop_at {
+    loop {
+        if fixed_work {
+            if idx >= total_firings {
+                break;
+            }
+        } else if Instant::now() >= stop_at {
+            break;
+        }
         let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
         // acquire may have blocked; re-check the deadline before launching.
-        if Instant::now() >= stop_at {
+        if !fixed_work && Instant::now() >= stop_at {
             break;
         }
         let start = idx % n;
-        idx += batch_size;
-        let idxs = batch_indices(start, batch_size, n);
+        let size = if fixed_work { batch_size.min(total_firings - idx) } else { batch_size };
+        idx += size;
+        let idxs = batch_indices(start, size, n);
         let target = target.clone();
         let vectors = vectors.clone();
         let tx = tx.clone();
@@ -673,7 +703,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_loop_fires_many_and_records_each() {
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1, passes: 0 };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results = run_storm(target, vectors(), &profile, 10, false, None).await;
         let summary = results.summary();
@@ -694,7 +724,7 @@ mod tests {
     async fn paced_does_not_overshoot_target_rps() {
         let target_rps = 200.0;
         let duration_s = 0.5;
-        let profile = LoadProfile { concurrency: 16, duration_s, target_rps, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 16, duration_s, target_rps, batch_size: 1, passes: 0 };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results = run_storm(target, vectors(), &profile, 10, false, None).await;
         let summary = results.summary();
@@ -729,7 +759,7 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1, passes: 0 };
         let results = run_storm(target, vectors, &profile, 4, false, None).await;
         let summary = results.summary();
 
@@ -762,7 +792,7 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1, passes: 0 };
         let results = run_storm(target, vectors, &profile, 1, false, None).await;
         let summary = results.summary();
 
@@ -791,7 +821,7 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1, passes: 0 };
         let results = run_storm(target, vectors, &profile, 2, false, None).await;
         let summary = results.summary();
 
@@ -818,7 +848,7 @@ mod tests {
                 })
                 .collect()
         };
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1, passes: 0 };
 
         // With a filter: every firing over-returned relative to its 1-id ground
         // truth, so it's counted...
@@ -1007,7 +1037,7 @@ mod tests {
             QueryVector { vector: crate::queries::VectorData::Dense(vec![2.0]), ground_truth: gt, filter_values: HashMap::new() },
         ];
         // duration long enough to cycle through all 3 at concurrency=1 several times
-        let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1, passes: 0 };
         let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2, false, None).await;
 
         // Only asserts the pipeline actually produced all 3 distinct values --
@@ -1070,7 +1100,7 @@ mod tests {
         let mut recorder = cfg.build();
         recorder.begin().expect("begin");
 
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1, passes: 0 };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results = run_storm(target, vectors(), &profile, 10, false, Some(recorder)).await;
         let summary = results.summary();
@@ -1109,7 +1139,7 @@ mod tests {
             }
         }
 
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1 };
+        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1, passes: 0 };
         let target = Arc::new(MockTarget::ok(vec![]));
         let results =
             run_storm(target, vectors(), &profile, 10, false, Some(Box::new(FailingRecorder))).await;
@@ -1171,7 +1201,7 @@ mod tests {
             })
             .collect();
         let batch_size = 3;
-        let profile = LoadProfile { concurrency: 1, duration_s: 0.15, target_rps: 0.0, batch_size };
+        let profile = LoadProfile { concurrency: 1, duration_s: 0.15, target_rps: 0.0, batch_size, passes: 0 };
         let target = Arc::new(BatchCapturingTarget { call_lens: std::sync::Mutex::new(Vec::new()) });
         let results = run_storm(target.clone(), vectors, &profile, 2, false, None).await;
 
@@ -1183,6 +1213,81 @@ mod tests {
         assert!(results.recalls.iter().any(|s| (s.recall - 0.5).abs() < 1e-9));
         assert!(results.recalls.iter().any(|s| (s.recall - 1.0).abs() < 1e-9));
         assert_eq!(results.summary().batch_size, batch_size);
+    }
+
+    /// A per-query firing counter, for asserting fixed-work exactness: each
+    /// query's dense vector encodes its index, and the mock counts firings.
+    struct CountingTarget {
+        counts: std::sync::Mutex<HashMap<usize, usize>>,
+    }
+
+    impl std::fmt::Display for CountingTarget {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "counting")
+        }
+    }
+
+    #[async_trait]
+    impl QueryTarget for CountingTarget {
+        async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
+            let mut counts = self.counts.lock().unwrap();
+            for q in queries {
+                let idx = q.vector.as_dense().expect("dense test vectors")[0] as usize;
+                *counts.entry(idx).or_insert(0) += 1;
+            }
+            BatchOutcome {
+                latency: std::time::Duration::from_micros(50),
+                ok: true,
+                ids: vec![None; queries.len()],
+                error: None,
+            }
+        }
+    }
+
+    fn indexed_vectors(n: usize) -> Vec<QueryVector> {
+        (0..n)
+            .map(|i| QueryVector {
+                vector: crate::queries::VectorData::Dense(vec![i as f32]),
+                ground_truth: None,
+                filter_values: HashMap::new(),
+            })
+            .collect()
+    }
+
+    /// Fixed work, closed loop: every query fired EXACTLY `passes` times, no
+    /// more, no less — regardless of concurrency racing — and `duration_s` is
+    /// irrelevant (deliberately absurd here: a timed run of 0.001s could never
+    /// fit this work; a timed run of 10000s would never end the test).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fixed_work_fires_each_query_exactly_passes_times() {
+        let target = Arc::new(CountingTarget { counts: std::sync::Mutex::new(HashMap::new()) });
+        let vectors = indexed_vectors(10);
+        let profile =
+            LoadProfile { concurrency: 4, duration_s: 0.001, target_rps: 0.0, batch_size: 3, passes: 2 };
+        let results = run_storm(target.clone(), vectors, &profile, 10, false, None).await;
+
+        let counts = target.counts.lock().unwrap();
+        assert_eq!(counts.len(), 10);
+        assert!(counts.values().all(|&c| c == 2), "{counts:?}");
+        // 20 firings at batch 3 = 6 full batches + a 2-query tail = 7 dispatches
+        assert_eq!(results.n_ok, 7);
+    }
+
+    /// Fixed work, paced: the launch budget ends the run, not the clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_work_paced_fires_each_query_exactly_once() {
+        let target = Arc::new(CountingTarget { counts: std::sync::Mutex::new(HashMap::new()) });
+        let vectors = indexed_vectors(5);
+        // 1000 rps so the schedule is not the bottleneck; duration absurd both ways.
+        let profile =
+            LoadProfile { concurrency: 2, duration_s: 10_000.0, target_rps: 1000.0, batch_size: 2, passes: 1 };
+        let results = run_storm(target.clone(), vectors, &profile, 5, false, None).await;
+
+        let counts = target.counts.lock().unwrap();
+        assert_eq!(counts.len(), 5);
+        assert!(counts.values().all(|&c| c == 1), "{counts:?}");
+        // 5 firings at batch 2 = 2 full + 1-query tail = 3 dispatches
+        assert_eq!(results.n_ok, 3);
     }
 
     #[test]

@@ -174,6 +174,15 @@ pub struct LoadProfile {
     /// of size 1 by default, so existing configs behave identically.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// `0` (default) = timed run: fire for `duration_s`, queries cycling
+    /// round-robin. `>0` = FIXED-WORK run: fire every loaded query exactly
+    /// this many times, then stop — `duration_s` is ignored. Fixed work makes
+    /// run length data-dependent but the measurement composition exact: each
+    /// query contributes equally to recall and latency, so the mean recall is
+    /// the true mean over the query set (directly comparable to a brute-force
+    /// ground-truth sweep), not a mean over whichever firings a timer allowed.
+    #[serde(default)]
+    pub passes: usize,
 }
 
 impl Default for LoadProfile {
@@ -183,6 +192,7 @@ impl Default for LoadProfile {
             duration_s: default_duration(),
             target_rps: 0.0,
             batch_size: default_batch_size(),
+            passes: 0,
         }
     }
 }
