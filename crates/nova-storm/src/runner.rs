@@ -86,11 +86,13 @@ pub struct Summary {
     /// Batch dispatches (round-trips), not individual queries.
     pub requests: u64,
     pub errors: u64,
-    /// Of `errors`, how many were client-side timeouts (`timeout_s` expiry:
-    /// gRPC CANCELLED/DEADLINE_EXCEEDED). "Too slow" — a saturation signal —
-    /// as opposed to "broken". Any cell with `timeouts > 0` also has censored
-    /// tail latency: the timed-out dispatches contribute samples AT the
-    /// timeout value.
+    /// Of `errors`, how many were timeouts — the client's `timeout_s` expiry
+    /// (gRPC CANCELLED/DEADLINE_EXCEEDED) or the server's own search timeout
+    /// (qdrant: INTERNAL wrapping "timed out after"). "Too slow" — a
+    /// saturation signal — as opposed to "broken". Any cell with
+    /// `timeouts > 0` also has censored tail latency: the timed-out
+    /// dispatches contribute samples at (or, for server cuts, near) the
+    /// deadline instead of their honest duration.
     pub timeouts: u64,
     pub batch_size: usize,
     /// Batch dispatch rate — round-trips/sec, not query throughput.
@@ -200,7 +202,7 @@ impl std::fmt::Display for Summary {
             // Inserted right after the counts: a timing-out cell is "too slow
             // for timeout_s", not "broken", and its tail latency below is
             // censored at the timeout value.
-            lines.insert(2, format!("{:>16}: {} (client timeout_s expiry; tail latency censored)", "timeouts", self.timeouts));
+            lines.insert(2, format!("{:>16}: {} (client timeout_s or server search timeout; tail latency censored)", "timeouts", self.timeouts));
         }
         lines.extend([
             format!("{:>16}: {:.1}", "requests_per_sec", self.requests_per_sec),
@@ -342,9 +344,11 @@ fn report_first_error(error_reported: &std::sync::atomic::AtomicBool, error: &st
     let first = !error_reported.swap(true, Ordering::Relaxed);
     if first {
         let hint = if timed_out {
-            " [client-side timeout: the query was slower than the target's timeout_s -- raise it \
-             if the cluster is healthy-but-slow; the client also retries a cancelled read once, \
-             so each timeout costs ~2x timeout_s and doubles server work]"
+            " [timeout: the query outlived a deadline. Client-side (\"Timeout expired\"): raise \
+             the target's timeout_s if the cluster is healthy-but-slow; the client also retries \
+             a cancelled read once, so each such timeout costs ~2x timeout_s and doubles server \
+             work. Server-side (\"timed out after ...\"): raise the server's search timeout \
+             (qdrant: storage.performance.search_timeout_sec, 60s when unset)]"
         } else {
             ""
         };

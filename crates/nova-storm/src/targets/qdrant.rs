@@ -659,19 +659,30 @@ impl QueryTarget for QdrantTarget {
 /// plain string-set intersection against `hit_ids`, which `nova bf` also
 /// always stores as strings (see its own `str(...)` coercion) regardless of
 /// whether the underlying collection uses UUID or integer ids.
-/// Was this failure the CLIENT's own deadline rather than the server or the
-/// network? gRPC status codes are protocol constants (CANCELLED = 1,
-/// DEADLINE_EXCEEDED = 4 — fixed by the gRPC spec, not by tonic), so matching
-/// on the numeric code needs no tonic dependency. The client's tonic timeout
-/// layer surfaces `timeout_s` expiry as CANCELLED ("Timeout expired"); note
-/// the client also silently RETRIES a cancelled read once on a rebuilt
-/// channel, so an observed timeout costs ~2x `timeout_s` of wall time and
-/// double the server work — one more reason `timeout_s` must sit far above
-/// honest latency.
+/// Was this failure a deadline — the CLIENT's or the SERVER's — rather than
+/// a transport or query error? gRPC status codes are protocol constants
+/// (CANCELLED = 1, DEADLINE_EXCEEDED = 4 — fixed by the gRPC spec, not by
+/// tonic), so matching on the numeric code needs no tonic dependency. The
+/// client's tonic timeout layer surfaces `timeout_s` expiry as CANCELLED
+/// ("Timeout expired"); note the client also silently RETRIES a cancelled
+/// read once on a rebuilt channel, so an observed client timeout costs ~2x
+/// `timeout_s` of wall time and double the server work — one more reason
+/// `timeout_s` must sit far above honest latency.
+///
+/// The SERVER's own search timeout (`storage.performance.search_timeout_sec`,
+/// 60s when unset) does NOT arrive as DEADLINE_EXCEEDED: qdrant's replica-set
+/// read layer wraps the per-shard `Operation '...' timed out after ...` into
+/// a service error, so it lands here as INTERNAL (13) — verified live against
+/// qdrant with a 1s server timeout. Its message keeps the underlying
+/// "timed out after" text (qdrant's `OperationError::Timeout` display), which
+/// is what we sniff; if a future qdrant rewords it, such failures degrade to
+/// plain errors, never to false successes.
 fn is_client_timeout(err: &qdrant_client::QdrantError) -> bool {
     match err {
         qdrant_client::QdrantError::ResponseError { status } => {
             matches!(status.code() as i32, 1 | 4) // CANCELLED | DEADLINE_EXCEEDED
+                || (status.code() as i32 == 13 // INTERNAL wrapping the server's search timeout
+                    && status.message().contains("timed out after"))
         }
         _ => false,
     }
@@ -1007,10 +1018,23 @@ mod tests {
         for status in timeout_codes {
             assert!(is_client_timeout(&QdrantError::ResponseError { status }));
         }
+        // The server's own search timeout arrives as INTERNAL: qdrant's
+        // replica-set read layer wraps the shard's Timeout into a service
+        // error, keeping the "timed out after" text (verified live against a
+        // 1s storage.performance.search_timeout_sec).
+        let server_timeout = tonic::Status::internal(
+            "Service internal error: 1 of 1 read operations failed:\n  \
+             Timeout error: Operation 'Search' timed out after 999.376572ms",
+        );
+        assert!(is_client_timeout(&QdrantError::ResponseError { status: server_timeout }));
+
         let not_timeouts = [
             tonic::Status::invalid_argument("Wrong input: Not existing vector name"),
             tonic::Status::unavailable("connect refused"),
             tonic::Status::not_found("no collection"),
+            // INTERNAL alone is NOT a timeout — only with the server's
+            // "timed out after" marker text.
+            tonic::Status::internal("Service internal error: segment load failed"),
         ];
         for status in not_timeouts {
             assert!(!is_client_timeout(&QdrantError::ResponseError { status }));
