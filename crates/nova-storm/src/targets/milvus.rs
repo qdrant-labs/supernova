@@ -210,7 +210,7 @@ impl MilvusConfig {
                 "milvus target requires `query.vector_name` (the annsField to search)".to_string(),
             )
         })?;
-        if query.with_payload {
+        if query.with_payload.is_enabled() {
             tracing::warn!(
                 "milvus: `with_payload` has no effect — the milvus load backend doesn't persist \
                  payload, so there's nothing to fetch"
@@ -319,7 +319,7 @@ impl fmt::Display for MilvusTarget {
 
 /// A whole-batch failure outcome (no per-query ids).
 fn fail(started: Instant, n: usize, error: String) -> BatchOutcome {
-    BatchOutcome { latency: started.elapsed(), ok: false, ids: vec![None; n], error: Some(error) }
+    BatchOutcome { latency: started.elapsed(), ok: false, ids: vec![None; n], error: Some(error), timed_out: false, }
 }
 
 /// One SDK-returned id as a plain string (varchar → itself, int → decimal).
@@ -390,7 +390,7 @@ impl MilvusTarget {
                         latency: started.elapsed(),
                         ok: true,
                         ids: vec![None; results.len()],
-                        error: None,
+                        error: None, timed_out: false,
                     };
                 }
                 let mut ids = Vec::with_capacity(results.len());
@@ -410,7 +410,7 @@ impl MilvusTarget {
                     }
                     ids.push(Some(q));
                 }
-                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None, timed_out: false, }
             }
             Err(e) => fail(started, queries.len(), e.to_string()),
         }
@@ -478,7 +478,7 @@ impl MilvusTarget {
                 latency: started.elapsed(),
                 ok: true,
                 ids: vec![None; queries.len()],
-                error: None,
+                error: None, timed_out: false,
             };
         }
         let mut ids = Vec::with_capacity(queries.len());
@@ -498,7 +498,7 @@ impl MilvusTarget {
             }
             ids.push(Some(q));
         }
-        BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+        BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None, timed_out: false, }
     }
 }
 
@@ -507,7 +507,7 @@ impl QueryTarget for MilvusTarget {
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None, timed_out: false, };
         }
         match &self.transport {
             Transport::Sdk { collection, metric } => {

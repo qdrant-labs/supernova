@@ -63,6 +63,8 @@ pub struct StormResults {
     /// Count of batch dispatches, not individual queries.
     pub n_ok: u64,
     pub n_err: u64,
+    /// Of `n_err`, how many were CLIENT-side deadline expiries (`timeout_s`).
+    pub n_timeout: u64,
     pub wall_s: f64,
     /// How many query vectors went in each dispatch — carried alongside the
     /// raw samples so `summary()` can self-describe regardless of what
@@ -84,6 +86,12 @@ pub struct Summary {
     /// Batch dispatches (round-trips), not individual queries.
     pub requests: u64,
     pub errors: u64,
+    /// Of `errors`, how many were client-side timeouts (`timeout_s` expiry:
+    /// gRPC CANCELLED/DEADLINE_EXCEEDED). "Too slow" — a saturation signal —
+    /// as opposed to "broken". Any cell with `timeouts > 0` also has censored
+    /// tail latency: the timed-out dispatches contribute samples AT the
+    /// timeout value.
+    pub timeouts: u64,
     pub batch_size: usize,
     /// Batch dispatch rate — round-trips/sec, not query throughput.
     pub requests_per_sec: f64,
@@ -164,6 +172,7 @@ impl StormResults {
         Summary {
             requests: total,
             errors: self.n_err,
+            timeouts: self.n_timeout,
             batch_size: self.batch_size,
             requests_per_sec,
             qps: requests_per_sec * self.batch_size as f64,
@@ -186,13 +195,21 @@ impl std::fmt::Display for Summary {
             format!("{:>16}: {}", "requests", self.requests),
             format!("{:>16}: {}", "errors", self.errors),
             format!("{:>16}: {}", "batch_size", self.batch_size),
+        ];
+        if self.timeouts > 0 {
+            // Inserted right after the counts: a timing-out cell is "too slow
+            // for timeout_s", not "broken", and its tail latency below is
+            // censored at the timeout value.
+            lines.insert(2, format!("{:>16}: {} (client timeout_s expiry; tail latency censored)", "timeouts", self.timeouts));
+        }
+        lines.extend([
             format!("{:>16}: {:.1}", "requests_per_sec", self.requests_per_sec),
             format!("{:>16}: {:.1}", "qps", self.qps),
             format!("{:>16}: {:.2}", "p50_ms", self.p50_ms),
             format!("{:>16}: {:.2}", "p95_ms", self.p95_ms),
             format!("{:>16}: {:.2}", "p99_ms", self.p99_ms),
             format!("{:>16}: {:.2}", "max_ms", self.max_ms),
-        ];
+        ]);
         if let Some(b) = self.full_recall {
             lines.push(format!("{:>16}: {:.4} (n={})", "recall_full", b.mean, b.n));
         }
@@ -278,6 +295,12 @@ pub struct DispatchSample {
     pub t_s: f64,
     pub latency_ms: f64,
     pub ok: bool,
+    /// This dispatch failed on the CLIENT's own deadline (see
+    /// [`BatchOutcome::timed_out`]) — counted apart from other errors, because
+    /// a timing-out cell is a saturation finding while a transport error is a
+    /// broken run, and its latency sample sits AT the timeout value, so any
+    /// cell with `timeouts > 0` has artificially censored tail percentiles.
+    pub timed_out: bool,
     /// A query contributes no entry here (not a `0.0` entry) when it had no
     /// (or empty) ground truth to compare against, OR the whole dispatch failed
     /// (`!ok`) — a failed request has no "returned ids" to score, so it must not
@@ -315,11 +338,18 @@ pub struct DispatchSample {
 /// gets each run's own first error, and test runs stay order-independent.
 /// Returns whether THIS call did the logging, so the exactly-once contract is
 /// directly testable.
-fn report_first_error(error_reported: &std::sync::atomic::AtomicBool, error: &str) -> bool {
+fn report_first_error(error_reported: &std::sync::atomic::AtomicBool, error: &str, timed_out: bool) -> bool {
     let first = !error_reported.swap(true, Ordering::Relaxed);
     if first {
+        let hint = if timed_out {
+            " [client-side timeout: the query was slower than the target's timeout_s -- raise it \
+             if the cluster is healthy-but-slow; the client also retries a cancelled read once, \
+             so each timeout costs ~2x timeout_s and doubles server work]"
+        } else {
+            ""
+        };
         tracing::warn!(
-            "first failed dispatch of the run (further failures are only counted): {error}"
+            "first failed dispatch of the run (further failures are only counted): {error}{hint}"
         );
     }
     first
@@ -342,7 +372,7 @@ fn dispatch_sample(
     error_reported: &std::sync::atomic::AtomicBool,
 ) -> DispatchSample {
     if let Some(error) = &out.error {
-        report_first_error(error_reported, error);
+        report_first_error(error_reported, error, out.timed_out);
     }
 
     // A query scores recall only when the dispatch returned ids for it AND it
@@ -370,6 +400,7 @@ fn dispatch_sample(
         t_s: started.elapsed().as_secs_f64(),
         latency_ms: out.latency.as_secs_f64() * 1000.0,
         ok: out.ok,
+        timed_out: out.timed_out,
         recalls,
         empty_ground_truth,
         filter_overreturn,
@@ -435,6 +466,7 @@ pub async fn run_storm(
         let mut over_gt = 0u64;
         let mut n_ok = 0u64;
         let mut n_err = 0u64;
+        let mut n_timeout = 0u64;
         let mut dropped = 0u64;
         while let Some(s) = rx.recv().await {
             // Accumulate first — copying the fields the summary needs — so `s`
@@ -447,6 +479,9 @@ pub async fn run_storm(
                 n_ok += 1;
             } else {
                 n_err += 1;
+                if s.timed_out {
+                    n_timeout += 1;
+                }
             }
             if let Some(wtx) = writer_tx.as_ref() {
                 match wtx.try_send(s) {
@@ -462,7 +497,7 @@ pub async fn run_storm(
         }
         // Drop the sender so the writer thread's `recv` ends and it runs finish().
         drop(writer_tx);
-        (latencies, recalls, empty_gt, over_gt, n_ok, n_err, dropped)
+        (latencies, recalls, empty_gt, over_gt, n_ok, n_err, n_timeout, dropped)
     });
 
     let started = Instant::now();
@@ -483,7 +518,7 @@ pub async fn run_storm(
     drop(tx);
     let wall_s = started.elapsed().as_secs_f64();
 
-    let (latencies_ms, recalls, empty_ground_truth, filter_overreturn, n_ok, n_err, dropped_samples) =
+    let (latencies_ms, recalls, empty_ground_truth, filter_overreturn, n_ok, n_err, n_timeout, dropped_samples) =
         collector.await.unwrap_or_default();
     // Join the writer thread so its `finish()` (final flush) completes before we
     // return — otherwise a caller reading the file back could race the flush.
@@ -508,6 +543,7 @@ pub async fn run_storm(
         filter_overreturn,
         n_ok,
         n_err,
+        n_timeout,
         wall_s,
         batch_size,
         dropped_samples,
@@ -679,14 +715,14 @@ mod tests {
                     latency: Duration::from_micros(100),
                     ok: false,
                     ids: vec![None; queries.len()],
-                    error: Some("mock failure".into()),
+                    error: Some("mock failure".into()), timed_out: false,
                 };
             }
             BatchOutcome {
                 latency: Duration::from_micros(100),
                 ok: true,
                 ids: vec![Some(self.ids.clone()); queries.len()],
-                error: None,
+                error: None, timed_out: false,
             }
         }
     }
@@ -931,7 +967,7 @@ mod tests {
     fn summary_display_appends_recall_lines_only_when_present() {
         let base = Summary {
             requests: 10,
-            errors: 0,
+            errors: 0, timeouts: 0,
             batch_size: 1,
             requests_per_sec: 5.0,
             qps: 5.0,
@@ -975,7 +1011,7 @@ mod tests {
     fn summary_serializes_to_json_for_a_calling_tool_to_parse() {
         let summary = Summary {
             requests: 10,
-            errors: 1,
+            errors: 1, timeouts: 0,
             batch_size: 4,
             requests_per_sec: 5.0,
             qps: 20.0,
@@ -1027,7 +1063,7 @@ mod tests {
                         })
                     })
                     .collect();
-                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None }
+                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None, timed_out: false, }
             }
         }
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
@@ -1071,6 +1107,7 @@ mod tests {
             filter_overreturn: 0,
             n_ok: 3,
             n_err: 0,
+            n_timeout: 0,
             wall_s: 1.0,
             batch_size: 1,
             dropped_samples: 0,
@@ -1188,7 +1225,7 @@ mod tests {
                         })
                     })
                     .collect();
-                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None }
+                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None, timed_out: false, }
             }
         }
 
@@ -1239,7 +1276,7 @@ mod tests {
                 latency: std::time::Duration::from_micros(50),
                 ok: true,
                 ids: vec![None; queries.len()],
-                error: None,
+                error: None, timed_out: false,
             }
         }
     }
@@ -1294,12 +1331,12 @@ mod tests {
     fn first_error_is_reported_exactly_once_per_flag() {
         use std::sync::atomic::AtomicBool;
         let flag = AtomicBool::new(false);
-        assert!(report_first_error(&flag, "boom")); // first: logs
-        assert!(!report_first_error(&flag, "boom")); // second: counted only
-        assert!(!report_first_error(&flag, "different")); // still counted only
+        assert!(report_first_error(&flag, "boom", false)); // first: logs
+        assert!(!report_first_error(&flag, "boom", false)); // second: counted only
+        assert!(!report_first_error(&flag, "different", false)); // still counted only
 
         // a NEW flag (a new run) reports again — per-run, not per-process
         let fresh = AtomicBool::new(false);
-        assert!(report_first_error(&fresh, "next run's error"));
+        assert!(report_first_error(&fresh, "next run's error", false));
     }
 }

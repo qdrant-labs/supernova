@@ -110,14 +110,15 @@ pub struct QueryConfig {
     pub vector_type: VectorType,
     #[serde(default = "default_top_k")]
     pub top_k: u64,
-    /// Ask the server to return each hit's full payload. Default `false`
-    /// (ids/scores only). Turn it on when the production traffic being
-    /// modeled fetches payloads — payload retrieval is real server-side work
-    /// (reads payload storage, possibly from disk, for every hit) and real
-    /// response bytes, so benchmarking without it understates latency for
-    /// such workloads.
+    /// What payload the server returns with each hit. Default `false`
+    /// (ids/scores only). `true` = every payload field; a LIST of field names
+    /// (e.g. `[text]`) = only those fields — the shape a RAG workload has,
+    /// where each hit's document body comes back but nothing else. Either
+    /// non-false form makes the server do the payload-storage reads (possibly
+    /// from disk) for every hit, which is real cost a benchmark without it
+    /// understates.
     #[serde(default)]
-    pub with_payload: bool,
+    pub with_payload: WithPayload,
     pub source: QuerySource,
     /// Server-side search-time tuning, **interpreted per backend**. It's a raw
     /// value here so each target validates it against its own schema and rejects
@@ -132,6 +133,32 @@ pub struct QueryConfig {
     /// (Only the Qdrant target supports filters today; milvus/elastic reject one.)
     #[serde(default)]
     pub filter: Option<Filter>,
+}
+
+/// `query.with_payload`: a plain bool, or a list of payload field names to
+/// return (server-side include selector — the fields are trimmed at the
+/// source, not client-side).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum WithPayload {
+    Enable(bool),
+    Fields(Vec<String>),
+}
+
+impl Default for WithPayload {
+    fn default() -> Self {
+        WithPayload::Enable(false)
+    }
+}
+
+impl WithPayload {
+    /// Does this setting make the server read payload storage at all?
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            WithPayload::Enable(enabled) => *enabled,
+            WithPayload::Fields(fields) => !fields.is_empty(),
+        }
+    }
 }
 
 /// Where the query vectors come from — a parquet at a local path or `s3://`
@@ -325,7 +352,7 @@ load:
 "#;
         let cfg = StormConfig::from_yaml(yaml).expect("should parse");
         assert_eq!(cfg.query.top_k, 10);
-        assert!(!cfg.query.with_payload); // default: ids/scores only
+        assert!(!cfg.query.with_payload.is_enabled()); // default: ids/scores only
         assert_eq!(cfg.query.source.limit, 1000);
         assert_eq!(cfg.load.concurrency, 8);
         assert_eq!(cfg.load.target_rps, 75.0); // `rps` -> target_rps
@@ -418,7 +445,7 @@ query:
     column: embedding
 "#;
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        assert!(cfg.query.with_payload);
+        assert!(cfg.query.with_payload.is_enabled());
     }
 
     #[test]
@@ -517,6 +544,39 @@ query:
              query:\n  vector_name: sparse\n  vector_type: sparse\n  source:\n    uri: /tmp/q.parquet\n    column: e\n";
         let err = StormConfig::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, ConfigError::SparseTargetUnsupported));
+    }
+
+    #[test]
+    fn qdrant_timeout_defaults_generous_and_is_settable() {
+        use crate::targets::TargetConfig;
+        // default: 300s, NOT the qdrant client's 5s (a load tester must not
+        // count its own honest slow dispatches as errors)
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras("")).expect("parses");
+        let TargetConfig::Qdrant(q) = &cfg.target else { panic!("qdrant target") };
+        assert_eq!((q.timeout_s, q.connect_timeout_s), (300, 10));
+
+        let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n  timeout_s: 600\n  connect_timeout_s: 30\n\
+             query:\n  source:\n    uri: /tmp/q.parquet\n    column: e\n";
+        let cfg = StormConfig::from_yaml(yaml).expect("parses");
+        let TargetConfig::Qdrant(q) = &cfg.target else { panic!("qdrant target") };
+        assert_eq!((q.timeout_s, q.connect_timeout_s), (600, 30));
+    }
+
+    #[test]
+    fn with_payload_accepts_bool_and_field_list() {
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras("  with_payload: [text]\n"))
+            .expect("parses");
+        assert_eq!(cfg.query.with_payload, WithPayload::Fields(vec!["text".into()]));
+        assert!(cfg.query.with_payload.is_enabled());
+
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras("  with_payload: true\n"))
+            .expect("parses");
+        assert_eq!(cfg.query.with_payload, WithPayload::Enable(true));
+
+        // an empty include list selects nothing -> payload reads stay off
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras("  with_payload: []\n"))
+            .expect("parses");
+        assert!(!cfg.query.with_payload.is_enabled());
     }
 
     #[test]

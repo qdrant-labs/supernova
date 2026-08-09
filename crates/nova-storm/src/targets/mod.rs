@@ -44,6 +44,12 @@ pub struct BatchOutcome {
     /// was on, the dispatch succeeded, and that query just matched nothing.
     pub ids: Vec<Option<Vec<String>>>,
     pub error: Option<String>,
+    /// The failure was a CLIENT-SIDE deadline (gRPC CANCELLED/DEADLINE_EXCEEDED
+    /// — "the query was too slow for `timeout_s`"), not a broken target. Kept
+    /// apart from other errors all the way into the summary: a timing-out cell
+    /// is a saturation finding, a connection error is a broken run, and mixing
+    /// them makes both unreadable.
+    pub timed_out: bool,
 }
 
 /// A backend a storm sends queries to. `Display` is the name used in logs

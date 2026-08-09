@@ -15,7 +15,7 @@ use qdrant_client::qdrant::Filter as QdrantFilter;
 use serde::Deserialize;
 
 use super::{BatchOutcome, QueryTarget};
-use crate::config::QueryConfig;
+use crate::config::{QueryConfig, WithPayload};
 use crate::errors::TargetError;
 use crate::filter::{Filter, FilterCondition, FilterFieldValue, MatchSpec, MatchValue, RangeCondition, RangeFromQuery};
 use crate::queries::{QueryVector, VectorData};
@@ -70,11 +70,12 @@ pub struct QdrantTarget {
     /// a wasted allocation (a `String` clone per returned point) on every
     /// query.
     collect_ids: bool,
-    /// Ask the server for each hit's full payload (`query.with_payload`).
+    /// The payload selector built once from `query.with_payload` (bool or an
+    /// include-list of fields, e.g. just `text` for a RAG-shaped workload).
     /// The payloads are dropped on arrival — storm measures, it doesn't
     /// consume — but requesting them makes the server do the payload reads
     /// and ship the bytes, which is the cost being modeled.
-    with_payload: bool,
+    with_payload: qdrant_client::qdrant::with_payload_selector::SelectorOptions,
     /// Translated once at construction and applied unchanged to every
     /// query — set only when `query.filter` has no `_from_query` condition
     /// (a uniform filter has nothing to resolve per query). `None` when
@@ -113,6 +114,24 @@ pub struct QdrantConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_collection")]
     pub collection_name: String,
+    /// Per-operation (query) timeout in seconds. The qdrant client's own
+    /// default is FIVE seconds — far too short for a load tester, whose whole
+    /// job is to push a cluster into multi-second latencies; hitting it turns
+    /// honest slow dispatches into "operation was cancelled / Timeout
+    /// expired" errors and corrupts the error counts. Unset = 300s.
+    #[serde(default = "default_timeout_s")]
+    pub timeout_s: u64,
+    /// Connection-establishment timeout in seconds. Unset = 10s.
+    #[serde(default = "default_connect_timeout_s")]
+    pub connect_timeout_s: u64,
+}
+
+fn default_timeout_s() -> u64 {
+    300
+}
+
+fn default_connect_timeout_s() -> u64 {
+    10
 }
 
 fn default_collection() -> String {
@@ -122,7 +141,14 @@ fn default_collection() -> String {
 impl QdrantConfig {
     /// Connect and build the target, baking in the query knobs from `query`.
     pub fn into_target(self, query: &QueryConfig) -> Result<QdrantTarget, TargetError> {
-        let mut builder = Qdrant::from_url(&self.url);
+        // skip_compatibility_check: without it, `build()` fires a synchronous
+        // version-probe RPC before the run starts — an unreachable server then
+        // stalls construction for the full `timeout_s` instead of failing on
+        // the first dispatch, where the error is actually counted.
+        let mut builder = Qdrant::from_url(&self.url)
+            .timeout(std::time::Duration::from_secs(self.timeout_s))
+            .connect_timeout(std::time::Duration::from_secs(self.connect_timeout_s))
+            .skip_compatibility_check();
         if let Some(key) = self.api_key {
             builder = builder.api_key(key);
         }
@@ -171,7 +197,17 @@ impl QdrantConfig {
             top_k: query.top_k,
             search_params: search_params.as_ref().map(SearchParams::from),
             collect_ids: query.source.ground_truth_column.is_some(),
-            with_payload: query.with_payload,
+            with_payload: {
+                use qdrant_client::qdrant::with_payload_selector::SelectorOptions;
+                match &query.with_payload {
+                    WithPayload::Enable(enabled) => SelectorOptions::Enable(*enabled),
+                    // Server-side include selector: only these fields come
+                    // back (the RAG shape -- e.g. just `text`).
+                    WithPayload::Fields(fields) => SelectorOptions::Include(
+                        qdrant_client::qdrant::PayloadIncludeSelector { fields: fields.clone() },
+                    ),
+                }
+            },
             static_filter,
             per_query_filter,
         })
@@ -518,7 +554,7 @@ impl QueryTarget for QdrantTarget {
         // skew this dispatch's contribution to the run's latency percentiles.
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None, timed_out: false, };
         }
         let query_points: Vec<_> = match queries
             .iter()
@@ -526,7 +562,7 @@ impl QueryTarget for QdrantTarget {
                 let mut builder = QueryPointsBuilder::new(&self.collection_name)
                     .query(query_input(&q.vector))
                     .limit(self.top_k)
-                    .with_payload(self.with_payload);
+                    .with_payload(self.with_payload.clone());
                 if let Some(name) = &self.vector_name {
                     builder = builder.using(name.clone());
                 }
@@ -550,7 +586,7 @@ impl QueryTarget for QdrantTarget {
                     latency: started.elapsed(),
                     ok: false,
                     ids: vec![None; queries.len()],
-                    error: Some(e.to_string()),
+                    error: Some(e.to_string()), timed_out: false,
                 };
             }
         };
@@ -572,6 +608,7 @@ impl QueryTarget for QdrantTarget {
                     resp.result.len(),
                     queries.len()
                 )),
+                timed_out: false,
             },
             Ok(resp) => {
                 if !self.collect_ids {
@@ -579,7 +616,7 @@ impl QueryTarget for QdrantTarget {
                         latency: started.elapsed(),
                         ok: true,
                         ids: vec![None; resp.result.len()],
-                        error: None,
+                        error: None, timed_out: false,
                     };
                 }
                 let mut ids = Vec::with_capacity(resp.result.len());
@@ -596,19 +633,20 @@ impl QueryTarget for QdrantTarget {
                                 ids: vec![None; queries.len()],
                                 error: Some(
                                     "qdrant returned a scored point without a valid id".to_string(),
-                                ),
+                                ), timed_out: false,
                             };
                         };
                         query_ids.push(id);
                     }
                     ids.push(Some(query_ids));
                 }
-                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None, timed_out: false, }
             }
             Err(e) => BatchOutcome {
                 latency: started.elapsed(),
                 ok: false,
                 ids: vec![None; queries.len()],
+                timed_out: is_client_timeout(&e),
                 error: Some(e.to_string()),
             },
         }
@@ -621,6 +659,24 @@ impl QueryTarget for QdrantTarget {
 /// plain string-set intersection against `hit_ids`, which `nova bf` also
 /// always stores as strings (see its own `str(...)` coercion) regardless of
 /// whether the underlying collection uses UUID or integer ids.
+/// Was this failure the CLIENT's own deadline rather than the server or the
+/// network? gRPC status codes are protocol constants (CANCELLED = 1,
+/// DEADLINE_EXCEEDED = 4 — fixed by the gRPC spec, not by tonic), so matching
+/// on the numeric code needs no tonic dependency. The client's tonic timeout
+/// layer surfaces `timeout_s` expiry as CANCELLED ("Timeout expired"); note
+/// the client also silently RETRIES a cancelled read once on a rebuilt
+/// channel, so an observed timeout costs ~2x `timeout_s` of wall time and
+/// double the server work — one more reason `timeout_s` must sit far above
+/// honest latency.
+fn is_client_timeout(err: &qdrant_client::QdrantError) -> bool {
+    match err {
+        qdrant_client::QdrantError::ResponseError { status } => {
+            matches!(status.code() as i32, 1 | 4) // CANCELLED | DEADLINE_EXCEEDED
+        }
+        _ => false,
+    }
+}
+
 fn point_id_string(point: &ScoredPoint) -> Option<String> {
     match point.id.as_ref()?.point_id_options.as_ref()? {
         PointIdOptions::Uuid(s) => Some(s.clone()),
@@ -939,6 +995,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("mixes datetime and numeric"), "{err}");
+    }
+
+    /// gRPC CANCELLED (what tonic's timeout layer emits as "Timeout expired")
+    /// and DEADLINE_EXCEEDED are client-side timeouts; everything else is not.
+    #[test]
+    fn client_timeouts_are_classified_by_grpc_code() {
+        use qdrant_client::QdrantError;
+        let timeout_codes =
+            [tonic::Status::cancelled("Timeout expired"), tonic::Status::deadline_exceeded("x")];
+        for status in timeout_codes {
+            assert!(is_client_timeout(&QdrantError::ResponseError { status }));
+        }
+        let not_timeouts = [
+            tonic::Status::invalid_argument("Wrong input: Not existing vector name"),
+            tonic::Status::unavailable("connect refused"),
+            tonic::Status::not_found("no collection"),
+        ];
+        for status in not_timeouts {
+            assert!(!is_client_timeout(&QdrantError::ResponseError { status }));
+        }
     }
 
     #[test]
