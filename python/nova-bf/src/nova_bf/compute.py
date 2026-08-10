@@ -47,6 +47,15 @@ approximation, so a filtered search's metric never needs to already be used
 by anyone else — computing one more metric on a batch that's already
 resident on the GPU is cheap, unlike a second transfer.
 
+Several metrics on one batch also share the underlying PRODUCT, not just the
+transfer. Every dense metric is derivable from the same Gram `Q @ Cᵀ` plus
+per-vector norms (dot is the Gram; cosine divides by ‖c‖ and ‖q‖; euclidean is
+`−sqrt(‖q‖² + ‖c‖² − 2·Gram)`), so a batch scored by 2+ distinct dense metrics
+runs ONE GEMM and derives the rest — see `DenseBatchSlice`. `SparseBatchSlice`
+does the same for its own `dot`/`cosine` pair via `_masked_raw`. Both cost one
+extra `(n_q, rows)` matrix at peak and both leave the single-metric path
+untouched.
+
 What rows make up that shared grid depends on whether any search of the
 vector_type is unfiltered:
 
@@ -625,10 +634,17 @@ class DenseCorpusBatch:
     """Decoded dense corpus vectors for one file: `(n_rows, dim)`. Exposes the
     same `.n_rows`/`.nbytes`/`.compact`/`.transfer` surface as
     `SparseCorpusBatch` so `run_compute`'s per-file loop never branches on
-    vector_type."""
+    vector_type.
+
+    `share_gram` is set by `_process_batch_group` (from `metric_share_count`)
+    once it knows how many DISTINCT metrics will score this batch, and is
+    handed to every slice `transfer` produces — carried on the batch rather
+    than passed as a `transfer` argument so the `transfer(r0, r1, device)`
+    surface stays identical across vector_types. See `DenseBatchSlice`."""
 
     def __init__(self, arr: np.ndarray):
         self.arr = arr
+        self.share_gram = False
 
     @property
     def n_rows(self) -> int:
@@ -650,19 +666,79 @@ class DenseCorpusBatch:
         import torch
 
         Cb = torch.from_numpy(self.arr[r0:r1]).to(device, non_blocking=True)
-        return DenseBatchSlice(Cb)
+        return DenseBatchSlice(Cb, self.share_gram)
 
 
 @dataclass
 class DenseBatchSlice:
+    """One on-device slice of a dense corpus batch.
+
+    When two or more DISTINCT metrics score this slice (`share_gram`, set from
+    `metric_share_count` — see `_process_batch_group`), all of them are derived
+    from ONE raw Gram matrix `Q @ Cbᵀ` instead of each running its own GEMM:
+
+        dot        the Gram itself, returned WITHOUT a copy
+        cosine     Gram / ‖c‖ / ‖q‖              (per-row, then per-query scalar)
+        euclidean  −sqrt(‖q‖² + ‖c‖² − 2·Gram)   (clamped at 0)
+
+    The two formulations are mathematically equivalent and differ in float32 only because
+    normalization and accumulation happen in a different order — measured ~1 ulp
+    apart, with NO consistent accuracy advantage either way.
+
+    Cost: one extra `(n_q, rows)` matrix at peak — the Gram stays alive across
+    the member loop while each derived metric is built, where the unshared path
+    holds only the current metric's matrix. Bounded by `params.dense_batch_size`,
+    and the same trade `SparseBatchSlice` already documents for its own raw
+    cache. A batch scored by a SINGLE metric keeps the unshared `_scores` path
+    untouched, so the common case pays neither the extra matrix nor any change
+    in output.
+    """
+
     Cb: object  # torch.Tensor, (n_rows, dim)
+    share_gram: bool = False
+    _raw: object = None       # lazy Q @ Cbᵀ — only ever built when share_gram
+    _c_norms: object = None   # lazy per-row L2 norms (cosine)
+    _c_sq: object = None      # lazy per-row squared L2 norms (euclidean)
 
     @property
     def n_rows(self) -> int:
         return self.Cb.shape[0]
 
     def score(self, Q, metric: str, q_norms=None):
-        return _scores(Q, self.Cb, metric, q_norms)
+        if not self.share_gram:
+            return _scores(Q, self.Cb, metric, q_norms)
+        if self._raw is None:
+            self._raw = Q @ self.Cb.T
+        raw = self._raw
+        if metric == "dot":
+            # The Gram IS the dot score matrix — no copy. Callers never mutate
+            # what `score()` hands back in place (`_process_batch_group` uses
+            # `masked_fill`/column indexing, both of which allocate), so this
+            # stays safe to alias for the other metrics below.
+            return raw
+        if metric == "cosine":
+            if self._c_norms is None:
+                # clamp matches F.normalize's eps, so a zero corpus row scores
+                # 0 rather than NaN — identical convention to `_scores`.
+                self._c_norms = self.Cb.norm(dim=1).clamp_min(1e-12)
+            # First div allocates (raw must survive for the other metrics);
+            # the second is in place on that fresh copy.
+            return raw.div(self._c_norms[None, :]).div_(q_norms[:, None])
+        # euclidean: negate the distance so larger = nearer (topk picks
+        # nearest), matching `_scores`. Accumulated into ONE new tensor
+        # (`raw.mul(-2)` then two broadcast adds in place) rather than the
+        # naive `q_sq + c_sq - 2*raw`, which would hold two temporaries of the
+        # full (n_q, rows) size at once.
+        if self._c_sq is None:
+            self._c_sq = self.Cb.pow(2).sum(1)
+        # `run_compute` supplies `q_norms` for euclidean specs precisely so this
+        # is a reuse rather than a recompute; the fallback keeps `score()`
+        # callable standalone (tests, any future direct caller).
+        q_sq = q_norms.pow(2) if q_norms is not None else Q.pow(2).sum(1)
+        d2 = raw.mul(-2.0)
+        d2 += self._c_sq[None, :]
+        d2 += q_sq[:, None]
+        return d2.clamp_min_(0).sqrt_().neg_()
 
 
 class SparseCorpusBatch:
@@ -1470,6 +1546,12 @@ def _process_batch_group(
     # n_q=100k / rows=4096 — gets collected right after its own merge instead
     # of sitting in `score_cache` through every later member's matmul+merge.
     metric_share_count = Counter(specs[m].metric for m in member_idxs)
+    # Dense only: when 2+ DISTINCT metrics score this batch, derive all of them
+    # from ONE raw Gram instead of one GEMM each (see `DenseBatchSlice`). A
+    # single-metric batch keeps the unshared path, so it pays neither the extra
+    # resident matrix nor any change in its float32 output.
+    if isinstance(batch, DenseCorpusBatch):
+        batch.share_gram = len(metric_share_count) > 1
 
     # Amortized running top-k (see _merge_topk): per-slice candidates are
     # buffered (each part pre-topk'd to <= k columns, so the buffer holds at
@@ -2350,13 +2432,30 @@ def run_compute(
             )
         else:
             Q_gpu_by_vt[vt] = flat
+    # How many DISTINCT metrics each vector_type carries — the same quantity
+    # `_process_batch_group` gates the shared-Gram path on (its `member_idxs`
+    # is exactly this vt's spec list), computed here so a euclidean spec that
+    # can never share is not charged for query norms it will not read.
+    vt_distinct_metrics = {
+        vt: len({s.metric for s in specs if s.vector_type == vt}) for vt in vts_needed
+    }
     q_norms_by_vt: dict[str, object] = {}
     spec_Q, spec_q_norms, spec_top_scores, spec_top_enc = [], [], [], []
     for s in specs:
         # Multivector cosine normalizes each TOKEN inside score() (not a
         # per-query scalar divide like dense/sparse), so it needs no `q_norms`
         # — and Q here is a MultiVectorQuery, not a tensor with .norm().
-        if s.metric == "cosine" and s.vector_type != "multivector":
+        #
+        # `euclidean` (dense-only — rejected for sparse/multivector at config
+        # load) takes `q_norms` ONLY when the shared-Gram derivation can
+        # actually engage for its vector_type, i.e. some sibling spec uses a
+        # different metric: `_scores`'s euclidean branch ignores the argument,
+        # so building it for a euclidean-only run would be one O(n_q × dim)
+        # reduction and an (n_q,) tensor that nothing ever reads.
+        needs_q_norms = s.metric == "cosine" or (
+            s.metric == "euclidean" and vt_distinct_metrics[s.vector_type] > 1
+        )
+        if needs_q_norms and s.vector_type != "multivector":
             if s.vector_type not in q_norms_by_vt:
                 # clamp matches F.normalize's eps — a zero query scores 0
                 # everywhere instead of NaN (and its no-overlap gate already

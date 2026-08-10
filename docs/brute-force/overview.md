@@ -194,9 +194,20 @@ and `merge` (or single-GPU `compute`) writes each search's final result:
 | `query_id` | `str` | from `queries.id_column`, else `make_point_id(query_file, row)` |
 | *(payload)* | — | each column listed in `queries.payload_fields` |
 | `hit_ids` | `list[str]` | the K nearest corpus ids, best first |
-| `hit_scores` | `list[float]` | their similarity scores, descending |
+| `hit_scores` | `list[float]` | the matching scores, descending — always larger-is-nearer (see below) |
 
-**Sanity check:** if a query also appears in the corpus, its top hit should be itself with score ≈ 1.0 (cosine).
+**Score sign.** `hit_scores` is always ordered best-first, larger-is-nearer, so one ranking convention covers every metric. For `cosine` and `dot` that is the similarity itself. For **`euclidean` it is the NEGATED distance**, so every value is `≤ 0` and the nearest hit is the least negative:
+
+```
+euclidean:  scores=[-0.0007, -1.2913, -2.3253]   # distances 0.0007, 1.2913, 2.3253
+cosine:     scores=[ 1.0,     0.8110,  0.5593]
+```
+
+Recover a distance with `distance = -score`. This matters when comparing against a vector store directly: Qdrant reports Euclid as a *positive* distance sorted *ascending*, so line the two up by negating one side. It does not affect recall, which is an id-set intersection over `hit_ids` and never reads scores.
+
+Do not confuse this with a negative `dot` or `cosine` score, which is **not** a sign convention — it is the real similarity of two vectors pointing in opposing directions, written through unmodified (`cosine` spans `[-1, 1]`; `dot` is unbounded). The tell is the proportion: `euclidean` is negative for *every* hit by construction, while `dot`/`cosine` are negative only where the data says so. A positive value in a `euclidean` column means something is wrong.
+
+**Sanity check:** if a query also appears in the corpus, its top hit should be itself — with score ≈ 1.0 for cosine, or ≈ 0.0 for euclidean. Expect the euclidean self-hit to be a small negative number rather than exactly `-0.0`: it is computed as `‖q‖² + ‖c‖² − 2q·c`, whose cancellation resolves a true zero to roughly `sqrt(float32 eps) · ‖q‖` (~1e-2 at `‖q‖≈35`). That is inherent to the expansion — `torch.cdist` uses the same one at any real corpus size — and it bounds how finely euclidean *distances* can be trusted between near-duplicates, though not the ranking of ordinary neighbours.
 
 ## Hit IDs & recall evaluation
 
