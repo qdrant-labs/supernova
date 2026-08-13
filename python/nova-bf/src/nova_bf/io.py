@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -23,6 +24,22 @@ import pyarrow.parquet as pq
 class ParquetFile:
     read_path: str  # path handed to pyarrow (includes the bucket for s3)
     key: str        # loader-consistent filename used for id derivation
+
+
+# Parallel ranged-read tuning for LARGE parquet files (see Store.read_columns).
+# A reader can only parallelize along a file's internal structure (row groups /
+# column chunks). Files written with ~ONE row group cause the download to read
+# one giant column chunk — so the read degenerates into a single sequential stream
+# that no IO thread pool can speed up. Fetching the whole file as many
+# concurrent byte ranges FIRST (the `aws s3 cp` strategy), then parsing from
+# memory, sidesteps that regardless of parquet internals, on s3 and POSIX roots
+# alike. OPT-IN via `Store(uri, ranged_get=True)` — wired to
+# `params.io_ranged_get` in the compute config — and even then only for files
+# of at least _RANGED_GET_MIN_BYTES (below that the normal reader is already
+# fine). Costs one file's raw bytes of extra RAM while that file is parsed.
+_RANGED_GET_BYTES = 64 * 1024 * 1024
+_RANGED_GET_CONCURRENCY = 24
+_RANGED_GET_MIN_BYTES = 256 * 1024 * 1024
 
 
 def _is_s3(uri: str) -> bool:
@@ -39,9 +56,12 @@ def _fs_and_path(uri: str) -> tuple[pafs.FileSystem, str]:
 class Store:
     """A parquet root (local dir or s3:// prefix) you can list / read / write."""
 
-    def __init__(self, uri: str):
+    def __init__(self, uri: str, ranged_get: bool = False):
         self.uri = uri
         self.is_s3 = _is_s3(uri)
+        # Opt-in parallel ranged reads for large files
+        # (see the module comment above _RANGED_GET_BYTES).
+        self.ranged_get = ranged_get
         self.fs, self.root = _fs_and_path(uri)
 
     def _loader_key(self, read_path: str) -> str:
@@ -71,7 +91,41 @@ class Store:
         return out
 
     def read_columns(self, read_path: str, columns: list[str] | None) -> pa.Table:
+        if self.ranged_get:
+            size = self.fs.get_file_info(read_path).size
+            if size is not None and size >= _RANGED_GET_MIN_BYTES:
+                return pq.read_table(
+                    pa.BufferReader(self._ranged_download(read_path, size)),
+                    columns=columns,
+                )
         return pq.read_table(read_path, filesystem=self.fs, columns=columns)
+
+    def _ranged_download(self, read_path: str, size: int):
+        """The whole file via _RANGED_GET_CONCURRENCY concurrent byte-range
+        reads into one buffer (see the module comment above the constants).
+        Built from FileSystem API (`open_input_file`/`read_at`), so it runs
+        unchanged on s3 and on POSIX roots.
+
+        `read_at` is documented thread-safe on one Arrow file handle and a
+        failed range re-raises out of the pool — the reader thread's existing
+        try/except turns that into a loud run failure, same as any other read
+        error. The raw buffer is dropped as soon as `read_columns` finishes
+        parsing (parquet decompression copies out of it), so peak memory adds
+        one file's raw size only while that file is being parsed."""
+        data = np.empty(size, dtype=np.uint8)
+        view = memoryview(data)
+        with self.fs.open_input_file(read_path) as f:
+            def fetch(lo: int) -> None:
+                hi = min(lo + _RANGED_GET_BYTES, size)
+                view[lo:hi] = f.read_at(hi - lo, lo)
+
+            with ThreadPoolExecutor(max_workers=_RANGED_GET_CONCURRENCY) as pool:
+                for fut in [
+                    pool.submit(fetch, lo)
+                    for lo in range(0, size, _RANGED_GET_BYTES)
+                ]:
+                    fut.result()
+        return pa.py_buffer(data)
 
     def write(self, filename: str, table: pa.Table) -> str:
         """

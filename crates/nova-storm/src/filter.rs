@@ -38,7 +38,10 @@ pub enum MatchSpec {
     Any(Vec<MatchValue>),
 }
 
-/// Numeric bounds, combinable (e.g. `gte` + `lt` together).
+/// Numeric bounds, combinable (e.g. `gte` + `lt` together). KNOWN LIMITATION:
+/// static bounds are numeric only — a fixed datetime cutoff ("date >= X for
+/// all queries") is not expressible here yet; the workaround is a constant
+/// column in the queries file consumed via [`RangeFromQuery`].
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RangeCondition {
@@ -58,10 +61,13 @@ impl RangeCondition {
     }
 }
 
-/// Per-query numeric bounds — same shape as [`RangeCondition`], but each bound
+/// Per-query range bounds — same shape as [`RangeCondition`], but each bound
 /// names a QUERIES column supplying that query's own value for the bound,
-/// instead of a literal number (e.g. `lt: max_budget` means "each query's own
-/// ceiling comes from its own `max_budget` column").
+/// instead of a literal (e.g. `lt: max_budget` means "each query's own
+/// ceiling comes from its own `max_budget` column"). The bound TYPE follows
+/// the data: numeric columns build a numeric range; datetime strings (RFC3339
+/// or DuckDB's `YYYY-MM-DD HH:MM:SS`) and TIMESTAMP columns build a qdrant
+/// DatetimeRange. One condition's bounds must all be one kind.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RangeFromQuery {
@@ -217,6 +223,19 @@ impl Filter {
     /// `queries::load_query_vectors`).
     pub fn query_fields(&self) -> BTreeSet<&str> {
         self.all_conditions().flat_map(FilterCondition::query_columns).collect()
+    }
+
+    /// The queries columns referenced specifically as RANGE bounds
+    /// (`range_from_query`). The loader treats these differently from match
+    /// columns: text/TIMESTAMP/DATE values in a range column are validated
+    /// (and normalized) as datetimes at LOAD time, so a malformed bound fails
+    /// the run up front instead of as a per-dispatch error loop; a datetime
+    /// value in a MATCH column is a load error (qdrant match has no datetime).
+    pub fn range_columns(&self) -> BTreeSet<&str> {
+        self.all_conditions()
+            .filter_map(|c| c.range_from_query.as_ref())
+            .flat_map(RangeFromQuery::columns)
+            .collect()
     }
 
     /// Does any condition in this filter vary per query?

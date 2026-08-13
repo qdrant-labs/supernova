@@ -44,6 +44,15 @@ pub struct ElasticConfig {
     /// cert). DEV ONLY.
     #[serde(default)]
     pub tls_insecure: bool,
+    /// Per-request timeout in seconds (the same generous-default reasoning as
+    /// the qdrant target's `timeout_s`: a load test must not count its own
+    /// honest slow requests as errors). Unset = 300s.
+    #[serde(default = "default_elastic_timeout_s")]
+    pub timeout_s: u64,
+}
+
+fn default_elastic_timeout_s() -> u64 {
+    300
 }
 
 fn default_index() -> String {
@@ -85,7 +94,7 @@ pub struct ElasticTarget {
     /// `> k`); pinning it to `k` would be the lowest-recall setting. When set, we
     /// validate `>= k` at construction.
     num_candidates: Option<u64>,
-    with_payload: bool,
+    with_payload: crate::config::WithPayload,
     collect_ids: bool,
 }
 
@@ -142,7 +151,8 @@ impl ElasticConfig {
             None
         };
         let pool = SingleNodeConnectionPool::new(Url::parse(&self.url).map_err(to_other)?);
-        let mut builder = TransportBuilder::new(pool);
+        let mut builder =
+            TransportBuilder::new(pool).timeout(std::time::Duration::from_secs(self.timeout_s));
         if let Some(creds) = creds {
             builder = builder.auth(creds);
         }
@@ -157,7 +167,7 @@ impl ElasticConfig {
             vector_field,
             top_k: query.top_k,
             num_candidates: sp.num_candidates,
-            with_payload: query.with_payload,
+            with_payload: query.with_payload.clone(),
             collect_ids: query.source.ground_truth_column.is_some(),
         })
     }
@@ -171,7 +181,7 @@ impl fmt::Display for ElasticTarget {
 
 /// A whole-batch failure outcome (no per-query ids).
 fn fail(started: Instant, n: usize, error: String) -> BatchOutcome {
-    BatchOutcome { latency: started.elapsed(), ok: false, ids: vec![None; n], error: Some(error) }
+    BatchOutcome { latency: started.elapsed(), ok: false, ids: vec![None; n], error: Some(error), timed_out: false, }
 }
 
 #[async_trait]
@@ -179,27 +189,38 @@ impl QueryTarget for ElasticTarget {
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None, timed_out: false, };
         }
 
         // What to return in `_source`. To match Qdrant's `with_payload` (payload
         // only, NOT the vector), exclude the vector field — ES stores the vector
         // in `_source`, so a plain `_source: true` would refetch+serialize it and
         // inflate the measured cost.
-        let source = if self.with_payload {
-            json!({ "excludes": [self.vector_field.as_str()] })
-        } else {
-            json!(false)
+        let source = match &self.with_payload {
+            crate::config::WithPayload::Enable(true) => {
+                json!({ "excludes": [self.vector_field.as_str()] })
+            }
+            crate::config::WithPayload::Enable(false) => json!(false),
+            // Field include-list (RAG shape): return exactly these _source
+            // fields; the vector field is excluded implicitly by not being
+            // listed.
+            crate::config::WithPayload::Fields(fields) => json!({ "includes": fields }),
         };
 
         // `_msearch` body: one header line + one kNN search-body line per query.
         // `num_candidates` is omitted when unset so ES applies its own default.
         let mut body: Vec<JsonBody<Value>> = Vec::with_capacity(queries.len() * 2);
         for q in queries {
+            // Dense-only target: guard at the point of use, so no separate
+            // check can drift out of sync — a sparse query is a per-dispatch
+            // data error, never a panic.
+            let Some(dense) = q.vector.as_dense() else {
+                return fail(started, queries.len(), "the elastic target does not support sparse queries".to_string());
+            };
             body.push(json!({ "index": self.index_name }).into());
             let mut knn = json!({
                 "field": self.vector_field,
-                "query_vector": q.vector,
+                "query_vector": dense,
                 "k": self.top_k,
             });
             if let Some(nc) = self.num_candidates {
@@ -280,6 +301,6 @@ impl QueryTarget for ElasticTarget {
             }
         }
 
-        BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+        BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None, timed_out: false, }
     }
 }

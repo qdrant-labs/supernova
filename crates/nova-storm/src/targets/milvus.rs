@@ -210,7 +210,7 @@ impl MilvusConfig {
                 "milvus target requires `query.vector_name` (the annsField to search)".to_string(),
             )
         })?;
-        if query.with_payload {
+        if query.with_payload.is_enabled() {
             tracing::warn!(
                 "milvus: `with_payload` has no effect — the milvus load backend doesn't persist \
                  payload, so there's nothing to fetch"
@@ -319,7 +319,7 @@ impl fmt::Display for MilvusTarget {
 
 /// A whole-batch failure outcome (no per-query ids).
 fn fail(started: Instant, n: usize, error: String) -> BatchOutcome {
-    BatchOutcome { latency: started.elapsed(), ok: false, ids: vec![None; n], error: Some(error) }
+    BatchOutcome { latency: started.elapsed(), ok: false, ids: vec![None; n], error: Some(error), timed_out: false, }
 }
 
 /// One SDK-returned id as a plain string (varchar → itself, int → decimal).
@@ -360,8 +360,16 @@ impl MilvusTarget {
         queries: &[&QueryVector],
         started: Instant,
     ) -> BatchOutcome {
-        let data: Vec<MValue> =
-            queries.iter().map(|q| MValue::FloatArray(Cow::Borrowed(q.vector.as_slice()))).collect();
+        // Dense-only transport: the guard lives HERE, next to the use, so a
+        // future call site (warm-up probe, retry path) cannot bypass it and
+        // panic — a sparse query is a per-dispatch data error, never a crash.
+        let Some(data) = queries
+            .iter()
+            .map(|q| q.vector.as_dense().map(|v| MValue::FloatArray(Cow::Borrowed(v))))
+            .collect::<Option<Vec<MValue>>>()
+        else {
+            return fail(started, queries.len(), "the milvus target does not support sparse queries".to_string());
+        };
         let mut option = SearchOption::new();
         for (k, v) in self.search_param_pairs() {
             option.add_param(k, json!(v));
@@ -382,7 +390,7 @@ impl MilvusTarget {
                         latency: started.elapsed(),
                         ok: true,
                         ids: vec![None; results.len()],
-                        error: None,
+                        error: None, timed_out: false,
                     };
                 }
                 let mut ids = Vec::with_capacity(results.len());
@@ -402,14 +410,21 @@ impl MilvusTarget {
                     }
                     ids.push(Some(q));
                 }
-                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None, timed_out: false, }
             }
             Err(e) => fail(started, queries.len(), e.to_string()),
         }
     }
 
     async fn search_rest(&self, queries: &[&QueryVector], started: Instant) -> BatchOutcome {
-        let vectors: Vec<&Vec<f32>> = queries.iter().map(|q| &q.vector).collect();
+        // Same in-place dense-only guard as `search_sdk` — see the note there.
+        let Some(vectors) = queries
+            .iter()
+            .map(|q| q.vector.as_dense())
+            .collect::<Option<Vec<&[f32]>>>()
+        else {
+            return fail(started, queries.len(), "the milvus target does not support sparse queries".to_string());
+        };
         let mut body = json!({
             "collectionName": self.collection_name,
             "data": vectors,
@@ -463,7 +478,7 @@ impl MilvusTarget {
                 latency: started.elapsed(),
                 ok: true,
                 ids: vec![None; queries.len()],
-                error: None,
+                error: None, timed_out: false,
             };
         }
         let mut ids = Vec::with_capacity(queries.len());
@@ -483,7 +498,7 @@ impl MilvusTarget {
             }
             ids.push(Some(q));
         }
-        BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+        BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None, timed_out: false, }
     }
 }
 
@@ -492,7 +507,7 @@ impl QueryTarget for MilvusTarget {
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None, timed_out: false, };
         }
         match &self.transport {
             Transport::Sdk { collection, metric } => {

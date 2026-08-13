@@ -8,17 +8,17 @@ use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::{
-    Condition, QuantizationSearchParams, QueryBatchPointsBuilder, QueryPointsBuilder, Range as QdrantRange,
-    ScoredPoint, SearchParams,
+    Condition, DatetimeRange, QuantizationSearchParams, Query, QueryBatchPointsBuilder,
+    QueryPointsBuilder, Range as QdrantRange, ScoredPoint, SearchParams, Timestamp, VectorInput,
 };
 use qdrant_client::qdrant::Filter as QdrantFilter;
 use serde::Deserialize;
 
 use super::{BatchOutcome, QueryTarget};
-use crate::config::QueryConfig;
+use crate::config::{QueryConfig, WithPayload};
 use crate::errors::TargetError;
 use crate::filter::{Filter, FilterCondition, FilterFieldValue, MatchSpec, MatchValue, RangeCondition, RangeFromQuery};
-use crate::queries::QueryVector;
+use crate::queries::{QueryVector, VectorData};
 
 /// Qdrant's server-side search-time tuning (`query.search_params` for a
 /// `qdrant` target). All fields optional; the server applies its own defaults
@@ -70,11 +70,12 @@ pub struct QdrantTarget {
     /// a wasted allocation (a `String` clone per returned point) on every
     /// query.
     collect_ids: bool,
-    /// Ask the server for each hit's full payload (`query.with_payload`).
+    /// The payload selector built once from `query.with_payload` (bool or an
+    /// include-list of fields, e.g. just `text` for a RAG-shaped workload).
     /// The payloads are dropped on arrival — storm measures, it doesn't
     /// consume — but requesting them makes the server do the payload reads
     /// and ship the bytes, which is the cost being modeled.
-    with_payload: bool,
+    with_payload: qdrant_client::qdrant::with_payload_selector::SelectorOptions,
     /// Translated once at construction and applied unchanged to every
     /// query — set only when `query.filter` has no `_from_query` condition
     /// (a uniform filter has nothing to resolve per query). `None` when
@@ -113,6 +114,24 @@ pub struct QdrantConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_collection")]
     pub collection_name: String,
+    /// Per-operation (query) timeout in seconds. The qdrant client's own
+    /// default is FIVE seconds — far too short for a load tester, whose whole
+    /// job is to push a cluster into multi-second latencies; hitting it turns
+    /// honest slow dispatches into "operation was cancelled / Timeout
+    /// expired" errors and corrupts the error counts. Unset = 300s.
+    #[serde(default = "default_timeout_s")]
+    pub timeout_s: u64,
+    /// Connection-establishment timeout in seconds. Unset = 10s.
+    #[serde(default = "default_connect_timeout_s")]
+    pub connect_timeout_s: u64,
+}
+
+fn default_timeout_s() -> u64 {
+    300
+}
+
+fn default_connect_timeout_s() -> u64 {
+    10
 }
 
 fn default_collection() -> String {
@@ -122,7 +141,14 @@ fn default_collection() -> String {
 impl QdrantConfig {
     /// Connect and build the target, baking in the query knobs from `query`.
     pub fn into_target(self, query: &QueryConfig) -> Result<QdrantTarget, TargetError> {
-        let mut builder = Qdrant::from_url(&self.url);
+        // skip_compatibility_check: without it, `build()` fires a synchronous
+        // version-probe RPC before the run starts — an unreachable server then
+        // stalls construction for the full `timeout_s` instead of failing on
+        // the first dispatch, where the error is actually counted.
+        let mut builder = Qdrant::from_url(&self.url)
+            .timeout(std::time::Duration::from_secs(self.timeout_s))
+            .connect_timeout(std::time::Duration::from_secs(self.connect_timeout_s))
+            .skip_compatibility_check();
         if let Some(key) = self.api_key {
             builder = builder.api_key(key);
         }
@@ -171,7 +197,17 @@ impl QdrantConfig {
             top_k: query.top_k,
             search_params: search_params.as_ref().map(SearchParams::from),
             collect_ids: query.source.ground_truth_column.is_some(),
-            with_payload: query.with_payload,
+            with_payload: {
+                use qdrant_client::qdrant::with_payload_selector::SelectorOptions;
+                match &query.with_payload {
+                    WithPayload::Enable(enabled) => SelectorOptions::Enable(*enabled),
+                    // Server-side include selector: only these fields come
+                    // back (the RAG shape -- e.g. just `text`).
+                    WithPayload::Fields(fields) => SelectorOptions::Include(
+                        qdrant_client::qdrant::PayloadIncludeSelector { fields: fields.clone() },
+                    ),
+                }
+            },
             static_filter,
             per_query_filter,
         })
@@ -308,6 +344,19 @@ fn to_qdrant_range(range: &RangeCondition) -> QdrantRange {
     QdrantRange { gt: range.gt, gte: range.gte, lt: range.lt, lte: range.lte }
 }
 
+/// A query's nearest-neighbour input in either modality. Dense stays the
+/// plain float vector it always was; sparse becomes qdrant's paired
+/// indices/values input (dot-scored server-side — qdrant sparse has no other
+/// metric). `query.vector_name` ("using") rides separately on the builder.
+fn query_input(vector: &VectorData) -> Query {
+    match vector {
+        VectorData::Dense(v) => Query::new_nearest(v.clone()),
+        VectorData::Sparse { indices, values } => {
+            Query::new_nearest(VectorInput::new_sparse(indices.clone(), values.clone()))
+        }
+    }
+}
+
 /// Translate a `match`/`match_from_query` value. Qdrant's own match condition
 /// has no float variant (only keyword/integer/bool, plus `MatchAny` lists of
 /// integers or keywords) — a `MatchValue::Float` is rejected here, not at
@@ -380,15 +429,26 @@ fn to_qdrant_match_from_value(field: &str, value: &FilterFieldValue) -> Result<C
     }
 }
 
+/// A `range_from_query` condition translates to one of TWO qdrant conditions,
+/// decided by the DATA: numeric column values build the f64 `Range` they
+/// always did; text values are parsed as RFC3339 datetimes and build a
+/// `DatetimeRange` (qdrant's datetime-indexed fields — e.g. fineweb's `date`
+/// — take timestamps on the gRPC wire, not strings). Mixing the two kinds
+/// across one condition's bounds is rejected: a range over one field is over
+/// one type.
 fn to_qdrant_range_from_query(
     field: &str,
     range: &RangeFromQuery,
     query_values: &HashMap<String, FilterFieldValue>,
 ) -> Result<Condition, TargetError> {
-    let bound = |col: &Option<String>| -> Result<Option<f64>, TargetError> {
+    enum Bound {
+        Num(f64),
+        Datetime(Timestamp),
+    }
+    let bound = |col: &Option<String>| -> Result<Option<Bound>, TargetError> {
         let Some(name) = col else { return Ok(None) };
         match resolve_query_value(query_values, name)? {
-            FilterFieldValue::Num(n) => Ok(Some(*n)),
+            FilterFieldValue::Num(n) => Ok(Some(Bound::Num(*n))),
             // Qdrant range bounds are f64; reject an integer that can't round-trip
             // exactly (|i| > 2^53) rather than silently shifting the bound.
             FilterFieldValue::Int(i) => {
@@ -401,17 +461,65 @@ fn to_qdrant_range_from_query(
                          can't be represented exactly as an f64 range bound"
                     )));
                 }
-                Ok(Some(f))
+                Ok(Some(Bound::Num(f)))
             }
+            FilterFieldValue::Text(s) => Ok(Some(Bound::Datetime(parse_datetime_bound(field, name, s)?))),
             _ => Err(TargetError::Other(format!(
-                "filter condition on `{field}`: `range_from_query` column `{name}` must be numeric"
+                "filter condition on `{field}`: `range_from_query` column `{name}` must be numeric \
+                 or an RFC3339 datetime string"
             ))),
         }
     };
-    Ok(Condition::range(
+
+    let (gt, gte, lt, lte) = (bound(&range.gt)?, bound(&range.gte)?, bound(&range.lt)?, bound(&range.lte)?);
+    let any_datetime = [&gt, &gte, &lt, &lte].iter().any(|b| matches!(b, Some(Bound::Datetime(_))));
+    if !any_datetime {
+        let num = |b: Option<Bound>| b.map(|b| if let Bound::Num(n) = b { n } else { unreachable!() });
+        return Ok(Condition::range(
+            field,
+            QdrantRange { gt: num(gt), gte: num(gte), lt: num(lt), lte: num(lte), ..Default::default() },
+        ));
+    }
+    let ts = |b: Option<Bound>| -> Result<Option<Timestamp>, TargetError> {
+        match b {
+            None => Ok(None),
+            Some(Bound::Datetime(t)) => Ok(Some(t)),
+            Some(Bound::Num(_)) => Err(TargetError::Other(format!(
+                "filter condition on `{field}`: `range_from_query` mixes datetime and numeric \
+                 bounds — one range condition is over one field of one type"
+            ))),
+        }
+    };
+    Ok(Condition::datetime_range(
         field,
-        QdrantRange { gt: bound(&range.gt)?, gte: bound(&range.gte)?, lt: bound(&range.lt)?, lte: bound(&range.lte)? },
+        DatetimeRange { gt: ts(gt)?, gte: ts(gte)?, lt: ts(lt)?, lte: ts(lte)?, ..Default::default() },
     ))
+}
+
+/// One datetime string as the `Timestamp` qdrant's gRPC `DatetimeRange`
+/// carries (re-exported by qdrant-client, so it always matches qdrant's own
+/// prost version). Parsing lives in [`crate::datetime`] — shared with the
+/// loader, which VALIDATES and normalizes every range-bound value at load
+/// time, so by the time a value reaches this per-dispatch path it is
+/// canonical RFC3339 and cannot fail. The error context here covers direct
+/// library callers that skip the loader.
+fn parse_datetime_bound(field: &str, column: &str, raw: &str) -> Result<Timestamp, TargetError> {
+    let parsed = crate::datetime::parse_datetime_utc(raw).map_err(|e| {
+        TargetError::Other(format!(
+            "filter condition on `{field}`: `range_from_query` column `{column}` value `{raw}` is \
+             not a recognized datetime — accepted forms are RFC3339 (offsets and pre-1970 dates \
+             included), `YYYY-MM-DD HH:MM:SS[+HH]`, and date-only `YYYY-MM-DD`, all read as UTC \
+             when offsetless: {e}"
+        ))
+    })?;
+    let total_nanos = parsed.unix_timestamp_nanos();
+    // Timestamp is (seconds, nanos 0..1e9); euclidean split keeps pre-1970
+    // values well-formed (e.g. 1969-12-31T23:59:59.5Z -> seconds=-1, nanos=5e8).
+    Ok(Timestamp {
+        seconds: total_nanos.div_euclid(1_000_000_000) as i64,
+        nanos: total_nanos.rem_euclid(1_000_000_000) as i32,
+        ..Default::default()
+    })
 }
 
 /// 2^63 = i64::MAX+1 — the first f64 above the i64 range (i64::MAX itself isn't
@@ -446,15 +554,15 @@ impl QueryTarget for QdrantTarget {
         // skew this dispatch's contribution to the run's latency percentiles.
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None };
+            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None, timed_out: false, };
         }
         let query_points: Vec<_> = match queries
             .iter()
             .map(|q| {
                 let mut builder = QueryPointsBuilder::new(&self.collection_name)
-                    .query(q.vector.to_vec())
+                    .query(query_input(&q.vector))
                     .limit(self.top_k)
-                    .with_payload(self.with_payload);
+                    .with_payload(self.with_payload.clone());
                 if let Some(name) = &self.vector_name {
                     builder = builder.using(name.clone());
                 }
@@ -478,7 +586,7 @@ impl QueryTarget for QdrantTarget {
                     latency: started.elapsed(),
                     ok: false,
                     ids: vec![None; queries.len()],
-                    error: Some(e.to_string()),
+                    error: Some(e.to_string()), timed_out: false,
                 };
             }
         };
@@ -500,6 +608,7 @@ impl QueryTarget for QdrantTarget {
                     resp.result.len(),
                     queries.len()
                 )),
+                timed_out: false,
             },
             Ok(resp) => {
                 if !self.collect_ids {
@@ -507,7 +616,7 @@ impl QueryTarget for QdrantTarget {
                         latency: started.elapsed(),
                         ok: true,
                         ids: vec![None; resp.result.len()],
-                        error: None,
+                        error: None, timed_out: false,
                     };
                 }
                 let mut ids = Vec::with_capacity(resp.result.len());
@@ -524,19 +633,20 @@ impl QueryTarget for QdrantTarget {
                                 ids: vec![None; queries.len()],
                                 error: Some(
                                     "qdrant returned a scored point without a valid id".to_string(),
-                                ),
+                                ), timed_out: false,
                             };
                         };
                         query_ids.push(id);
                     }
                     ids.push(Some(query_ids));
                 }
-                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None }
+                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None, timed_out: false, }
             }
             Err(e) => BatchOutcome {
                 latency: started.elapsed(),
                 ok: false,
                 ids: vec![None; queries.len()],
+                timed_out: is_client_timeout(&e),
                 error: Some(e.to_string()),
             },
         }
@@ -549,6 +659,35 @@ impl QueryTarget for QdrantTarget {
 /// plain string-set intersection against `hit_ids`, which `nova bf` also
 /// always stores as strings (see its own `str(...)` coercion) regardless of
 /// whether the underlying collection uses UUID or integer ids.
+/// Was this failure a deadline — the CLIENT's or the SERVER's — rather than
+/// a transport or query error? gRPC status codes are protocol constants
+/// (CANCELLED = 1, DEADLINE_EXCEEDED = 4 — fixed by the gRPC spec, not by
+/// tonic), so matching on the numeric code needs no tonic dependency. The
+/// client's tonic timeout layer surfaces `timeout_s` expiry as CANCELLED
+/// ("Timeout expired"); note the client also silently RETRIES a cancelled
+/// read once on a rebuilt channel, so an observed client timeout costs ~2x
+/// `timeout_s` of wall time and double the server work — one more reason
+/// `timeout_s` must sit far above honest latency.
+///
+/// The SERVER's own search timeout (`storage.performance.search_timeout_sec`,
+/// 60s when unset) does NOT arrive as DEADLINE_EXCEEDED: qdrant's replica-set
+/// read layer wraps the per-shard `Operation '...' timed out after ...` into
+/// a service error, so it lands here as INTERNAL (13) — verified live against
+/// qdrant with a 1s server timeout. Its message keeps the underlying
+/// "timed out after" text (qdrant's `OperationError::Timeout` display), which
+/// is what we sniff; if a future qdrant rewords it, such failures degrade to
+/// plain errors, never to false successes.
+fn is_client_timeout(err: &qdrant_client::QdrantError) -> bool {
+    match err {
+        qdrant_client::QdrantError::ResponseError { status } => {
+            matches!(status.code() as i32, 1 | 4) // CANCELLED | DEADLINE_EXCEEDED
+                || (status.code() as i32 == 13 // INTERNAL wrapping the server's search timeout
+                    && status.message().contains("timed out after"))
+        }
+        _ => false,
+    }
+}
+
 fn point_id_string(point: &ScoredPoint) -> Option<String> {
     match point.id.as_ref()?.point_id_options.as_ref()? {
         PointIdOptions::Uuid(s) => Some(s.clone()),
@@ -790,5 +929,209 @@ mod tests {
         to_qdrant_condition(&cond("field: tenant_id\nmatch_from_query: tenant_column\n"), Some(&values))
             .unwrap();
         to_qdrant_condition(&cond("field: code\nmatch_from_query: codes_column\n"), Some(&values)).unwrap();
+    }
+
+    // ---------------------------------------------------------------- sparse
+
+    #[test]
+    fn query_input_builds_dense_and_sparse() {
+        use crate::queries::VectorData;
+
+        let dense = query_input(&VectorData::Dense(vec![0.1, 0.2]));
+        assert_eq!(dense, Query::new_nearest(vec![0.1, 0.2]));
+
+        let sparse =
+            query_input(&VectorData::Sparse { indices: vec![7, 42], values: vec![0.5, 0.25] });
+        assert_eq!(
+            sparse,
+            Query::new_nearest(VectorInput::new_sparse(vec![7u32, 42], vec![0.5f32, 0.25]))
+        );
+        // The two modalities must not collapse into the same wire shape.
+        assert_ne!(sparse, Query::new_nearest(vec![0.5f32, 0.25]));
+    }
+
+    // ------------------------------------------------------------- datetime
+
+    /// `2017-09-19T11:23:19Z` / `2018-05-28T09:22:20Z` — real fineweb `date`
+    /// values, epoch seconds computed independently.
+    const T1: (&str, i64) = ("2017-09-19T11:23:19Z", 1_505_820_199);
+    const T2: (&str, i64) = ("2018-05-28T09:22:20Z", 1_527_499_340);
+
+    fn datetime_values() -> HashMap<String, FilterFieldValue> {
+        HashMap::from([
+            ("date_gte".to_string(), FilterFieldValue::Text(T1.0.to_string())),
+            ("date_lt".to_string(), FilterFieldValue::Text(T2.0.to_string())),
+            ("ls_gte".to_string(), FilterFieldValue::Num(0.5)),
+        ])
+    }
+
+    #[test]
+    fn text_range_bounds_become_a_datetime_range() {
+        let condition = to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gte: date_gte\n  lt: date_lt\n"),
+            Some(&datetime_values()),
+        )
+        .unwrap();
+        let expected = Condition::datetime_range(
+            "date",
+            DatetimeRange {
+                gt: None,
+                gte: Some(Timestamp { seconds: T1.1, nanos: 0 }),
+                lt: Some(Timestamp { seconds: T2.1, nanos: 0 }),
+                lte: None,
+            },
+        );
+        assert_eq!(condition, expected);
+    }
+
+    #[test]
+    fn numeric_range_bounds_still_become_a_numeric_range() {
+        let condition = to_qdrant_condition(
+            &cond("field: language_score\nrange_from_query:\n  gte: ls_gte\n"),
+            Some(&datetime_values()),
+        )
+        .unwrap();
+        let expected = Condition::range(
+            "language_score",
+            QdrantRange { gt: None, gte: Some(0.5), lt: None, lte: None },
+        );
+        assert_eq!(condition, expected);
+    }
+
+    #[test]
+    fn mixed_datetime_and_numeric_bounds_are_rejected() {
+        let err = to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gte: date_gte\n  lt: ls_gte\n"),
+            Some(&datetime_values()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mixes datetime and numeric"), "{err}");
+    }
+
+    /// gRPC CANCELLED (what tonic's timeout layer emits as "Timeout expired")
+    /// and DEADLINE_EXCEEDED are client-side timeouts; everything else is not.
+    #[test]
+    fn client_timeouts_are_classified_by_grpc_code() {
+        use qdrant_client::QdrantError;
+        let timeout_codes =
+            [tonic::Status::cancelled("Timeout expired"), tonic::Status::deadline_exceeded("x")];
+        for status in timeout_codes {
+            assert!(is_client_timeout(&QdrantError::ResponseError { status }));
+        }
+        // The server's own search timeout arrives as INTERNAL: qdrant's
+        // replica-set read layer wraps the shard's Timeout into a service
+        // error, keeping the "timed out after" text (verified live against a
+        // 1s storage.performance.search_timeout_sec).
+        let server_timeout = tonic::Status::internal(
+            "Service internal error: 1 of 1 read operations failed:\n  \
+             Timeout error: Operation 'Search' timed out after 999.376572ms",
+        );
+        assert!(is_client_timeout(&QdrantError::ResponseError { status: server_timeout }));
+
+        let not_timeouts = [
+            tonic::Status::invalid_argument("Wrong input: Not existing vector name"),
+            tonic::Status::unavailable("connect refused"),
+            tonic::Status::not_found("no collection"),
+            // INTERNAL alone is NOT a timeout — only with the server's
+            // "timed out after" marker text.
+            tonic::Status::internal("Service internal error: segment load failed"),
+        ];
+        for status in not_timeouts {
+            assert!(!is_client_timeout(&QdrantError::ResponseError { status }));
+        }
+    }
+
+    #[test]
+    fn a_non_datetime_string_bound_is_a_clear_error() {
+        let values = HashMap::from([(
+            "date_gte".to_string(),
+            FilterFieldValue::Text("last tuesday".to_string()),
+        )]);
+        let err = to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gte: date_gte\n"),
+            Some(&values),
+        )
+        .unwrap_err();
+        // Must be the datetime PARSER's message, not the generic "must be
+        // numeric or..." fallback — a mutation deleting the Text arm entirely
+        // was shown to survive a looser "RFC3339" substring.
+        assert!(err.to_string().contains("not a recognized datetime"), "{err}");
+    }
+
+    /// One helper: the condition `field: date / range_from_query: gte: col`
+    /// translated against a single text value.
+    fn datetime_gte(value: &str) -> Result<Condition, TargetError> {
+        let values =
+            HashMap::from([("col".to_string(), FilterFieldValue::Text(value.to_string()))]);
+        to_qdrant_condition(&cond("field: date\nrange_from_query:\n  gte: col\n"), Some(&values))
+    }
+
+    fn gte_timestamp(condition: Condition) -> Timestamp {
+        use qdrant_client::qdrant::condition::ConditionOneOf;
+        let ConditionOneOf::Field(f) = condition.condition_one_of.expect("field condition") else {
+            panic!("not a field condition")
+        };
+        f.datetime_range.expect("datetime range").gte.expect("gte bound set")
+    }
+
+    #[test]
+    fn pre_1970_datetimes_are_accepted_with_negative_seconds() {
+        let ts = gte_timestamp(datetime_gte("1969-12-31T23:59:59Z").unwrap());
+        assert_eq!((ts.seconds, ts.nanos), (-1, 0));
+        // fractional pre-1970: euclidean split keeps nanos in 0..1e9
+        let ts = gte_timestamp(datetime_gte("1969-12-31T23:59:59.5Z").unwrap());
+        assert_eq!((ts.seconds, ts.nanos), (-1, 500_000_000));
+    }
+
+    #[test]
+    fn nonzero_utc_offsets_are_accepted_and_normalized() {
+        // 12:00 at +02:00 == 10:00Z
+        let plus2 = gte_timestamp(datetime_gte("2017-09-19T12:00:00+02:00").unwrap());
+        let utc = gte_timestamp(datetime_gte("2017-09-19T10:00:00Z").unwrap());
+        assert_eq!(plus2, utc);
+    }
+
+    #[test]
+    fn fractional_seconds_carry_into_nanos() {
+        let ts = gte_timestamp(datetime_gte("2017-09-19T11:23:19.123Z").unwrap());
+        assert_eq!((ts.seconds, ts.nanos), (T1.1, 123_000_000));
+    }
+
+    #[test]
+    fn duckdb_space_separated_form_is_read_as_utc() {
+        let space = gte_timestamp(datetime_gte("2017-09-19 11:23:19").unwrap());
+        assert_eq!((space.seconds, space.nanos), (T1.1, 0));
+        // and with an explicit offset after the space form
+        let off = gte_timestamp(datetime_gte("2017-09-19 13:23:19+02:00").unwrap());
+        assert_eq!(off.seconds, T1.1);
+    }
+
+    #[test]
+    fn whitespace_padding_is_trimmed() {
+        let ts = gte_timestamp(datetime_gte("  2017-09-19T11:23:19Z  ").unwrap());
+        assert_eq!(ts.seconds, T1.1);
+    }
+
+    #[test]
+    fn all_four_datetime_bounds_translate() {
+        let values = HashMap::from([
+            ("a".to_string(), FilterFieldValue::Text(T1.0.to_string())),
+            ("b".to_string(), FilterFieldValue::Text(T2.0.to_string())),
+        ]);
+        let condition = to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gt: a\n  gte: a\n  lt: b\n  lte: b\n"),
+            Some(&values),
+        )
+        .unwrap();
+        let expected = Condition::datetime_range(
+            "date",
+            DatetimeRange {
+                gt: Some(Timestamp { seconds: T1.1, nanos: 0 }),
+                gte: Some(Timestamp { seconds: T1.1, nanos: 0 }),
+                lt: Some(Timestamp { seconds: T2.1, nanos: 0 }),
+                lte: Some(Timestamp { seconds: T2.1, nanos: 0 }),
+            },
+        );
+        assert_eq!(condition, expected);
     }
 }

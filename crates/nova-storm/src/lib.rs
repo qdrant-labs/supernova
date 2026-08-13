@@ -12,6 +12,7 @@
 //! drives any backend.
 
 pub mod config;
+pub mod datetime;
 pub mod errors;
 pub mod filter;
 pub mod queries;
@@ -49,10 +50,16 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         None => None,
     };
 
-    let vectors = load_query_vectors(&query.source, query.filter.as_ref())?;
+    tracing::info!(
+        "queries: {:?} via vector `{}`",
+        query.vector_type,
+        query.vector_name.as_deref().unwrap_or("(unnamed)"),
+    );
+    let vectors = load_query_vectors(&query.source, query.vector_type, query.filter.as_ref())?;
     if vectors.is_empty() {
         return Err(StormError::Other(format!(
-            "no query vectors loaded from {:?} (column {:?})",
+            "no query vectors loaded from {:?} (column {:?}) — NULL and empty vectors are \
+             excluded; a file of only those loads nothing",
             query.source.uri, query.source.column
         )));
     }

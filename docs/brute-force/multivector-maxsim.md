@@ -237,5 +237,119 @@ slower + 1.8× more memory** under skew (it pads every doc to the longest and
 `amax`es over mostly-`-inf`). `scatter_reduce` stays the default; `pad+amax` is
 **not** landed.
 
-Net: the one landed GPU optimization is the opt-in `allow_tf32` knob (~1.4× on
-the score path when enabled), plus the already-landed host-sync removal.
+Net at the time of that sweep: the one measured GPU optimization was the
+opt-in `allow_tf32` knob (~1.4× on the score path when enabled), plus the
+already-landed host-sync removal.
+
+### Exact cuBLAS + fused ragged reduction
+
+The higher-payoff exact backend is selected explicitly with:
+
+```yaml
+params:
+  multivector_kernel: triton_reduce
+```
+
+It preserves the large FP32 `Q @ C.T` GEMM handled by cuBLAS, then launches one
+Triton program per query/document pair. The program reads only that pair's
+ragged rectangle from `P`, computes max over document tokens and sum over query
+tokens, and writes the final scalar. It replaces `repeat_interleave`,
+`scatter_reduce_(amax)`, the token-by-document `M` allocation, and `index_add_`
+with a single non-atomic reduction kernel. It is exact aside from normal FP32
+reduction-order differences and retains the same empty-segment `-inf` behavior.
+
+On the same seeded A10G PubMed shape used above (`D=1024`, 16 queries, 1,000
+documents), all 12 forced-backend CUDA parity cases passed across dot/cosine and
+dimensions 8, 33, and 1024. Top-10 and top-100 membership and order matched in
+the scale benchmark; maximum absolute score difference was `1.19e-6`:
+
+| implementation | median score time | incremental peak allocation |
+|---|---:|---:|
+| torch segmented reductions | 36.949 ms | 624.9 MiB |
+| **cuBLAS + fused reducer** | **19.432 ms** | 620.1 MiB |
+| cuBLAS matmul alone | 18.274 ms | 620.0 MiB |
+
+This is a **1.90× exact speedup**. The fused reduction itself is only
+`1.43–1.58 ms`; the retained `P` matrix still dominates memory, so this backend
+is faster but not materially lower-memory than torch.
+
+#### PubMed scheduling sweep
+
+A second A10G sweep held total work fixed at 64 queries, 1,000 documents, 2,101
+query tokens, and 317,119 document tokens. It varied the query block and corpus
+document batch. A final run included Nova-BF's real running top-1000 merge after
+every slice. All configurations retained exact top-100 membership.
+
+| implementation / schedule (docs × queries) | score + top-k | peak scratch |
+|---|---:|---:|
+| torch `1000 × 16` (old setting) | 159.883 ms | 1,288.2 MiB |
+| torch `250 × 64` | 157.975 ms | 651.5 MiB |
+| hybrid `1000 × 16` | 90.784 ms | 1,283.3 MiB |
+| hybrid `500 × 32` | 86.163 ms | 1,279.7 MiB |
+| **hybrid `250 × 64`** | **82.451 ms** | **648.9 MiB** |
+| auto `250 × 64` | 82.459 ms | 648.9 MiB |
+
+Moving the same token-pair budget from the document axis to the query axis made
+the GEMMs taller and reduced the number of query-block launches. Even after the
+extra top-k merge rounds, it improved the hybrid path another 9.2% while
+halving measured scratch. Together, the fused reducer and rebalanced schedule
+were **1.94× faster** than the old torch schedule. Top-100 order was identical
+for 62 of 64 queries and membership was exact for all 64; the two harmless
+order changes were within the allowed FP32 reduction-order tolerance.
+
+#### Adaptive token budget and transfer double buffer
+
+Fixed document/query counts are poor memory predictors for ragged data. When
+`multivector_token_budget` is set, Nova-BF now derives any missing item-count
+knobs as before, then enforces the budget from actual offsets at scoring time.
+The configured document and query counts are upper bounds: whole documents are
+packed until `max_actual_query_block_tokens x slice_document_tokens` reaches
+the budget. An individually oversized document runs alone, preserving progress
+and exact coverage.
+
+`multivector_double_buffer: true` adds a CUDA-only ordered pipeline. Corpus data
+is already decoded and prefetched on the host; the next packed slice is copied
+via pinned staging on a dedicated transfer stream while current-slice GEMM,
+reduction, and top-k execute. CUDA events and `record_stream` protect ownership,
+and consumption/merge order is unchanged. CPU and other vector types retain the
+synchronous path.
+
+A larger A10G run used `D=1024`, 512 queries / 16,353 query tokens, and one
+full-sized synthetic PubMed file of 3,000 documents / 949,662 document tokens
+(`k=1000`, FP32, TF32 disabled). Corpus generation and host prefetch completed
+before timing; scan-time H2D was included because it is the work the double
+buffer overlaps. All 49 CUDA multivector tests passed, and every schedule kept
+exact top-100 membership and order for all 512 queries.
+
+| hybrid schedule | scan + top-k | peak scratch | vs fixed |
+|---|---:|---:|---:|
+| fixed q64, 250 docs | 2,174.428 ms | 1,599.7 MiB | 1.000x |
+| adaptive q64 | 2,181.482 ms | 1,590.8 MiB | 0.997x |
+| adaptive q128 | 2,174.471 ms | 1,465.1 MiB | 1.000x |
+| adaptive q256 | 2,173.600 ms | 1,378.6 MiB | 1.000x |
+| fixed q64 + buffer | 1,979.078 ms | 1,599.8 MiB | 1.099x |
+| **adaptive q256 + buffer** | **1,970.205 ms** | **1,378.6 MiB** | **1.104x** |
+
+Adaptive scheduling is primarily a memory and workload-stability win at this
+scale; the transfer pipeline provides the throughput gain. A second run on the
+identical seeded workload compared the complete final path directly with the
+original implementation:
+
+| implementation | scan + top-k | peak scratch | vs original |
+|---|---:|---:|---:|
+| original torch, q16 / 1,000 docs | 4,021.022 ms | 2,533.0 MiB | 1.000x |
+| torch, q64 / 250 docs | 3,859.725 ms | 1,603.3 MiB | 1.042x |
+| fused reducer, q64 / 250 docs | 2,162.890 ms | 1,600.6 MiB | 1.859x |
+| **adaptive q256 + fused reducer + buffer** | **1,925.085 ms** | **1,378.7 MiB** | **2.089x** |
+
+Every path retained exact top-100 membership for all 512 queries. FP32
+reduction-order differences changed complete top-100 order for 12 queries in
+the final path, within the established correctness tolerance. The PubMed
+configuration therefore uses a 170M-element budget, q256/doc1000 upper bounds,
+`triton_reduce`, and double buffering. With fewer queries, the same budget
+automatically returns to roughly the previously measured q64/doc250 shape.
+
+If the active corpus slice is already resident on the GPU before timing, H2D
+does not exist to overlap and double buffering should be disabled. In that
+case, the relevant measured improvement is the fused reducer's `1.859x`, while
+adaptive scheduling still lowers peak scratch.

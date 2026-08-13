@@ -223,7 +223,7 @@ mod tests {
             .map(|recall| RecallSample { recall, short: false })
             .chain(short.into_iter().map(|recall| RecallSample { recall, short: true }))
             .collect();
-        DispatchSample { t_s, latency_ms, ok, recalls, empty_ground_truth: 0, filter_overreturn: 0 }
+        DispatchSample { t_s, latency_ms, ok, timed_out: false, recalls, empty_ground_truth: 0, filter_overreturn: 0 }
     }
 
     fn run_recorder(cfg: &ReportConfig, samples: &[DispatchSample]) -> String {

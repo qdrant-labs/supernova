@@ -47,6 +47,15 @@ approximation, so a filtered search's metric never needs to already be used
 by anyone else — computing one more metric on a batch that's already
 resident on the GPU is cheap, unlike a second transfer.
 
+Several metrics on one batch also share the underlying PRODUCT, not just the
+transfer. Every dense metric is derivable from the same Gram `Q @ Cᵀ` plus
+per-vector norms (dot is the Gram; cosine divides by ‖c‖ and ‖q‖; euclidean is
+`−sqrt(‖q‖² + ‖c‖² − 2·Gram)`), so a batch scored by 2+ distinct dense metrics
+runs ONE GEMM and derives the rest — see `DenseBatchSlice`. `SparseBatchSlice`
+does the same for its own `dot`/`cosine` pair via `_masked_raw`. Both cost one
+extra `(n_q, rows)` matrix at peak and both leave the single-metric path
+untouched.
+
 What rows make up that shared grid depends on whether any search of the
 vector_type is unfiltered:
 
@@ -119,9 +128,10 @@ import os
 import re
 import time
 
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import cached_property
 from queue import Empty, Queue
 from threading import Semaphore, Thread
 
@@ -142,6 +152,13 @@ PREFETCH_QUEUE_SIZE = 4
 # Per-file id encoding: global_file_idx * MAX_ROWS_PER_FILE + row. Collision-free
 # and reversible as long as no single file has more rows than this.
 MAX_ROWS_PER_FILE = 100_000_000
+
+# Fraction of FREE CUDA memory a multivector batch's whole token matrix may
+# occupy for the batch to be transferred to the device ONCE and sliced as
+# zero-copy views (see _process_batch_group), instead of one H2D per slice.
+# Conservative: the per-slice score matrix P (bounded by the token budget),
+# metric copies, and the running top-k state share the same pool.
+_MV_RESIDENT_FREE_FRACTION = 0.5
 
 
 def filter_corpus_files(
@@ -617,10 +634,17 @@ class DenseCorpusBatch:
     """Decoded dense corpus vectors for one file: `(n_rows, dim)`. Exposes the
     same `.n_rows`/`.nbytes`/`.compact`/`.transfer` surface as
     `SparseCorpusBatch` so `run_compute`'s per-file loop never branches on
-    vector_type."""
+    vector_type.
+
+    `share_gram` is set by `_process_batch_group` (from `metric_share_count`)
+    once it knows how many DISTINCT metrics will score this batch, and is
+    handed to every slice `transfer` produces — carried on the batch rather
+    than passed as a `transfer` argument so the `transfer(r0, r1, device)`
+    surface stays identical across vector_types. See `DenseBatchSlice`."""
 
     def __init__(self, arr: np.ndarray):
         self.arr = arr
+        self.share_gram = False
 
     @property
     def n_rows(self) -> int:
@@ -642,19 +666,79 @@ class DenseCorpusBatch:
         import torch
 
         Cb = torch.from_numpy(self.arr[r0:r1]).to(device, non_blocking=True)
-        return DenseBatchSlice(Cb)
+        return DenseBatchSlice(Cb, self.share_gram)
 
 
 @dataclass
 class DenseBatchSlice:
+    """One on-device slice of a dense corpus batch.
+
+    When two or more DISTINCT metrics score this slice (`share_gram`, set from
+    `metric_share_count` — see `_process_batch_group`), all of them are derived
+    from ONE raw Gram matrix `Q @ Cbᵀ` instead of each running its own GEMM:
+
+        dot        the Gram itself, returned WITHOUT a copy
+        cosine     Gram / ‖c‖ / ‖q‖              (per-row, then per-query scalar)
+        euclidean  −sqrt(‖q‖² + ‖c‖² − 2·Gram)   (clamped at 0)
+
+    The two formulations are mathematically equivalent and differ in float32 only because
+    normalization and accumulation happen in a different order — measured ~1 ulp
+    apart, with NO consistent accuracy advantage either way.
+
+    Cost: one extra `(n_q, rows)` matrix at peak — the Gram stays alive across
+    the member loop while each derived metric is built, where the unshared path
+    holds only the current metric's matrix. Bounded by `params.dense_batch_size`,
+    and the same trade `SparseBatchSlice` already documents for its own raw
+    cache. A batch scored by a SINGLE metric keeps the unshared `_scores` path
+    untouched, so the common case pays neither the extra matrix nor any change
+    in output.
+    """
+
     Cb: object  # torch.Tensor, (n_rows, dim)
+    share_gram: bool = False
+    _raw: object = None       # lazy Q @ Cbᵀ — only ever built when share_gram
+    _c_norms: object = None   # lazy per-row L2 norms (cosine)
+    _c_sq: object = None      # lazy per-row squared L2 norms (euclidean)
 
     @property
     def n_rows(self) -> int:
         return self.Cb.shape[0]
 
     def score(self, Q, metric: str, q_norms=None):
-        return _scores(Q, self.Cb, metric, q_norms)
+        if not self.share_gram:
+            return _scores(Q, self.Cb, metric, q_norms)
+        if self._raw is None:
+            self._raw = Q @ self.Cb.T
+        raw = self._raw
+        if metric == "dot":
+            # The Gram IS the dot score matrix — no copy. Callers never mutate
+            # what `score()` hands back in place (`_process_batch_group` uses
+            # `masked_fill`/column indexing, both of which allocate), so this
+            # stays safe to alias for the other metrics below.
+            return raw
+        if metric == "cosine":
+            if self._c_norms is None:
+                # clamp matches F.normalize's eps, so a zero corpus row scores
+                # 0 rather than NaN — identical convention to `_scores`.
+                self._c_norms = self.Cb.norm(dim=1).clamp_min(1e-12)
+            # First div allocates (raw must survive for the other metrics);
+            # the second is in place on that fresh copy.
+            return raw.div(self._c_norms[None, :]).div_(q_norms[:, None])
+        # euclidean: negate the distance so larger = nearer (topk picks
+        # nearest), matching `_scores`. Accumulated into ONE new tensor
+        # (`raw.mul(-2)` then two broadcast adds in place) rather than the
+        # naive `q_sq + c_sq - 2*raw`, which would hold two temporaries of the
+        # full (n_q, rows) size at once.
+        if self._c_sq is None:
+            self._c_sq = self.Cb.pow(2).sum(1)
+        # `run_compute` supplies `q_norms` for euclidean specs precisely so this
+        # is a reuse rather than a recompute; the fallback keeps `score()`
+        # callable standalone (tests, any future direct caller).
+        q_sq = q_norms.pow(2) if q_norms is not None else Q.pow(2).sum(1)
+        d2 = raw.mul(-2.0)
+        d2 += self._c_sq[None, :]
+        d2 += q_sq[:, None]
+        return d2.clamp_min_(0).sqrt_().neg_()
 
 
 class SparseCorpusBatch:
@@ -906,22 +990,47 @@ class MultiVectorQuery:
     (`flat`) plus a length-`n_q+1` token-offset array (`offsets`), so query `q`'s
     tokens are `flat[offsets[q]:offsets[q+1]]`. This is what a spec's `Q` is for
     a multivector search — passed through `_process_batch_group` unchanged to
-    `MultiVectorBatchSlice.score`, which tiles the query axis by whole queries
-    (`query_block`) to bound the per-slice score matrix. `n_q` is stored
-    explicitly because a trailing run of zero-token queries makes it
-    unrecoverable from `flat` alone.
+    `MultiVectorBatchSlice.score`. Both implementations (torch and the hybrid
+    Triton reducer) tile the query axis by whole queries (`query_block`) to
+    bound their per-slice intermediate. `n_q` is stored explicitly because a
+    trailing run of zero-token queries is unrecoverable from `flat`.
 
-    `offsets` (device) drives the on-device segment reductions; `offsets_cpu`
+    `offsets` (device) drives the on-device ragged boundaries; `offsets_cpu`
     (the same values, host numpy) drives the Python block-loop slicing so
-    `int(offsets[qs])` never forces a per-block CUDA→CPU sync (see `score`).
-    This object is the SINGLE source of `query_block` — the corpus batch/slice
-    deliberately don't carry it (it's a query-axis concept, not a corpus one)."""
+    `int(offsets[qs])` never forces a per-block CUDA→CPU sync (see `score`)."""
 
     flat: object       # torch.Tensor (total_query_tokens, D)
     offsets: object    # torch.Tensor (n_q + 1,) int64, ON DEVICE — for reductions
     offsets_cpu: object  # np.ndarray (n_q + 1,) int64 — for host block-loop slicing (no sync)
     n_q: int
     query_block: int | None  # queries per query-axis tile (None = all at once)
+    kernel: str = "torch"  # torch reference, fused Triton, or compatible auto-selection
+
+    @cached_property
+    def max_block_tokens(self) -> int:
+        """Largest actual token count in any whole-query score block."""
+        block = self.query_block or self.n_q
+        if self.n_q == 0:
+            return 0
+        return max(
+            int(self.offsets_cpu[min(start + block, self.n_q)])
+            - int(self.offsets_cpu[start])
+            for start in range(0, self.n_q, block)
+        )
+
+    @cached_property
+    def flat_normalized(self):
+        """Per-token L2-normalized copy of `flat`, built once per run.
+
+        Cosine scoring previously re-ran `F.normalize` on the query block
+        inside every (slice x block) iteration — identical output every time,
+        since `F.normalize` is strictly row-wise. Caching trades one extra
+        Q-sized tensor (never materialized on a dot-only run — this property
+        is lazy) for eliminating that per-slice recompute; row-slicing this
+        cached copy is bit-identical to normalizing the slice."""
+        import torch.nn.functional as F
+
+        return F.normalize(self.flat, dim=1)
 
 
 def _segment_max_over_cols(P, col_group, n_groups: int):
@@ -966,15 +1075,22 @@ class MultiVectorCorpusBatch:
         )
         return MultiVectorCorpusBatch(doc_offsets, flat_tokens), orig_rows
 
-    def transfer(self, r0: int, r1: int, device: str) -> "MultiVectorBatchSlice":
+    def transfer(
+        self, r0: int, r1: int, device: str, *, pin_memory: bool = False
+    ) -> "MultiVectorBatchSlice":
         import torch
 
         t0, t1 = int(self.doc_offsets[r0]), int(self.doc_offsets[r1])
         # doc_offsets for this slice, rebased so the slice's first token is 0.
-        local_off = torch.from_numpy(
+        local_off_cpu = torch.from_numpy(
             (self.doc_offsets[r0 : r1 + 1] - t0).astype(np.int64, copy=False)
-        ).to(device, non_blocking=True)
-        flat = torch.from_numpy(self.flat_tokens[t0:t1]).to(device, non_blocking=True)
+        )
+        flat_cpu = torch.from_numpy(self.flat_tokens[t0:t1])
+        if pin_memory:
+            local_off_cpu = local_off_cpu.pin_memory()
+            flat_cpu = flat_cpu.pin_memory()
+        local_off = local_off_cpu.to(device, non_blocking=True)
+        flat = flat_cpu.to(device, non_blocking=True)
         return MultiVectorBatchSlice(flat, local_off)
 
 
@@ -986,16 +1102,11 @@ class MultiVectorBatchSlice:
     unchanged.
 
     MaxSim(q, d) = sum over q's tokens of (max over d's tokens of q_tok . d_tok).
-    Computed per query-axis tile (whole queries only — a query's tokens never
-    split across tiles) so the intermediate `(block_query_tokens ×
-    slice_doc_tokens)` product `P` stays bounded (see `params.
-    multivector_query_block` / `multivector_batch_size`): P is the ONLY
-    matmul-sized intermediate, and unlike the pooled dense/sparse paths it's
-    token×token, which is why the query axis MUST be tiled too. Two ragged
-    segment reductions fold P down: max over each doc's tokens
-    (`_segment_max_over_cols`), then sum over each query's tokens (an
-    `index_add_` straight into the output view). A zero-token doc's `-inf`
-    survives both, marking it a non-candidate.
+    The established torch path computes per-query-axis tiles and materializes
+    `(block_query_tokens × slice_doc_tokens)` product `P`, then performs two
+    ragged reductions. The hybrid `triton_reduce` path retains that cuBLAS
+    product but fuses both reductions into one kernel. A zero-token query or document 
+    is `-inf`in every implementation.
 
     `dot` (Qdrant's default) uses the raw tokens; `cosine` L2-normalizes every
     token (query and corpus) FIRST — genuinely a separate matmul, not a
@@ -1010,6 +1121,11 @@ class MultiVectorBatchSlice:
     @property
     def n_rows(self) -> int:
         return self.doc_offsets.shape[0] - 1
+
+    def record_stream(self, stream) -> None:
+        """Keep transfer-stream allocations alive through their consumer."""
+        self.flat.record_stream(stream)
+        self.doc_offsets.record_stream(stream)
 
     def score(self, Q: "MultiVectorQuery", metric: str, q_norms=None):
         # `q_norms` is unused: it's the per-query cosine scalar the dense/sparse
@@ -1027,9 +1143,16 @@ class MultiVectorBatchSlice:
         dev = self.flat.device
         n_rows = self.n_rows
         n_q = Q.n_q
-        out = torch.full((n_q, n_rows), float("-inf"), dtype=self.flat.dtype, device=dev)
         if n_rows == 0 or self.flat.shape[0] == 0:
-            return out  # no corpus tokens in this slice — every doc a non-candidate
+            # No corpus tokens in this slice — every doc is a non-candidate.
+            return torch.full(
+                (n_q, n_rows), float("-inf"), dtype=self.flat.dtype, device=dev
+            )
+        if Q.flat.shape[0] == 0:
+            # Every query is zero-token — all remain non-candidates.
+            return torch.full(
+                (n_q, n_rows), float("-inf"), dtype=self.flat.dtype, device=dev
+            )
         if Q.flat.shape[0] and Q.flat.shape[1] != self.flat.shape[1]:
             raise ValueError(
                 f"multivector token dim mismatch: query D={Q.flat.shape[1]} vs "
@@ -1038,22 +1161,73 @@ class MultiVectorBatchSlice:
             )
 
         C = F.normalize(self.flat, dim=1) if metric == "cosine" else self.flat
-        # Each corpus token column -> its doc id, for the segment-max.
-        col_doc = torch.repeat_interleave(
-            torch.arange(n_rows, device=dev), self.doc_offsets.diff()
+        triton_compatible = (
+            dev.type == "cuda"
+            and Q.flat.device == dev
+            and self.flat.dtype == torch.float32
+            and Q.flat.dtype == torch.float32
+            and self.flat.shape[1] > 0
         )
+        selected_kernel = Q.kernel
+        if selected_kernel != "torch":
+            if triton_compatible:
+                try:
+                    from nova_bf.multivector_kernels import fused_ragged_maxsim_reduce
+                except ImportError as exc:
+                    if selected_kernel == "triton_reduce":
+                        raise RuntimeError(
+                            f"params.multivector_kernel={selected_kernel!r} requires Triton; "
+                            "install a CUDA PyTorch distribution that includes it"
+                        ) from exc
+                    selected_kernel = "torch"
+                else:
+                    if selected_kernel == "auto":
+                        selected_kernel = "triton_reduce"
+            elif selected_kernel == "triton_reduce":
+                raise RuntimeError(
+                    f"params.multivector_kernel={selected_kernel!r} requires same-device CUDA "
+                    "float32 query/document tokens with a positive token dimension"
+                )
+            else:
+                selected_kernel = "torch"
+
+        out = torch.full(
+            (n_q, n_rows), float("-inf"), dtype=self.flat.dtype, device=dev
+        )
+        # Only the torch reference needs a token->doc map; the hybrid Triton
+        # reducer consumes the contiguous offsets directly.
+        col_doc = None
+        if selected_kernel != "triton_reduce":
+            col_doc = torch.repeat_interleave(
+                torch.arange(n_rows, device=dev), self.doc_offsets.diff()
+            )
         qoff = Q.offsets            # device — feeds the on-device reductions below
         qoff_cpu = Q.offsets_cpu    # host — feeds the Python block-loop bounds (no CUDA sync)
+        # Row-slicing the run-wide normalized cache is bit-identical to
+        # normalizing each block (F.normalize is strictly row-wise) and skips
+        # a per-(slice x block) recompute.
+        q_source = Q.flat_normalized if metric == "cosine" else Q.flat
         block = Q.query_block or n_q
         for qs in range(0, n_q, block):
             qe = min(qs + block, n_q)
             t0, t1 = int(qoff_cpu[qs]), int(qoff_cpu[qe])  # host read: no per-block device sync
             if t1 == t0:
                 continue  # every query in this block is zero-token -> left -inf (see below)
-            Qb = Q.flat[t0:t1]
-            if metric == "cosine":
-                Qb = F.normalize(Qb, dim=1)
+            Qb = q_source[t0:t1]
             P = Qb @ C.T                                   # (block_q_tokens, slice_doc_tokens)
+            if selected_kernel == "triton_reduce":
+                # Written straight into this block's rows of `out` (the kernel
+                # takes a row stride) — no separate device-to-device copy.
+                fused_ragged_maxsim_reduce(
+                    P,
+                    qoff,
+                    self.doc_offsets,
+                    query_start=qs,
+                    query_token_base=t0,
+                    n_queries=qe - qs,
+                    out=out[qs:qe],
+                )
+                continue
             M = _segment_max_over_cols(P, col_doc, n_rows)  # (block_q_tokens, n_rows)
             # Segment-SUM over each query's tokens, written STRAIGHT into this
             # block's output rows (zeroed first): `index_add_` into the `out`
@@ -1110,33 +1284,39 @@ def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "Mul
     return MultiVectorCorpusBatch(doc_offsets, flat)
 
 
-def _merge_topk(top_scores, top_enc, batch_scores, encoded_rows, k: int):
-    """Fold one batch's `(n_q, n_candidate_rows)` score matrix into a spec's
-    running `(top_scores, top_enc)` top-k state: top-k the batch on its own
-    (bounded by however many candidate rows it actually has), append to the
-    running state, and re-top-k down to `k`. `encoded_rows` must already be
-    the fully-encoded `global_file_idx * MAX_ROWS_PER_FILE + row` id for each
-    of `batch_scores`'s columns — this function no longer computes that
-    encoding itself (see `_process_batch_group`, which builds `encoded_rows`
-    either from a single file's own `gidx` or, when several files' rows have
-    been coalesced into one batch, from each contributing row's OWN file's
-    gidx), so the same encoding scheme holds regardless of batching,
-    compaction, or coalescing."""
+def _merge_topk(top_scores, top_enc, parts: list[tuple], k: int):
+    """Fold pending per-slice candidate columns into a spec's running
+    `(top_scores, top_enc)` top-k state with ONE topk, amortized.
+
+    `parts` is a list of `(scores, encoded)` pairs accumulated by
+    `_process_batch_group` across one or more slices, in slice (i.e. corpus)
+    order. Each `scores` is `(n_q, cols)` with `cols <= k` (any wider slice
+    was pre-topk'd down to `k` at append time — see `process_slice`); its
+    `encoded` is either the matching `(n_q, cols)` id tensor (a pre-topk'd
+    part) or the raw 1-D `(cols,)` fully-encoded
+    `global_file_idx * MAX_ROWS_PER_FILE + row` column ids, broadcast here.
+    Re-top-k'ing once per ~k accumulated columns instead of once per slice
+    is what makes the token-budget regime cheap: with ~65-doc slices and
+    k=1000, this cuts the number of `(n_q, ~2k)` radix-selects ~15x while
+    keeping peak transient memory the same order as the old per-slice merge
+    (the cat is bounded by k + ~2k columns). Candidate order inside the cat
+    is exactly arrival (corpus) order, so determinism for a fixed config is
+    unchanged; which of several EXACTLY tied candidates survives can differ
+    from the old one-merge-per-slice fold (both are deterministic)."""
     import torch
 
     # Each intermediate is del'd as soon as the next line no longer needs it:
     # at n_q=100k / k=1000 they are 0.4-1.6 GiB EACH, and Python locals would
-    # otherwise keep all of them alive until return — ~2.8 GiB of dead
-    # tensors held through the final topk/gather on a GPU already carrying
-    # Q, the batch's score matrices, and both running top-K states.
-    bk = min(k, batch_scores.shape[1])
-    f_scores, f_local = torch.topk(batch_scores, k=bk, dim=1)
-    f_enc = encoded_rows[f_local]
-    del f_local
-    merged_s = torch.cat([top_scores, f_scores], dim=1)
-    del f_scores
-    merged_e = torch.cat([top_enc, f_enc], dim=1)
-    del f_enc
+    # otherwise keep all of them alive until return.
+    merged_s = torch.cat([top_scores] + [p for p, _ in parts], dim=1)
+    merged_e = torch.cat(
+        [top_enc]
+        + [
+            e if e.ndim == 2 else e.unsqueeze(0).expand(p.shape[0], -1)
+            for p, e in parts
+        ],
+        dim=1,
+    )
     new_top_scores, idx = torch.topk(merged_s, k=k, dim=1)
     del merged_s
     return new_top_scores, merged_e.gather(1, idx)
@@ -1250,11 +1430,38 @@ def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | N
     return np.logical_or.reduce(parts)
 
 
+def _ragged_batch_ranges(
+    offsets: np.ndarray, max_rows: int, max_tokens: int | None
+) -> list[tuple[int, int]]:
+    """Split ragged rows by both item count and actual packed token count.
+
+    Rows are never split. If one row alone exceeds ``max_tokens``, it forms a
+    one-row slice so iteration still progresses. Zero-token rows are included
+    without consuming the token budget.
+    """
+    n_rows = len(offsets) - 1
+    ranges: list[tuple[int, int]] = []
+    r0 = 0
+    while r0 < n_rows:
+        row_cap = min(n_rows, r0 + max_rows)
+        if max_tokens is None:
+            r1 = row_cap
+        else:
+            token_cap = int(offsets[r0]) + max_tokens
+            token_cap_row = int(np.searchsorted(offsets, token_cap, side="right") - 1)
+            r1 = min(row_cap, max(r0 + 1, token_cap_row))
+        ranges.append((r0, r1))
+        r0 = r1
+    return ranges
+
+
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_scores, spec_top_enc,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
     encoded_row_ids: np.ndarray | None = None,
+    multivector_token_budget: int | None = None,
+    multivector_double_buffer: bool = False,
 ) -> float:
     """The shared per-vector_type primitive behind `_process_shared_batch`:
     iterate `batch` in `batch_size`-row slices, transfer each slice once
@@ -1320,15 +1527,56 @@ def _process_batch_group(
         return 0.0
     t0 = time.perf_counter()
     step = batch_size or n_rows
+    max_doc_tokens = None
+    if isinstance(batch, MultiVectorCorpusBatch) and multivector_token_budget is not None:
+        # Every backend (torch and triton_reduce alike) materializes the
+        # (block_query_tokens x slice_doc_tokens) matrix P, so the budget is
+        # always enforced against the worst actual query block.
+        max_query_tokens = max(
+            1, max(spec_Q[m].max_block_tokens for m in member_idxs)
+        )
+        max_doc_tokens = max(1, multivector_token_budget // max_query_tokens)
+    if isinstance(batch, MultiVectorCorpusBatch):
+        ranges = _ragged_batch_ranges(batch.doc_offsets, step, max_doc_tokens)
+    else:
+        ranges = [(r0, min(r0 + step, n_rows)) for r0 in range(0, n_rows, step)]
     # How many members read each distinct metric's score matrix — used below
     # to skip caching one nobody else will reuse (the score-matrix analog of
     # `filter_share_count`): a single-reader (n_q, rows) matrix — 1.6 GiB at
     # n_q=100k / rows=4096 — gets collected right after its own merge instead
     # of sitting in `score_cache` through every later member's matmul+merge.
     metric_share_count = Counter(specs[m].metric for m in member_idxs)
-    for r0 in range(0, n_rows, step):
-        r1 = min(r0 + step, n_rows)
-        sl = batch.transfer(r0, r1, device)
+    # Dense only: when 2+ DISTINCT metrics score this batch, derive all of them
+    # from ONE raw Gram instead of one GEMM each (see `DenseBatchSlice`). A
+    # single-metric batch keeps the unshared path, so it pays neither the extra
+    # resident matrix nor any change in its float32 output.
+    if isinstance(batch, DenseCorpusBatch):
+        batch.share_gram = len(metric_share_count) > 1
+
+    # Amortized running top-k (see _merge_topk): per-slice candidates are
+    # buffered (each part pre-topk'd to <= k columns, so the buffer holds at
+    # most ~2k columns per member) and folded with ONE topk once >= k pending
+    # columns accumulate, instead of one topk per slice. Flushed for every
+    # member before this function returns, so callers still observe a fully
+    # merged running state per batch.
+    pending: dict[int, list[tuple]] = {m: [] for m in member_idxs}
+    pending_cols: dict[int, int] = {m: 0 for m in member_idxs}
+
+    def _flush_pending(m: int) -> None:
+        if not pending[m]:
+            return
+        parts = pending[m]
+        pending[m] = []
+        pending_cols[m] = 0
+        spec_top_scores[m], spec_top_enc[m] = _merge_topk(
+            spec_top_scores[m], spec_top_enc[m], parts, specs[m].k
+        )
+
+    def _flush_all_pending() -> None:
+        for m in member_idxs:
+            _flush_pending(m)
+
+    def process_slice(r0: int, r1: int, sl) -> None:
         if orig_rows is None:
             # No CPU round-trip: build the row-index tensor directly on
             # device, and use a plain slice (a view, not a gather-copy) to
@@ -1363,9 +1611,144 @@ def _process_batch_group(
             if cell_mask is not None:
                 sel_scores = sel_scores.masked_fill(~cell_mask, float("-inf"))
 
-            spec_top_scores[m], spec_top_enc[m] = _merge_topk(
-                spec_top_scores[m], spec_top_enc[m], sel_scores, sel_encoded, s.k
+            # Append to the pending buffer (pre-topk wide slices down to k so
+            # the buffer, and any slice score matrix it would otherwise pin
+            # alive, stays bounded); merge only once >= k columns accumulate.
+            if sel_scores.shape[1] > s.k:
+                part_scores, part_local = torch.topk(sel_scores, k=s.k, dim=1)
+                part_enc = sel_encoded[part_local]
+                del part_local
+            else:
+                part_scores, part_enc = sel_scores, sel_encoded
+            pending[m].append((part_scores, part_enc))
+            pending_cols[m] += part_scores.shape[1]
+            if pending_cols[m] >= s.k:
+                _flush_pending(m)
+
+    use_double_buffer = (
+        multivector_double_buffer
+        and isinstance(batch, MultiVectorCorpusBatch)
+        and str(device).startswith("cuda")
+        and len(ranges) > 1
+    )
+
+    # Whole-batch device residency (synchronous path only): when the batch's
+    # token matrix comfortably fits in free CUDA memory, transfer it ONCE and
+    # score every slice as a device-side view — per-slice H2D and allocation
+    # overhead disappear. Slicing `flat_gpu` by token range is a zero-copy
+    # contiguous view; the rebased offsets are a tiny on-device subtraction
+    # (no host sync). Deliberately NOT taken when double buffering was
+    # requested: the resident upload is one big serial copy, while double
+    # buffering exists precisely to hide per-slice H2D behind compute — a
+    # compute-bound run with `multivector_double_buffer: true` must never get
+    # slower by having its overlap silently replaced with an upfront copy.
+    if (
+        not use_double_buffer
+        and isinstance(batch, MultiVectorCorpusBatch)
+        and str(device).startswith("cuda")
+        and batch.flat_tokens.shape[0] > 0
+        and len(ranges) > 1
+    ):
+        free_mem, _ = torch.cuda.mem_get_info(torch.device(device))
+        # mem_get_info reports torch's cached-but-unallocated pool as used, so
+        # a warm process would under-report free memory and stop taking this
+        # path after its first few large batches — count that reclaimable
+        # cache back in (the allocator returns it under pressure).
+        free_mem += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        need = int(batch.flat_tokens.nbytes) + int(batch.doc_offsets.nbytes)
+        if need <= _MV_RESIDENT_FREE_FRACTION * free_mem:
+            flat_gpu = torch.from_numpy(batch.flat_tokens).to(device)
+            off_gpu = torch.from_numpy(
+                np.ascontiguousarray(batch.doc_offsets, dtype=np.int64)
+            ).to(device)
+            for r0, r1 in ranges:
+                tk0, tk1 = int(batch.doc_offsets[r0]), int(batch.doc_offsets[r1])
+                sl = MultiVectorBatchSlice(
+                    flat_gpu[tk0:tk1], off_gpu[r0 : r1 + 1] - off_gpu[r0]
+                )
+                process_slice(r0, r1, sl)
+            _flush_all_pending()
+            return time.perf_counter() - t0
+
+    if not use_double_buffer:
+        for r0, r1 in ranges:
+            process_slice(r0, r1, batch.transfer(r0, r1, device))
+        _flush_all_pending()
+        return time.perf_counter() - t0
+
+    transfer_stream = torch.cuda.Stream(device=torch.device(device))
+    compute_stream = torch.cuda.current_stream(device=torch.device(device))
+
+    # Pinned staging RING (two buffers, sized once for the largest slice) —
+    # NOT a fresh pin_memory() per slice. Ragged slices make almost every
+    # per-slice pinned allocation a unique size, and torch's pinned pool
+    # caches freed blocks by size without returning them to the OS, so
+    # per-slice pinning grew unswappable host memory by ~the size of every
+    # slice ever staged (~one file's tokens per file scanned) — observed as
+    # a host OOM on a 32 GB worker by its third 4.3 GB file. Two fixed
+    # buffers bound pinned memory at 2x the largest slice for the whole run.
+    stage_rows = max(r1 - r0 for r0, r1 in ranges)
+    stage_tokens = max(
+        int(batch.doc_offsets[r1] - batch.doc_offsets[r0]) for r0, r1 in ranges
+    )
+    stages = [
+        (
+            torch.empty(
+                (stage_tokens, batch.flat_tokens.shape[1]),
+                dtype=torch.float32,
+                pin_memory=True,
+            ),
+            torch.empty(stage_rows + 1, dtype=torch.int64, pin_memory=True),
+        )
+        for _ in range(2)
+    ]
+
+    def prefetch(index: int, r0: int, r1: int):
+        # Ring-reuse safety: stage[index % 2] was last used by slice
+        # index - 2, and the backpressure below synchronized on slice
+        # index - 2's COMPUTE event before this call — compute waits on its
+        # H2D, so that H2D (the only reader of this buffer) has completed.
+        flat_stage, off_stage = stages[index % 2]
+        tk0, tk1 = int(batch.doc_offsets[r0]), int(batch.doc_offsets[r1])
+        flat_host = flat_stage[: tk1 - tk0]
+        off_host = off_stage[: r1 - r0 + 1]
+        flat_host.copy_(torch.from_numpy(batch.flat_tokens[tk0:tk1]))
+        off_host.copy_(
+            torch.from_numpy(
+                (batch.doc_offsets[r0 : r1 + 1] - tk0).astype(np.int64, copy=False)
             )
+        )
+        with torch.cuda.stream(transfer_stream):
+            sl = MultiVectorBatchSlice(
+                flat_host.to(device, non_blocking=True),
+                off_host.to(device, non_blocking=True),
+            )
+            ready = torch.cuda.Event()
+            ready.record(transfer_stream)
+        return sl, ready
+
+    # Backpressure: bound CPU run-ahead to the two slices double buffering
+    # actually wants. Without this, the CPU races through the whole loop
+    # enqueueing async work while each consumed slice's record_stream'd
+    # buffers stay unreclaimable until the GPU reaches them — peak device
+    # memory then grows with the CPU's lead (observed as a transient CUDA
+    # OOM on a 24 GB A10G in a compute-bound run). Waiting on the
+    # second-newest compute event is free when transfers are the bottleneck
+    # (the event has already fired) and throttles exactly when compute is.
+    inflight_compute: deque = deque()
+    sl, ready = prefetch(0, *ranges[0])
+    for index, (r0, r1) in enumerate(ranges):
+        compute_stream.wait_event(ready)
+        sl.record_stream(compute_stream)
+        process_slice(r0, r1, sl)
+        done = torch.cuda.Event()
+        done.record(compute_stream)
+        inflight_compute.append(done)
+        if len(inflight_compute) > 1:
+            inflight_compute.popleft().synchronize()
+        if index + 1 < len(ranges):
+            sl, ready = prefetch(index + 1, *ranges[index + 1])
+    _flush_all_pending()
     return time.perf_counter() - t0
 
 
@@ -1704,6 +2087,8 @@ def _process_shared_batch(
     query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
     encoded_row_ids: np.ndarray | None = None,
+    multivector_token_budget: int | None = None,
+    multivector_double_buffer: bool = False,
 ) -> float:
     """Every search of this vector_type shares one batch grid: `orig_rows`
     is `None` when some search is unfiltered (`batch` is the raw, whole
@@ -1781,6 +2166,8 @@ def _process_shared_batch(
         batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_scores, spec_top_enc,
         batch_size, gidx, device, orig_rows=orig_rows, select=select,
         encoded_row_ids=encoded_row_ids,
+        multivector_token_budget=multivector_token_budget,
+        multivector_double_buffer=multivector_double_buffer,
     )
 
 
@@ -1839,6 +2226,34 @@ def run_compute(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         logger.warning("No GPU detected — brute force on CPU will be slow.")
+    if "multivector" in vts_needed and cfg.params.multivector_kernel != "torch":
+        if device != "cuda":
+            if cfg.params.multivector_kernel == "triton_reduce":
+                raise RuntimeError(
+                    f"params.multivector_kernel={cfg.params.multivector_kernel!r} "
+                    "requires a CUDA GPU"
+                )
+            logger.info(
+                "params.multivector_kernel='auto': CUDA unavailable; using torch"
+            )
+        else:
+            try:
+                import nova_bf.multivector_kernels  # noqa: F401
+            except ImportError as exc:
+                if cfg.params.multivector_kernel == "triton_reduce":
+                    raise RuntimeError(
+                        f"params.multivector_kernel={cfg.params.multivector_kernel!r} "
+                        "requires Triton; "
+                        "install a CUDA PyTorch distribution that includes it"
+                    ) from exc
+                logger.warning(
+                    "params.multivector_kernel='auto': Triton unavailable; using torch"
+                )
+            else:
+                logger.info(
+                    "multivector scoring uses cuBLAS FP32 matmul plus the "
+                    "fused Triton ragged reducer"
+                )
     # Opt-in TF32 tensor-core matmuls (see ParamsConfig.allow_tf32). CUDA-only;
     # torch's flag is a no-op on CPU, but gate on device anyway so the log is
     # honest. OFF by default keeps GT bit-exact f32 (matching Qdrant).
@@ -1853,7 +2268,7 @@ def run_compute(
 
     # 1. queries — loaded once per DISTINCT vector_type needed across all specs
     #    (queries files are small, so no need to dedupe further than that).
-    qstore = Store(cfg.queries.path)
+    qstore = Store(cfg.queries.path, ranged_get=cfg.params.io_ranged_get)
     # Union of every spec's per-query filter columns — same "read exactly (and
     # only) what's referenced" guarantee corpus-side filter_cols already makes,
     # extended to the query side (see Filter.query_fields()).
@@ -1936,7 +2351,7 @@ def run_compute(
     # 2. corpus files (global, deterministic order); this worker takes a stride
     #    slice so its global indices stay stable for id decoding. Shared across
     #    every spec — they must all see the identical file set/order/truncation.
-    cstore = Store(cfg.corpus.path)
+    cstore = Store(cfg.corpus.path, ranged_get=cfg.params.io_ranged_get)
     all_files = cstore.list_parquets()
     # Restrict the recursive glob to the intended shards (see corpus.include/exclude).
     # Applied BEFORE striding so the global file index — and thus make_point_id — is
@@ -1964,25 +2379,36 @@ def run_compute(
     mv_batch_size = cfg.params.multivector_batch_size
     mv_query_block = cfg.params.multivector_query_block
     if "multivector" in vts_needed and cfg.params.multivector_token_budget is not None:
-        if mv_batch_size is not None and mv_query_block is not None:
-            logger.warning(
-                "multivector_token_budget=%d is set but BOTH multivector_batch_size "
-                "and multivector_query_block are also set explicitly — the budget has "
-                "nothing to derive and is ignored (explicit knobs win).",
-                cfg.params.multivector_token_budget,
+        if mv_batch_size is None or mv_query_block is None:
+            mean_q_tok = float(mv_q_offsets[-1]) / max(1, n_q) if n_q else 1.0
+            mean_doc_tok = _sample_mean_doc_tokens(
+                cstore, mine, cfg.corpus.multivector_column
             )
-        mean_q_tok = float(mv_q_offsets[-1]) / max(1, n_q) if n_q else 1.0
-        mean_doc_tok = _sample_mean_doc_tokens(cstore, mine, cfg.corpus.multivector_column)
-        mv_batch_size, mv_query_block = _resolve_multivector_tiles(
-            cfg.params.multivector_token_budget, mean_q_tok, mean_doc_tok,
-            mv_batch_size, mv_query_block,
-        )
-        logger.info(
-            "multivector token_budget=%d -> batch_size=%s query_block=%s "
-            "(mean tokens/query=%.1f, tokens/doc=%.1f)",
-            cfg.params.multivector_token_budget, mv_batch_size, mv_query_block,
-            mean_q_tok, mean_doc_tok,
-        )
+            mv_batch_size, mv_query_block = _resolve_multivector_tiles(
+                cfg.params.multivector_token_budget,
+                mean_q_tok,
+                mean_doc_tok,
+                mv_batch_size,
+                mv_query_block,
+            )
+            logger.info(
+                "multivector token_budget=%d derived batch_size=%s query_block=%s "
+                "(mean tokens/query=%.1f, tokens/doc=%.1f); actual ragged offsets "
+                "enforce the budget at scoring time",
+                cfg.params.multivector_token_budget,
+                mv_batch_size,
+                mv_query_block,
+                mean_q_tok,
+                mean_doc_tok,
+            )
+        else:
+            logger.info(
+                "multivector token_budget=%d enforces an actual ragged token-product "
+                "cap within batch_size=%d query_block=%d",
+                cfg.params.multivector_token_budget,
+                mv_batch_size,
+                mv_query_block,
+            )
 
     # 3. per-spec GPU state: each spec gets its own running (top_scores, top_enc)
     #    pair, but every spec of the same vector_type shares ONE raw query
@@ -2002,17 +2428,34 @@ def run_compute(
             off_cpu = np.ascontiguousarray(mv_q_offsets, dtype=np.int64)
             Q_gpu_by_vt[vt] = MultiVectorQuery(
                 flat, torch.tensor(off_cpu, dtype=torch.int64, device=device),
-                off_cpu, n_q, mv_query_block,
+                off_cpu, n_q, mv_query_block, cfg.params.multivector_kernel,
             )
         else:
             Q_gpu_by_vt[vt] = flat
+    # How many DISTINCT metrics each vector_type carries — the same quantity
+    # `_process_batch_group` gates the shared-Gram path on (its `member_idxs`
+    # is exactly this vt's spec list), computed here so a euclidean spec that
+    # can never share is not charged for query norms it will not read.
+    vt_distinct_metrics = {
+        vt: len({s.metric for s in specs if s.vector_type == vt}) for vt in vts_needed
+    }
     q_norms_by_vt: dict[str, object] = {}
     spec_Q, spec_q_norms, spec_top_scores, spec_top_enc = [], [], [], []
     for s in specs:
         # Multivector cosine normalizes each TOKEN inside score() (not a
         # per-query scalar divide like dense/sparse), so it needs no `q_norms`
         # — and Q here is a MultiVectorQuery, not a tensor with .norm().
-        if s.metric == "cosine" and s.vector_type != "multivector":
+        #
+        # `euclidean` (dense-only — rejected for sparse/multivector at config
+        # load) takes `q_norms` ONLY when the shared-Gram derivation can
+        # actually engage for its vector_type, i.e. some sibling spec uses a
+        # different metric: `_scores`'s euclidean branch ignores the argument,
+        # so building it for a euclidean-only run would be one O(n_q × dim)
+        # reduction and an (n_q,) tensor that nothing ever reads.
+        needs_q_norms = s.metric == "cosine" or (
+            s.metric == "euclidean" and vt_distinct_metrics[s.vector_type] > 1
+        )
+        if needs_q_norms and s.vector_type != "multivector":
             if s.vector_type not in q_norms_by_vt:
                 # clamp matches F.normalize's eps — a zero query scores 0
                 # everywhere instead of NaN (and its no-overlap gate already
@@ -2452,6 +2895,12 @@ def run_compute(
             combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_gpu,
             filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
             encoded_row_ids=encoded_ids,
+            multivector_token_budget=(
+                cfg.params.multivector_token_budget if vt == "multivector" else None
+            ),
+            multivector_double_buffer=(
+                cfg.params.multivector_double_buffer if vt == "multivector" else False
+            ),
         )
         coalesce_buf[vt] = []
         coalesce_rows[vt] = 0
@@ -2531,6 +2980,16 @@ def run_compute(
                         spec_top_scores, spec_top_enc,
                         keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
                         filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=batch_orig_rows[vt],
+                        multivector_token_budget=(
+                            cfg.params.multivector_token_budget
+                            if vt == "multivector"
+                            else None
+                        ),
+                        multivector_double_buffer=(
+                            cfg.params.multivector_double_buffer
+                            if vt == "multivector"
+                            else False
+                        ),
                     )
 
             if bar.n % 200 == 0:
