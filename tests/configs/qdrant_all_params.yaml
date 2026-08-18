@@ -46,6 +46,17 @@ vectorstore:
   url: http://localhost:6334
   api_key: secret
   upsert_wait: true
+  # Custom (user-defined) sharding. `shard_key` is a DuckDB expression
+  # evaluated per row in the same context as payload_fields. With custom
+  # sharding, `params.shard_number` means shards PER KEY; `shards_number` /
+  # `replication_factor` here override it per created key. `pre_create` is an
+  # explicit key list created at prepare time (never computed from the data);
+  # unlisted keys are created lazily as workers first upsert under them.
+  custom_sharding:
+    shard_key: "label"
+    shards_number: 2
+    replication_factor: 2
+    pre_create: [tenant_a, 42]  # keywords and numbers both work
   params:
     shard_number: 12
     replication_factor: 2

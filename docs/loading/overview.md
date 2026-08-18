@@ -159,6 +159,60 @@ vectorstore:
 | `turbo` | `bits` (`1`, `1.5`, `2`, `4`), `always_ram` | Qdrant's bit-packed quantization method. |
 | `none` | -- | No quantization. A no-op at creation (same as omitting `quantization:` entirely) — see [Reindexing an existing collection](#reindexing-an-existing-collection) for what it does on `reindex`. |
 
+## Custom sharding (Qdrant)
+
+`vectorstore.custom_sharding` creates the collection with Qdrant's
+[user-defined sharding](https://qdrant.tech/documentation/guides/distributed_deployment/#user-defined-sharding)
+and routes every point to a shard key computed **per row** by a DuckDB
+expression — the same expression machinery as `payload_fields`, so the
+expression sees the source columns, the injected `filename`, the
+`file_row_number` pseudo-column, and the registered macros.
+
+```yaml
+vectorstore:
+  type: qdrant
+  collection_name: my-collection
+  url: ${QDRANT_URL}
+  custom_sharding:
+    shard_key: "org_id"                          # a plain column…
+    # shard_key: "strftime(created_at, '%Y-%m')" # …or time buckets
+    # shard_key: "hash(user_id) % 16"            # …or a bounded hash
+    # shard_key: "file_row_number % 100"         # …or perfectly balanced slices
+    shards_number: 2         # optional: physical shards created per key
+    replication_factor: 2    # optional: replicas per shard, per key
+    pre_create: [acme, globex]  # optional: keys to create at prepare time
+```
+
+- **Key types.** A key is a string (`keyword`) or a non-negative integer
+  (`number`). Anything else — `NULL`, floats, dates, negative ints — is a hard
+  read error with a cast hint (e.g. `(expr)::VARCHAR`), never a silent
+  stringification: a shard key is routing.
+- **Keys are created lazily.** The distinct key set is *never* computed from
+  the data (no `DISTINCT` scan — `prepare` never reads the corpus). Each
+  worker creates a key the first time it upserts under it; racing workers are
+  fine (the loser re-checks and moves on). `pre_create` is an explicit list
+  for when you know the keys up front — it just creates them during
+  `prepare`/`run` instead of mid-load.
+- **`shard_number` changes meaning.** With custom sharding,
+  `params.shard_number` (and `custom_sharding.shards_number`, which overrides
+  it per key) means shards **per shard key**. Total physical shards = keys ×
+  shards_number × replication_factor — keep the per-key count small for
+  high-cardinality keys.
+- **The expression must be deterministic.** Qdrant does not dedupe point ids
+  *across* shard keys: re-loading with an expression that maps an id to a
+  different key (e.g. anything `random()`-based) leaves duplicate points in
+  the collection. Make the key a pure function of the row.
+- **Batching.** An upsert request carries exactly one shard key, so each
+  file's points are grouped by key before batching. A high-cardinality key
+  interleaved *within* files fragments batches (the loader warns when this
+  bites); files partitioned or sorted by the key batch perfectly.
+- **Existing collections.** If the collection already exists (`recreate:
+  false`), the loader verifies it was actually created with custom sharding
+  and fails fast otherwise.
+
+Custom sharding is Qdrant-only: on other backends the `custom_sharding` key
+is rejected at config parse time.
+
 ## Reindexing an existing collection
 
 `nova load reindex <config>` patches `hnsw`/`quantization`/`optimizers` on a

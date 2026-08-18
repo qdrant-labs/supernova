@@ -17,7 +17,7 @@ use duckdb::arrow::datatypes::DataType;
 use duckdb::{Connection, params};
 
 use crate::config::{VectorKind, VectorSpec};
-use crate::stores::{Point, PointId, VectorValue};
+use crate::stores::{Point, PointId, ShardKeyValue, VectorValue};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -40,6 +40,10 @@ pub struct ReadJob {
     pub payload: HashMap<String, String>,
     /// SQL id expression, e.g. `vf_point_id(filename, file_row_number)`.
     pub id_expression: String,
+    /// Custom-sharding key expression, evaluated per row in the same context
+    /// as the payload expressions. `None` when the store has no custom
+    /// sharding. Must return a string or non-negative integer.
+    pub shard_key_expr: Option<String>,
     /// Cap the number of rows read. `None` reads the whole file; `Some(n)` is
     /// used to cheaply sample a file (e.g. inferring dimensions from one row).
     pub limit: Option<usize>,
@@ -58,18 +62,30 @@ impl ReadJob {
         let mut points = Vec::new();
         for batch in stmt.query_arrow(params![])? {
             let id_col = self.column(&batch, "__id")?;
+            let shard_col = match &self.shard_key_expr {
+                Some(_) => Some(self.column(&batch, "__shard_key")?),
+                None => None,
+            };
             for row in 0..batch.num_rows() {
-                points.push(self.build_point(&batch, id_col, row)?);
+                points.push(self.build_point(&batch, id_col, shard_col, row)?);
             }
         }
         Ok(points)
     }
 
-    /// `SELECT {id} AS __id, {col AS vec_name}…, {col AS payload_field}…`
-    /// over the parquet, with the logical filename injected and `file_row_number`
-    /// exposed.
+    /// `SELECT {id} AS __id, {shard expr AS __shard_key}, {col AS vec_name}…,
+    /// {col AS payload_field}…` over the parquet, with the logical filename
+    /// injected and `file_row_number` exposed.
+    ///
+    /// The shard-key projection sits *before* the vector/payload aliases:
+    /// DuckDB resolves lateral column aliases within a SELECT list, so a
+    /// payload field whose name shadows a source column must not be able to
+    /// hijack the columns the shard expression references.
     fn build_sql(&self) -> String {
         let mut projections = vec![format!("{} AS __id", self.id_expression)];
+        if let Some(expr) = &self.shard_key_expr {
+            projections.push(format!("{expr} AS \"__shard_key\""));
+        }
         for (name, spec) in &self.vectors {
             projections.push(format!("{} AS \"{}\"", spec.column, esc_ident(name)));
         }
@@ -94,9 +110,11 @@ impl ReadJob {
         &self,
         batch: &duckdb::arrow::array::RecordBatch,
         id_col: &dyn Array,
+        shard_col: Option<&dyn Array>,
         row: usize,
     ) -> Result<Point, EngineError> {
         let id = self.read_id(id_col, row)?;
+        let shard_key = shard_col.map(|col| self.read_shard_key(col, row)).transpose()?;
 
         let mut vectors = HashMap::with_capacity(self.vectors.len());
         for (name, spec) in &self.vectors {
@@ -118,7 +136,7 @@ impl ReadJob {
             payload.insert(field.clone(), cell_to_json(col, row));
         }
 
-        Ok(Point { id, vectors, payload })
+        Ok(Point { id, vectors, payload, shard_key })
     }
 
     fn column<'b>(
@@ -143,6 +161,45 @@ impl ReadJob {
             return Ok(PointId::Integer(a.value(row)));
         }
         Err(self.schema_err(format!("id column must be string or integer, got {:?}", col.data_type())))
+    }
+
+    /// Coerce one shard-key cell into a [`ShardKeyValue`]. Strict on purpose:
+    /// a shard key is routing, so a NULL or an unsupported type is a loud error
+    /// with a cast hint, never a silent stringification.
+    fn read_shard_key(&self, col: &dyn Array, row: usize) -> Result<ShardKeyValue, EngineError> {
+        let expr = self.shard_key_expr.as_deref().unwrap_or("<shard key>");
+        if col.is_null(row) {
+            return Err(self.schema_err(format!(
+                "shard key expression `{expr}` returned NULL at row {row}; every row must \
+                 produce a key (wrap it, e.g. `coalesce({expr}, 'unknown')`)"
+            )));
+        }
+        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+            return Ok(ShardKeyValue::Keyword(a.value(row).to_string()));
+        }
+        if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+            return Ok(ShardKeyValue::Number(a.value(row)));
+        }
+        if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
+            return Ok(ShardKeyValue::Number(a.value(row) as u64));
+        }
+        let signed = col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| a.value(row))
+            .or_else(|| col.as_any().downcast_ref::<Int32Array>().map(|a| a.value(row) as i64));
+        match signed {
+            Some(v) if v >= 0 => Ok(ShardKeyValue::Number(v as u64)),
+            Some(v) => Err(self.schema_err(format!(
+                "shard key expression `{expr}` returned a negative integer ({v}) at row {row}; \
+                 shard keys are strings or non-negative integers (cast: `({expr})::VARCHAR`)"
+            ))),
+            None => Err(self.schema_err(format!(
+                "shard key expression `{expr}` must return a string or integer, got {:?}; \
+                 cast it, e.g. `({expr})::VARCHAR`",
+                col.data_type()
+            ))),
+        }
     }
 
     fn dense_at(&self, col: &dyn Array, row: usize) -> Result<Vec<f32>, EngineError> {
@@ -365,5 +422,124 @@ mod tests {
             .query_row("SELECT random_words(5)", [], |r| r.get(0))
             .unwrap();
         assert_eq!(phrase.split(' ').count(), 5);
+    }
+
+    /// Write a 3-row parquet (label VARCHAR, num BIGINT, emb FLOAT[]) with
+    /// DuckDB itself, then read it back through a full ReadJob — the same path
+    /// a real load takes. The payload maps `label` to `upper(label)`, so the
+    /// shard-key tests below also prove the shard expression sees the *source*
+    /// column, not the payload alias (the projection-order guarantee).
+    fn read_points(shard_key_expr: Option<&str>) -> Result<Vec<Point>, EngineError> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f.parquet");
+        let conn = Connection::open_in_memory().expect("duckdb");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES
+                ('a', 10::BIGINT, [1.0::FLOAT, 2.0::FLOAT]),
+                ('b', -3::BIGINT, [3.0::FLOAT, 4.0::FLOAT]),
+                ('a', 7::BIGINT,  [5.0::FLOAT, 6.0::FLOAT])
+             ) t(label, num, emb)) TO '{}' (FORMAT parquet)",
+            path.display()
+        ))
+        .expect("write parquet");
+
+        let vectors = HashMap::from([(
+            "dense".to_string(),
+            VectorSpec {
+                kind: VectorKind::Dense,
+                column: "emb".into(),
+                size: None,
+                distance: None,
+                comparator: None,
+                datatype: None,
+                on_disk: None,
+                modifier: None,
+            },
+        )]);
+        ReadJob {
+            path,
+            filename: "f.parquet".into(),
+            vectors,
+            payload: HashMap::from([("label".to_string(), "upper(label)".to_string())]),
+            id_expression: "vf_point_id(filename, file_row_number)".into(),
+            shard_key_expr: shard_key_expr.map(str::to_string),
+            limit: None,
+        }
+        .run()
+    }
+
+    fn schema_detail(err: EngineError) -> String {
+        match err {
+            EngineError::Schema { detail, .. } => detail,
+            other => panic!("expected schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_shard_expr_leaves_keys_none() {
+        let points = read_points(None).unwrap();
+        assert_eq!(points.len(), 3);
+        assert!(points.iter().all(|p| p.shard_key.is_none()));
+    }
+
+    /// A string column becomes keyword keys — and the value is the raw source
+    /// column even though a payload field aliases the same name to
+    /// `upper(label)`: the shard projection precedes the payload aliases.
+    #[test]
+    fn shard_key_from_string_column() {
+        let points = read_points(Some("label")).unwrap();
+        let mut keys: Vec<String> = points
+            .iter()
+            .map(|p| match p.shard_key.as_ref().expect("key set") {
+                ShardKeyValue::Keyword(s) => s.clone(),
+                other => panic!("expected keyword, got {other:?}"),
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["a", "a", "b"]);
+        // The payload still got the transformed value.
+        let labels: Vec<&str> =
+            points.iter().filter_map(|p| p.payload["label"].as_str()).collect();
+        assert!(labels.iter().all(|l| *l == "A" || *l == "B"));
+    }
+
+    /// Integer expressions (here over the `file_row_number` pseudo-column)
+    /// become number keys.
+    #[test]
+    fn shard_key_integer_expression() {
+        let points = read_points(Some("file_row_number % 2")).unwrap();
+        let mut keys: Vec<u64> = points
+            .iter()
+            .map(|p| match p.shard_key.as_ref().expect("key set") {
+                ShardKeyValue::Number(n) => *n,
+                other => panic!("expected number, got {other:?}"),
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, [0, 0, 1]);
+    }
+
+    #[test]
+    fn negative_shard_key_errors_with_cast_hint() {
+        let detail = schema_detail(read_points(Some("num")).unwrap_err());
+        assert!(detail.contains("negative"), "unexpected detail: {detail}");
+        assert!(detail.contains("::VARCHAR"), "unexpected detail: {detail}");
+    }
+
+    #[test]
+    fn null_shard_key_errors() {
+        let detail = schema_detail(read_points(Some("nullif(label, 'a')")).unwrap_err());
+        assert!(detail.contains("NULL"), "unexpected detail: {detail}");
+    }
+
+    /// `/` on integers is float division in DuckDB — a DOUBLE shard key must be
+    /// rejected with the cast hint, not silently stringified.
+    #[test]
+    fn non_integer_shard_key_type_errors() {
+        let detail = schema_detail(read_points(Some("num / 2")).unwrap_err());
+        assert!(
+            detail.contains("must return a string or integer"),
+            "unexpected detail: {detail}"
+        );
     }
 }

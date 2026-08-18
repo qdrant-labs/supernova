@@ -50,12 +50,29 @@ vectors:
   #   type: sparse
   #   column: sparse_embedding
 
-# vectorstore:
+vectorstore:
   type: qdrant
   collection_name: mteb_tweets_all-MiniLM-L6-v2
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
   upsert_wait: false
+  # --- custom (user-defined) sharding, Qdrant-only (uncomment to try) ---
+  # `shard_key` is a DuckDB expression evaluated per row, in the same context
+  # as payload_fields (source columns, filename, file_row_number, macros). It
+  # must return a string or non-negative integer, and must be deterministic —
+  # Qdrant does not dedupe ids across shard keys, so a key that changes
+  # between runs duplicates points. Keys are created lazily as workers first
+  # upsert under them (never a DISTINCT scan); `pre_create` is an explicit
+  # list created at prepare time. NOTE: with custom sharding,
+  # params.shard_number means shards PER KEY (total = keys × shards × replicas).
+  # custom_sharding:
+  #   shard_key: "label"                           # plain column → keyword keys
+  #   # shard_key: "strftime(created_at, '%Y-%m')" # time buckets
+  #   # shard_key: "hash(id) % 16"                 # bounded hash → number keys
+  #   # shard_key: "file_row_number % 100"         # perfectly balanced slices
+  #   # shards_number: 2                           # per-key physical shards
+  #   # replication_factor: 2                      # per-key replicas
+  #   # pre_create: [tenant_a, tenant_b]           # create up front in `prepare`
 
 # Other backends are compiled in only with the matching cargo feature:
 #   cargo build -p nova-load --features elastic,milvus

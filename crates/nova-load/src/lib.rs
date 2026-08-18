@@ -196,6 +196,7 @@ async fn resolve_dims(
         vectors: vectors.clone(),
         payload: HashMap::new(), // dims don't need payload
         id_expression: datasource.reader().id_expression.clone(),
+        shard_key_expr: None, // nor a shard key
         limit: Some(1),
     };
     let sample = tokio::task::spawn_blocking(move || read_job.run()).await??;
@@ -230,6 +231,7 @@ async fn fetch_and_read(
     vectors: &HashMap<String, VectorSpec>,
     payload: &HashMap<String, String>,
     id_expression: &str,
+    shard_key_expr: Option<&str>,
 ) -> Result<Vec<Point>, LoadError> {
     let local = datasource.fetch(file).await?;
     let read_job = engine::ReadJob {
@@ -238,6 +240,7 @@ async fn fetch_and_read(
         vectors: vectors.clone(),
         payload: payload.clone(),
         id_expression: id_expression.to_string(),
+        shard_key_expr: shard_key_expr.map(str::to_string),
         limit: None,
     };
     let points = tokio::task::spawn_blocking(move || read_job.run()).await??;
@@ -270,6 +273,11 @@ async fn load_files(
     let max_failed_files = loader.max_failed_files;
     let id_expression = datasource.reader().id_expression.clone();
     let payload = datasource.reader().payload_fields.clone();
+    // Custom sharding lives on the store (the vectorstore config was consumed
+    // by `connect`), but the key is computed by the reader — so pull the
+    // expression back off the store and hand it to every read job.
+    let shard_key_expr = store.custom_sharding().map(|c| c.shard_key.clone());
+    let sharding = shard_key_expr.is_some();
 
     let total_files = all_files.len();
     let files = plan::partition(&all_files, partition);
@@ -329,12 +337,22 @@ async fn load_files(
             let vectors = &vectors;
             let payload = &payload;
             let id_expression = &id_expression;
+            let shard_key_expr = &shard_key_expr;
             async move {
                 // Retry the whole download+read with exponential backoff; a
                 // re-fetch also recovers from a truncated/corrupt prior download.
                 let mut attempt = 0u32;
                 loop {
-                    match fetch_and_read(datasource, file, vectors, payload, id_expression).await {
+                    match fetch_and_read(
+                        datasource,
+                        file,
+                        vectors,
+                        payload,
+                        id_expression,
+                        shard_key_expr.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(points) => return Ok::<Vec<Point>, (String, LoadError)>(points),
                         Err(err) => {
                             attempt += 1;
@@ -366,8 +384,9 @@ async fn load_files(
     let rate_window = &rate_window;
 
     let mut skipped = 0u64;
+    let mut fragmentation_warned = false;
     while let Some(outcome) = reads.next().await {
-        let points = match outcome {
+        let mut points = match outcome {
             Ok(points) => points,
             Err((key, err)) => {
                 tracing::warn!(
@@ -385,11 +404,33 @@ async fn load_files(
             }
         };
 
+        // Under custom sharding an upsert's shard_key_selector scopes the whole
+        // request, so a chunk must never mix keys: make the file's points
+        // key-contiguous (stable sort keeps row order within a key), then let
+        // `shard_chunks` split at key boundaries as well as `batch_size`.
+        if sharding {
+            points.sort_by(|a, b| a.shard_key.cmp(&b.shard_key));
+        }
+        let chunks = shard_chunks(&points, batch_size);
+        if sharding && !fragmentation_warned && chunks.len() > 1 {
+            let mean = points.len() / chunks.len();
+            if mean < batch_size / 8 {
+                fragmentation_warned = true;
+                tracing::warn!(
+                    "shard key fragments upserts: a file split into {} requests averaging {mean} \
+                     points (batch_size is {batch_size}); a high-cardinality key interleaved \
+                     within files costs throughput — consider partitioning/sorting the source \
+                     files by the shard key",
+                    chunks.len(),
+                );
+            }
+        }
+
         // Upsert this file's batches with up to `concurrency` requests in flight.
         // `buffer_unordered` is the idiomatic bounded-concurrency primitive — a
         // semaphore over a stream of upsert futures — and lets each future borrow
         // `store` without `Arc`/spawning. Each landed batch refreshes the rate.
-        futures::stream::iter(points.chunks(batch_size))
+        futures::stream::iter(chunks)
             .map(|chunk| async move {
                 let n = chunk.len() as u64;
                 // Retry transient store errors with backoff; a persistent failure
@@ -456,6 +497,27 @@ async fn load_files(
     Ok(total)
 }
 
+/// Split `points` into upsert chunks that are at most `batch_size` long AND
+/// never mix shard keys (a Qdrant upsert's `shard_key_selector` scopes the
+/// whole request). Callers sort by key first so each key yields contiguous,
+/// maximally-full chunks. With no shard keys (custom sharding off) this is
+/// exactly `points.chunks(batch_size)`.
+fn shard_chunks(points: &[Point], batch_size: usize) -> Vec<&[Point]> {
+    let mut chunks = Vec::with_capacity(points.len() / batch_size.max(1) + 1);
+    let mut start = 0;
+    while start < points.len() {
+        let key = &points[start].shard_key;
+        let len = points[start..]
+            .iter()
+            .take(batch_size)
+            .take_while(|p| p.shard_key == *key)
+            .count();
+        chunks.push(&points[start..start + len]);
+        start += len;
+    }
+    chunks
+}
+
 /// Human-readable byte count (e.g. `2.4 MB`).
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -469,5 +531,66 @@ fn human_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stores::ShardKeyValue;
+
+    fn point(shard_key: Option<ShardKeyValue>) -> Point {
+        Point {
+            id: stores::PointId::Integer(0),
+            vectors: HashMap::new(),
+            payload: serde_json::Map::new(),
+            shard_key,
+        }
+    }
+
+    fn keyed(keys: &[&str]) -> Vec<Point> {
+        keys.iter().map(|k| point(Some(ShardKeyValue::Keyword(k.to_string())))).collect()
+    }
+
+    /// No shard keys → identical to `chunks(batch_size)`.
+    #[test]
+    fn shard_chunks_without_keys_is_plain_chunking() {
+        let points: Vec<Point> = (0..7).map(|_| point(None)).collect();
+        let chunks = shard_chunks(&points, 3);
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [3, 3, 1]);
+    }
+
+    /// Chunks split at key boundaries as well as batch_size, cover every point,
+    /// and never mix keys.
+    #[test]
+    fn shard_chunks_split_at_key_boundaries_and_batch_size() {
+        // sorted by key, as load_files guarantees: a×5, b×2, c×1
+        let points = keyed(&["a", "a", "a", "a", "a", "b", "b", "c"]);
+        let chunks = shard_chunks(&points, 3);
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [3, 2, 2, 1]);
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(total, points.len());
+        for chunk in &chunks {
+            let first = &chunk[0].shard_key;
+            assert!(chunk.iter().all(|p| p.shard_key == *first), "chunk mixes shard keys");
+        }
+    }
+
+    /// Numbers sort before keywords (enum variant order) — the exact order is
+    /// unimportant, but sorting must make equal keys contiguous for
+    /// `shard_chunks` even when keyword and number keys mix.
+    #[test]
+    fn sorted_mixed_keys_group_contiguously() {
+        let mut points = vec![
+            point(Some(ShardKeyValue::Keyword("a".into()))),
+            point(Some(ShardKeyValue::Number(2))),
+            point(Some(ShardKeyValue::Keyword("a".into()))),
+            point(Some(ShardKeyValue::Number(2))),
+        ];
+        points.sort_by(|a, b| a.shard_key.cmp(&b.shard_key));
+        let chunks = shard_chunks(&points, 10);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 2);
+        assert_eq!(chunks[1].len(), 2);
     }
 }

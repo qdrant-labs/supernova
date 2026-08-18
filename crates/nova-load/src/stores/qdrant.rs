@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -7,18 +7,22 @@ use serde::Deserialize;
 
 use qdrant_client::qdrant::{
     BinaryQuantization, BinaryQuantizationEncoding, CollectionStatus, CompressionRatio,
-    CreateCollectionBuilder, Datatype, Disabled, Distance, HnswConfigDiff, Modifier,
-    MultiVectorComparator, MultiVectorConfigBuilder, OptimizersConfigDiff,
-    OptimizersConfigDiffBuilder, PointStruct, ProductQuantization, QuantizationType,
-    ScalarQuantization, SparseIndexConfigBuilder, SparseVectorConfig, SparseVectorParams,
-    SparseVectorParamsBuilder, TurboQuantBitSize, TurboQuantization, UpdateCollectionBuilder,
-    UpsertPointsBuilder, Vector, VectorParams, VectorParamsBuilder, VectorParamsMap, VectorsConfig,
-    quantization_config, quantization_config_diff, vectors_config,
+    CreateCollectionBuilder, CreateShardKeyBuilder, CreateShardKeyRequestBuilder, Datatype,
+    Disabled, Distance, HnswConfigDiff, Modifier, MultiVectorComparator, MultiVectorConfigBuilder,
+    OptimizersConfigDiff, OptimizersConfigDiffBuilder, PointStruct, ProductQuantization,
+    QuantizationType, ScalarQuantization, ShardKey, ShardKeySelector, ShardingMethod,
+    SparseIndexConfigBuilder, SparseVectorConfig, SparseVectorParams, SparseVectorParamsBuilder,
+    TurboQuantBitSize, TurboQuantization, UpdateCollectionBuilder, UpsertPointsBuilder, Vector,
+    VectorParams, VectorParamsBuilder, VectorParamsMap, VectorsConfig, quantization_config,
+    quantization_config_diff, vectors_config,
 };
 use qdrant_client::{Payload, Qdrant};
 
 use crate::config::{HnswConfig, OptimizersConfig, QuantizationConfig, VectorKind, VectorSpec};
-use crate::stores::{CollectionSchema, Point, PointId, StoreError, VectorStore, VectorValue};
+use crate::stores::{
+    CollectionSchema, CustomSharding, Point, PointId, ShardKeyValue, StoreError, VectorStore,
+    VectorValue,
+};
 
 /// Connection + store settings for a Qdrant backend, as written under
 /// `vectorstore:` in the YAML.
@@ -40,6 +44,11 @@ pub struct QdrantConfig {
     /// Whether upserts block until the write is applied (slower, stronger).
     #[serde(default)]
     pub upsert_wait: bool,
+    /// Custom (user-defined) sharding: the collection is created with
+    /// `sharding_method: custom` and every point routes to the shard key its
+    /// `shard_key` expression evaluates to. See [`CustomSharding`].
+    #[serde(default)]
+    pub custom_sharding: Option<CustomSharding>,
     /// Collection-wide creation params. All optional; Qdrant defaults apply.
     #[serde(default)]
     pub params: Option<QdrantParams>,
@@ -54,6 +63,7 @@ impl fmt::Debug for QdrantConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("collection_name", &self.collection_name)
             .field("upsert_wait", &self.upsert_wait)
+            .field("custom_sharding", &self.custom_sharding)
             .field("params", &self.params)
             .finish()
     }
@@ -129,11 +139,15 @@ pub enum QdrantConfigError {
 /// `dims` supplies resolved dimensionality for dense vectors by name. The loader
 /// fills it from the parquet schema; an explicit `size:` on a [`VectorSpec`]
 /// takes precedence. Sparse vectors ignore `dims`.
+///
+/// `custom_sharding` switches the collection to `sharding_method: custom`; note
+/// that flips `shard_number`'s meaning to *shards per shard key*.
 pub fn build_create_collection(
     collection_name: &str,
     vectors: &HashMap<String, VectorSpec>,
     params: &QdrantParams,
     dims: &HashMap<String, u64>,
+    custom_sharding: Option<&CustomSharding>,
 ) -> Result<CreateCollectionBuilder, QdrantConfigError> {
     let mut dense: HashMap<String, VectorParams> = HashMap::new();
     let mut sparse: HashMap<String, SparseVectorParams> = HashMap::new();
@@ -165,6 +179,9 @@ pub fn build_create_collection(
         builder = builder.sparse_vectors_config(SparseVectorConfig::from(sparse));
     }
 
+    if custom_sharding.is_some() {
+        builder = builder.sharding_method(ShardingMethod::Custom as i32);
+    }
     if let Some(v) = params.shard_number {
         builder = builder.shard_number(v);
     }
@@ -464,6 +481,11 @@ pub struct QdrantStore {
     collection_name: String,
     params: QdrantParams,
     upsert_wait: bool,
+    custom_sharding: Option<CustomSharding>,
+    /// Shard keys known to exist on the server — created by this process, or
+    /// observed after losing a create race. Async mutex because concurrent
+    /// batch upserts can discover new keys simultaneously.
+    ensured_keys: tokio::sync::Mutex<HashSet<ShardKeyValue>>,
 }
 
 impl QdrantConfig {
@@ -478,7 +500,25 @@ impl QdrantConfig {
             collection_name: self.collection_name,
             params: self.params.unwrap_or_default(),
             upsert_wait: self.upsert_wait,
+            custom_sharding: self.custom_sharding,
+            ensured_keys: tokio::sync::Mutex::new(HashSet::new()),
         })
+    }
+}
+
+/// A loader shard-key value → the qdrant wire `ShardKey`.
+fn qdrant_shard_key(value: &ShardKeyValue) -> ShardKey {
+    match value {
+        ShardKeyValue::Keyword(s) => s.clone().into(),
+        ShardKeyValue::Number(n) => (*n).into(),
+    }
+}
+
+/// A loader shard-key value → a single-key `ShardKeySelector` for upserts.
+fn qdrant_shard_selector(value: &ShardKeyValue) -> ShardKeySelector {
+    match value {
+        ShardKeyValue::Keyword(s) => s.clone().into(),
+        ShardKeyValue::Number(n) => (*n).into(),
     }
 }
 
@@ -520,6 +560,90 @@ impl From<Point> for PointStruct {
 }
 
 impl QdrantStore {
+    /// Make sure `key` exists as a shard key on the collection, creating it on
+    /// first sight. Keys are created lazily as the load discovers them (the
+    /// distinct key set isn't known up front and is never computed from the
+    /// data), with an in-process cache so the steady-state cost is one lock +
+    /// set lookup per batch. Racing creators — concurrent batches here, or
+    /// other fleet workers — are fine: whoever loses re-checks
+    /// `list_shard_keys` and accepts the key if it exists now.
+    async fn ensure_shard_key(&self, key: &ShardKeyValue) -> Result<(), StoreError> {
+        let Some(sharding) = &self.custom_sharding else { return Ok(()) };
+        let mut seen = self.ensured_keys.lock().await;
+        if seen.contains(key) {
+            return Ok(());
+        }
+
+        let mut create = CreateShardKeyBuilder::default().shard_key(qdrant_shard_key(key));
+        if let Some(n) = sharding.shards_number {
+            create = create.shards_number(n);
+        }
+        if let Some(r) = sharding.replication_factor {
+            create = create.replication_factor(r);
+        }
+        let request =
+            CreateShardKeyRequestBuilder::new(self.collection_name.as_str()).request(create);
+        match self.client.create_shard_key(request).await {
+            Ok(resp) if resp.result => {
+                tracing::info!("{self} created shard key `{key}`");
+            }
+            outcome => {
+                // Failed or refused — usually a racing worker won. Accept if
+                // the key exists now; otherwise surface the original failure.
+                let live = self.client.list_shard_keys(self.collection_name.as_str()).await?;
+                let want = qdrant_shard_key(key);
+                if !live.shard_keys.iter().any(|d| d.key.as_ref() == Some(&want)) {
+                    return Err(match outcome {
+                        Err(err) => err.into(),
+                        Ok(_) => StoreError::Other(format!(
+                            "qdrant refused to create shard key `{key}` on {self}"
+                        )),
+                    });
+                }
+            }
+        }
+        seen.insert(key.clone());
+        Ok(())
+    }
+
+    /// Create the configured `pre_create` shard keys — an explicit list from
+    /// the config, never computed from the data. A no-op when empty. Runs from
+    /// `ensure_collection`, so a fleet's master creates them during `prepare`.
+    async fn precreate_shard_keys(&self) -> Result<(), StoreError> {
+        let Some(sharding) = &self.custom_sharding else { return Ok(()) };
+        for key in &sharding.pre_create {
+            self.ensure_shard_key(key).await?;
+        }
+        Ok(())
+    }
+
+    /// When custom sharding is configured against an *existing* collection
+    /// (recreate: false), confirm it was actually created with
+    /// `sharding_method: custom` — otherwise every upsert would fail with an
+    /// opaque server error, long after the downloads started.
+    async fn verify_custom_sharding(&self) -> Result<(), StoreError> {
+        if self.custom_sharding.is_none() {
+            return Ok(());
+        }
+        let method = self
+            .client
+            .collection_info(self.collection_name.as_str())
+            .await?
+            .result
+            .and_then(|r| r.config)
+            .and_then(|c| c.params)
+            .and_then(|p| p.sharding_method);
+        if method != Some(ShardingMethod::Custom as i32) {
+            return Err(StoreError::Other(format!(
+                "custom_sharding is configured, but the existing collection `{}` was not \
+                 created with custom sharding; recreate it (params.recreate: true) or drop \
+                 the custom_sharding block",
+                self.collection_name
+            )));
+        }
+        Ok(())
+    }
+
     /// Sanity check: confirm the collection's live config reflects the HNSW and
     /// optimizer index params we requested. Every field set in config must match
     /// what `collection_info` reports; unset fields are skipped (Qdrant keeps its
@@ -599,12 +723,20 @@ impl QdrantStore {
 
 #[async_trait]
 impl VectorStore for QdrantStore {
+    fn custom_sharding(&self) -> Option<&CustomSharding> {
+        self.custom_sharding.as_ref()
+    }
+
     async fn ensure_collection(&self, schema: &CollectionSchema) -> Result<(), StoreError> {
         let exists = self.client.collection_exists(self.collection_name.as_str()).await?;
         if exists {
             if !self.params.recreate {
                 // We dont confirm that the collection schema matches the config
                 // in the future we could... but for now, just assume the user knows what they're doing if they set recreate=false.
+                // Custom sharding IS verified though: a mismatch there fails
+                // every single upsert, so catch it before the load starts.
+                self.verify_custom_sharding().await?;
+                self.precreate_shard_keys().await?;
                 return Ok(());
             }
             self.client.delete_collection(self.collection_name.as_str()).await?;
@@ -615,20 +747,51 @@ impl VectorStore for QdrantStore {
             &schema.vectors,
             &self.params,
             &schema.dims,
+            self.custom_sharding.as_ref(),
         )
         .map_err(|e| StoreError::Other(e.to_string()))?;
         self.client.create_collection(request).await?;
+        self.precreate_shard_keys().await?;
         Ok(())
     }
 
     async fn upsert_batch(&self, points: Vec<Point>) -> Result<(), StoreError> {
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        // Under custom sharding the selector scopes the whole request, so the
+        // batch must be key-homogeneous — the loader guarantees it, but a mixed
+        // batch would silently misroute points, so refuse rather than assume.
+        let shard_key = match &self.custom_sharding {
+            Some(_) => {
+                let key = points.first().and_then(|p| p.shard_key.clone()).ok_or_else(|| {
+                    StoreError::Other(
+                        "custom_sharding is configured but a point arrived without a shard \
+                         key (loader bug: the reader sets one per point)"
+                            .into(),
+                    )
+                })?;
+                if points.iter().any(|p| p.shard_key.as_ref() != Some(&key)) {
+                    return Err(StoreError::Other(
+                        "upsert batch mixes shard keys (loader bug: batches must be \
+                         key-homogeneous)"
+                            .into(),
+                    ));
+                }
+                self.ensure_shard_key(&key).await?;
+                Some(key)
+            }
+            None => None,
+        };
+
         let points: Vec<PointStruct> = points.into_iter().map(PointStruct::from).collect();
-        self.client
-            .upsert_points(
-                UpsertPointsBuilder::new(self.collection_name.as_str(), points)
-                    .wait(self.upsert_wait),
-            )
-            .await?;
+        let mut request = UpsertPointsBuilder::new(self.collection_name.as_str(), points)
+            .wait(self.upsert_wait);
+        if let Some(key) = &shard_key {
+            request = request.shard_key_selector(qdrant_shard_selector(key));
+        }
+        self.client.upsert_points(request).await?;
         Ok(())
     }
 
@@ -788,18 +951,34 @@ mod tests {
         assert!(store.upsert_wait);
         assert!(store.params.as_ref().is_some_and(|p| p.recreate));
 
+        // Custom sharding: the expression + per-key knobs parse, and pre_create
+        // accepts both keyword and number keys (untagged).
+        let sharding = store.custom_sharding.as_ref().expect("custom_sharding present");
+        assert_eq!(sharding.shard_key, "label");
+        assert_eq!(sharding.shards_number, Some(2));
+        assert_eq!(sharding.replication_factor, Some(2));
+        assert_eq!(
+            sharding.pre_create,
+            vec![
+                ShardKeyValue::Keyword("tenant_a".into()),
+                ShardKeyValue::Number(42),
+            ]
+        );
+
         // Sizes are explicit in the fixture, so no inference is needed.
         let cc = build_create_collection(
             &store.collection_name,
             &cfg.vectors,
             store.params.as_ref().unwrap_or(&QdrantParams::default()),
             &HashMap::new(),
+            store.custom_sharding.as_ref(),
         )
         .expect("build should succeed")
         .build();
 
         // Collection-wide params.
         assert_eq!(cc.collection_name, "everything");
+        assert_eq!(cc.sharding_method, Some(ShardingMethod::Custom as i32));
         assert_eq!(cc.shard_number, Some(12));
         assert_eq!(cc.replication_factor, Some(2));
         assert_eq!(cc.write_consistency_factor, Some(3));
@@ -945,8 +1124,9 @@ mod tests {
     fn dense_without_size_errors() {
         let mut vectors = HashMap::new();
         vectors.insert("d".to_string(), bare_dense_spec());
-        let err = build_create_collection("c", &vectors, &QdrantParams::default(), &HashMap::new())
-            .unwrap_err();
+        let err =
+            build_create_collection("c", &vectors, &QdrantParams::default(), &HashMap::new(), None)
+                .unwrap_err();
         assert!(matches!(err, QdrantConfigError::MissingSize(_)));
     }
 
@@ -956,7 +1136,7 @@ mod tests {
         let mut vectors = HashMap::new();
         vectors.insert("d".to_string(), bare_dense_spec());
         let dims = HashMap::from([("d".to_string(), 768u64)]);
-        let cc = build_create_collection("c", &vectors, &QdrantParams::default(), &dims)
+        let cc = build_create_collection("c", &vectors, &QdrantParams::default(), &dims, None)
             .expect("build")
             .build();
         let dense = match cc.vectors_config.unwrap().config.unwrap() {
@@ -964,6 +1144,19 @@ mod tests {
             other => panic!("expected ParamsMap, got {other:?}"),
         };
         assert_eq!(dense["d"].size, 768);
+    }
+
+    /// Without `custom_sharding`, the create request must not set a sharding
+    /// method — the server default (auto) applies.
+    #[test]
+    fn no_custom_sharding_leaves_sharding_method_unset() {
+        let mut vectors = HashMap::new();
+        vectors.insert("d".to_string(), bare_dense_spec());
+        let dims = HashMap::from([("d".to_string(), 8u64)]);
+        let cc = build_create_collection("c", &vectors, &QdrantParams::default(), &dims, None)
+            .expect("build")
+            .build();
+        assert_eq!(cc.sharding_method, None);
     }
 
     #[rstest]
