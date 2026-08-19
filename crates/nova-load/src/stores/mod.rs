@@ -82,6 +82,58 @@ pub enum PointId {
     String(String),
 }
 
+/// A resolved shard-key value, mirroring the two shapes Qdrant accepts
+/// (keyword or unsigned number). `Ord` so the loader can sort a file's points
+/// into key-homogeneous runs; `Hash` for the store's created-keys cache.
+/// Untagged with `Number` first so a YAML `42` parses as a number and
+/// `"tenant-a"` as a keyword.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShardKeyValue {
+    Number(u64),
+    Keyword(String),
+}
+
+impl std::fmt::Display for ShardKeyValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShardKeyValue::Number(n) => write!(f, "{n}"),
+            ShardKeyValue::Keyword(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// Custom-sharding settings, as written under `vectorstore.custom_sharding`.
+/// Backend-agnostic in shape; only backends that support it declare the field
+/// on their config (so `deny_unknown_fields` rejects it elsewhere at parse
+/// time). Currently Qdrant-only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomSharding {
+    /// DuckDB SQL expression evaluated per row during the upsert read, in the
+    /// same context as `payload_fields` expressions: the source columns, the
+    /// injected `filename`, `file_row_number`, and the registered macros.
+    /// Must return a string or a non-negative integer, and must be a pure
+    /// function of the row — the id→key mapping is the user's contract, and a
+    /// re-run that maps an id to a different key duplicates the point across
+    /// shards.
+    pub shard_key: String,
+    /// Physical shards created per key (Qdrant's `CreateShardKey.shards_number`).
+    /// Unset = the server default. Total shards = keys × shards_number ×
+    /// replication_factor, so keep this small for high-cardinality keys.
+    #[serde(default)]
+    pub shards_number: Option<u32>,
+    /// Replicas per shard, per key. Unset = the server default.
+    #[serde(default)]
+    pub replication_factor: Option<u32>,
+    /// Keys to create up front in `ensure_collection` (i.e. during `prepare`),
+    /// for when the key set is known ahead of time — an explicit list, never
+    /// computed from the data. Keys not listed here are still created lazily
+    /// the first time a worker upserts under them.
+    #[serde(default)]
+    pub pre_create: Vec<ShardKeyValue>,
+}
+
 /// One named vector's value, as read from the source. Covers the three shapes a
 /// backend like Qdrant accepts; the reader emits the variant matching the
 /// vector's configured [`kind`](crate::config::VectorKind).
@@ -103,12 +155,25 @@ pub struct Point {
     /// Arbitrary metadata stored alongside the vectors.
     #[serde(default)]
     pub payload: serde_json::Map<String, serde_json::Value>,
+    /// Where this point routes under custom sharding. Set per row by the
+    /// reader when the store has a `custom_sharding` config; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key: Option<ShardKeyValue>,
 }
 
 /// A vector store backend. `Display` is the human-readable name used in logs
 /// (e.g. `qdrant(my_collection)`).
 #[async_trait]
 pub trait VectorStore: Send + Sync + std::fmt::Display {
+    /// This backend's custom-sharding config, if it supports the feature and
+    /// the config sets it. The loader consults this to evaluate the shard-key
+    /// expression during the read (the config itself is consumed by `connect`,
+    /// so the connected store is where the expression lives afterwards).
+    /// Default `None`: no custom sharding.
+    fn custom_sharding(&self) -> Option<&CustomSharding> {
+        None
+    }
+
     /// Create the target collection if absent (or verify it exists), from the
     /// backend-agnostic [`CollectionSchema`].
     async fn ensure_collection(&self, schema: &CollectionSchema) -> Result<(), StoreError>;
