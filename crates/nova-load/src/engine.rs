@@ -43,6 +43,10 @@ pub struct ReadJob {
     /// Cap the number of rows read. `None` reads the whole file; `Some(n)` is
     /// used to cheaply sample a file (e.g. inferring dimensions from one row).
     pub limit: Option<usize>,
+    /// DuckDB `memory_limit` setting for this connection, e.g. `"2GB"`.
+    pub duckdb_memory_limit: String,
+    /// DuckDB `threads` setting for this connection.
+    pub duckdb_threads: u32,
 }
 
 impl ReadJob {
@@ -50,6 +54,11 @@ impl ReadJob {
     /// `spawn_blocking`.
     pub fn run(&self) -> Result<Vec<Point>, EngineError> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch(&format!(
+            "SET memory_limit='{}'; SET threads TO {};",
+            esc_str(&self.duckdb_memory_limit),
+            self.duckdb_threads,
+        ))?;
         register_macros(&conn)?;
 
         let sql = self.build_sql();
@@ -334,6 +343,31 @@ fn esc_ident(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `duckdb_memory_limit`/`duckdb_threads` must actually reach the DuckDB
+    /// connection `ReadJob::run` opens — this reproduces that SET (see `run`)
+    /// directly and reads the settings back via `current_setting`, rather than
+    /// trusting they're merely present on the struct.
+    #[test]
+    fn memory_limit_and_threads_are_applied_to_the_connection() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "SET memory_limit='{}'; SET threads TO {};",
+            esc_str("777MB"),
+            3,
+        ))
+        .unwrap();
+
+        let threads: i64 =
+            conn.query_row("SELECT current_setting('threads')", [], |r| r.get(0)).unwrap();
+        assert_eq!(threads, 3);
+
+        // DuckDB parses "777MB" as decimal (777e6 bytes) but echoes settings
+        // back in binary MiB, so this reads as "741.0 MiB", not "777...".
+        let limit: String =
+            conn.query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0)).unwrap();
+        assert_eq!(limit, "741.0 MiB");
+    }
 
     /// The id + synthetic-payload macros register and evaluate in the bundled
     /// DuckDB (the version the loader actually links), not just in pip duckdb.

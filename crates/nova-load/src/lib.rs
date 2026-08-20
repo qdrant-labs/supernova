@@ -221,6 +221,8 @@ async fn resolve_dims(
         payload: HashMap::new(), // dims don't need payload
         id_expression: datasource.reader().id_expression.clone(),
         limit: Some(1),
+        duckdb_memory_limit: datasource.reader().duckdb_memory_limit.clone(),
+        duckdb_threads: datasource.reader().duckdb_threads,
     };
     let sample = tokio::task::spawn_blocking(move || read_job.run()).await??;
     Ok(engine::infer_dims(&sample, vectors))
@@ -273,6 +275,8 @@ async fn fetch_and_read(
         payload: payload.clone(),
         id_expression: id_expression.to_string(),
         limit: None,
+        duckdb_memory_limit: datasource.reader().duckdb_memory_limit.clone(),
+        duckdb_threads: datasource.reader().duckdb_threads,
     };
     let points = tokio::task::spawn_blocking(move || read_job.run()).await??;
     drop(local); // read done; delete the temp download
