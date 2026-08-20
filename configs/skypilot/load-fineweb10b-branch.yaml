@@ -1,0 +1,20 @@
+# Resources override for `nova dist load` that pins the worker install to the
+# `fineweb-10b` branch instead of the default (`cargo install --git ... nova-load`
+# installs from the repo's default branch, `master` — which predates the
+# qdrant-client 1.19 compatibility work and the `payload_indexes` config field,
+# both only merged on `fineweb-10b` so far). Use until `fineweb-10b` merges to
+# `master`, then delete this file.
+#
+#   nova dist load configs/loader/fineweb_10b_full_with_catalog_env.yaml \
+#     --resources configs/skypilot/load-fineweb10b-branch.yaml --num-jobs 10
+
+setup: |
+  set -e
+  SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+  # A bare AWS base image has no C compiler; cargo (and duckdb's bundled C++
+  # build) needs one, or `cargo install` fails immediately with `linker "cc" not found`.
+  command -v cc >/dev/null || ($SUDO apt-get update && $SUDO apt-get install -y build-essential pkg-config)
+  command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  . "$HOME/.cargo/env"
+  cargo install --git https://github.com/qdrant-labs/supernova --branch fineweb-10b nova-load
+  $SUDO install -m 0755 "$HOME/.cargo/bin/nova-load" /usr/local/bin/nova-load

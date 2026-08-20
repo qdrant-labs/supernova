@@ -7,7 +7,7 @@
 #
 # Run:
 #   nova load inspect configs/loader/fineweb_10b_full_with_catalog_env.yaml --num-jobs 1 --job-rank 0
-#   nova dist load configs/loader/fineweb_10b_full_with_catalog_env.yaml --num-jobs 7
+#   nova dist load configs/loader/fineweb_10b_full_with_catalog_env.yaml --num-jobs 10
 #   nova dist load configs/loader/fineweb_10b_full_with_catalog_env.yaml --finalize
 
 datasource:
@@ -44,7 +44,7 @@ vectorstore:
   upsert_wait: false
   params:
     recreate: false
-    shard_number: 28
+    shard_number: 10
     on_disk_payload: true
     hnsw:
       m: 16
@@ -54,8 +54,13 @@ vectorstore:
       type: turbo
       bits: 4
       always_ram: true
+    # mode: none — temporary workaround: nova-load's payload-index creation
+    # (mode: all) hits "cannot convert field_type" against Qdrant 1.19.0
+    # (crates/nova-load/src/stores/qdrant.rs ensure_payload_indexes). Re-enable
+    # `mode: all` once that's fixed, then re-run `nova load prepare` (idempotent
+    # with recreate: false) to backfill indexes onto the already-loaded collection.
     payload_indexes:
-      mode: all
+      mode: none
     optimizers:
       indexing_threshold: 0
       max_segment_size_kb: 4194304

@@ -1,6 +1,7 @@
 target
 data
 thirdparty
+tools
 
 # Cargo lockfile handling
 # Keep Cargo.lock for applications; ignore for libraries if you prefer reproducible deps via Cargo.toml only

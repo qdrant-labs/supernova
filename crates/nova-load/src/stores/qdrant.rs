@@ -592,6 +592,23 @@ impl QdrantConfig {
 
 const DEFAULT_ENABLED_INDEXING_THRESHOLD: u64 = 20_000;
 
+/// `indexing_threshold: 0` means "keep indexing deferred" and isn't a value
+/// Qdrant will actually apply when finalizing, so `enable_indexing` normalizes
+/// it to the default. The sanity check must expect that same normalized value
+/// rather than the raw configured one, or a `0` config always fails finalize.
+fn enabled_indexing_threshold(params: &QdrantParams) -> u64 {
+    let configured = params
+        .optimizers
+        .as_ref()
+        .and_then(|o| o.indexing_threshold)
+        .unwrap_or(DEFAULT_ENABLED_INDEXING_THRESHOLD);
+    if configured == 0 {
+        DEFAULT_ENABLED_INDEXING_THRESHOLD
+    } else {
+        configured
+    }
+}
+
 impl fmt::Display for QdrantStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "qdrant({})", self.collection_name)
@@ -673,25 +690,37 @@ impl QdrantStore {
 
         if let Some(want) = &self.params.optimizers {
             let live = config.as_ref().and_then(|c| c.optimizer_config.clone()).unwrap_or_default();
-            self.check_u64(
-                "optimizers.indexing_threshold",
-                want.indexing_threshold,
-                live.indexing_threshold,
-            )?;
-            self.check_u64(
-                "optimizers.default_segment_number",
-                want.default_segment_number,
-                live.default_segment_number,
-            )?;
-            self.check_u64(
-                "optimizers.max_segment_size",
-                want.max_segment_size,
-                live.max_segment_size,
-            )?;
-            self.check_u64("optimizers.memmap_threshold", want.memmap_threshold, live.memmap_threshold)?;
+            self.check_optimizers(want, &live)?;
         }
 
         tracing::info!("{self} index params verified against live collection config");
+        Ok(())
+    }
+
+    /// The `optimizers.*` half of [`verify_params`](Self::verify_params),
+    /// split out so it can be exercised directly in tests without a live
+    /// collection round-trip.
+    fn check_optimizers(
+        &self,
+        want: &OptimizersConfig,
+        live: &OptimizersConfigDiff,
+    ) -> Result<(), StoreError> {
+        // `enable_indexing` normalizes a configured 0 (deferred) up to the
+        // default enabled threshold before applying it, so the live value
+        // it produced must be compared against that same normalization —
+        // not the raw configured value, which would never match.
+        self.check_u64(
+            "optimizers.indexing_threshold",
+            want.indexing_threshold.map(|_| enabled_indexing_threshold(&self.params)),
+            live.indexing_threshold,
+        )?;
+        self.check_u64(
+            "optimizers.default_segment_number",
+            want.default_segment_number,
+            live.default_segment_number,
+        )?;
+        self.check_u64("optimizers.max_segment_size", want.max_segment_size, live.max_segment_size)?;
+        self.check_u64("optimizers.memmap_threshold", want.memmap_threshold, live.memmap_threshold)?;
         Ok(())
     }
 
@@ -812,21 +841,14 @@ impl VectorStore for QdrantStore {
     }
 
     async fn enable_indexing(&self, _schema: &CollectionSchema) -> Result<(), StoreError> {
-        let configured = self
-            .params
-            .optimizers
-            .as_ref()
-            .and_then(|o| o.indexing_threshold)
-            .unwrap_or(DEFAULT_ENABLED_INDEXING_THRESHOLD);
-        let threshold = if configured == 0 {
+        let configured = self.params.optimizers.as_ref().and_then(|o| o.indexing_threshold);
+        if configured == Some(0) {
             tracing::warn!(
                 "indexing_threshold=0 keeps indexing disabled; using default {} for finalize",
                 DEFAULT_ENABLED_INDEXING_THRESHOLD
             );
-            DEFAULT_ENABLED_INDEXING_THRESHOLD
-        } else {
-            configured
-        };
+        }
+        let threshold = enabled_indexing_threshold(&self.params);
         self.client
             .update_collection(
                 UpdateCollectionBuilder::new(self.collection_name.as_str()).optimizers_config(
@@ -930,19 +952,6 @@ mod tests {
         }
     }
 
-    fn enabled_indexing_threshold(params: &QdrantParams) -> u64 {
-        let configured = params
-            .optimizers
-            .as_ref()
-            .and_then(|o| o.indexing_threshold)
-            .unwrap_or(DEFAULT_ENABLED_INDEXING_THRESHOLD);
-        if configured == 0 {
-            DEFAULT_ENABLED_INDEXING_THRESHOLD
-        } else {
-            configured
-        }
-    }
-
     #[test]
     fn finalize_threshold_defaults_when_missing() {
         assert_eq!(
@@ -976,6 +985,39 @@ mod tests {
             enabled_indexing_threshold(&params),
             DEFAULT_ENABLED_INDEXING_THRESHOLD
         );
+    }
+
+    /// Regression test for a finalize failure seen with `indexing_threshold: 0`
+    /// (the production 10B ingest config): `defer_indexing` pushes 0 to keep
+    /// indexing off during bulk load, `enable_indexing` then normalizes that 0
+    /// up to `DEFAULT_ENABLED_INDEXING_THRESHOLD` when finalizing (0 isn't a
+    /// valid live target), but the sanity check used to compare the live value
+    /// against the raw configured 0 and always failed. It must instead expect
+    /// whatever `enable_indexing` actually applied.
+    #[test]
+    fn finalize_sanity_check_accepts_normalized_threshold_after_deferred_indexing() {
+        let params = QdrantParams {
+            optimizers: Some(OptimizersConfig { indexing_threshold: Some(0), ..Default::default() }),
+            ..Default::default()
+        };
+        // gRPC connections are lazy: this never dials out, so the test needs
+        // no live Qdrant server.
+        let store = QdrantStore {
+            client: Qdrant::from_url("http://localhost:6334").build().expect("lazy client build"),
+            collection_name: "regression".into(),
+            params,
+            upsert_wait: false,
+        };
+
+        // What `defer_indexing` would have set (0, deferred) plays no part in
+        // the sanity check; what matters is what `enable_indexing` applies.
+        let applied = enabled_indexing_threshold(&store.params);
+        assert_eq!(applied, DEFAULT_ENABLED_INDEXING_THRESHOLD);
+        let live = OptimizersConfigDiff { indexing_threshold: Some(applied), ..Default::default() };
+
+        store
+            .check_optimizers(store.params.optimizers.as_ref().unwrap(), &live)
+            .expect("sanity check should accept the normalized threshold enable_indexing applied");
     }
 
     #[test]
