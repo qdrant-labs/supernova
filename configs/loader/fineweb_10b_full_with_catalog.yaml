@@ -18,8 +18,8 @@ datasource:
   path: s3://fineweb-gte-with-payloads/resharded/
   catalog: ./data/catalog_all_with_payload.parquet
   download_timeout_secs: 600
-  duckdb_memory_limit: 16GB
-  duckdb_threads: 16
+  duckdb_memory_limit: 4GB
+  duckdb_threads: 8
   id_expression: "vf_point_id(filename, file_row_number)"
   payload_fields:
     id: id

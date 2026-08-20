@@ -74,6 +74,57 @@ impl ReadJob {
         Ok(points)
     }
 
+    /// Like [`run`](Self::run), but sends `batch_size`-sized chunks of points
+    /// through `tx` as they're read, instead of collecting the whole file into
+    /// one `Vec` first. Some files in this corpus decode to tens of GB once
+    /// materialized as `Point`s (avg ~4.6GB compressed, ~1.1M rows) — that blew
+    /// past worker memory even with `duckdb_memory_limit` correctly applied,
+    /// because that setting only bounds DuckDB's own internal buffers, not the
+    /// Rust-side `Vec` built from `query_arrow`'s output. `tx.blocking_send`
+    /// gives the read natural backpressure: it only gets as far ahead of the
+    /// consumer as the channel's bound allows. Blocking — call from
+    /// `spawn_blocking`. A closed `tx` (consumer stopped, e.g. hit a points
+    /// budget) ends the read early rather than erroring.
+    pub fn run_streamed(
+        &self,
+        batch_size: usize,
+        tx: tokio::sync::mpsc::Sender<Result<Vec<Point>, EngineError>>,
+    ) {
+        let result = (|| -> Result<(), EngineError> {
+            let conn = Connection::open_in_memory()?;
+            conn.execute_batch(&format!(
+                "SET memory_limit='{}'; SET threads TO {};",
+                esc_str(&self.duckdb_memory_limit),
+                self.duckdb_threads,
+            ))?;
+            register_macros(&conn)?;
+
+            let sql = self.build_sql();
+            let mut stmt = conn.prepare(&sql)?;
+
+            let mut chunk = Vec::with_capacity(batch_size);
+            for batch in stmt.query_arrow(params![])? {
+                let id_col = self.column(&batch, "__id")?;
+                for row in 0..batch.num_rows() {
+                    chunk.push(self.build_point(&batch, id_col, row)?);
+                    if chunk.len() >= batch_size {
+                        let full = std::mem::replace(&mut chunk, Vec::with_capacity(batch_size));
+                        if tx.blocking_send(Ok(full)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if !chunk.is_empty() {
+                let _ = tx.blocking_send(Ok(chunk));
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = tx.blocking_send(Err(e));
+        }
+    }
+
     /// `SELECT {id} AS __id, {col AS vec_name}…, {col AS payload_field}…`
     /// over the parquet, with the logical filename injected and `file_row_number`
     /// exposed.
@@ -367,6 +418,49 @@ mod tests {
         let limit: String =
             conn.query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0)).unwrap();
         assert_eq!(limit, "741.0 MiB");
+    }
+
+    /// `run_streamed` must yield every row across `batch_size`-capped chunks —
+    /// none larger than `batch_size`, and their lengths summing to the file's
+    /// full row count — instead of `run`'s single whole-file `Vec` (the point
+    /// of streaming is to never hold more than one chunk's worth of decoded
+    /// rows in memory at once).
+    #[tokio::test]
+    async fn run_streamed_yields_batch_size_capped_chunks_covering_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.parquet");
+        let setup = Connection::open_in_memory().unwrap();
+        setup
+            .execute_batch(&format!(
+                "COPY (SELECT range AS n, 'v' || range AS s FROM range(10)) TO '{}' (FORMAT PARQUET)",
+                path.display(),
+            ))
+            .unwrap();
+
+        let job = ReadJob {
+            path,
+            filename: "rows.parquet".to_string(),
+            vectors: HashMap::new(),
+            payload: HashMap::from([("s".to_string(), "s".to_string())]),
+            id_expression: "n".to_string(),
+            limit: None,
+            duckdb_memory_limit: "512MB".to_string(),
+            duckdb_threads: 2,
+        };
+
+        let batch_size = 3;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let handle = tokio::task::spawn_blocking(move || job.run_streamed(batch_size, tx));
+
+        let mut chunk_lens = Vec::new();
+        while let Some(item) = rx.recv().await {
+            chunk_lens.push(item.unwrap().len());
+        }
+        handle.await.unwrap();
+
+        assert_eq!(chunk_lens.iter().sum::<usize>(), 10);
+        assert!(chunk_lens.iter().all(|&n| n <= batch_size && n > 0));
+        assert_eq!(chunk_lens, vec![3, 3, 3, 1]);
     }
 
     /// The id + synthetic-payload macros register and evaluate in the bundled

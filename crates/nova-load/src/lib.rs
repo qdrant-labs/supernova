@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
@@ -259,14 +260,30 @@ async fn finish_indexing(
     Ok(())
 }
 
-/// Download one file and DuckDB-read it into points — the unit retried per file.
-async fn fetch_and_read(
+/// A file's read in progress: points arrive in `batch_size` chunks over `rx`
+/// instead of being materialized into one `Vec` up front (some files in this
+/// corpus decode to tens of GB once turned into `Point`s). Holding `_local`
+/// keeps the temp download alive until the read finishes; `task` is awaited
+/// once `rx` closes, to surface a DuckDB-side error or a panic.
+struct StreamedRead {
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<Point>, engine::EngineError>>,
+    task: tokio::task::JoinHandle<()>,
+    _local: sources::LocalFile,
+}
+
+/// Download one file and start a bounded-memory streamed DuckDB read of it —
+/// the unit retried per file. The channel bound (2) is what actually caps
+/// memory: the blocking read task parks once it's a couple of chunks ahead of
+/// whatever's draining `rx`, so at most a couple of `batch_size` chunks are
+/// ever resident, regardless of how many rows the file has.
+async fn fetch_and_read_streamed(
     datasource: &DataSourceConfig,
     file: &FileRef,
     vectors: &HashMap<String, VectorSpec>,
     payload: &HashMap<String, String>,
     id_expression: &str,
-) -> Result<Vec<Point>, LoadError> {
+    batch_size: usize,
+) -> Result<StreamedRead, LoadError> {
     let local = datasource.fetch(file).await?;
     let read_job = engine::ReadJob {
         path: local.path().to_path_buf(),
@@ -278,9 +295,140 @@ async fn fetch_and_read(
         duckdb_memory_limit: datasource.reader().duckdb_memory_limit.clone(),
         duckdb_threads: datasource.reader().duckdb_threads,
     };
-    let points = tokio::task::spawn_blocking(move || read_job.run()).await??;
-    drop(local); // read done; delete the temp download
-    Ok(points)
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let task = tokio::task::spawn_blocking(move || read_job.run_streamed(batch_size, tx));
+    Ok(StreamedRead { rx, task, _local: local })
+}
+
+/// Upsert one already-`batch_size`-capped chunk, retrying transient store
+/// errors with backoff. A persistent failure (store down / misconfigured) is
+/// fatal — the caller propagates it immediately, unlike a read failure, which
+/// retries the whole file.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_one_batch(
+    store: &dyn VectorStore,
+    chunk: Vec<Point>,
+    upsert_retries: usize,
+    points_done: &AtomicU64,
+    rate_window: &std::sync::Mutex<(Instant, u64)>,
+    tty: bool,
+    rate_interval: f64,
+    progress: &ProgressBar,
+) -> Result<u64, StoreError> {
+    let n = chunk.len() as u64;
+    let mut attempt = 0u32;
+    loop {
+        match store.upsert_batch(chunk.clone()).await {
+            Ok(()) => break,
+            Err(err) => {
+                attempt += 1;
+                if attempt > upsert_retries as u32 {
+                    return Err(err);
+                }
+                let backoff = Duration::from_millis((250u64 << (attempt - 1)).min(30_000));
+                tracing::warn!(
+                    "upsert batch failed (attempt {}/{}): {err}; retrying in {:?}",
+                    attempt,
+                    upsert_retries + 1,
+                    backoff,
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+
+    let done = points_done.fetch_add(n, Ordering::Relaxed) + n;
+    let mut w = rate_window.lock().expect("rate window");
+    let dt = w.0.elapsed().as_secs_f64();
+    if dt >= rate_interval {
+        let rate = (done - w.1) as f64 / dt;
+        *w = (Instant::now(), done);
+        drop(w);
+        if tty {
+            progress.set_message(format!("{done} pts · {rate:.0} pts/s"));
+        } else {
+            tracing::info!("{done} pts · {rate:.0} pts/s");
+        }
+    }
+    Ok(n)
+}
+
+/// Drain an already-started file read and upsert its chunks as they arrive,
+/// applying `remaining_row_offset`/`points_budget` in receive order (so those
+/// shared, cross-file counters stay correct) before handing each chunk to a
+/// pool of up to `concurrency` concurrent upserts — the same pipelining the
+/// old "collect the whole file, then `.chunks(batch_size)`" code had, just
+/// without ever holding more than `concurrency` chunks at once.
+///
+/// Returns `(points loaded from this file, whether it stopped early on
+/// budget)`. An `Err` here means the read failed (DuckDB/download/panic) or
+/// upserting exhausted its own retries — the caller distinguishes the two via
+/// `LoadError::Store` (fatal, propagate as-is) vs. anything else (retry the
+/// whole file).
+#[allow(clippy::too_many_arguments)]
+async fn drain_and_upsert(
+    mut streamed: StreamedRead,
+    store: &dyn VectorStore,
+    concurrency: usize,
+    upsert_retries: usize,
+    remaining_row_offset: &mut u64,
+    points_budget: &mut Option<u64>,
+    points_done: &AtomicU64,
+    rate_window: &std::sync::Mutex<(Instant, u64)>,
+    tty: bool,
+    rate_interval: f64,
+    progress: &ProgressBar,
+) -> Result<(u64, bool), LoadError> {
+    let mut inflight = FuturesUnordered::new();
+    let mut file_total = 0u64;
+    let mut budget_hit = false;
+    let mut channel_closed = false;
+
+    loop {
+        while inflight.len() < concurrency && !channel_closed && !budget_hit {
+            if *points_budget == Some(0) {
+                budget_hit = true;
+                break;
+            }
+            let Some(item) = streamed.rx.recv().await else {
+                channel_closed = true;
+                break;
+            };
+            let chunk = item?;
+            let (chunk, partial) =
+                slice_for_offset_and_budget(chunk, remaining_row_offset, points_budget);
+            if !chunk.is_empty() {
+                inflight.push(upsert_one_batch(
+                    store,
+                    chunk,
+                    upsert_retries,
+                    points_done,
+                    rate_window,
+                    tty,
+                    rate_interval,
+                    progress,
+                ));
+            }
+            if partial {
+                budget_hit = true;
+                break;
+            }
+        }
+
+        let Some(result) = inflight.next().await else {
+            // Nothing in flight, and the loop above stopped pulling — either
+            // the channel closed (file fully read) or we hit budget.
+            break;
+        };
+        file_total += result?;
+    }
+
+    // Signal the blocking read task to stop early if it's still going (budget
+    // hit before the channel closed on its own), then wait for it to actually
+    // finish so any DuckDB-side error or panic surfaces here, not silently.
+    drop(streamed.rx);
+    streamed.task.await.map_err(LoadError::Join)?;
+    Ok((file_total, budget_hit))
 }
 
 /// The core load loop: partition the files, then download → DuckDB-read →
@@ -390,10 +538,13 @@ async fn load_files(
     let started = Instant::now();
     let mut total = 0u64;
 
-    // Prefetch pipeline: download + DuckDB-read up to `look_ahead` files
-    // concurrently while the current file's batches are still uploading, so the
-    // store connection isn't stalled on S3/parse time. `buffered` keeps file
-    // order and bounds how many reads are in flight (and how much sits in RAM).
+    // Prefetch pipeline: download + start the streamed DuckDB read for up to
+    // `look_ahead` files concurrently while the current file's batches are
+    // still uploading, so the store connection isn't stalled on S3/parse time.
+    // `buffered` keeps file order and bounds how many downloads+reads are
+    // kicked off at once — it no longer bounds RAM directly (the streamed read
+    // itself does that, via `fetch_and_read_streamed`'s bounded channel), so
+    // this is now mainly about not opening unbounded concurrent S3 downloads.
     let reads = futures::stream::iter(files.iter())
         .map(|file| {
             let datasource = &datasource;
@@ -401,36 +552,18 @@ async fn load_files(
             let payload = &payload;
             let id_expression = &id_expression;
             async move {
-                // Retry the whole download+read with exponential backoff; a
-                // re-fetch also recovers from a truncated/corrupt prior download.
-                let mut attempt = 0u32;
-                loop {
-                    match fetch_and_read(datasource, file, vectors, payload, id_expression).await {
-                        Ok(points) => {
-                            return Ok::<(String, Vec<Point>), (String, LoadError)>((
-                                file.key.clone(),
-                                points,
-                            ));
-                        }
-                        Err(err) => {
-                            attempt += 1;
-                            if attempt > file_retries as u32 {
-                                // Exhausted retries: hand the key + error to the
-                                // consumer to log and skip — don't abort the run.
-                                return Err((file.key.clone(), err));
-                            }
-                            let backoff =
-                                Duration::from_millis((250u64 << (attempt - 1)).min(30_000));
-                            tracing::warn!(
-                                "file `{}` failed (attempt {}/{}): {err}; retrying in {:?}",
-                                file.key,
-                                attempt,
-                                file_retries + 1,
-                                backoff,
-                            );
-                            tokio::time::sleep(backoff).await;
-                        }
-                    }
+                match fetch_and_read_streamed(
+                    datasource,
+                    file,
+                    vectors,
+                    payload,
+                    id_expression,
+                    batch_size,
+                )
+                .await
+                {
+                    Ok(streamed) => Ok((file, streamed)),
+                    Err(err) => Err((file, err)),
                 }
             }
         })
@@ -445,14 +578,128 @@ async fn load_files(
     let mut remaining_row_offset = row_offset;
     let mut bounded_stop = false;
     let mut skipped = 0u64;
-    while let Some(outcome) = reads.next().await {
+    while let Some(prefetched) = reads.next().await {
         if points_budget == Some(0) {
             bounded_stop = true;
             break;
         }
-        let (key, points) = match outcome {
-            Ok(points) => points,
-            Err((key, err)) => {
+        let file = match &prefetched {
+            Ok((file, _)) => *file,
+            Err((file, _)) => *file,
+        };
+        let key = file.key.clone();
+
+        // Attempt 1 is whatever `look_ahead` already prefetched. A retry (rare
+        // — read failures, not upsert failures, which are fatal and returned
+        // immediately below) starts a fresh, non-prefetched streamed read;
+        // retries are the exceptional path, so losing prefetch for them isn't
+        // a meaningful throughput hit.
+        let mut attempt = 0u32;
+        let mut current: Result<StreamedRead, LoadError> = match prefetched {
+            Ok((_, streamed)) => Ok(streamed),
+            Err((_, err)) => Err(err),
+        };
+        let file_outcome = loop {
+            match current {
+                Ok(streamed) => {
+                    match drain_and_upsert(
+                        streamed,
+                        store,
+                        concurrency,
+                        upsert_retries,
+                        &mut remaining_row_offset,
+                        &mut points_budget,
+                        points_done,
+                        rate_window,
+                        tty,
+                        rate_interval,
+                        progress,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => break Ok(outcome),
+                        // Upsert exhausted its own retries — fatal, matches the
+                        // original code's `?` propagation out of `load_files`.
+                        Err(LoadError::Store(err)) => return Err(LoadError::Store(err)),
+                        Err(err) => {
+                            attempt += 1;
+                            if attempt > file_retries as u32 {
+                                break Err(err);
+                            }
+                            let backoff =
+                                Duration::from_millis((250u64 << (attempt - 1)).min(30_000));
+                            tracing::warn!(
+                                "file `{}` failed (attempt {}/{}): {err}; retrying in {:?}",
+                                file.key,
+                                attempt,
+                                file_retries + 1,
+                                backoff,
+                            );
+                            tokio::time::sleep(backoff).await;
+                            current = fetch_and_read_streamed(
+                                datasource,
+                                file,
+                                vectors,
+                                &payload,
+                                &id_expression,
+                                batch_size,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(err) => {
+                    attempt += 1;
+                    if attempt > file_retries as u32 {
+                        break Err(err);
+                    }
+                    let backoff = Duration::from_millis((250u64 << (attempt - 1)).min(30_000));
+                    tracing::warn!(
+                        "file `{}` failed (attempt {}/{}): {err}; retrying in {:?}",
+                        file.key,
+                        attempt,
+                        file_retries + 1,
+                        backoff,
+                    );
+                    tokio::time::sleep(backoff).await;
+                    current = fetch_and_read_streamed(
+                        datasource,
+                        file,
+                        vectors,
+                        &payload,
+                        &id_expression,
+                        batch_size,
+                    )
+                    .await;
+                }
+            }
+        };
+
+        match file_outcome {
+            Ok((n, partial_file_due_to_budget)) => {
+                total += n;
+                points_budget = points_budget.map(|remaining| remaining.saturating_sub(n));
+                if let Some(0) = points_budget {
+                    bounded_stop = true;
+                }
+                if let Some(ctx) = checkpoint_ctx.as_mut()
+                    && !partial_file_due_to_budget
+                {
+                    ctx.state.completed_files.insert(key);
+                    ctx.completed_since_flush += 1;
+                    if ctx.completed_since_flush >= ctx.flush_every_files {
+                        checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
+                        ctx.completed_since_flush = 0;
+                    }
+                }
+                progress.inc(1);
+                if bounded_stop {
+                    break;
+                }
+            }
+            Err(err) => {
+                // Exhausted retries: log and skip — don't abort the whole run
+                // for one bad file.
                 tracing::warn!(
                     "skipping file `{key}` after {} attempt(s): {err}",
                     file_retries + 1,
@@ -464,95 +711,7 @@ async fn load_files(
                     return Err(LoadError::TooManyFailedFiles { skipped, max });
                 }
                 progress.inc(1);
-                continue;
             }
-        };
-
-        let (points, partial_file_due_to_budget) =
-            slice_for_offset_and_budget(points, &mut remaining_row_offset, &mut points_budget);
-        if points.is_empty() {
-            if let Some(ctx) = checkpoint_ctx.as_mut() {
-                ctx.state.completed_files.insert(key);
-                ctx.completed_since_flush += 1;
-                if ctx.completed_since_flush >= ctx.flush_every_files {
-                    checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
-                    ctx.completed_since_flush = 0;
-                }
-            }
-            progress.inc(1);
-            continue;
-        }
-
-        // Upsert this file's batches with up to `concurrency` requests in flight.
-        // `buffer_unordered` is the idiomatic bounded-concurrency primitive — a
-        // semaphore over a stream of upsert futures — and lets each future borrow
-        // `store` without `Arc`/spawning. Each landed batch refreshes the rate.
-        futures::stream::iter(points.chunks(batch_size))
-            .map(|chunk| async move {
-                let n = chunk.len() as u64;
-                // Retry transient store errors with backoff; a persistent failure
-                // (store down / misconfigured) aborts the run via `?` on try_collect.
-                let mut attempt = 0u32;
-                loop {
-                    match store.upsert_batch(chunk.to_vec()).await {
-                        Ok(()) => break,
-                        Err(err) => {
-                            attempt += 1;
-                            if attempt > upsert_retries as u32 {
-                                return Err(err);
-                            }
-                            let backoff =
-                                Duration::from_millis((250u64 << (attempt - 1)).min(30_000));
-                            tracing::warn!(
-                                "upsert batch failed (attempt {}/{}): {err}; retrying in {:?}",
-                                attempt,
-                                upsert_retries + 1,
-                                backoff,
-                            );
-                            tokio::time::sleep(backoff).await;
-                        }
-                    }
-                }
-                let done = points_done.fetch_add(n, Ordering::Relaxed) + n;
-
-                // Recompute the rate over the most recent window, then either
-                // refresh the bar (TTY) or log it (headless fleet worker).
-                let mut w = rate_window.lock().expect("rate window");
-                let dt = w.0.elapsed().as_secs_f64();
-                if dt >= rate_interval {
-                    let rate = (done - w.1) as f64 / dt;
-                    *w = (Instant::now(), done);
-                    drop(w);
-                    if tty {
-                        progress.set_message(format!("{done} pts · {rate:.0} pts/s"));
-                    } else {
-                        tracing::info!("{done} pts · {rate:.0} pts/s");
-                    }
-                }
-                Ok::<(), StoreError>(())
-            })
-            .buffer_unordered(concurrency)
-            .try_collect::<Vec<()>>()
-            .await?;
-
-        total += points.len() as u64;
-        points_budget = points_budget.map(|remaining| remaining.saturating_sub(points.len() as u64));
-        if let Some(0) = points_budget {
-            bounded_stop = true;
-        }
-        if let Some(ctx) = checkpoint_ctx.as_mut() {
-            if !partial_file_due_to_budget {
-                ctx.state.completed_files.insert(key);
-                ctx.completed_since_flush += 1;
-                if ctx.completed_since_flush >= ctx.flush_every_files {
-                    checkpoint::save(&ctx.path, &ctx.meta, &ctx.state)?;
-                    ctx.completed_since_flush = 0;
-                }
-            }
-        }
-        progress.inc(1);
-        if bounded_stop {
-            break;
         }
     }
 

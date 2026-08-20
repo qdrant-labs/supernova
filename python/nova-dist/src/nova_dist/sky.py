@@ -182,7 +182,11 @@ DEFAULTS: dict[str, dict] = {
 
 # Top-level keys an override may replace. `run:` is intentionally not here — we
 # always inject the per-rank command.
-_MERGE_KEYS = ("resources", "setup", "envs")
+#
+# `file_mounts` lets an override stage extra local files onto workers (e.g. a
+# locally-built binary, to skip an in-`setup` compile) — merged under the
+# run's own mounts (staged config, `--catalog`), which win on path collision.
+_MERGE_KEYS = ("resources", "setup", "envs", "file_mounts")
 
 
 def skypilot_dir() -> Path:
@@ -200,10 +204,11 @@ def resolve_resources(tool: str, flag_path: str | None) -> tuple[dict, str]:
 
         built-in DEFAULTS  <  ~/.nova/skypilot/<tool>.yaml  <  --resources flag
 
-    Only the top-level keys present in an override (`resources`/`setup`/`envs`)
-    replace the default's value for that key — so a file with just `setup:` keeps
-    the default `resources:`, and vice versa. Returns `(spec, source)` where
-    `source` describes where the override came from (for logging).
+    Only the top-level keys present in an override (`resources`/`setup`/`envs`/
+    `file_mounts`) replace the default's value for that key — so a file with
+    just `setup:` keeps the default `resources:`, and vice versa. Returns
+    `(spec, source)` where `source` describes where the override came from (for
+    logging).
     """
     if tool not in DEFAULTS:
         raise ValueError(f"no built-in defaults for tool {tool!r}")
@@ -255,10 +260,11 @@ def write_pool_and_job(
     jobs must restate resources but must NOT set setup/file_mounts).
     """
     resources = sky_cfg["resources"]
+    merged_mounts = {**sky_cfg.get("file_mounts", {}), **file_mounts}
     pool_yaml = {
         "pool": {"min_workers": num_jobs, "max_workers": num_jobs},
         "resources": resources,
-        "file_mounts": file_mounts,
+        "file_mounts": merged_mounts,
     }
     if sky_cfg.get("setup"):
         pool_yaml["setup"] = sky_cfg["setup"]
