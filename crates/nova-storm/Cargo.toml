@@ -57,4 +57,4 @@ milvus = ["dep:milvus", "dep:reqwest"]
 tempfile = { workspace = true }
 # Constructing tonic::Status values in the timeout-classification tests; must
 # track qdrant-client's tonic major (compile error on drift, not silent skew).
-tonic = "0.12"
+tonic = "0.14"

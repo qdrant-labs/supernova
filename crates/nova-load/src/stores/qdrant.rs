@@ -8,7 +8,8 @@ use serde::Deserialize;
 use qdrant_client::qdrant::{
     BinaryQuantization, BinaryQuantizationEncoding, CollectionStatus, CompressionRatio,
     CreateCollectionBuilder, CreateShardKeyBuilder, CreateShardKeyRequestBuilder, Datatype,
-    Disabled, Distance, HnswConfigDiff, Modifier, MultiVectorComparator, MultiVectorConfigBuilder,
+    Disabled, Distance, HnswConfigDiff, Memory, Modifier, MultiVectorComparator,
+    MultiVectorConfigBuilder,
     OptimizersConfigDiff, OptimizersConfigDiffBuilder, PointStruct, ProductQuantization,
     QuantizationType, ScalarQuantization, ShardKey, ShardKeySelector, ShardingMethod,
     SparseIndexConfigBuilder, SparseVectorConfig, SparseVectorParams, SparseVectorParamsBuilder,
@@ -254,7 +255,12 @@ fn dense_params(
 
     let mut b = VectorParamsBuilder::new(size, parse_distance(name, spec.distance.as_deref())?);
     if let Some(on_disk) = spec.on_disk {
+        // Both the deprecated flag and its 1.19 `memory` replacement — see the
+        // compat note above `always_ram_memory`.
         b = b.on_disk(on_disk);
+        if let Some(memory) = on_disk_memory(Some(on_disk)) {
+            b = b.memory(memory);
+        }
     }
     if let Some(dt) = parse_datatype(name, spec.datatype.as_deref())? {
         b = b.datatype(dt);
@@ -269,7 +275,12 @@ fn dense_params(
 fn sparse_params(name: &str, spec: &VectorSpec) -> Result<SparseVectorParams, QdrantConfigError> {
     let mut idx = SparseIndexConfigBuilder::default();
     if let Some(on_disk) = spec.on_disk {
+        // Both the deprecated flag and its 1.19 `memory` replacement — see the
+        // compat note above `always_ram_memory`.
         idx = idx.on_disk(on_disk);
+        if let Some(memory) = on_disk_memory(Some(on_disk)) {
+            idx = idx.memory(memory);
+        }
     }
     if let Some(dt) = parse_datatype(name, spec.datatype.as_deref())? {
         idx = idx.datatype(dt);
@@ -283,6 +294,7 @@ fn sparse_params(name: &str, spec: &VectorSpec) -> Result<SparseVectorParams, Qd
 
 /// Map the config HNSW knobs onto a qdrant `HnswConfigDiff` (unset fields stay
 /// `None`, so the server keeps its defaults).
+#[allow(deprecated)] // on_disk is sent alongside `memory` — see above
 fn hnsw_diff(h: &HnswConfig) -> HnswConfigDiff {
     HnswConfigDiff {
         m: h.m,
@@ -290,6 +302,7 @@ fn hnsw_diff(h: &HnswConfig) -> HnswConfigDiff {
         full_scan_threshold: h.full_scan_threshold,
         max_indexing_threads: h.max_indexing_threads,
         on_disk: h.on_disk,
+        memory: on_disk_memory(h.on_disk),
         payload_m: h.payload_m,
         ..Default::default()
     }
@@ -321,6 +334,25 @@ enum ParsedQuantization {
     Turbo(TurboQuantization),
 }
 
+// qdrant-client 1.19 deprecated the placement bools (`always_ram`, `on_disk`)
+// in favor of a `memory` enum (cold / cached / pinned). We send BOTH: servers
+// older than the enum ignore the unknown field and read the bool, newer
+// servers let `memory` override it — same placement either way. The
+// `#[allow(deprecated)]` blocks below exist for exactly that compat window.
+
+/// `always_ram: true` pinned quantized vectors in RAM; false/absent meant
+/// "follow the main storage config" (the server default), so nothing is sent.
+fn always_ram_memory(always_ram: Option<bool>) -> Option<i32> {
+    matches!(always_ram, Some(true)).then_some(Memory::Pinned as i32)
+}
+
+/// `on_disk: true` meant disk-resident (not preloaded) → cold; `false` meant
+/// in-RAM → pinned. Absent stays absent (server default).
+fn on_disk_memory(on_disk: Option<bool>) -> Option<i32> {
+    on_disk.map(|d| if d { Memory::Cold } else { Memory::Pinned } as i32)
+}
+
+#[allow(deprecated)] // always_ram is sent alongside `memory` — see above
 fn parse_quantization(q: &QuantizationConfig) -> Result<ParsedQuantization, QdrantConfigError> {
     match q.kind.as_deref().map(str::to_ascii_lowercase).as_deref() {
         // A bare `quantization: {}` block means scalar (int8) quantization.
@@ -328,18 +360,22 @@ fn parse_quantization(q: &QuantizationConfig) -> Result<ParsedQuantization, Qdra
             r#type: QuantizationType::Int8 as i32,
             quantile: q.quantile,
             always_ram: q.always_ram,
+            memory: always_ram_memory(q.always_ram),
         })),
         Some("product") => Ok(ParsedQuantization::Product(ProductQuantization {
             compression: parse_compression(q.compression.as_deref())? as i32,
             always_ram: q.always_ram,
+            memory: always_ram_memory(q.always_ram),
         })),
         Some("binary") => Ok(ParsedQuantization::Binary(BinaryQuantization {
             always_ram: q.always_ram,
+            memory: always_ram_memory(q.always_ram),
             encoding: parse_quantization_encoding(q.encoding.as_deref())?.map(|e| e as i32),
             query_encoding: None,
         })),
         Some("turbo") => Ok(ParsedQuantization::Turbo(TurboQuantization {
             always_ram: q.always_ram,
+            memory: always_ram_memory(q.always_ram),
             bits: parse_turbo_bits(q.bits)?.map(|b| b as i32),
         })),
         Some("none") => Ok(ParsedQuantization::None),
@@ -660,7 +696,7 @@ impl QdrantStore {
             .and_then(|r| r.config);
 
         if let Some(want) = &self.params.hnsw {
-            let live = config.as_ref().and_then(|c| c.hnsw_config.clone()).unwrap_or_default();
+            let live = config.as_ref().and_then(|c| c.hnsw_config).unwrap_or_default();
             self.check_u64("hnsw.m", want.m, live.m)?;
             self.check_u64("hnsw.ef_construct", want.ef_construct, live.ef_construct)?;
             self.check_u64(
@@ -674,19 +710,28 @@ impl QdrantStore {
                 live.max_indexing_threads,
             )?;
             self.check_u64("hnsw.payload_m", want.payload_m, live.payload_m)?;
-            if let Some(w) = want.on_disk
-                && live.on_disk != Some(w)
-            {
-                return Err(StoreError::Other(format!(
-                    "sanity check FAILED on {self} hnsw.on_disk: requested {w} but live \
-                     config has {:?}",
-                    live.on_disk
-                )));
+            if let Some(w) = want.on_disk {
+                // The server may report placement through the deprecated
+                // `on_disk` flag or the 1.19 `memory` enum depending on its
+                // version — accept either representation of what we asked for.
+                #[allow(deprecated)]
+                let live_on_disk = live.on_disk.or(match live.memory.map(Memory::try_from) {
+                    Some(Ok(Memory::Cold)) => Some(true),
+                    Some(Ok(Memory::Pinned)) => Some(false),
+                    _ => None,
+                });
+                if live_on_disk != Some(w) {
+                    return Err(StoreError::Other(format!(
+                        "sanity check FAILED on {self} hnsw.on_disk: requested {w} but live \
+                         config has on_disk={live_on_disk:?} (memory={:?})",
+                        live.memory
+                    )));
+                }
             }
         }
 
         if let Some(want) = &self.params.optimizers {
-            let live = config.as_ref().and_then(|c| c.optimizer_config.clone()).unwrap_or_default();
+            let live = config.as_ref().and_then(|c| c.optimizer_config).unwrap_or_default();
             self.check_u64(
                 "optimizers.indexing_threshold",
                 want.indexing_threshold,
@@ -940,6 +985,7 @@ mod tests {
     /// `QdrantParams`, add it to `tests/configs/qdrant_all_params.yaml` and assert
     /// it here — that pairing is what keeps "all params available" honest.
     #[test]
+    #[allow(deprecated)] // asserts the deprecated flags are still sent alongside `memory`
     fn all_collection_params_flow_through() {
         let cfg = load_fixture();
         let store = qdrant_store(&cfg);
@@ -991,6 +1037,7 @@ mod tests {
         assert_eq!(chnsw.full_scan_threshold, Some(10000));
         assert_eq!(chnsw.max_indexing_threads, Some(4));
         assert_eq!(chnsw.on_disk, Some(true));
+        assert_eq!(chnsw.memory, Some(Memory::Cold as i32)); // on_disk:true → cold
         assert_eq!(chnsw.payload_m, Some(8));
 
         // Collection-wide scalar quantization.
@@ -1006,6 +1053,7 @@ mod tests {
         assert_eq!(quant.r#type, QuantizationType::Int8 as i32);
         assert_eq!(quant.quantile, Some(0.99));
         assert_eq!(quant.always_ram, Some(true));
+        assert_eq!(quant.memory, Some(Memory::Pinned as i32)); // always_ram:true → pinned
 
         // Collection-wide optimizers.
         let opt = cc.optimizers_config.as_ref().expect("optimizers");
@@ -1248,7 +1296,11 @@ mod tests {
         match quantization_for_create(&q).unwrap() {
             Some(quantization_config::Quantization::Binary(b)) => {
                 assert_eq!(b.encoding, expected.map(|e| e as i32));
-                assert_eq!(b.always_ram, Some(true));
+                // Statement-level allow: rstest's expansion drops fn-level ones.
+                #[allow(deprecated)] // deprecated flag is still sent alongside `memory`
+                let live_always_ram = b.always_ram;
+                assert_eq!(live_always_ram, Some(true));
+                assert_eq!(b.memory, Some(Memory::Pinned as i32));
             }
             other => panic!("expected binary, got {other:?}"),
         }

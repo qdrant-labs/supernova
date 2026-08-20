@@ -102,6 +102,7 @@ impl From<&SearchParamsConfig> for SearchParams {
             quantization: p.quantization.as_ref().map(QuantizationSearchParams::from),
             indexed_only: None,
             acorn: None,
+            idf: None,
         }
     }
 }
@@ -566,8 +567,11 @@ impl QueryTarget for QdrantTarget {
                 if let Some(name) = &self.vector_name {
                     builder = builder.using(name.clone());
                 }
-                if let Some(params) = self.search_params {
-                    builder = builder.params(params);
+                // Clone: SearchParams stopped being `Copy` in qdrant-client
+                // 1.19 (the new `idf` sub-message), so a bare `Some(params)`
+                // bind would move it out of `self` inside this FnMut closure.
+                if let Some(params) = &self.search_params {
+                    builder = builder.params(params.clone());
                 }
                 if let Some(filter) = self.effective_filter(q)? {
                     builder = builder.filter(filter);
