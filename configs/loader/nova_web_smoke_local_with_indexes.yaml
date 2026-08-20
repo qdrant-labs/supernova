@@ -1,0 +1,31 @@
+datasource:
+  type: local
+  path: /tmp/nova_web_smoke_data
+  id_expression: "vf_point_id(filename, file_row_number)"
+  payload_fields:
+    id: id
+    text: text
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 8
+
+vectorstore:
+  type: qdrant
+  collection_name: nova_web_smoke_test_with_indexes
+  url: ${QDRANT_URL:-http://127.0.0.1:6334}
+  api_key: ${QDRANT_API_KEY:-}
+  upsert_wait: false
+  params:
+    recreate: true
+    payload_indexes:
+      mode: all
+    optimizers:
+      indexing_threshold: 0
+
+loader:
+  batch_size: 64
+  concurrency: 1

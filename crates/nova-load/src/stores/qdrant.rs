@@ -355,19 +355,23 @@ fn parse_quantization(q: &QuantizationConfig) -> Result<ParsedQuantization, Qdra
             r#type: QuantizationType::Int8 as i32,
             quantile: q.quantile,
             always_ram: q.always_ram,
+            memory: None,
         })),
         Some("product") => Ok(ParsedQuantization::Product(ProductQuantization {
             compression: parse_compression(q.compression.as_deref())? as i32,
             always_ram: q.always_ram,
+            memory: None,
         })),
         Some("binary") => Ok(ParsedQuantization::Binary(BinaryQuantization {
             always_ram: q.always_ram,
             encoding: parse_quantization_encoding(q.encoding.as_deref())?.map(|e| e as i32),
             query_encoding: None,
+            memory: None,
         })),
         Some("turbo") => Ok(ParsedQuantization::Turbo(TurboQuantization {
             always_ram: q.always_ram,
             bits: parse_turbo_bits(q.bits)?.map(|b| b as i32),
+            memory: None,
         })),
         Some("none") => Ok(ParsedQuantization::None),
         Some(other) => Err(QdrantConfigError::UnknownQuantizationType(other.to_string())),

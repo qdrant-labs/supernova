@@ -109,6 +109,7 @@ impl From<&SearchParamsConfig> for SearchParams {
             quantization: p.quantization.as_ref().map(QuantizationSearchParams::from),
             indexed_only: None,
             acorn: None,
+            idf: None,
         }
     }
 }
@@ -517,7 +518,7 @@ impl QueryTarget for QdrantTarget {
                 if let Some(name) = &self.vector_name {
                     builder = builder.using(name.clone());
                 }
-                if let Some(params) = self.search_params {
+                if let Some(params) = self.search_params.clone() {
                     builder = builder.params(params);
                 }
                 if let Some(filter) = self.effective_filter(q)? {

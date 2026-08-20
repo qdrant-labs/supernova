@@ -1,0 +1,34 @@
+# Paste into the "Submit Load Job" panel in the Supernova tab.
+# Prerequisite: create /tmp/nova_web_smoke_data/part-0000.parquet (test dataset).
+
+datasource:
+  type: local
+  path: /tmp/nova_web_smoke_data
+  id_expression: "vf_point_id(filename, file_row_number)"
+  payload_fields:
+    mode: none
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 8
+
+vectorstore:
+  type: qdrant
+  collection_name: nova_web_smoke_test
+  # For the current web API + qdrant-client path, use the Qdrant gRPC port.
+  url: ${QDRANT_URL:-http://127.0.0.1:6334}
+  api_key: ${QDRANT_API_KEY:-}
+  upsert_wait: false
+  params:
+    recreate: true
+    payload_indexes:
+      mode: none
+    optimizers:
+      indexing_threshold: 0
+
+loader:
+  batch_size: 64
+  concurrency: 1

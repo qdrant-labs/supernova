@@ -1,0 +1,39 @@
+# Paste into dist-load API payload as "config_yaml" for dry-run tests.
+# Works with:
+#   /api/v1/dist/load
+# and payload fields such as:
+#   resources: configs/skypilot/load.yaml
+#   num_jobs: 2
+#   pool_name: supernova-web-dist-load-smoke
+#   dry_run: true
+
+datasource:
+  type: local
+  path: /tmp/nova_web_smoke_data
+  id_expression: "vf_point_id(filename, file_row_number)"
+  payload_fields:
+    id: id
+    text: text
+
+vectors:
+  dense:
+    type: dense
+    column: dense_embedding
+    distance: cosine
+    size: 8
+
+vectorstore:
+  type: qdrant
+  collection_name: nova_web_smoke_dist_skypilot
+  # For the current web API + qdrant-client path, use the Qdrant gRPC port.
+  url: ${QDRANT_URL:-http://127.0.0.1:6334}
+  api_key: ${QDRANT_API_KEY:-}
+  upsert_wait: false
+  params:
+    recreate: true
+    payload_indexes:
+      mode: none
+
+loader:
+  batch_size: 64
+  concurrency: 1
