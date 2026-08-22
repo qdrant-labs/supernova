@@ -58,6 +58,7 @@ lifecycle so a fleet can prepare once, load in parallel, and finalize once.
 nova load run      <config>                          # single machine: all phases
 nova load prepare  <config>                          # master: create collection, defer indexing
 nova load load     <config> --num-jobs N --job-rank R  # worker: load this slice (no indexing mgmt)
+nova load load     <config> --num-jobs N --job-rank R --continue  # resume an interrupted worker
 nova load finalize <config>                          # master: re-enable + await indexing
 nova load reindex  <config>                          # patch HNSW/quantization/optimizers on an existing collection
 nova load delete   <config>                          # delete the collection if it exists
@@ -70,6 +71,12 @@ nova load inspect  <config> [--num-jobs N --job-rank R]  # dry inspection (confi
   stride, so workers need no coordination.
 - `--num-jobs` / `--job-rank` apply to `load` and `inspect` only (the phases that
   operate on a slice).
+- **`--continue`** (alias `--resume`, `load` only) resumes an interrupted worker:
+  it binary-searches the worker's slice — probing the store for each file's
+  first point id — and skips the files already fully loaded, re-upserting only
+  the boundary file (idempotent). Safe to pass on every rank, including ones
+  that finished. Same corpus and `--num-jobs` as the interrupted run required.
+  See [Resuming an interrupted load](../loading/overview.md#resuming-an-interrupted-load-continue).
 - **`reindex`** patches `vectorstore.params.{hnsw,quantization,optimizers}` on an
   *already-existing* collection in place — no data is touched, and it doesn't
   create the collection first. Useful for comparing index/quantization variants

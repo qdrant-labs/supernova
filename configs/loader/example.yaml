@@ -2,6 +2,9 @@
 #   nova-load configs/loader/test.yaml
 # For distributed loading, shard the corpus across jobs with CLI flags:
 #   nova-load configs/loader/test.yaml --num-jobs 25 --job-rank $SKYPILOT_JOB_RANK
+# If a worker dies mid-load, rerun it with --continue to resume where it
+# stopped (probes the store for its slice's progress; safe to pass on every
+# rank, even finished ones — see docs/loading "Resuming an interrupted load").
 # (workers should also pass --no-manage-indexing so only the master creates the
 # collection). Resources/dispatch are an orchestration concern now, not part of
 # this file — the loader rejects unknown top-level keys.

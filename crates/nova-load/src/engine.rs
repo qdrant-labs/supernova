@@ -151,16 +151,7 @@ impl ReadJob {
     }
 
     fn read_id(&self, col: &dyn Array, row: usize) -> Result<PointId, EngineError> {
-        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-            return Ok(PointId::String(a.value(row).to_string()));
-        }
-        if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-            return Ok(PointId::Integer(a.value(row) as u64));
-        }
-        if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-            return Ok(PointId::Integer(a.value(row)));
-        }
-        Err(self.schema_err(format!("id column must be string or integer, got {:?}", col.data_type())))
+        id_at(col, row).map_err(|detail| self.schema_err(detail))
     }
 
     /// Coerce one shard-key cell into a [`ShardKeyValue`]. Strict on purpose:
@@ -273,6 +264,50 @@ impl ReadJob {
     fn schema_err(&self, detail: String) -> EngineError {
         EngineError::Schema { file: self.filename.clone(), detail }
     }
+}
+
+/// Read a point id out of an arrow column, or describe why the type is wrong
+/// (the caller attaches file context).
+fn id_at(col: &dyn Array, row: usize) -> Result<PointId, String> {
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return Ok(PointId::String(a.value(row).to_string()));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return Ok(PointId::Integer(a.value(row) as u64));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(PointId::Integer(a.value(row)));
+    }
+    Err(format!("id column must be string or integer, got {:?}", col.data_type()))
+}
+
+/// Evaluate `id_expression` for one VIRTUAL row — `filename` bound to the
+/// given name, `file_row_number` to `row` — with the loader macros registered
+/// and NO file access. This only succeeds when the expression is a pure
+/// function of those two pseudo-columns (like the default
+/// `vf_point_id(filename, file_row_number)`); an expression referencing any
+/// real data column fails to bind, and the caller falls back to reading the
+/// file. Used by the `--continue` resume probe to compute a file's first
+/// point id without downloading it. Blocking — call from `spawn_blocking`.
+pub fn eval_virtual_id(
+    filename: &str,
+    row: i64,
+    id_expression: &str,
+) -> Result<PointId, EngineError> {
+    let conn = Connection::open_in_memory()?;
+    register_macros(&conn)?;
+    let sql = format!(
+        "SELECT {id_expression} AS __id \
+         FROM (SELECT '{}' AS filename, {row}::BIGINT AS file_row_number)",
+        esc_str(filename),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let batch = stmt.query_arrow(params![])?.next().ok_or_else(|| EngineError::Schema {
+        file: filename.to_string(),
+        detail: "virtual id evaluation returned no rows".into(),
+    })?;
+    id_at(batch.column(0).as_ref(), 0)
+        .map_err(|detail| EngineError::Schema { file: filename.to_string(), detail })
 }
 
 /// Infer dense/multivector dimensions from the first point of a file. An
@@ -541,5 +576,23 @@ mod tests {
             detail.contains("must return a string or integer"),
             "unexpected detail: {detail}"
         );
+    }
+
+    /// The virtual evaluation matches a real file read for the default id
+    /// expression — so `--continue` resume probes need no download at all.
+    #[test]
+    fn virtual_id_matches_file_read_for_row_expressions() {
+        let points = read_points(None).unwrap();
+        let virt =
+            eval_virtual_id("f.parquet", 0, "vf_point_id(filename, file_row_number)").unwrap();
+        assert_eq!(virt, points[0].id);
+    }
+
+    /// Column-referencing id expressions can't bind against the virtual row —
+    /// the resume probe falls back to reading the file.
+    #[test]
+    fn virtual_id_rejects_column_expressions() {
+        assert!(eval_virtual_id("f.parquet", 0, "substr(id, 11, 36)").is_err());
+        assert!(eval_virtual_id("f.parquet", 0, "label").is_err());
     }
 }

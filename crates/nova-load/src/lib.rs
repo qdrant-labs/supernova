@@ -15,7 +15,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use config::{LoadConfig, LoaderConfig, VectorSpec};
 use plan::Partition;
 use sources::{DataSource, DataSourceConfig, FileRef};
-use stores::{CollectionSchema, Point, StoreError, VectorStore};
+use stores::{CollectionSchema, Point, PointId, StoreError, VectorStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -57,6 +57,7 @@ pub async fn run(config: LoadConfig) -> Result<(), LoadError> {
         &config.loader,
         all_files,
         Partition::single(),
+        0,
     )
     .await?;
 
@@ -82,9 +83,37 @@ pub async fn prepare(config: LoadConfig) -> Result<(), LoadError> {
 
 /// Worker step: load this worker's slice of the files. Assumes the collection
 /// already exists (run `prepare` first) and does NOT manage indexing.
-pub async fn load(config: LoadConfig, partition: Partition) -> Result<(), LoadError> {
+///
+/// With `resume` (the `--continue` flag), first find where a previous run of
+/// this same slice stopped — a binary search probing the store for each
+/// file's first point id — and skip the files already fully loaded. Safe to
+/// pass unconditionally: against a fresh collection every probe misses and
+/// the whole slice loads; on a finished worker only the final file is redone
+/// (upserts are idempotent). Requires the same corpus and `--num-jobs` as the
+/// interrupted run, and a deterministic `id_expression`.
+pub async fn load(config: LoadConfig, partition: Partition, resume: bool) -> Result<(), LoadError> {
     let store = config.vectorstore.connect().await?;
     let all_files = config.datasource.list_files().await?;
+
+    let skip_files = if resume {
+        let slice = plan::partition(&all_files, partition);
+        let start = resume_start(store.as_ref(), &config.datasource, &slice).await?;
+        if start > 0 {
+            tracing::info!(
+                "--continue: resuming at file {start}/{} of this slice (`{}`); {start} file(s) \
+                 probe as loaded and are skipped — the boundary file itself is re-upserted, \
+                 since the previous run may have died mid-file (idempotent)",
+                slice.len(),
+                slice[start].key,
+            );
+        } else {
+            tracing::info!("--continue: no prior progress found for this slice; loading all of it");
+        }
+        start
+    } else {
+        0
+    };
+
     let n = load_files(
         store.as_ref(),
         &config.datasource,
@@ -92,10 +121,111 @@ pub async fn load(config: LoadConfig, partition: Partition) -> Result<(), LoadEr
         &config.loader,
         all_files,
         partition,
+        skip_files,
     )
     .await?;
     tracing::info!("worker {}/{} done: {n} points", partition.rank, partition.num_jobs);
     Ok(())
+}
+
+/// Where a previous run of this worker's slice stopped: the index of the
+/// first file to (re)load. Files complete strictly in order within a worker
+/// (see `load_files`), so the loaded files form a prefix of the slice and a
+/// binary search over "does this file's first point exist in the store" finds
+/// the boundary in ~log2(slice) probes.
+///
+/// Returns the boundary *inclusive*: the last loaded-looking file is
+/// re-uploaded rather than skipped, because batches within a file land out of
+/// order — the file in flight at the moment of death can have its first
+/// batch stored while later ones are missing. One file of redundant,
+/// idempotent work buys the no-gaps guarantee.
+async fn resume_start(
+    store: &dyn VectorStore,
+    datasource: &DataSourceConfig,
+    files: &[FileRef],
+) -> Result<usize, LoadError> {
+    let id_expression = datasource.reader().id_expression.clone();
+    let probe = async |i: usize| -> Result<bool, LoadError> {
+        let file = &files[i];
+        let loaded = match first_point_id(datasource, file, &id_expression).await? {
+            Some(id) => store.point_exists(&id).await?,
+            // An empty file has no first row to probe; calling it "not loaded"
+            // errs early (re-scanning it is free — it has no points).
+            None => false,
+        };
+        tracing::info!(
+            "--continue probe: file[{i}] `{}` → {}",
+            file.key,
+            if loaded { "loaded" } else { "not loaded" },
+        );
+        Ok(loaded)
+    };
+    Ok(bisect_last_loaded(files.len(), probe).await?.unwrap_or(0))
+}
+
+/// The id of `file`'s first row (row 0), or `None` for an empty file. Tries
+/// the no-IO virtual evaluation first — id expressions over only `filename` /
+/// `file_row_number` (the default `vf_point_id`) never touch the file — and
+/// falls back to downloading the file and reading a single row when the
+/// expression references real data columns.
+async fn first_point_id(
+    datasource: &DataSourceConfig,
+    file: &FileRef,
+    id_expression: &str,
+) -> Result<Option<PointId>, LoadError> {
+    let (key, expr) = (file.key.clone(), id_expression.to_string());
+    let virtual_id = tokio::task::spawn_blocking(move || engine::eval_virtual_id(&key, 0, &expr))
+        .await?;
+    if let Ok(id) = virtual_id {
+        return Ok(Some(id));
+    }
+
+    let local = datasource.fetch(file).await?;
+    let read_job = engine::ReadJob {
+        path: local.path().to_path_buf(),
+        filename: local.source.key.clone(),
+        vectors: HashMap::new(), // id only — no vectors, no payload
+        payload: HashMap::new(),
+        id_expression: id_expression.to_string(),
+        shard_key_expr: None,
+        limit: Some(1),
+    };
+    let points = tokio::task::spawn_blocking(move || read_job.run()).await??;
+    Ok(points.into_iter().next().map(|p| p.id))
+}
+
+/// Find the greatest index in `0..n` whose probe reports "loaded", assuming
+/// the loaded indexes form a prefix (`probe` is monotone true→false). `None`
+/// when index 0 already misses. Costs at most `2 + log2(n)` probes.
+///
+/// A stray miss inside the loaded prefix (a file the original run *skipped*
+/// after exhausting its retries) leaves the search landing on some
+/// loaded-probing index at or before the true boundary. Everything from the
+/// result onward gets (re)loaded, so nothing the original run had loaded or
+/// hadn't reached is ever skipped; a file the original run skipped stays
+/// skipped — the same outcome (and warning) the original run already
+/// reported.
+async fn bisect_last_loaded<F>(n: usize, mut probe: F) -> Result<Option<usize>, LoadError>
+where
+    F: AsyncFnMut(usize) -> Result<bool, LoadError>,
+{
+    if n == 0 || !probe(0).await? {
+        return Ok(None);
+    }
+    if probe(n - 1).await? {
+        return Ok(Some(n - 1));
+    }
+    // Invariant: probe(lo) == true, probe(hi) == false.
+    let (mut lo, mut hi) = (0usize, n - 1);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if probe(mid).await? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(Some(lo))
 }
 
 /// Master step: re-enable indexing and wait for it to settle. Run once, after
@@ -264,6 +394,7 @@ async fn load_files(
     loader: &LoaderConfig,
     all_files: Vec<FileRef>,
     partition: Partition,
+    skip_files: usize,
 ) -> Result<u64, LoadError> {
     let batch_size = loader.batch_size.max(1);
     let concurrency = loader.concurrency.max(1);
@@ -280,7 +411,10 @@ async fn load_files(
     let sharding = shard_key_expr.is_some();
 
     let total_files = all_files.len();
-    let files = plan::partition(&all_files, partition);
+    let mut files = plan::partition(&all_files, partition);
+    // `--continue` resume: the first `skip_files` of this slice probed as
+    // already loaded (see `resume_start`).
+    files.drain(..skip_files.min(files.len()));
     if files.is_empty() {
         tracing::warn!(
             "worker {}/{} has no files of {total_files} to load (more workers than files?)",
@@ -574,6 +708,51 @@ mod tests {
             let first = &chunk[0].shard_key;
             assert!(chunk.iter().all(|p| p.shard_key == *first), "chunk mixes shard keys");
         }
+    }
+
+    async fn bisect(states: &[bool]) -> Option<usize> {
+        bisect_last_loaded(states.len(), async |i| Ok(states[i])).await.unwrap()
+    }
+
+    /// Every prefix length resolves to its exact boundary (resume-inclusive).
+    #[tokio::test]
+    async fn bisect_finds_the_loaded_prefix_boundary() {
+        assert_eq!(bisect(&[]).await, None);
+        assert_eq!(bisect(&[false]).await, None);
+        assert_eq!(bisect(&[true]).await, Some(0));
+        assert_eq!(bisect(&[true, false]).await, Some(0));
+        assert_eq!(bisect(&[true, true, false, false, false]).await, Some(1));
+        for k in 0..=33 {
+            let states: Vec<bool> = (0..33).map(|i| i < k).collect();
+            let want = if k == 0 { None } else { Some(k - 1) };
+            assert_eq!(bisect(&states).await, want, "prefix length {k}");
+        }
+    }
+
+    /// A miss poked into the prefix (a file the original run skipped after
+    /// retries) must leave the result on a loaded-probing index at or before
+    /// the true boundary — never past it.
+    #[tokio::test]
+    async fn bisect_with_skipped_file_stays_at_or_before_the_boundary() {
+        let states = [true, false, true, true, false, false];
+        let got = bisect(&states).await.expect("prefix starts loaded");
+        assert!(got <= 3, "resume index {got} is past the true boundary");
+        assert!(states[got], "resume index {got} must probe as loaded");
+    }
+
+    #[tokio::test]
+    async fn bisect_probe_count_is_logarithmic() {
+        use std::cell::Cell;
+        let (n, boundary) = (1024usize, 700usize); // loaded prefix 0..700
+        let calls = Cell::new(0usize);
+        let got = bisect_last_loaded(n, async |i| {
+            calls.set(calls.get() + 1);
+            Ok(i < boundary)
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, Some(boundary - 1));
+        assert!(calls.get() <= 2 + n.ilog2() as usize, "{} probes for n={n}", calls.get());
     }
 
     /// Numbers sort before keywords (enum variant order) — the exact order is

@@ -506,6 +506,14 @@ impl VectorStore for ElasticStore {
         Ok(())
     }
 
+    async fn point_exists(&self, _id: &PointId) -> Result<bool, StoreError> {
+        // The `--continue` resume probe is Qdrant-only for now; implementing
+        // it here needs a cheap get-by-id (doable, just untested).
+        Err(StoreError::Other(
+            "`--continue` resume probing is not implemented for the elastic backend".into(),
+        ))
+    }
+
     async fn close(&self) -> Result<(), StoreError> {
         Ok(())
     }

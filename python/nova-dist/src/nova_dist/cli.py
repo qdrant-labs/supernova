@@ -134,13 +134,15 @@ def embed(config, resources, num_jobs, pool_name, dry_run):
 @click.option("--pool-name", default=None)
 @click.option("--dry-run", is_flag=True)
 @click.option("--finalize", is_flag=True, help="Re-enable + await indexing on the controller (run after all workers finish). Does not launch a fleet.")
-def load(config, resources, num_jobs, pool_name, dry_run, finalize):
+@click.option("--continue", "continue_", is_flag=True, help="Resume an interrupted fleet: every worker gets `nova-load load --continue`, probing the store for its slice's progress and skipping files already loaded. Safe on every rank (finished ranks redo only their final file). Requires the same corpus and --num-jobs as the interrupted run.")
+def load(config, resources, num_jobs, pool_name, dry_run, finalize, continue_):
     """
     Load pre-embedded parquet across a pool.
 
     Lifecycle: this command runs `prepare` on the controller, then fans out N
     `load` workers (each takes its file slice). When they've all finished, run
-    `nova dist load <config> --finalize` to build the index.
+    `nova dist load <config> --finalize` to build the index. If the fleet dies
+    partway, relaunch with `--continue` — workers resume where they stopped.
     """
     if finalize:
         _run_local("nova-load", ["finalize", config])
@@ -148,7 +150,9 @@ def load(config, resources, num_jobs, pool_name, dry_run, finalize):
     if num_jobs is None:
         raise click.UsageError("--num-jobs is required (unless --finalize).")
 
-    # 1. Master creates the collection + defers indexing.
+    # 1. Master creates the collection + defers indexing. Idempotent, so it
+    #    also runs on --continue (re-deferring indexing is exactly right when
+    #    resuming a bulk load).
     if not dry_run:
         _run_local("nova-load", ["prepare", config])
 
@@ -156,7 +160,8 @@ def load(config, resources, num_jobs, pool_name, dry_run, finalize):
     #    so pass it explicitly from the env SkyPilot sets per job.
     _fanout(
         "load", config, resources, num_jobs, pool_name, dry_run,
-        run_cmd="nova-load load {cfg} --num-jobs {n} --job-rank $SKYPILOT_JOB_RANK",
+        run_cmd="nova-load load {cfg} --num-jobs {n} --job-rank $SKYPILOT_JOB_RANK"
+        + (" --continue" if continue_ else ""),
         env_extra=["QDRANT_URL", "QDRANT_API_KEY"],
     )
 
