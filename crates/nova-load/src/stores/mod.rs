@@ -75,7 +75,7 @@ pub struct CollectionSchema {
 /// A point id. Backends differ on what they accept (Qdrant: `u64` or a UUID
 /// string; others allow arbitrary strings), so the core models the two shapes
 /// the reader can produce and lets each backend enforce its own rules.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PointId {
     Integer(u64),
@@ -180,6 +180,14 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
 
     /// Upsert a batch of points.
     async fn upsert_batch(&self, points: Vec<Point>) -> Result<(), StoreError>;
+
+    /// Whether a point with `id` currently exists in the collection. Powers
+    /// the loader's `--continue` resume probe (a binary search over a
+    /// worker's file slice for where a previous run stopped), so it must be
+    /// cheap: a single-id lookup fetching no payload and no vectors. Backends
+    /// without an implementation must return a clear "not supported" error —
+    /// there is no default, so every backend states its behavior.
+    async fn point_exists(&self, id: &PointId) -> Result<bool, StoreError>;
 
     /// Clean up connections.
     async fn close(&self) -> Result<(), StoreError>;

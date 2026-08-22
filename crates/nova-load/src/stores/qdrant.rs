@@ -8,7 +8,7 @@ use serde::Deserialize;
 use qdrant_client::qdrant::{
     BinaryQuantization, BinaryQuantizationEncoding, CollectionStatus, CompressionRatio,
     CreateCollectionBuilder, CreateShardKeyBuilder, CreateShardKeyRequestBuilder, Datatype,
-    Disabled, Distance, HnswConfigDiff, Memory, Modifier, MultiVectorComparator,
+    Disabled, Distance, GetPointsBuilder, HnswConfigDiff, Memory, Modifier, MultiVectorComparator,
     MultiVectorConfigBuilder,
     OptimizersConfigDiff, OptimizersConfigDiffBuilder, PointStruct, ProductQuantization,
     QuantizationType, ScalarQuantization, ShardKey, ShardKeySelector, ShardingMethod,
@@ -838,6 +838,25 @@ impl VectorStore for QdrantStore {
         }
         self.client.upsert_points(request).await?;
         Ok(())
+    }
+
+    async fn point_exists(&self, id: &PointId) -> Result<bool, StoreError> {
+        let qid: qdrant_client::qdrant::PointId = match id {
+            PointId::Integer(n) => (*n).into(),
+            PointId::String(s) => s.clone().into(),
+        };
+        // No payload, no vectors — pure existence. Under custom sharding a
+        // retrieve without a shard-key selector fans out across all shards,
+        // so this works regardless of where the point routed.
+        let resp = self
+            .client
+            .get_points(
+                GetPointsBuilder::new(self.collection_name.as_str(), vec![qid])
+                    .with_payload(false)
+                    .with_vectors(false),
+            )
+            .await?;
+        Ok(!resp.result.is_empty())
     }
 
     async fn close(&self) -> Result<(), StoreError> {

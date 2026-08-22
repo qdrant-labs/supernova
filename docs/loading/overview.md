@@ -53,6 +53,56 @@ loader:
 nova load configs/loader/my_dataset.yaml
 ```
 
+## Resuming an interrupted load (`--continue`)
+
+When a worker dies mid-load (spot preemption, the store buckling under load,
+an operator Ctrl-C), rerun the **same** command with `--continue`:
+
+```bash
+nova load load my.yaml --num-jobs 32 --job-rank 17 --continue
+```
+
+The worker finds where its previous run stopped and picks up from there,
+instead of re-upserting its whole slice. No checkpoint files, no coordination
+— the resume point is derived from the store itself:
+
+1. Within a worker, files complete **strictly in order** (batches of file
+   *N+1* never start before file *N* finishes), so the loaded files form a
+   prefix of the slice.
+2. The worker binary-searches its slice (~log2(files) probes), asking for each
+   probed file: *does this file's first point id exist in the collection?*
+3. It resumes **at** the last loaded-looking file — inclusive, because the
+   file in flight at the moment of death can be partially loaded (batches
+   within a file land out of order). Re-upserting it is idempotent: at most
+   one file of redundant work, and no gaps.
+
+Probe cost depends on the `id_expression`. Expressions over only `filename` /
+`file_row_number` — the default `vf_point_id(...)` — are evaluated with **no
+file access at all**: a resume is just a handful of point lookups,
+milliseconds. Expressions referencing data columns (e.g. fineweb's
+`substr(id, 11, 36)`) download one file per probe and read a single row —
+~log2(slice) downloads, typically a couple of minutes.
+
+Properties worth knowing:
+
+- **Safe to pass unconditionally.** A fresh collection probes all-miss and
+  loads from scratch; a finished worker probes all-hit and redoes only its
+  final file. So after a partial fleet failure, just relaunch **all** ranks
+  with `--continue` — no need to work out which ones died.
+- **Pairs with SkyPilot self-healing.** Put `--continue` in the task's `run:`
+  permanently and set `job_recovery: {max_restarts_on_errors: N}` — a worker
+  killed by cluster overload restarts and resumes itself.
+- **Requires** the same corpus (unchanged prefix) and the same `--num-jobs`
+  as the interrupted run — the stride must mean the same thing — and a
+  **deterministic** `id_expression` (a `random()`-based id can never match,
+  so `--continue` degrades to a full reload).
+- Upserts are idempotent overwrites, so `--continue` is a *time* optimization
+  — when in doubt, rerunning without it is always correct, just slower.
+- Files the original run **skipped** (after exhausting `file_retries`) stay
+  skipped, exactly as the original run warned. Resume never un-skips or
+  newly-skips anything.
+- Qdrant-only for now; the other backends return a clear error.
+
 ## Datasources
 
 ### S3

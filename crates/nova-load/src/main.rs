@@ -53,6 +53,15 @@ struct LoadArgs {
     /// This job's index, in `[0, num_jobs)`. Each job loads its own slice.
     #[arg(long, default_value_t = 0)]
     job_rank: usize,
+    /// Resume an interrupted load: binary-search this worker's slice, probing
+    /// the store for each file's first point id, and skip the files already
+    /// fully loaded (the boundary file is re-upserted — idempotent). Safe to
+    /// pass unconditionally: a fresh collection loads from scratch and a
+    /// finished worker redoes only its final file. Requires the same corpus
+    /// and --num-jobs as the interrupted run, and a deterministic
+    /// id_expression. (Ignored by `inspect`.)
+    #[arg(long = "continue", visible_alias = "resume", default_value_t = false)]
+    resume: bool,
 }
 
 impl LoadArgs {
@@ -97,7 +106,7 @@ async fn run(command: Command) -> Result<(), ExitCode> {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
             })?;
-            nova_load::load(load_config(&a.config)?, partition).await
+            nova_load::load(load_config(&a.config)?, partition, a.resume).await
         }
         Command::Inspect(a) => {
             let partition = a.partition().map_err(|e| {

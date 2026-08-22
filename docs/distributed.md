@@ -95,6 +95,11 @@ nova dist load configs/loader/test.yaml --num-jobs 50
 
 # 3. controller, after all workers finish: build the index
 nova dist load configs/loader/test.yaml --finalize
+
+# fleet died partway? relaunch it with --continue — every worker probes the
+# store for its slice's progress and resumes where it stopped (finished ranks
+# redo only their final file). Same corpus + --num-jobs required.
+nova dist load configs/loader/test.yaml --num-jobs 50 --continue
 ```
 
 `nova dist load` runs phase 1 locally, then fans out phase 2. Phase 3 is a

@@ -5,7 +5,7 @@ members = [
     "crates/nova-load",
     "crates/nova-inspect",
 ]
-version = "0.0.10"
+version = "0.0.11"
 
 # Shrink debug-build artifacts (the `target/` dir was filling the disk). These are
 # profile keys, so they must live under [profile.*], not [workspace].
