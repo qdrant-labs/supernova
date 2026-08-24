@@ -4,8 +4,14 @@ name: rust-binaries
 # instead of compiling duckdb's bundled C++ from scratch on every ephemeral node.
 #
 # Triggers:
-#   - push to master  -> rolling `dev` pre-release (overwritten each merge)
-#   - tag v*          -> the matching versioned release
+#   - tag v* pushed via git       -> the matching versioned release
+#   - release published (gh/UI)   -> same (API-created tags emit no `push`
+#                                    event, so `gh release create vX.Y.Z`
+#                                    needs this trigger to build assets)
+#   - workflow_dispatch on master -> rolling `dev` PRE-release only; note
+#                                    `releases/latest` never serves
+#                                    prereleases, so this does NOT update
+#                                    what workers install
 #
 # Assets are named `<bin>-<target>` (raw binaries) and attached to the release.
 # Workers curl the one matching `uname -m`; `cargo binstall` also resolves them
@@ -14,7 +20,9 @@ name: rust-binaries
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: 
+  release:
+    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: write  # create/update releases
