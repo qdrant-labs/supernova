@@ -44,6 +44,15 @@ pub struct LoaderConfig {
     /// silently skipping the whole corpus.
     #[serde(default)]
     pub max_failed_files: Option<usize>,
+    /// Ceiling on points upserted per second **by this process** — an upper
+    /// bound, not a target: the loader gets as close as it can and never
+    /// exceeds it (token bucket, one second of burst). Unset = unlimited. It
+    /// applies per worker like every other `loader:` knob, so a fleet of N
+    /// workers presents N× this rate to the store; the startup log and
+    /// `inspect` print that fleet-wide figure. Use it to hold a cluster under
+    /// the ingest rate at which it starts timing out.
+    #[serde(default)]
+    pub max_points_per_sec: Option<u64>,
 }
 
 impl Default for LoaderConfig {
@@ -55,6 +64,7 @@ impl Default for LoaderConfig {
             file_retries: default_file_retries(),
             upsert_retries: default_upsert_retries(),
             max_failed_files: None,
+            max_points_per_sec: None,
         }
     }
 }
@@ -398,5 +408,16 @@ mod tests {
             expand("x: ${UNCLOSED", &[]).unwrap_err(),
             ConfigError::UnterminatedPlaceholder
         ));
+    }
+
+    /// `max_points_per_sec` is optional (unlimited when absent) and parses as
+    /// a plain integer when set.
+    #[test]
+    fn loader_rate_limit_parses_and_defaults_to_unlimited() {
+        let unset: LoaderConfig = serde_yaml::from_str("batch_size: 10").unwrap();
+        assert_eq!(unset.max_points_per_sec, None);
+        assert_eq!(LoaderConfig::default().max_points_per_sec, None);
+        let set: LoaderConfig = serde_yaml::from_str("max_points_per_sec: 2500").unwrap();
+        assert_eq!(set.max_points_per_sec, Some(2500));
     }
 }

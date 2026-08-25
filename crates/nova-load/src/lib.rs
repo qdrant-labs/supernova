@@ -1,6 +1,7 @@
 pub mod config;
 pub mod engine;
 pub mod plan;
+pub mod rate;
 pub mod sources;
 pub mod stores;
 
@@ -280,6 +281,9 @@ pub async fn inspect(config: LoadConfig, partition: Partition) -> Result<(), Loa
     println!("== nova-load inspect ==\n");
     println!("partition:   job_rank={} num_jobs={}", partition.rank, partition.num_jobs);
     println!("loader:      {:?}", config.loader);
+    if let Some(rate) = config.loader.max_points_per_sec {
+        println!("rate limit:  {}", describe_rate_limit(rate, partition.num_jobs));
+    }
     println!("vectorstore: {:?}", config.vectorstore);
     println!("datasource:  {:?}", config.datasource);
     println!("vectors:     {:?}", config.vectors);
@@ -399,6 +403,13 @@ async fn load_files(
     let batch_size = loader.batch_size.max(1);
     let concurrency = loader.concurrency.max(1);
     let look_ahead = loader.file_look_ahead.max(1);
+    // Per-worker upsert ceiling (see `rate`). Every attempt draws tokens, so
+    // retries can't push the store past the cap either.
+    let limiter = loader.max_points_per_sec.map(|r| rate::RateLimiter::new(r, batch_size));
+    if let Some(r) = loader.max_points_per_sec {
+        tracing::info!("rate limit: {}", describe_rate_limit(r, partition.num_jobs));
+    }
+    let cap = loader.max_points_per_sec.map(|r| format!(" (cap {r})")).unwrap_or_default();
     let file_retries = loader.file_retries;
     let upsert_retries = loader.upsert_retries;
     let max_failed_files = loader.max_failed_files;
@@ -516,6 +527,8 @@ async fn load_files(
     let progress = &progress;
     let points_done = &points_done;
     let rate_window = &rate_window;
+    let limiter = &limiter;
+    let cap = &cap;
 
     let mut skipped = 0u64;
     let mut fragmentation_warned = false;
@@ -571,9 +584,19 @@ async fn load_files(
                 // (store down / misconfigured) aborts the run via `?` on try_collect.
                 let mut attempt = 0u32;
                 loop {
+                    if let Some(limiter) = limiter {
+                        limiter.acquire(chunk.len()).await;
+                    }
                     match store.upsert_batch(chunk.to_vec()).await {
                         Ok(()) => break,
                         Err(err) => {
+                            // A bad request / auth / missing collection can't
+                            // succeed on retry — don't burn the budget (and
+                            // don't keep re-sending the same points).
+                            if !err.is_retryable() {
+                                tracing::error!("upsert batch failed with a non-retryable error: {err}");
+                                return Err(err);
+                            }
                             attempt += 1;
                             if attempt > upsert_retries as u32 {
                                 return Err(err);
@@ -601,9 +624,9 @@ async fn load_files(
                     *w = (Instant::now(), done);
                     drop(w);
                     if tty {
-                        progress.set_message(format!("{done} pts · {rate:.0} pts/s"));
+                        progress.set_message(format!("{done} pts · {rate:.0} pts/s{cap}"));
                     } else {
-                        tracing::info!("{done} pts · {rate:.0} pts/s");
+                        tracing::info!("{done} pts · {rate:.0} pts/s{cap}");
                     }
                 }
                 Ok::<(), StoreError>(())
@@ -650,6 +673,20 @@ fn shard_chunks(points: &[Point], batch_size: usize) -> Vec<&[Point]> {
         start += len;
     }
     chunks
+}
+
+/// The rate cap as configured (per worker) plus what that means for the
+/// whole fleet — so both the "this process" and "the cluster sees" mental
+/// models get their number without changing the knob's semantics.
+fn describe_rate_limit(per_worker: u64, num_jobs: usize) -> String {
+    if num_jobs > 1 {
+        format!(
+            "{per_worker} pts/s per worker (× {num_jobs} workers = {} pts/s fleet-wide)",
+            per_worker as u128 * num_jobs as u128
+        )
+    } else {
+        format!("{per_worker} pts/s")
+    }
 }
 
 /// Human-readable byte count (e.g. `2.4 MB`).
@@ -753,6 +790,15 @@ mod tests {
         .unwrap();
         assert_eq!(got, Some(boundary - 1));
         assert!(calls.get() <= 2 + n.ilog2() as usize, "{} probes for n={n}", calls.get());
+    }
+
+    #[test]
+    fn rate_limit_description_shows_fleet_math_only_for_fleets() {
+        assert_eq!(describe_rate_limit(5000, 1), "5000 pts/s");
+        assert_eq!(
+            describe_rate_limit(5000, 32),
+            "5000 pts/s per worker (× 32 workers = 160000 pts/s fleet-wide)"
+        );
     }
 
     /// Numbers sort before keywords (enum variant order) — the exact order is

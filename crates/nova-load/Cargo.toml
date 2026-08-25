@@ -1,6 +1,6 @@
 [package]
 name = "nova-load"
-version = "0.0.11"
+version = "0.0.12"
 edition = "2024"
 repository = "https://github.com/qdrant-labs/supernova"
 
@@ -54,3 +54,8 @@ milvus = ["dep:milvus", "dep:reqwest"]
 
 [dev-dependencies]
 rstest = "0.26.1"
+# Constructing tonic::Status values in the retryability tests; must track
+# qdrant-client's tonic major (compile error on drift, not silent skew).
+tonic = "0.14"
+# `start_paused` tokio tests for the rate limiter (virtual time).
+tokio = { workspace = true, features = ["test-util"] }

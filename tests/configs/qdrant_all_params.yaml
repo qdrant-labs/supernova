@@ -10,6 +10,7 @@
 loader:
   batch_size: 256
   concurrency: 4
+  max_points_per_sec: 5000   # per-worker upsert ceiling (unset = unlimited)
 
 datasource:
   type: local
@@ -46,6 +47,10 @@ vectorstore:
   url: http://localhost:6334
   api_key: secret
   upsert_wait: true
+  # Per-request / connect timeouts in seconds (defaults 120 / 10; the client's
+  # own 5s default is too short for upserts into a loaded cluster).
+  timeout_s: 240
+  connect_timeout_s: 20
   # Custom (user-defined) sharding. `shard_key` is a DuckDB expression
   # evaluated per row in the same context as payload_fields. With custom
   # sharding, `params.shard_number` means shards PER KEY; `shards_number` /
