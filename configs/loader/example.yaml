@@ -59,6 +59,11 @@ vectorstore:
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
   upsert_wait: false
+  # Per-request / connect timeouts in seconds (defaults 120 / 10). The client's
+  # own default is 5s — too short for upserts into a loaded cluster (the server
+  # still applies the write; the retry re-sends it). Raise under backpressure.
+  # timeout_s: 300
+  # connect_timeout_s: 10
   # --- custom (user-defined) sharding, Qdrant-only (uncomment to try) ---
   # `shard_key` is a DuckDB expression evaluated per row, in the same context
   # as payload_fields (source columns, filename, file_row_number, macros). It
@@ -105,3 +110,7 @@ vectorstore:
 loader:
   batch_size: 256
   concurrency: 4
+  # Per-WORKER upsert ceiling (points/sec; unset = unlimited). An upper bound,
+  # not a target. A fleet of N workers presents N× this to the store — the
+  # startup log prints that fleet-wide figure.
+  # max_points_per_sec: 5000

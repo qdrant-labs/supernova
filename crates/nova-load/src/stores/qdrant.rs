@@ -45,6 +45,17 @@ pub struct QdrantConfig {
     /// Whether upserts block until the write is applied (slower, stronger).
     #[serde(default)]
     pub upsert_wait: bool,
+    /// Per-request timeout in seconds. qdrant-client's own default is FIVE
+    /// seconds — far too short for upserts into a cluster under load: the
+    /// client gives up, the server most likely still applies the write, and
+    /// the retry re-sends the same points (duplicate work for an already-slow
+    /// cluster), so a tight timeout *amplifies* backpressure instead of
+    /// surviving it. Default 120.
+    #[serde(default = "default_timeout_s")]
+    pub timeout_s: u64,
+    /// Connection-establishment timeout in seconds. Default 10.
+    #[serde(default = "default_connect_timeout_s")]
+    pub connect_timeout_s: u64,
     /// Custom (user-defined) sharding: the collection is created with
     /// `sharding_method: custom` and every point routes to the shard key its
     /// `shard_key` expression evaluates to. See [`CustomSharding`].
@@ -64,6 +75,8 @@ impl fmt::Debug for QdrantConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("collection_name", &self.collection_name)
             .field("upsert_wait", &self.upsert_wait)
+            .field("timeout_s", &self.timeout_s)
+            .field("connect_timeout_s", &self.connect_timeout_s)
             .field("custom_sharding", &self.custom_sharding)
             .field("params", &self.params)
             .finish()
@@ -509,6 +522,14 @@ fn default_collection() -> String {
     "default".to_string()
 }
 
+fn default_timeout_s() -> u64 {
+    120
+}
+
+fn default_connect_timeout_s() -> u64 {
+    10
+}
+
 /// A connected Qdrant backend. Unlike the data sources (where the config itself
 /// implements the trait), the store holds an initialized client reused across
 /// every `upsert_batch`, so it's a distinct runtime object built once.
@@ -529,6 +550,8 @@ impl QdrantConfig {
     pub async fn connect(self) -> Result<QdrantStore, StoreError> {
         let client = Qdrant::from_url(&self.url)
             .api_key(self.api_key)
+            .timeout(Duration::from_secs(self.timeout_s))
+            .connect_timeout(Duration::from_secs(self.connect_timeout_s))
             // .check_compatibility(false) // skip since the log is annoying
             .build()?;
         Ok(QdrantStore {
@@ -1014,6 +1037,8 @@ mod tests {
         assert_eq!(store.api_key.as_deref(), Some("secret"));
         assert_eq!(store.collection_name, "everything");
         assert!(store.upsert_wait);
+        assert_eq!(store.timeout_s, 240);
+        assert_eq!(store.connect_timeout_s, 20);
         assert!(store.params.as_ref().is_some_and(|p| p.recreate));
 
         // Custom sharding: the expression + per-key knobs parse, and pre_create
@@ -1211,6 +1236,16 @@ mod tests {
             other => panic!("expected ParamsMap, got {other:?}"),
         };
         assert_eq!(dense["d"].size, 768);
+    }
+
+    /// Timeouts default to loader-appropriate values (NOT qdrant-client's 5s)
+    /// when the config omits them.
+    #[test]
+    fn timeouts_default_to_patient_values() {
+        let cfg: QdrantConfig =
+            serde_yaml::from_str("url: http://localhost:6334\ncollection_name: c\n").unwrap();
+        assert_eq!(cfg.timeout_s, 120);
+        assert_eq!(cfg.connect_timeout_s, 10);
     }
 
     /// Without `custom_sharding`, the create request must not set a sharding

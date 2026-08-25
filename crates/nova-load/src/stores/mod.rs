@@ -32,6 +32,29 @@ impl From<qdrant_client::QdrantError> for StoreError {
     }
 }
 
+impl StoreError {
+    /// Whether retrying the identical request could plausibly succeed.
+    /// Transient conditions — timeouts, unavailable, overloaded, dropped
+    /// connections — can; request, auth, and schema problems cannot, and
+    /// retrying those only burns the retry budget while re-sending work to a
+    /// store that already rejected it. Backend-agnostic `Other` errors carry
+    /// no status, so they keep the historical assume-transient behavior.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            StoreError::Qdrant(err) => match err.as_ref() {
+                qdrant_client::QdrantError::ResponseError { status } => !matches!(
+                    status.code() as i32,
+                    // INVALID_ARGUMENT | NOT_FOUND | PERMISSION_DENIED |
+                    // UNIMPLEMENTED | UNAUTHENTICATED
+                    3 | 5 | 7 | 12 | 16
+                ),
+                _ => true,
+            },
+            StoreError::Other(_) => true,
+        }
+    }
+}
+
 /// Vectorstore backend config, dispatched on `type:`. Each backend owns its
 /// config struct in its own module; the variant is gated on the same feature.
 #[derive(Debug, Deserialize)]
@@ -252,4 +275,39 @@ pub trait VectorStore: Send + Sync + std::fmt::Display {
 
     /// Delete the collection if it exists. A no-op if it doesn't.
     async fn delete_collection(&self) -> Result<(), StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_err(status: tonic::Status) -> StoreError {
+        StoreError::from(qdrant_client::QdrantError::ResponseError { status })
+    }
+
+    /// Transient gRPC statuses retry; request/auth problems abort immediately.
+    #[test]
+    fn retryability_follows_grpc_status() {
+        for transient in [
+            tonic::Status::deadline_exceeded("slow"),
+            tonic::Status::cancelled("Timeout expired"),
+            tonic::Status::unavailable("connect refused"),
+            tonic::Status::resource_exhausted("too many requests"),
+            tonic::Status::internal("service internal error"),
+            tonic::Status::unknown("?"),
+        ] {
+            assert!(status_err(transient.clone()).is_retryable(), "{transient:?}");
+        }
+        for fatal in [
+            tonic::Status::invalid_argument("Unable to parse UUID"),
+            tonic::Status::not_found("collection missing"),
+            tonic::Status::unauthenticated("bad api key"),
+            tonic::Status::permission_denied("nope"),
+            tonic::Status::unimplemented("no"),
+        ] {
+            assert!(!status_err(fatal.clone()).is_retryable(), "{fatal:?}");
+        }
+        // No status to inspect → assume transient (other backends' behavior).
+        assert!(StoreError::Other("bulk upsert failed".into()).is_retryable());
+    }
 }

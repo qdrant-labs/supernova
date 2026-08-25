@@ -45,6 +45,7 @@ loader:
   file_retries: 3                   # per-file download+read retries before skipping the file
   upsert_retries: 3                 # per-batch upsert retries before aborting
   # max_failed_files: 50            # abort if more than N files are skipped (default: unlimited)
+  # max_points_per_sec: 5000        # per-worker upsert ceiling — see "Backpressure" below
 ```
 
 ## Running
@@ -327,13 +328,68 @@ on the same store via `reindex`), not an apples-to-apples cross-system benchmark
   the post-load wait for background merges took (usually ~0). The ingestion cost itself
   shows up in the loader's throughput lines (`… pts/s`).
 
+## Backpressure: timeouts, retries, and rate limiting
+
+A cluster under heavy ingest slows its acks, and a loader that reacts badly
+makes it worse. Three knobs, in the order to reach for them:
+
+**1. `vectorstore.timeout_s` (default 120) / `connect_timeout_s` (default 10).**
+The per-request timeout. qdrant-client's own default is *five seconds*, which
+is a trap for bulk upserts: when the client gives up, the server most likely
+still applies the write, and the loader's retry re-sends the same points —
+duplicate work for a cluster that was already too slow, plus inflated
+segment-level point counts until the optimizers vacuum them. A patient timeout
+turns "timed out, retried, died" into "waited, succeeded".
+
+```yaml
+vectorstore:
+  timeout_s: 300          # seconds per upsert request
+  connect_timeout_s: 10
+```
+
+**2. `loader.upsert_retries` (default 5).** Exponential backoff (250ms → 30s
+cap) between attempts, then the worker aborts — a persistent failure usually
+means the store is down or misconfigured. Non-retryable errors (bad request,
+auth, unknown collection) now abort immediately instead of burning the budget.
+
+**3. `loader.max_points_per_sec`.** A hard ceiling on this worker's upsert
+rate — an upper bound, not a target. A token bucket holding one second of the
+rate (or one batch, whichever is larger) gates every upsert *attempt*,
+retries included, so the store never sees more than the configured rate from
+this process over any sustained window.
+
+```yaml
+loader:
+  max_points_per_sec: 5000
+```
+
+It is **per worker**, like every other `loader:` knob: the config describes
+this process, and the fleet is an orchestration concern layered on top. A
+fleet of 32 workers at `5000` presents 160,000 pts/s to the cluster — the
+startup log and `nova load inspect` print exactly that fleet-wide figure so
+neither mental model gets surprised:
+
+```
+rate limit: 5000 pts/s per worker (× 32 workers = 160000 pts/s fleet-wide)
+```
+
+The three compose: `concurrency` caps in-flight requests, `upsert_wait: true`
+couples each request to server-side completion (natural latency backpressure),
+and `max_points_per_sec` caps throughput independent of both. If the cluster's
+sustainable rate is unknown, start with the observed rate at which timeouts
+began and back off from there — an adaptive controller (slow down on
+timeouts, creep back up when clean) is a natural follow-up on top of this.
+
 ## Tuning
 
 | Parameter | Default | Guidance |
 |-----------|---------|----------|
-| `batch_size` | 1000 | Points per upsert call. Larger = fewer HTTP calls; 1000 is good for 768-1024 dim vectors. |
-| `concurrency` | 8 | In-flight upsert batches. Lower if the store times out. |
+| `batch_size` | 256 | Points per upsert call. Larger = fewer calls; 256–1000 is typical for 768-1024 dim vectors. |
+| `concurrency` | CPUs − 1 | In-flight upsert batches. Lower if the store times out. |
 | `file_look_ahead` | 2 | Files downloaded + read ahead of the uploader. Higher = more overlap, more RAM/disk. |
-| `file_retries` | 3 | Per-file download+read retries (exponential backoff) before the file is skipped. |
-| `upsert_retries` | 3 | Per-batch upsert retries (exponential backoff) before the run aborts. |
+| `file_retries` | 5 | Per-file download+read retries (exponential backoff) before the file is skipped. |
+| `upsert_retries` | 5 | Per-batch upsert retries (exponential backoff) before the run aborts. Non-retryable errors abort immediately. |
 | `max_failed_files` | _(none)_ | Abort once more than this many files are skipped. Unset = skip every failing file and finish. |
+| `max_points_per_sec` | _(unlimited)_ | Per-worker upsert ceiling (token bucket). See [Backpressure](#backpressure-timeouts-retries-and-rate-limiting). |
+| `vectorstore.timeout_s` | 120 | Per-request timeout (seconds). Raise under sustained backpressure; the client's own 5s default is far too short. |
+| `vectorstore.connect_timeout_s` | 10 | Connection-establishment timeout (seconds). |
