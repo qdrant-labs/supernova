@@ -117,7 +117,7 @@ def _print_file_partition(source, jobs: int, num_jobs: int | None) -> None:
         )
 
 
-@click.command(name="embed", help="Embed a dataset locally.")
+@click.command(name="run", help="Embed a dataset locally.")
 @click.argument("config", required=False)
 @click.option(
     "--num-jobs",
