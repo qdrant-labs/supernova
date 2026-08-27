@@ -989,8 +989,8 @@ def test_mismatched_dense_and_sparse_query_loads_are_rejected(ds, monkeypatch):
     load's ids/payload to the other's vectors."""
     orig_load_sparse = compute_mod.load_queries_sparse
 
-    def reordered_load_queries_sparse(store, qcfg, filter_cols=()):
-        Q_np, vocab, q_ids, payload, filter_vals = orig_load_sparse(store, qcfg, filter_cols)
+    def reordered_load_queries_sparse(store, qcfg, filter_cols=(), rows=None):
+        Q_np, vocab, q_ids, payload, filter_vals = orig_load_sparse(store, qcfg, filter_cols, rows)
         assert len(q_ids) > 1  # sanity: reordering must actually change something
         return Q_np, vocab, list(reversed(q_ids)), payload, filter_vals
 

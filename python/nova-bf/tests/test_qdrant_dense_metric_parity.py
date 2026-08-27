@@ -190,13 +190,16 @@ def _spec(metric, k=K, language=None):
     return SearchSpec(name=metric, vector_type="dense", metric=metric, k=k, filter=f)
 
 
-def _assert_parity(nova, qd, metric, label):
+def _assert_parity(nova, qd, metric, label, queries=None):
     """Position-agnostic comparison with a boundary-aware tolerance: an id only
     one engine returned is accepted only when its score sits within tolerance
     of the OTHER engine's K-th score (a genuine near-tie straddling the top-K
-    boundary), never when it is a real ranking disagreement."""
+    boundary), never when it is a real ranking disagreement.
+
+    `queries` limits the comparison to a subset of query indices — a spec with
+    a `SearchSpec.rows` selector only produces those."""
     tol = TOL[metric]
-    for qi in range(N_Q):
+    for qi in (range(N_Q) if queries is None else queries):
         n, q = nova[qi], qd[qi]
         assert n, f"{label} {metric} q{qi}: nova returned nothing"
         assert q, f"{label} {metric} q{qi}: qdrant returned nothing"
@@ -333,3 +336,88 @@ def test_parity_holds_across_batch_size(client, collections, data, batch_size):
     for metric in METRIC_DISTANCE:
         _assert_parity(nova[metric], _qdrant_topk(client, collections, metric, data),
                        metric, f"shared batch_size={batch_size}")
+
+
+# --------------------------------------------------------------------------
+# SearchSpec.rows — per-search QUERY-row subsets
+# --------------------------------------------------------------------------
+def _queries_with_sets(data, path, assign):
+    """Rewrite the module's queries with a `query_set` column (`assign(qi)`)."""
+    pq.write_table(
+        pa.table({
+            "dense_embedding": pa.array(data["Q"].tolist(), type=pa.list_(pa.float32())),
+            "qid": pa.array([str(i) for i in range(N_Q)]),
+            "query_set": pa.array([assign(i) for i in range(N_Q)]),
+        }),
+        str(path),
+    )
+    return str(path)
+
+
+def _nova_subset(data, qpath, specs, tag):
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=data["cdir"], id_column="id"),
+        queries=QueriesConfig(path=qpath, id_column="qid"),
+        output=OutputConfig(path=str(data["tmp"] / f"out_{tag}")),
+        params=ParamsConfig(io_workers=2, dense_batch_size=64),
+        searches=specs,
+    )
+    paths = run_compute(cfg)
+    return {
+        name: {
+            int(q): {int(i): float(s) for i, s in zip(hi, hs)}
+            for q, hi, hs in zip(*(pq.read_table(p).to_pydict()[c]
+                                   for c in ("query_id", "hit_ids", "hit_scores")))
+        }
+        for name, p in paths.items()
+    }
+
+
+@pytest.mark.parametrize("metric", ["dot", "cosine"])
+def test_row_subset_agrees_with_qdrant_and_with_the_unsubsetted_run(
+    client, data, collections, metric
+):
+    """A `rows` subset is an optimization, not a semantic change: the subset
+    spec must return exactly what Qdrant's own exact search returns for the
+    queries it owns, and exactly what the same search returns with no subset.
+
+    The subset is every OTHER query (0, 2, 4, …) so the selector is a
+    non-contiguous gather, not a slice — the harder of the two paths."""
+    qpath = _queries_with_sets(
+        data, data["tmp"] / f"queries_sets_{metric}.parquet",
+        lambda i: "pick" if i % 2 == 0 else "skip",
+    )
+    picked = [i for i in range(N_Q) if i % 2 == 0]
+
+    nova = _nova_subset(data, qpath, [
+        SearchSpec(name="full", vector_type="dense", metric=metric, k=K),
+        SearchSpec(name="subset", vector_type="dense", metric=metric, k=K,
+                   rows={"column": "query_set", "isin": ["pick"]}),
+    ], f"rows_{metric}")
+
+    assert set(nova["subset"]) == set(picked), "subset spec covered the wrong queries"
+
+    qd = _qdrant_topk(client, collections, metric, data)
+    for qi in picked:
+        # vs the same run without a subset — must be bit-identical
+        assert nova["subset"][qi] == nova["full"][qi], f"{metric}/q{qi}: subset changed the result"
+    # vs live Qdrant, with the same boundary-aware tolerance the other tests use
+    _assert_parity(nova["subset"], qd, metric, f"rows-subset/{metric}", queries=picked)
+
+
+def test_row_subset_with_a_corpus_filter_agrees_with_qdrant(client, data, collections):
+    """Subset on the query axis AND a filter on the corpus axis at once —
+    the two selections are independent and must compose."""
+    qpath = _queries_with_sets(
+        data, data["tmp"] / "queries_sets_filtered.parquet",
+        lambda i: "pick" if i < N_Q // 2 else "skip",
+    )
+    picked = list(range(N_Q // 2))
+    nova = _nova_subset(data, qpath, [
+        SearchSpec(name="eng", vector_type="dense", metric="dot", k=K,
+                   filter=Filter(must=[FilterCondition(field="language", match="eng")]),
+                   rows={"column": "query_set", "isin": ["pick"]}),
+    ], "rows_filtered")
+    assert set(nova["eng"]) == set(picked)
+    qd = _qdrant_topk(client, collections, "dot", data, language="eng")
+    _assert_parity(nova["eng"], qd, "dot", "rows-subset+filter/dot", queries=picked)

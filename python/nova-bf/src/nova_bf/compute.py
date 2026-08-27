@@ -247,8 +247,11 @@ def _to_query_array(values: list) -> np.ndarray:
 
 
 def load_queries(
-    store: Store, qcfg, filter_cols: list[str] = (),
+    store: Store, qcfg, filter_cols: list[str] = (), rows: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[str], dict[str, list], dict[str, np.ndarray]]:
+    """`rows` (sorted file-row indices, see `SearchSpec.rows`) restricts the
+    returned MATRIX to those queries. ids/payload/filter_vals stay FULL length
+    either way, and per-query filter masks are built over the full query axis"""
     cols = [qcfg.dense_column]
     if qcfg.id_column:
         cols.append(qcfg.id_column)
@@ -279,6 +282,8 @@ def load_queries(
         for c in filter_cols:
             filter_vals[c] += conv[c].to_pylist()
     Q = np.concatenate(embs, axis=0) if embs else np.zeros((0, 0), np.float32)
+    if rows is not None:
+        Q = Q[rows]
     return Q, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
 
 
@@ -357,7 +362,7 @@ def _sparse_rows_to_dense(row_offsets: np.ndarray, indices: np.ndarray, values: 
 
 
 def load_queries_sparse(
-    store: Store, qcfg, filter_cols: list[str] = (),
+    store: Store, qcfg, filter_cols: list[str] = (), rows: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, list], dict[str, np.ndarray]]:
     """Sparse analog of `load_queries`: reads the struct<indices,values> column
     from every query file, then densifies once over the query set's own
@@ -401,6 +406,15 @@ def load_queries_sparse(
     n_q = len(counts)
     row_offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
 
+    if rows is not None:
+        # Compact to the subset BEFORE the vocab build and the densify.
+        # Narrowing the vocab (only the subset's own token ids) is exact:
+        # a token no surviving query uses can never contribute to any score.
+        keep = np.zeros(n_q, dtype=bool)
+        keep[rows] = True
+        row_offsets, indices, values, _, _ = _compact_sparse_rows(
+            row_offsets, indices, values, None, keep
+        )
     vocab = _build_query_vocab(indices)
     Q = _sparse_rows_to_dense(row_offsets, indices, values, vocab)
     return Q, vocab, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
@@ -1462,6 +1476,8 @@ def _process_batch_group(
     encoded_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
+    spec_qsel: list | None = None,
+    spec_qrows: list | None = None,
 ) -> float:
     """The shared per-vector_type primitive behind `_process_shared_batch`:
     iterate `batch` in `batch_size`-row slices, transfer each slice once
@@ -1608,7 +1624,21 @@ def _process_batch_group(
                 continue
             sel_scores = scores if sel_cols is None else scores[:, sel_cols]
             sel_encoded = encoded_rows if sel_cols is None else encoded_rows[sel_cols]
+            # Query-row subset (`SearchSpec.rows`). The score matrix spans this
+            # vector_type's whole row union — every spec sharing the type reads
+            # the same one — so a spec that owns only part of it slices here,
+            # BEFORE the top-k.
+            qsel = None if spec_qsel is None else spec_qsel[m]
+            if qsel is not None:
+                sel_scores = sel_scores[qsel]
             if cell_mask is not None:
+                if qsel is not None:
+                    # `cell_mask` is built over the FULL query axis, so it is
+                    # indexed by FILE row (`spec_qrows`), not by position
+                    # within this spec's slice (`spec_qsel`). Rebinding, never
+                    # mutating: the mask may be cached and shared with another
+                    # spec that has a different subset.
+                    cell_mask = cell_mask[spec_qrows[m]]
                 sel_scores = sel_scores.masked_fill(~cell_mask, float("-inf"))
 
             # Append to the pending buffer (pre-topk wide slices down to k so
@@ -2089,6 +2119,9 @@ def _process_shared_batch(
     encoded_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
+    spec_qsel: list | None = None,
+    spec_qrows: list | None = None,
+    n_q_full: int | None = None,
 ) -> float:
     """Every search of this vector_type shares one batch grid: `orig_rows`
     is `None` when some search is unfiltered (`batch` is the raw, whole
@@ -2146,7 +2179,13 @@ def _process_shared_batch(
                     # slice's bytes ever get expanded back to
                     # one-bool-per-query, not the whole file's.
                     packed_np = keeps[s.filter][:, true_rows]
-                    cell_np = _unpack_query_axis(packed_np, spec_Q[m].shape[0])
+                    # Height is the FULL query axis: `keeps` is packed over
+                    # every query in the file (see `_pack_query_axis`), which
+                    # is NOT `spec_Q[m].shape[0]` once a `rows` subset makes
+                    # this vector_type's matrix shorter than the file.
+                    cell_np = _unpack_query_axis(
+                        packed_np, spec_Q[m].shape[0] if n_q_full is None else n_q_full
+                    )
                     cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
                 if filter_share_count[s.filter] > 1:
                     cache[s.filter] = cell_mask
@@ -2168,7 +2207,92 @@ def _process_shared_batch(
         encoded_row_ids=encoded_row_ids,
         multivector_token_budget=multivector_token_budget,
         multivector_double_buffer=multivector_double_buffer,
+        spec_qsel=spec_qsel, spec_qrows=spec_qrows,
     )
+
+
+def _load_query_columns(
+    store: Store, qcfg, cols: list[str],
+) -> dict[str, np.ndarray]:
+    """Read a few small query columns, nothing else.
+
+    Used for `SearchSpec.rows` selectors, which have to be resolved before the
+    vector loaders run (they decide the query matrix height). Walks the same
+    `store.list_parquets()` order the loaders do, so row i here is row i there.
+    """
+    out: dict[str, list] = {c: [] for c in cols}
+    date_fmts = normalize_date_fields(qcfg.date_fields)
+    for f in store.list_parquets():
+        table = store.read_columns(f.read_path, list(cols))
+        conv = convert_table_date_columns(table, date_fmts)
+        for c in cols:
+            out[c] += conv[c].to_pylist()
+    return {c: _to_query_array(v) for c, v in out.items()}
+
+
+def _resolve_spec_rows(
+    specs: list, query_filter_vals: dict[str, np.ndarray], n_q: int,
+) -> tuple[list, dict[str, np.ndarray | None]]:
+    """Turn each spec's `rows` selector into sorted file-row indices.
+
+    Returns `(spec_rows, vt_rows)`:
+      * `spec_rows[m]` — that spec's own rows, or `None` for "every row".
+      * `vt_rows[vt]`  — the UNION of that vector_type's specs' rows, or `None`
+        if any of them takes every row. This is what the vector matrix gets
+        built over: specs of one vector_type share a single query matrix (and
+        a single score matrix per metric), so the matrix has to cover
+        everything any of them asks for, and each spec indexes its own slice
+        out of it afterwards.
+
+    A selector matching nothing is an error, not an empty result: it means the
+    column or the values are misspelled, and silently writing an empty output
+    would look like a successful run.
+    """
+    spec_rows: list[np.ndarray | None] = []
+    for s in specs:
+        if s.rows is None:
+            spec_rows.append(None)
+            continue
+        vals = query_filter_vals[s.rows.column]
+        # Compare as strings so a selector works against an int/categorical
+        # source column without the config having to mirror its dtype.
+        mask = np.isin(vals.astype(str), np.asarray(s.rows.isin, dtype=str))
+        idx = np.nonzero(mask)[0].astype(np.int64)
+        if idx.size == 0:
+            raise ValueError(
+                f"search {s.name!r}: rows.column={s.rows.column!r} has no row matching "
+                f"isin={s.rows.isin!r} — every query would be excluded"
+            )
+        spec_rows.append(idx)
+
+    vt_rows: dict[str, np.ndarray | None] = {}
+    for s, rows in zip(specs, spec_rows):
+        vt = s.vector_type
+        if vt not in vt_rows:
+            vt_rows[vt] = rows
+        elif vt_rows[vt] is None or rows is None:
+            vt_rows[vt] = None
+        else:
+            vt_rows[vt] = np.union1d(vt_rows[vt], rows)
+    for vt, rows in vt_rows.items():
+        if rows is not None and len(rows) == n_q:
+            vt_rows[vt] = None  # covers everything; skip the indexing entirely
+    return spec_rows, vt_rows
+
+
+def _local_positions(
+    rows: np.ndarray | None, vt_rows: np.ndarray | None,
+) -> np.ndarray | None:
+    """Map a spec's file-row indices to positions in its vector_type's matrix.
+
+    `None` means "the identity" — the spec reads every row of that matrix, so
+    the scoring path can skip the gather entirely.
+    """
+    if rows is None:
+        return None
+    if vt_rows is None:
+        return rows  # matrix is full height: file row == matrix row
+    return np.searchsorted(vt_rows, rows).astype(np.int64)
 
 
 def _validate_query_filter_cols(qstore: Store, filter_cols: list[str]) -> None:
@@ -2273,7 +2397,21 @@ def run_compute(
     # only) what's referenced" guarantee corpus-side filter_cols already makes,
     # extended to the query side (see Filter.query_fields()).
     query_filter_cols = sorted({c for s in specs if s.filter for c in s.filter.query_fields()})
+    # `SearchSpec.rows` columns ride along with the per-query filter columns:
+    # both are read from the queries file into `query_filter_vals`, and both
+    # get the same "referenced columns must exist" validation below.
+    subset_cols = sorted({s.rows.column for s in specs if s.rows is not None})
+    query_filter_cols = sorted(set(query_filter_cols) | set(subset_cols))
     _validate_query_filter_cols(qstore, query_filter_cols)
+    # Row subsets must be known BEFORE the loaders run, because they decide how
+    # tall each vector_type's query matrix is. The selector columns are a few
+    # small columns, so reading them first is cheap next to the vector columns.
+    spec_rows: list = [None] * len(specs)
+    vt_rows: dict[str, np.ndarray | None] = {}
+    if subset_cols:
+        pre = _load_query_columns(qstore, cfg.queries, subset_cols)
+        n_q_pre = len(next(iter(pre.values())))
+        spec_rows, vt_rows = _resolve_spec_rows(specs, pre, n_q_pre)
     Q_np_by_vt: dict[str, np.ndarray] = {}
     query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
     mv_q_offsets = None  # multivector only: (n_q+1,) query-token offsets (see load_queries_multivector)
@@ -2288,7 +2426,7 @@ def run_compute(
     for vt in vts_needed:
         if vt == "sparse":
             Q_np, query_vocab, q_ids, q_payload, q_filter_vals = load_queries_sparse(
-                qstore, cfg.queries, query_filter_cols
+                qstore, cfg.queries, query_filter_cols, rows=vt_rows.get(vt)
             )
             if len(query_vocab) == 0 and len(q_ids) > 0:
                 logger.warning(
@@ -2316,7 +2454,9 @@ def run_compute(
                     "every corpus row will score 0; check queries.multivector_column is correct."
                 )
         else:
-            Q_np, q_ids, q_payload, q_filter_vals = load_queries(qstore, cfg.queries, query_filter_cols)
+            Q_np, q_ids, q_payload, q_filter_vals = load_queries(
+                qstore, cfg.queries, query_filter_cols, rows=vt_rows.get(vt)
+            )
         Q_np_by_vt[vt] = Q_np
         if query_ids is None:
             query_ids, payload, query_filter_vals = q_ids, q_payload, q_filter_vals
@@ -2441,7 +2581,7 @@ def run_compute(
     }
     q_norms_by_vt: dict[str, object] = {}
     spec_Q, spec_q_norms, spec_top_scores, spec_top_enc = [], [], [], []
-    for s in specs:
+    for i_spec, s in enumerate(specs):
         # Multivector cosine normalizes each TOKEN inside score() (not a
         # per-query scalar divide like dense/sparse), so it needs no `q_norms`
         # — and Q here is a MultiVectorQuery, not a tensor with .norm().
@@ -2467,8 +2607,45 @@ def run_compute(
         else:
             spec_q_norms.append(None)
         spec_Q.append(Q_gpu_by_vt[s.vector_type])
-        spec_top_scores.append(torch.full((n_q, s.k), float("-inf"), device=device))
-        spec_top_enc.append(torch.zeros((n_q, s.k), dtype=torch.int64, device=device))
+        # Height is this spec's OWN query count, not the file's: with several
+        # specs over a unioned queries file that is the difference between
+        # sum(len(subset)) and n_specs * n_q rows of running top-K state.
+        h = n_q if spec_rows[i_spec] is None else len(spec_rows[i_spec])
+        spec_top_scores.append(torch.full((h, s.k), float("-inf"), device=device))
+        spec_top_enc.append(torch.zeros((h, s.k), dtype=torch.int64, device=device))
+
+    # Device-side row selectors for `SearchSpec.rows`, built once per run:
+    #   spec_qsel[m]  — indexes this spec's rows in its vector_type's SCORE
+    #                   matrix (which spans that type's row union)
+    #   spec_qrows[m] — indexes the same rows in a FULL-query-axis per-query
+    #                   filter mask (see `_pack_query_axis`)
+    # A contiguous run becomes a `slice` so the score matrix is sliced as a
+    # view instead of gathered; `None` means "all rows", the historical path,
+    # which skips the indexing entirely.
+    def _sel(idx: np.ndarray | None):
+        if idx is None:
+            return None
+        if len(idx) and idx[-1] - idx[0] == len(idx) - 1:
+            return slice(int(idx[0]), int(idx[-1]) + 1)
+        return torch.from_numpy(np.ascontiguousarray(idx)).to(device)
+
+    spec_qsel = [
+        _sel(_local_positions(spec_rows[m], vt_rows.get(specs[m].vector_type)))
+        for m in range(len(specs))
+    ]
+    spec_qrows = [_sel(spec_rows[m]) for m in range(len(specs))]
+    if any(r is not None for r in spec_rows):
+        logger.info(
+            "query-row subsets active: %s (file has %d queries; per-spec top-K "
+            "state covers %d rows total instead of %d)",
+            ", ".join(
+                f"{s.name}={len(spec_rows[m])}"
+                for m, s in enumerate(specs) if spec_rows[m] is not None
+            ),
+            n_q,
+            sum(n_q if r is None else len(r) for r in spec_rows),
+            n_q * len(specs),
+        )
 
     # Per vector_type: does any spec have no filter (or an explicit-but-empty
     # one — see `_is_unfiltered`) OR a per-query filter (see `_is_per_query` —
@@ -2895,6 +3072,7 @@ def run_compute(
             combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_gpu,
             filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
             encoded_row_ids=encoded_ids,
+            spec_qsel=spec_qsel, spec_qrows=spec_qrows, n_q_full=n_q,
             multivector_token_budget=(
                 cfg.params.multivector_token_budget if vt == "multivector" else None
             ),
@@ -2980,6 +3158,7 @@ def run_compute(
                         spec_top_scores, spec_top_enc,
                         keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
                         filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=batch_orig_rows[vt],
+                        spec_qsel=spec_qsel, spec_qrows=spec_qrows, n_q_full=n_q,
                         multivector_token_budget=(
                             cfg.params.multivector_token_budget
                             if vt == "multivector"
@@ -3082,13 +3261,24 @@ def run_compute(
         enc = spec_top_enc[i].cpu().numpy()
         sc = spec_top_scores[i].cpu().numpy()
         valid = sc > float("-inf")
+        # A spec with a `rows` subset wrote state for its OWN queries only, so
+        # its output covers those rows — ids and payload are sliced to match.
+        # `query_ids`/`payload` stay full-length upstream (both loaders return
+        # every row) precisely so this slice is the only place that has to know.
+        rows_i = spec_rows[i]
+        out_n = sc.shape[0]
         hit_ids, hit_scores = [], []
-        for q in range(n_q):
+        for q in range(out_n):
             qe, qs = enc[q][valid[q]], sc[q][valid[q]]
             hit_ids.append([resolve_id(int(e)) for e in qe])
             hit_scores.append(qs.tolist())
 
-        table = build_result_table(query_ids, payload, hit_ids, hit_scores)
+        if rows_i is None:
+            out_ids, out_payload = query_ids, payload
+        else:
+            out_ids = [query_ids[r] for r in rows_i]
+            out_payload = {c: [v[r] for r in rows_i] for c, v in payload.items()}
+        table = build_result_table(out_ids, out_payload, hit_ids, hit_scores)
         if num_jobs is not None:
             width = max(3, len(str(num_jobs - 1)))
             name = f"{partial_dir(cfg, s)}/rank{job_rank:0{width}d}.parquet"
@@ -3101,6 +3291,6 @@ def run_compute(
             name = result_name(cfg, s)
             warn_if_short(sum(1 for h in hit_ids if len(h) < s.k), len(hit_ids), s.k, s.name, logger)
         path = out.write(name, table)
-        logger.info("search=%r wrote %s (%d queries)", s.name, path, n_q)
+        logger.info("search=%r wrote %s (%d queries)", s.name, path, out_n)
         results[s.name] = path
     return results

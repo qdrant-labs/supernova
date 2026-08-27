@@ -166,7 +166,11 @@ class ParamsConfig(BaseModel):
     # given vector_type ends up sharing one GPU pass over the corpus anyway
     # (see compute.py), so a per-search value would just be resolved down to
     # this same shared number regardless — this makes that explicit instead
-    # of implicit. A value below some search's own `k` is never raised —
+    # of implicit. `SearchSpec.rows` does NOT change that: the shared score
+    # matrix spans the vector_type's whole query-row union and each search
+    # slices its own rows out of it AFTER scoring, so what this bounds is
+    # still one matrix per vector_type, not one per search.
+    # A value below some search's own `k` is never raised —
     # only warned about (that search just needs extra merge rounds to fill
     # its own top-K, at no extra memory cost to anyone).
     #
@@ -472,6 +476,30 @@ class Filter(BaseModel):
         return bool(self.query_fields())
 
 
+class RowSelector(BaseModel):
+    """Which QUERY rows a search owns — `SearchSpec.rows`.
+
+    Without one, a spec covers every row in the queries file, so a run that
+    unions several query sets into one file has to neutralize each spec's
+    foreign rows with a match-nothing sentinel value.
+
+    A selector names the rows directly instead, and the sentinels become
+    unnecessary:
+
+        rows: {column: query_set, isin: [filtered_text]}
+
+    `column` is read from the queries file alongside the per-query filter
+    columns, so it does NOT need to be listed in `queries.payload_fields`
+    (though it usually is, to carry through to the output). Values are compared
+    as strings, so `isin: ["1"]` matches an integer 1 in the source column.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    column: str = Field(min_length=1)
+    isin: list[str] = Field(min_length=1)
+
+
 class SearchSpec(BaseModel):
     """One independent top-K search to compute in a `nova-bf compute` run —
     its own vector_type, metric, k, and (optional) filter, scored and top-K'd
@@ -497,6 +525,10 @@ class SearchSpec(BaseModel):
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
     vector_type: Literal["dense", "sparse", "multivector"] = "dense"
     filter: Filter | None = None
+    # Which QUERY rows this search owns (see RowSelector). None = every row,
+    # the historical behavior. `filter` is the CORPUS-side predicate; this is
+    # the query-side one, and the two are independent.
+    rows: RowSelector | None = None
 
     @model_validator(mode="after")
     def _no_euclidean_for_non_dense(self) -> "SearchSpec":
@@ -509,6 +541,21 @@ class SearchSpec(BaseModel):
             raise ValueError(
                 f"metric='euclidean' is not supported with vector_type="
                 f"'{self.vector_type}' — use 'dot' or 'cosine'"
+                + (f" (search {self.name!r})" if self.name else "")
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _rows_not_multivector(self) -> "SearchSpec":
+        # The multivector path carries its own ragged (total_tokens, D) matrix
+        # plus a length-n_q+1 token-offset array (`MultiVectorQuery`); taking a
+        # query-row subset means rebuilding those offsets, which the dense and
+        # sparse paths don't need. Rejected explicitly rather than silently
+        # ignored — a subset that didn't apply would produce a correct-looking
+        # result over the WRONG query set.
+        if self.rows is not None and self.vector_type == "multivector":
+            raise ValueError(
+                "`rows` is not supported with vector_type='multivector'"
                 + (f" (search {self.name!r})" if self.name else "")
             )
         return self

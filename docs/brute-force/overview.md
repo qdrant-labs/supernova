@@ -97,6 +97,38 @@ searches:
 
 **Mixing `vector_type: dense` and `vector_type: sparse` in one run doubles the per-file host-RAM budget**: each in-flight file's reader decodes both columns at once, so `io_workers × file_size` (see [Performance & tuning](#performance--tuning)) becomes `io_workers × (dense_bytes + sparse_bytes)`. Lower `io_workers` accordingly on memory-constrained boxes when mixing vector_types.
 
+### Giving each search its own query rows
+
+By default every search scores every row of the queries file. 
+However, `rows:` lets a search declare which rows are its own instead. The generic format is as follows: `rows: {column: <parquet_column_with_query_set_values>, isin: [<specific_query_set>]}`. For example, if you have a parquet with a `query_set` column, where the `query_set` values could either be `filtered_text` or `structured`, you would use the following yaml format:  
+
+```yaml
+queries:
+  path: s3://…/ms_marco_10000_combined.parquet
+
+searches:
+  - name: filtered_text
+    rows: {column: query_set, isin: [filtered_text]}
+    filter:
+      must:
+        - field: text
+          match_text_from_query: keyword_phrase
+
+  - name: structured
+    rows: {column: query_set, isin: [structured]}
+    filter:
+      must:
+        - field: language_score
+          range_from_query: {gte: ls_gte}
+```
+
+Omit `rows` and the search covers every query, as before. The selector column is read from the queries file directly, so it does not need to appear in `queries.payload_fields` (list it there anyway if you want it carried into the output). Values compare as strings. A selector that matches no row is an error, not an empty result.
+
+- **Not supported with `vector_type: multivector`** — that path carries ragged
+  per-query token offsets that a row subset would have to rebuild. Configuring
+  both is rejected at config load rather than silently ignored.
+- Order the unified query file rows based on the query_set value (i.e., keep the same values contiguous) to improve computational efficiency with row selection.
+
 ### Sparse vectors
 
 Set a search's `vector_type: sparse` to score a `struct<indices: list<uint32>, values: list<float32>>` column instead of the dense one — the same schema `nova embed`'s sparse embedders write and `nova load` reads (default column name `sparse_embedding`, override via `corpus.sparse_column` / `queries.sparse_column`). Only `metric: dot` and `metric: cosine` are supported (`euclidean` has no real use case for sparse retrieval and is rejected at config load).
