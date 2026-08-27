@@ -55,7 +55,8 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         query.vector_type,
         query.vector_name.as_deref().unwrap_or("(unnamed)"),
     );
-    let vectors = load_query_vectors(&query.source, query.vector_type, query.filter.as_ref())?;
+    let vectors =
+        load_query_vectors(&query.source, query.vector_type, query.filter.as_ref(), query.top_k)?;
     if vectors.is_empty() {
         return Err(StormError::Other(format!(
             "no query vectors loaded from {:?} (column {:?}) — NULL and empty vectors are \
