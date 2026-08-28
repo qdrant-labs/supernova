@@ -44,6 +44,17 @@ query:
   # REQUIRED for milvus (the annsField) and elastic (the dense_vector field).
   vector_name: dense
   top_k: 10                         # neighbours per query (default 10)
+  # A ground truth DEEPER than top_k is truncated to its first top_k ids at
+  # load (the list is best-first, so the prefix is the true top-k) — recall is
+  # measured against the true top-k, not against every id in the list.
+
+  # Relative score tolerance for calling two scores tied. Unset (default) =
+  # derived from the collection's stored datatype, probed at startup:
+  # float32 -> 5e-6, float16 -> 2e-3. A collection created without an explicit
+  # datatype reports none and takes the float32 value, since that is Qdrant's
+  # default storage; only an unreadable or unrecognized one gets 2e-3.
+  # See docs/storm/recall.md for the measurements behind those.
+  # tie_epsilon: 2e-3
   # Return each hit's full payload (default false = ids/scores only). Turn on
   # when the modeled production traffic fetches payloads — payload reads and
   # response bytes are real cost the benchmark otherwise understates. (No-op on
@@ -68,6 +79,12 @@ query:
     # `nova bf`'s `hit_ids`), read from the same row as the vector. Ids are
     # compared as strings — works across Qdrant/Milvus/Elastic identically.
     # ground_truth_column: hit_ids
+    # The matching score column (`nova bf`'s `hit_scores`). Optional, and only
+    # meaningful alongside `ground_truth_column`. With it, storm can tell a
+    # genuine miss from a TIE — several documents sharing the ground truth's
+    # k-th score are all equally correct — and reports recall as a RANGE
+    # instead of a single, unfairly harsh number.
+    # ground_truth_score_column: hit_scores
 
 # Per-worker load shape (replicated across the fleet).
 load:

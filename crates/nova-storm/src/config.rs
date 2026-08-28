@@ -49,6 +49,14 @@ impl StormConfig {
         if cfg.query.top_k == 0 {
             return Err(ConfigError::ZeroTopK);
         }
+        // A negative or non-finite tolerance makes `scores_tied` false for
+        // EVERY pair, including exactly-equal scores: ties would silently
+        // vanish and every above-cutoff result would land in `missing_from_gt`.
+        if let Some(eps) = cfg.query.tie_epsilon {
+            if !eps.is_finite() || eps < 0.0 {
+                return Err(ConfigError::BadTieEpsilon(eps));
+            }
+        }
         if cfg.load.batch_size == 0 {
             return Err(ConfigError::ZeroBatchSize);
         }
@@ -78,8 +86,10 @@ impl StormConfig {
     /// Read and parse a config file, expanding `${VAR}` references.
     pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let yaml = std::fs::read_to_string(path)
-            .map_err(|source| ConfigError::Read { path: path.display().to_string(), source })?;
+        let yaml = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
         Self::from_yaml(&yaml)
     }
 }
@@ -110,6 +120,16 @@ pub struct QueryConfig {
     pub vector_type: VectorType,
     #[serde(default = "default_top_k")]
     pub top_k: u64,
+    /// Two scores within this RELATIVE tolerance (`|a-b| / (1+|b|)`) count as
+    /// the same score, so an engine that returned a DIFFERENT member of a tie
+    /// still counts as correct.
+    ///
+    /// `None` (default) → derived from the collection's stored `datatype`,
+    /// probed once at startup; see [`tie_epsilon_for_datatype`] for the
+    /// measured table. Set it explicitly to override, e.g. when the backend
+    /// can't report its datatype or a quantization mode widens the gap.
+    #[serde(default)]
+    pub tie_epsilon: Option<f64>,
     /// What payload the server returns with each hit. Default `false`
     /// (ids/scores only). `true` = every payload field; a LIST of field names
     /// (e.g. `[text]`) = only those fields — the shape a RAG workload has,
@@ -179,6 +199,12 @@ pub struct QuerySource {
     /// truth (not an error), so it still contributes latency but no recall.
     #[serde(default)]
     pub ground_truth_column: Option<String>,
+    /// The matching `list<float>` score column (e.g. nova-bf's `hit_scores`),
+    /// read alongside `ground_truth_column`. Enables the tie-aware numbers:
+    /// the ground truth's score at the top-k cutoff, and how many of its
+    /// entries share that score.
+    #[serde(default)]
+    pub ground_truth_score_column: Option<String>,
 }
 
 /// Per-worker load shape, replicated (NOT sharded) across the fleet.
@@ -227,6 +253,32 @@ impl Default for LoadProfile {
 fn default_top_k() -> u64 {
     10
 }
+
+/// Score tolerance to use for a given stored `datatype`, when the config
+/// leaves `query.tie_epsilon` unset.
+///
+/// MEASURED, not guessed: worst-case relative gap (`|a-b| / (1+|b|)`) between
+/// nova-bf's published `hit_scores` and live Qdrant exact search, over 4,000
+/// dim-128 vectors x 100 queries x top-20:
+///
+/// | datatype | dot     | cosine  | default |
+/// |----------|---------|---------|---------|
+/// | float32  | 6.5e-07 | 1.5e-07 | 5e-06   |
+/// | float16  | 4.2e-04 | 7.3e-05 | 2e-03   |
+///
+/// Each default carries roughly 5-8x headroom over the measured worst case.
+/// A too-LARGE tolerance only widens the tie-tolerant upper bound, which is
+/// already an upper bound; a too-small one silently under-reports ties. So
+/// anything unrecognized — including `uint8`, whose quantization loss the
+/// measurement above did not exercise — gets the conservative value.
+pub fn tie_epsilon_for_datatype(datatype: Option<&str>) -> f64 {
+    match datatype {
+        Some("float32") => 5e-6,
+        Some("float16") => 2e-3,
+        _ => 2e-3,
+    }
+}
+
 fn default_limit() -> usize {
     5000
 }
@@ -243,13 +295,23 @@ fn default_batch_size() -> usize {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file `{path}`: {source}")]
-    Read { path: String, source: std::io::Error },
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("config YAML is invalid: {0}")]
     Yaml(#[from] serde_yaml::Error),
-    #[error("environment variable `{0}` referenced in config is not set; set it or supply a default with `${{{0}:-...}}`")]
+    #[error(
+        "environment variable `{0}` referenced in config is not set; set it or supply a default with `${{{0}:-...}}`"
+    )]
     MissingEnvVar(String),
     #[error("unterminated `${{` placeholder in config (missing closing `}}`)")]
     UnterminatedPlaceholder,
+    #[error(
+        "query.tie_epsilon must be a finite, non-negative relative tolerance (got {0}) — a \
+         negative or NaN value makes every score comparison fail, hiding all ties"
+    )]
+    BadTieEpsilon(f64),
     #[error("query.top_k must be greater than 0")]
     ZeroTopK,
     #[error("load.batch_size must be greater than 0")]
@@ -273,7 +335,9 @@ pub enum ConfigError {
     FilterConditionBlankMatchText { field: String },
     #[error("filter condition on `{field}` range needs at least one of gt/gte/lt/lte")]
     FilterConditionEmptyRange { field: String },
-    #[error("filter condition on `{field}` has an empty `match: []` list — it would never match anything")]
+    #[error(
+        "filter condition on `{field}` has an empty `match: []` list — it would never match anything"
+    )]
     FilterConditionEmptyMatchAny { field: String },
 }
 
@@ -392,7 +456,10 @@ query:
     uri: /tmp/q.parquet
     column: embedding
 "#;
-        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::ZeroTopK));
+        assert!(matches!(
+            StormConfig::from_yaml(yaml).unwrap_err(),
+            ConfigError::ZeroTopK
+        ));
     }
 
     #[test]
@@ -409,7 +476,10 @@ query:
 load:
   batch_size: 0
 "#;
-        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::ZeroBatchSize));
+        assert!(matches!(
+            StormConfig::from_yaml(yaml).unwrap_err(),
+            ConfigError::ZeroBatchSize
+        ));
     }
 
     #[test]
@@ -428,7 +498,10 @@ load:
 "#;
         // `qps` was replaced by `rps` with no back-compat alias -- an old config
         // using it now hits `deny_unknown_fields` like any other typo'd key.
-        assert!(matches!(StormConfig::from_yaml(yaml).unwrap_err(), ConfigError::Yaml(_)));
+        assert!(matches!(
+            StormConfig::from_yaml(yaml).unwrap_err(),
+            ConfigError::Yaml(_)
+        ));
     }
 
     #[test]
@@ -472,7 +545,10 @@ query:
 
         // unknown format dies at parse time like any other config typo
         let bad = format!("{base}report:\n  format: sqlite\n  path: /tmp/ts.db\n");
-        assert!(matches!(StormConfig::from_yaml(&bad).unwrap_err(), ConfigError::Yaml(_)));
+        assert!(matches!(
+            StormConfig::from_yaml(&bad).unwrap_err(),
+            ConfigError::Yaml(_)
+        ));
     }
 
     #[test]
@@ -489,7 +565,10 @@ query:
     ground_truth_column: hit_ids
 "#;
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        assert_eq!(cfg.query.source.ground_truth_column.as_deref(), Some("hit_ids"));
+        assert_eq!(
+            cfg.query.source.ground_truth_column.as_deref(),
+            Some("hit_ids")
+        );
     }
 
     /// A minimal valid config with `extra` spliced into the `query` section.
@@ -518,8 +597,8 @@ query:
 
     #[test]
     fn sparse_without_vector_name_is_rejected() {
-        let err = StormConfig::from_yaml(&yaml_with_query_extras("  vector_type: sparse\n"))
-            .unwrap_err();
+        let err =
+            StormConfig::from_yaml(&yaml_with_query_extras("  vector_type: sparse\n")).unwrap_err();
         assert!(matches!(err, ConfigError::SparseRequiresVectorName));
     }
 
@@ -552,13 +631,17 @@ query:
         // default: 300s, NOT the qdrant client's 5s (a load tester must not
         // count its own honest slow dispatches as errors)
         let cfg = StormConfig::from_yaml(&yaml_with_query_extras("")).expect("parses");
-        let TargetConfig::Qdrant(q) = &cfg.target else { panic!("qdrant target") };
+        let TargetConfig::Qdrant(q) = &cfg.target else {
+            panic!("qdrant target")
+        };
         assert_eq!((q.timeout_s, q.connect_timeout_s), (300, 10));
 
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n  timeout_s: 600\n  connect_timeout_s: 30\n\
              query:\n  source:\n    uri: /tmp/q.parquet\n    column: e\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let TargetConfig::Qdrant(q) = &cfg.target else { panic!("qdrant target") };
+        let TargetConfig::Qdrant(q) = &cfg.target else {
+            panic!("qdrant target")
+        };
         assert_eq!((q.timeout_s, q.connect_timeout_s), (600, 30));
     }
 
@@ -566,7 +649,10 @@ query:
     fn with_payload_accepts_bool_and_field_list() {
         let cfg = StormConfig::from_yaml(&yaml_with_query_extras("  with_payload: [text]\n"))
             .expect("parses");
-        assert_eq!(cfg.query.with_payload, WithPayload::Fields(vec!["text".into()]));
+        assert_eq!(
+            cfg.query.with_payload,
+            WithPayload::Fields(vec!["text".into()])
+        );
         assert!(cfg.query.with_payload.is_enabled());
 
         let cfg = StormConfig::from_yaml(&yaml_with_query_extras("  with_payload: true\n"))
@@ -593,14 +679,16 @@ query:
 
     #[test]
     fn unknown_vector_type_is_rejected() {
-        let err = StormConfig::from_yaml(&yaml_with_query_extras("  vector_type: hybrid\n"))
-            .unwrap_err();
+        let err =
+            StormConfig::from_yaml(&yaml_with_query_extras("  vector_type: hybrid\n")).unwrap_err();
         assert!(matches!(err, ConfigError::Yaml(_)));
     }
 
     fn expand(input: &str, vars: &[(&str, &str)]) -> Result<String, ConfigError> {
-        let map: std::collections::HashMap<String, String> =
-            vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         expand_env_with(input, |k| map.get(k).cloned())
     }
 
@@ -608,6 +696,9 @@ query:
     fn expands_and_defaults() {
         assert_eq!(expand("url: ${U}", &[("U", "x")]).unwrap(), "url: x");
         assert_eq!(expand("url: ${U:-fallback}", &[]).unwrap(), "url: fallback");
-        assert!(matches!(expand("${NOPE}", &[]).unwrap_err(), ConfigError::MissingEnvVar(_)));
+        assert!(matches!(
+            expand("${NOPE}", &[]).unwrap_err(),
+            ConfigError::MissingEnvVar(_)
+        ));
     }
 }

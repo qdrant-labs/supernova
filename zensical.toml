@@ -23,6 +23,9 @@ nav = [
   {"Brute Force" = [
     "brute-force/overview.md",
   ]},
+  {"Storm" = [
+    "storm/recall.md",
+  ]},
   {"Sweep" = [
     "sweep/overview.md",
   ]},

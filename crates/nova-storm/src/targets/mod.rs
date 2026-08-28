@@ -19,11 +19,11 @@ use crate::config::QueryConfig;
 use crate::errors::TargetError;
 use crate::queries::QueryVector;
 
-pub mod qdrant;
 #[cfg(feature = "elastic")]
 pub mod elastic;
 #[cfg(feature = "milvus")]
 pub mod milvus;
+pub mod qdrant;
 
 /// Outcome of a single batch dispatch (one `query_batch` round-trip, covering
 /// `vectors.len()` queries). A failure is recorded here (`ok = false`) rather
@@ -43,6 +43,14 @@ pub struct BatchOutcome {
     /// (`!ok`). `Some(vec![])` is a real, different thing — recall tracking
     /// was on, the dispatch succeeded, and that query just matched nothing.
     pub ids: Vec<Option<Vec<String>>>,
+    /// The score each returned point came back with, positionally aligned
+    /// with `ids`. `None` at a position for the same reasons `ids` is, plus
+    /// when the backend didn't report scores.
+    ///
+    /// Recall needs these to tell a genuine miss from a TIE: several documents
+    /// can share the score at the ground truth's k-th place, and an engine
+    /// that returned a different one of them is not wrong.
+    pub scores: Vec<Option<Vec<f32>>>,
     pub error: Option<String>,
     /// The failure was a CLIENT-SIDE deadline (gRPC CANCELLED/DEADLINE_EXCEEDED
     /// — "the query was too slow for `timeout_s`"), not a broken target. Kept
@@ -50,6 +58,20 @@ pub struct BatchOutcome {
     /// is a saturation finding, a connection error is a broken run, and mixing
     /// them makes both unreadable.
     pub timed_out: bool,
+}
+
+/// What a backend's scores look like, probed once from the collection.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScoringProfile {
+    /// Stored vector `datatype` (`"float32"`, `"float16"`, `"uint8"`), which
+    /// sets the default score tolerance.
+    pub datatype: Option<String>,
+    /// Distance function (`"dot"`, `"cosine"`, `"euclid"`, `"manhattan"`).
+    /// `None` means unknown — NOT "assume larger is better".
+    pub distance: Option<String>,
+    /// Whether quantization is configured. Only matters alongside a
+    /// `rescore: false` search param.
+    pub quantized: bool,
 }
 
 /// A backend a storm sends queries to. `Display` is the name used in logs
@@ -63,6 +85,26 @@ pub trait QueryTarget: Send + Sync + std::fmt::Display {
     /// (`filter_values`) alongside its vector. A single-element slice is not
     /// a special case — it's the default (`LoadProfile::batch_size == 1`).
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome;
+
+    /// How this backend scores, when it can report it — one probe, so a
+    /// single RPC failure can't leave the three answers inconsistent.
+    ///
+    /// Every field defaults to "unknown" rather than to a guess: an assumed
+    /// orientation is the one error mode that turns a healthy run's every miss
+    /// into a `missing_from_gt` alarm, so callers disable score-based
+    /// reporting on `None` instead of picking a side.
+    async fn scoring_profile(&self) -> ScoringProfile {
+        ScoringProfile::default()
+    }
+
+    /// Stop materializing per-point scores.
+    ///
+    /// Called once, after `scoring_profile()`, when the run turns out not to
+    /// compare scores after all — a quantized collection queried with
+    /// `rescore: false`, or an unreadable distance. Score collection happens
+    /// inside the measured latency window, so a run that will discard them
+    /// must not keep paying for them.
+    fn disable_score_collection(&self) {}
 
     /// Tear down connections. Default: nothing (clients close on drop).
     async fn close(&self) -> Result<(), TargetError> {

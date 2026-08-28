@@ -30,7 +30,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::config::LoadProfile;
-use crate::queries::QueryVector;
+use crate::queries::{GtCutoff, QueryVector, scores_tied};
 use crate::targets::QueryTarget;
 
 /// One worker's raw measurements. Latencies (and recalls, if ground truth is
@@ -60,6 +60,26 @@ pub struct StormResults {
     /// [`DispatchSample::filter_overreturn`]. A firing count, like the recall
     /// bucket `n`s.
     pub filter_overreturn: u64,
+    /// Total firings where the VDB returned fewer than `top_k` ids.
+    pub short_returns: u64,
+    /// Total results scoring better than the ground truth's k-th place yet
+    /// absent from it — a ground-truth/collection mismatch, not a tie.
+    pub missing_from_gt: u64,
+    /// Distinct queries behind the `recall@k` line — non-empty ground truth,
+    /// at least `top_k` deep. Not the loaded query count.
+    pub full_recall_queries: u64,
+    /// Ground-truth tie stats at the top-k cutoff, when scores were available.
+    pub ties: Option<TieStats>,
+    pub top_k: u64,
+    pub tie_epsilon: f64,
+    pub tie_epsilon_source: String,
+    /// `Some(reason)` when tie reporting was withheld — see `run_storm`.
+    pub tie_disabled_reason: Option<String>,
+    /// Whether a ground-truth score column was configured at all. Distinct
+    /// from `tie_disabled_reason`: a run that never asked for tie reporting
+    /// isn't a run where it was refused, so it gets no banner — but it must
+    /// still not emit a tolerance that was never applied.
+    pub scores_configured: bool,
     /// Count of batch dispatches, not individual queries.
     pub n_ok: u64,
     pub n_err: u64,
@@ -131,6 +151,67 @@ pub struct Summary {
     /// when the filtered ground truth is the EXHAUSTIVE match set (bf found all
     /// matching docs, i.e. wasn't itself capped). `0` when it never happened.
     pub filter_overreturn: u64,
+    /// Tie-tolerant mean recall over the same firings as `full_recall` — the
+    /// UPPER bound (see [`RecallSample::tolerant`]). Equals `full_recall` when
+    /// no score column is configured or nothing ties.
+    pub full_recall_tolerant: Option<f64>,
+    /// Tie-tolerant mean over the SHORT bucket's firings — the same upper
+    /// bound as `full_recall_tolerant`, for queries whose ground truth is
+    /// shallower than `top_k`. Ties are not a full-bucket phenomenon: under a
+    /// selective filter a shallow ground truth is the norm, and those are
+    /// exactly the queries whose cutoff is most likely to be tied.
+    pub short_recall_tolerant: Option<f64>,
+    /// Tie-tolerant mean over both buckets, matching `total_recall`.
+    pub total_recall_tolerant: Option<f64>,
+    /// Firings where the engine returned fewer than `top_k` ids, excluding
+    /// queries whose ground truth is present but empty. Deflates recall for
+    /// full-depth queries, whose denominator stays `top_k`.
+    pub short_returns: u64,
+    /// Results scoring better than the ground truth's k-th place yet absent
+    /// from it. Non-zero means the ground truth and the collection disagree.
+    pub missing_from_gt: u64,
+    /// Queries ELIGIBLE for the `recall@k` line — loaded with a non-empty
+    /// ground truth at least `top_k` deep. Not the number of vectors loaded
+    /// (empty and shallow ground truths are excluded; a latency-only run
+    /// reports 0), and not necessarily the number that fired: a short or paced
+    /// run can stop before cycling through them all, in which case the mean
+    /// covers a subset of this. The buckets' `n` counts FIRINGS.
+    pub full_recall_queries: u64,
+    pub ties: Option<TieStats>,
+    pub top_k: u64,
+    /// `None` when tie reporting was disabled — the tolerance was never
+    /// applied, so reporting it beside `full_recall_tolerant: null` would
+    /// suggest a comparison that did not happen.
+    pub tie_epsilon: Option<f64>,
+    pub tie_epsilon_source: Option<String>,
+    /// `Some(reason)` when every tie-derived field was withheld because
+    /// returned scores are not comparable to the ground truth's — a quantized
+    /// collection queried with `rescore: false` (measured 3.6e-02 to 26.4
+    /// relative error, vs 2.4e-07 with rescoring on), or a distance function
+    /// nova-bf stores with the opposite sign. `full_recall_tolerant` and
+    /// `ties` are then `None` and `missing_from_gt` is 0. Exact recall is
+    /// unaffected.
+    pub tie_disabled_reason: Option<String>,
+    /// Bumped when a field's MEANING changes without its type changing —
+    /// `nova sweep` cannot otherwise tell a pre-truncation run's recall from a
+    /// post-truncation one. 2 = ground truth truncated to `top_k`.
+    pub schema_version: u32,
+}
+
+/// How tied the ground truth is AT the top-k cutoff, across the loaded query
+/// set. Ties there are why recall is a range: several documents are equally
+/// correct, so an engine returning a different one is not wrong.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct TieStats {
+    pub mean: f64,
+    pub max: u32,
+    /// Share of queries whose k-th place is tied with at least one other doc.
+    pub fraction_of_queries: f64,
+    /// How many queries this describes — every one with a non-empty ground
+    /// truth and a derived cutoff, in EITHER recall bucket. Carried explicitly
+    /// so the line can state its own denominator instead of borrowing the one
+    /// on the recall line above it, which counts a different population.
+    pub queries: u64,
 }
 
 /// One recall bucket's headline: how many queries fell in it and their mean
@@ -145,8 +226,38 @@ pub struct RecallBucket {
 impl RecallBucket {
     /// `None` for an empty slice — an absent bucket, not a `0.0` mean.
     fn from(recalls: &[f64]) -> Option<Self> {
-        (!recalls.is_empty())
-            .then(|| RecallBucket { n: recalls.len() as u64, mean: recalls.iter().sum::<f64>() / recalls.len() as f64 })
+        (!recalls.is_empty()).then(|| RecallBucket {
+            n: recalls.len() as u64,
+            mean: recalls.iter().sum::<f64>() / recalls.len() as f64,
+        })
+    }
+}
+
+/// How a run compares engine scores against its ground truth's. Bundled
+/// rather than passed as loose `bool`s: three adjacent booleans in an
+/// eleven-argument call transpose silently, and swapping `higher_is_better`
+/// with `filtered` would invert every score comparison — the exact failure the
+/// orientation handling exists to prevent — while still compiling.
+#[derive(Debug, Clone)]
+pub struct ScoreComparison {
+    /// Relative tolerance within which two scores count as the same.
+    pub epsilon: f64,
+    /// How that tolerance was chosen, for the summary.
+    pub epsilon_source: String,
+    /// `Some(reason)` when scores are not comparable at all and every
+    /// tie-derived field must be withheld.
+    pub disabled_reason: Option<String>,
+    /// Whether a ground-truth score column AND id column were both configured.
+    pub configured: bool,
+    /// False for euclid/manhattan, where the engine returns a raw distance.
+    pub engine_higher_is_better: bool,
+}
+
+impl ScoreComparison {
+    /// Whether tie-derived numbers should be reported at all: they must have
+    /// been asked for, and not refused.
+    pub fn reported(&self) -> bool {
+        self.configured && self.disabled_reason.is_none()
     }
 }
 
@@ -156,8 +267,21 @@ impl RecallBucket {
 /// summary and the time-series report keep the two populations apart.
 #[derive(Debug, Clone, Copy)]
 pub struct RecallSample {
+    /// Exact id-set recall — the LOWER bound. Every id counted here is
+    /// unambiguously correct.
     pub recall: f64,
+    /// Tie-tolerant recall — the UPPER bound. Adds results that aren't in the
+    /// ground truth but scored the same as its k-th place: the ground truth
+    /// picked one member of a tie, the engine picked another, and both are
+    /// equally right. Equals `recall` when no score column is configured or
+    /// nothing ties.
+    pub tolerant: f64,
     pub short: bool,
+    /// Results that scored BETTER than the ground truth's k-th place yet are
+    /// absent from it. Not a tie — the ground truth and the collection
+    /// disagree (stale GT, wrong corpus version). Counted, never folded into
+    /// `tolerant`, which would hide it as a recall gain.
+    pub missing_from_gt: u32,
 }
 
 impl StormResults {
@@ -166,11 +290,39 @@ impl StormResults {
         ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         // Split the per-query recall samples into the full-depth and short
         // buckets; `total` scores every ground-truthed query together.
-        let full: Vec<f64> = self.recalls.iter().filter(|s| !s.short).map(|s| s.recall).collect();
-        let short: Vec<f64> = self.recalls.iter().filter(|s| s.short).map(|s| s.recall).collect();
+        let full: Vec<f64> = self
+            .recalls
+            .iter()
+            .filter(|s| !s.short)
+            .map(|s| s.recall)
+            .collect();
+        let short: Vec<f64> = self
+            .recalls
+            .iter()
+            .filter(|s| s.short)
+            .map(|s| s.recall)
+            .collect();
         let all: Vec<f64> = self.recalls.iter().map(|s| s.recall).collect();
+        // The tie-tolerant mean covers the SAME firings as `full`, so the two
+        // are directly comparable as a lower/upper pair.
+        // Reporting requires that ties were both ASKED for and possible.
+        let ties_reported = self.scores_configured && self.tie_disabled_reason.is_none();
+        let full_tol: Vec<f64> = self
+            .recalls
+            .iter()
+            .filter(|s| !s.short)
+            .map(|s| s.tolerant)
+            .collect();
+        let short_tol: Vec<f64> =
+            self.recalls.iter().filter(|s| s.short).map(|s| s.tolerant).collect();
+        let all_tol: Vec<f64> = self.recalls.iter().map(|s| s.tolerant).collect();
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
         let total = self.n_ok + self.n_err;
-        let requests_per_sec = if self.wall_s > 0.0 { total as f64 / self.wall_s } else { 0.0 };
+        let requests_per_sec = if self.wall_s > 0.0 {
+            total as f64 / self.wall_s
+        } else {
+            0.0
+        };
         Summary {
             requests: total,
             errors: self.n_err,
@@ -187,6 +339,28 @@ impl StormResults {
             total_recall: RecallBucket::from(&all),
             empty_ground_truth: self.empty_ground_truth,
             filter_overreturn: self.filter_overreturn,
+            full_recall_tolerant: (ties_reported && !full_tol.is_empty())
+                .then(|| mean(&full_tol)),
+            short_recall_tolerant: (ties_reported && !short_tol.is_empty())
+                .then(|| mean(&short_tol)),
+            total_recall_tolerant: (ties_reported && !all_tol.is_empty())
+                .then(|| mean(&all_tol)),
+            short_returns: self.short_returns,
+            // Withheld with the rest when scores are incomparable: it is the
+            // loud "stale ground truth" alarm, and a number derived from
+            // incomparable scores is exactly what must not fire it.
+            missing_from_gt: if ties_reported {
+                self.missing_from_gt
+            } else {
+                0
+            },
+            full_recall_queries: self.full_recall_queries,
+            ties: ties_reported.then_some(self.ties).flatten(),
+            top_k: self.top_k,
+            tie_epsilon: ties_reported.then_some(self.tie_epsilon),
+            tie_epsilon_source: ties_reported.then(|| self.tie_epsilon_source.clone()),
+            tie_disabled_reason: self.tie_disabled_reason.clone(),
+            schema_version: 2,
         }
     }
 }
@@ -202,7 +376,13 @@ impl std::fmt::Display for Summary {
             // Inserted right after the counts: a timing-out cell is "too slow
             // for timeout_s", not "broken", and its tail latency below is
             // censored at the timeout value.
-            lines.insert(2, format!("{:>16}: {} (client timeout_s or server search timeout; tail latency censored)", "timeouts", self.timeouts));
+            lines.insert(
+                2,
+                format!(
+                    "{:>16}: {} (client timeout_s or server search timeout; tail latency censored)",
+                    "timeouts", self.timeouts
+                ),
+            );
         }
         lines.extend([
             format!("{:>16}: {:.1}", "requests_per_sec", self.requests_per_sec),
@@ -212,24 +392,109 @@ impl std::fmt::Display for Summary {
             format!("{:>16}: {:.2}", "p99_ms", self.p99_ms),
             format!("{:>16}: {:.2}", "max_ms", self.max_ms),
         ]);
+        // Recall is reported at the depth it was measured at, and as a RANGE
+        // when ties make the exact value genuinely ambiguous: the ground truth
+        // recorded one member of a tied k-th place, the engine may return
+        // another, and both are correct. Lower = exact id match, upper = tied
+        // scores count. They collapse to one number when nothing ties, which
+        // is also what a run without a score column reports.
+        let label = format!("recall@{}", self.top_k);
+        // A bucket prints as a RANGE when its tie-tolerant bound is meaningfully
+        // above the exact one. 1e-4 is the resolution both endpoints print at,
+        // so a smaller gap would render as `0.8631 – 0.8631`.
+        let value = |exact: f64, tolerant: Option<f64>| match tolerant {
+            Some(t) if t >= exact + 1e-4 => format!("{exact:.4} – {t:.4}"),
+            _ => format!("{exact:.4}"),
+        };
         if let Some(b) = self.full_recall {
-            lines.push(format!("{:>16}: {:.4} (n={})", "recall_full", b.mean, b.n));
+            // "eligible", not "queries": a paced or short run may not have
+            // cycled through all of them, and claiming the mean covers every
+            // one would overstate it.
+            lines.push(format!(
+                "{:>16}: {}  ({} eligible queries, {} firings)",
+                label,
+                value(b.mean, self.full_recall_tolerant),
+                self.full_recall_queries,
+                b.n
+            ));
         }
         if let Some(b) = self.short_recall {
-            lines.push(format!("{:>16}: {:.4} (n={})", "recall_short", b.mean, b.n));
+            lines.push(format!(
+                "{:>16}: {} ({} firings whose ground truth held <{} ids)",
+                format!("{label}_short"),
+                value(b.mean, self.short_recall_tolerant),
+                b.n,
+                self.top_k
+            ));
         }
-        if let Some(b) = self.total_recall {
-            lines.push(format!("{:>16}: {:.4} (n={})", "recall_total", b.mean, b.n));
+        // Only when both buckets exist: otherwise it just repeats the one above.
+        // Both buckets, or it just repeats whichever single line printed above.
+        if let (Some(t), true, true) = (
+            self.total_recall,
+            self.short_recall.is_some(),
+            self.full_recall.is_some(),
+        ) {
+            lines.push(format!(
+                "{:>16}: {} (n={})",
+                "recall_total",
+                value(t.mean, self.total_recall_tolerant),
+                t.n
+            ));
+        }
+        // The ties that make the range a range, and the tolerance that decided
+        // what counts as tied — both only when scores were actually available.
+        if let Some(reason) = &self.tie_disabled_reason {
+            lines.push(format!(
+                "{:>16}: disabled — {reason}. Exact recall above is unaffected.",
+                "tie_reporting"
+            ));
+        }
+        if let Some(t) = self.ties {
+            lines.push(format!(
+                "{:>16}: {:.1} avg, {} max — {:.1}% of {} queries with a cutoff",
+                "ties_at_cutoff",
+                t.mean,
+                t.max,
+                t.fraction_of_queries * 100.0,
+                t.queries
+            ));
+        }
+        // Outside the `ties` block: the tolerance was applied whenever tie
+        // reporting ran, even on a run that happened to find none, and `--json`
+        // reports it on exactly that condition. The two must not disagree.
+        if let (Some(eps), Some(src)) = (self.tie_epsilon, self.tie_epsilon_source.as_ref()) {
+            lines.push(format!("{:>16}: {:.1e} ({})", "tie_epsilon", eps, src));
+        }
+        // Alarms — shown only when they fire (a 0 is the norm and reads as noise).
+        if self.missing_from_gt > 0 {
+            lines.push(format!(
+                "{:>16}: {}  (scored above their query's ground-truth cutoff yet absent \
+                 from it — stale GT or wrong corpus)",
+                "missing_from_gt", self.missing_from_gt
+            ));
+        }
+        if self.short_returns > 0 {
+            lines.push(format!(
+                "{:>16}: {}  (returned fewer than the ground truth holds, or than \
+                 top_k={} where it is deeper)",
+                "short_returns", self.short_returns, self.top_k
+            ));
         }
         // Only when it actually happened — a 0 here is the norm and would just
         // be noise next to the recall means.
         if self.empty_ground_truth > 0 {
-            lines.push(format!("{:>16}: {}", "recall_empty_gt", self.empty_ground_truth));
+            lines.push(format!(
+                "{:>16}: {}",
+                "recall_empty_gt", self.empty_ground_truth
+            ));
         }
         // Suspected filter leaks — visibility only, recall above is unaffected.
         // Shown when it happened.
         if self.filter_overreturn > 0 {
-            lines.push(format!("{:>16}: {}", "filter_overreturn", self.filter_overreturn));
+            lines.push(format!(
+                "{:>16}: {}",
+                "filter_overreturn", self.filter_overreturn
+            ));
         }
         write!(f, "{}", lines.join("\n"))
     }
@@ -267,21 +532,115 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
 /// `returned` is deduped before counting hits — a target that ever repeated an
 /// id within one query's results must not let that repeat count twice, which
 /// would push recall above the `1.0` ceiling a fraction is supposed to have.
-fn recall_at_k(returned: &[String], ground_truth: &HashSet<String>, k: u64) -> Option<RecallSample> {
+fn recall_at_k(
+    returned: &[String],
+    scores: Option<&[f32]>,
+    ground_truth: &HashSet<String>,
+    gt_depth: usize,
+    cutoff: Option<GtCutoff>,
+    k: u64,
+    tie_epsilon: f64,
+    engine_higher_is_better: bool,
+) -> Option<RecallSample> {
     let truth_len = ground_truth.len() as u64;
     if truth_len == 0 {
         return None;
     }
-    let hits = returned
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .filter(|id| ground_truth.contains(*id))
-        .count();
-    let short = truth_len < k;
+    // Depth is POSITIONAL: a repeated id shrinks the deduped set without making
+    // the ground truth shallower, so classifying on the set length would move a
+    // full-depth query into the forgiving `short` bucket. Bare `gt_depth`,
+    // matching `run_storm`'s eligibility filter and the lib.rs preflight — the
+    // loader guarantees `gt_depth >= truth_len`.
+    //
+    // The SHORT bucket then divides by the deduped count, since `hits` can
+    // never exceed it and dividing by the positional length would put 1.0 out
+    // of reach. The full bucket divides by `k` by design, so a full-depth
+    // ground truth containing a repeat caps below 1.0 — that ground truth is
+    // malformed, and the loader warns about it.
+    let depth = gt_depth as u64;
+    let short = depth < k;
     let denom = if short { truth_len } else { k };
-    Some(RecallSample { recall: hits as f64 / denom as f64, short })
+
+    // Orientation is a property of the QUERY, not of any one result, so it is
+    // resolved ONCE here rather than per returned id. `None` means "do not
+    // compare scores at all": either none were collected, or the ground truth
+    // is distance-valued against a larger-is-better engine, which no sign flip
+    // reconciles (see below).
+    let compare = match (scores, cutoff) {
+        (Some(scores), Some(cutoff)) => {
+            // Put both sides in larger-is-nearer orientation. The engine's raw
+            // distance is negated at the comparison; the ground truth's cutoff
+            // is negated when its own list ascends. With no ordering signal
+            // (all-equal scores, or one hit under a selective filter) fall back
+            // to the sign: a distance engine's ground truth holding a
+            // non-negative score must be raw distances, since nova-bf stores
+            // them negated.
+            let gt_ascending = cutoff
+                .ascending
+                .unwrap_or(!engine_higher_is_better && cutoff.score > 0.0);
+            // Negation recovers a NEGATED similarity or distance, which is
+            // always signed opposite to the engine's convention. A ground truth
+            // ascending through NON-NEGATIVE values against a larger-is-better
+            // engine is neither — it is distance-valued, such as `1 - cos`, and
+            // flipping it leaves the two sides a constant apart, firing
+            // `missing_from_gt` on every result. `>= 0.0` rather than `> 0.0`
+            // because such a list bottoms out AT zero over a near-duplicate
+            // corpus; skipping an exactly-orthogonal negated similarity is the
+            // harmless side of that ambiguity.
+            if gt_ascending && engine_higher_is_better && cutoff.score >= 0.0 {
+                None
+            } else {
+                let cutoff_score = if gt_ascending { -cutoff.score } else { cutoff.score };
+                // Whether the orientation was READ from the data or guessed.
+                // Treated asymmetrically below: a tie only widens a bound that
+                // is already an upper bound, but `missing_from_gt` is a loud
+                // "your ground truth is stale" claim and must not rest on a
+                // guess.
+                Some((scores, cutoff_score, cutoff.ascending.is_some()))
+            }
+        }
+        _ => None,
+    };
+
+    // ONE pass over the response and ONE set. `seen` both deduplicates (a
+    // target that repeats an id must not have it counted twice) and gates the
+    // tie check, so this runs per query per firing at half the allocations and
+    // half the walks it used to.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(returned.len());
+    let mut hits = 0usize;
+    let (mut near_ties, mut missing_from_gt) = (0usize, 0u32);
+    for (i, id) in returned.iter().enumerate() {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        if ground_truth.contains(id.as_str()) {
+            hits += 1;
+            continue; // already correct: no tie question to ask
+        }
+        let Some((scores, cutoff_score, orientation_known)) = compare else {
+            continue;
+        };
+        // Positional pairing; a response shorter on scores than on ids simply
+        // contributes no tie information for the tail.
+        let Some(raw) = scores.get(i) else { continue };
+        let score = if engine_higher_is_better { *raw } else { -*raw };
+        if scores_tied(score, cutoff_score, tie_epsilon) {
+            near_ties += 1; // equally correct at the cutoff
+        } else if orientation_known && score > cutoff_score {
+            missing_from_gt += 1; // better than the k-th yet unknown
+        }
+    }
+
+    let recall = hits as f64 / denom as f64;
+    // Capped: the upper bound is still a recall, and a pathological response
+    // full of boundary-scoring ids must not push it past 1.0.
+    let tolerant = ((hits + near_ties) as f64 / denom as f64).min(1.0);
+    Some(RecallSample {
+        recall,
+        tolerant,
+        short,
+        missing_from_gt,
+    })
 }
 
 /// One batch dispatch's observation forwarded from a worker to the collector
@@ -320,6 +679,15 @@ pub struct DispatchSample {
     /// how many firings were excluded from recall for this reason, separately
     /// from queries that simply had no ground truth configured (`None`).
     pub empty_ground_truth: u64,
+    /// Queries in this dispatch where the engine returned FEWER than `top_k`
+    /// ids — a thin index or a tight filter rather than a ranking failure.
+    /// Counted whether or not the query has ground truth; queries with a
+    /// present-but-empty ground truth are excluded, since returning nothing is
+    /// correct for those (they are counted as `empty_ground_truth`).
+    pub short_returns: u64,
+    /// Results in this dispatch that scored better than their ground truth's
+    /// k-th place yet were absent from it — see [`RecallSample::missing_from_gt`].
+    pub missing_from_gt: u64,
     /// Suspected filter leaks in this dispatch: queries where, with a filter
     /// configured, the vdb returned MORE result ids than their ground truth
     /// holds (`returned.len() > truth_len`, ground truth non-empty). Recall is
@@ -340,7 +708,11 @@ pub struct DispatchSample {
 /// gets each run's own first error, and test runs stay order-independent.
 /// Returns whether THIS call did the logging, so the exactly-once contract is
 /// directly testable.
-fn report_first_error(error_reported: &std::sync::atomic::AtomicBool, error: &str, timed_out: bool) -> bool {
+fn report_first_error(
+    error_reported: &std::sync::atomic::AtomicBool,
+    error: &str,
+    timed_out: bool,
+) -> bool {
     let first = !error_reported.swap(true, Ordering::Relaxed);
     if first {
         let hint = if timed_out {
@@ -371,6 +743,9 @@ fn dispatch_sample(
     idxs: &[usize],
     vectors: &[QueryVector],
     top_k: u64,
+    tie_epsilon: f64,
+    scores_comparable: bool,
+    engine_higher_is_better: bool,
     filtered: bool,
     started: Instant,
     error_reported: &std::sync::atomic::AtomicBool,
@@ -385,7 +760,51 @@ fn dispatch_sample(
     let mut recalls = Vec::new();
     let mut empty_ground_truth = 0u64;
     let mut filter_overreturn = 0u64;
-    for (&i, ids) in idxs.iter().zip(out.ids.iter()) {
+    let mut short_returns = 0u64;
+    for (pos, (&i, ids)) in idxs.iter().zip(out.ids.iter()).enumerate() {
+        // Incomparable scores are dropped here, at the source, so no
+        // tie-derived value is ever computed from them.
+        let scores = scores_comparable
+            .then(|| out.scores.get(pos).and_then(|s| s.as_deref()))
+            .flatten();
+        // Counted for every query that returned SOMETHING, with or without
+        // ground truth: a short response is a property of the engine, not of
+        // whether we can score it. Queries whose ground truth is present but
+        // empty are excluded — returning nothing is the expected outcome
+        // there, and they are already tallied as `recall_empty_gt`.
+        if let Some(returned) = ids.as_ref() {
+            // Not counted when returning fewer is the EXPECTED outcome:
+            //   * a filter is active — a selective one legitimately matches
+            //     fewer than top_k docs for most queries, which would otherwise
+            //     make this alarm fire on every firing of the run;
+            //   * the ground truth itself is shallower than top_k — the corpus
+            //     does not hold that many matches to return;
+            //   * the ground truth is present but empty (counted separately as
+            //     `empty_ground_truth`).
+            // The bar is what the corpus can actually supply for THIS query:
+            // `top_k`, or the ground truth's own depth when it is shallower.
+            //   * empty ground truth -> nothing expected (already counted as
+            //     `empty_ground_truth`);
+            //   * NO ground truth under a filter -> unknowable. A selective
+            //     filter legitimately matches only a handful of docs, and with
+            //     nothing to compare against, counting every firing would make
+            //     this alarm fire on the whole run.
+            let gt = vectors[i].ground_truth.as_ref();
+            let expected = match gt {
+                Some(g) if g.is_empty() => 0,
+                // DEDUPED count, matching the short bucket's denominator: a
+                // perfect engine returns distinct ids, so a ground truth
+                // holding a repeat cannot be answered with more than it has,
+                // and counting the positional depth would flag a query the
+                // recall math simultaneously scores 1.0.
+                Some(g) => top_k.min(g.len() as u64),
+                None if filtered => 0,
+                None => top_k,
+            };
+            if (returned.len() as u64) < expected {
+                short_returns += 1;
+            }
+        }
         if let Some((ids, gt)) = ids.as_ref().zip(vectors[i].ground_truth.as_ref()) {
             // Suspected filter leak: with a filter active, the vdb returned more
             // ids than the (exhaustive) filtered ground truth holds. Only under
@@ -394,12 +813,22 @@ fn dispatch_sample(
             if filtered && !gt.is_empty() && ids.len() as u64 > gt.len() as u64 {
                 filter_overreturn += 1;
             }
-            match recall_at_k(ids, gt, top_k) {
+            match recall_at_k(
+                ids,
+                scores,
+                gt,
+                vectors[i].gt_depth,
+                vectors[i].gt_cutoff,
+                top_k,
+                tie_epsilon,
+                engine_higher_is_better,
+            ) {
                 Some(sample) => recalls.push(sample),
                 None => empty_ground_truth += 1,
             }
         }
     }
+    let missing_from_gt = recalls.iter().map(|r| r.missing_from_gt as u64).sum();
     DispatchSample {
         t_s: started.elapsed().as_secs_f64(),
         latency_ms: out.latency.as_secs_f64() * 1000.0,
@@ -408,6 +837,8 @@ fn dispatch_sample(
         recalls,
         empty_ground_truth,
         filter_overreturn,
+        short_returns,
+        missing_from_gt,
     }
 }
 
@@ -438,9 +869,49 @@ pub async fn run_storm(
     vectors: Vec<QueryVector>,
     profile: &LoadProfile,
     top_k: u64,
+    // Relative score tolerance for calling two scores tied — resolved from
+    // the collection's datatype (or the config) before the run starts.
+    cmp: ScoreComparison,
     filtered: bool,
     recorder: Option<Box<dyn crate::report::Recorder>>,
 ) -> StormResults {
+    // Static facts about the query set — computed once, before any load is
+    // offered, from the cutoffs the loader already derived.
+    let scores_comparable = cmp.disabled_reason.is_none();
+    let engine_higher_is_better = cmp.engine_higher_is_better;
+    // Only queries that actually carry ground truth contribute to recall, so
+    // reporting the full loaded count next to a recall mean overstates how
+    // many queries that mean is over.
+    let queries = vectors
+        .iter()
+        .filter(|v| {
+            // The count printed beside `recall@k` must describe THAT bucket:
+            // empty ground truths never score, and shallow ones land in
+            // `recall@k_short`.
+            v.ground_truth.as_ref().is_some_and(|g| !g.is_empty()) && v.gt_depth as u64 >= top_k
+        })
+        .count() as u64;
+    // Same eligibility filter as `full_recall_queries` below, plus one more:
+    // rows whose score column was SQL NULL have no cutoff and drop out here.
+    // Those rows also make `full_recall_tolerant` conservative — with no
+    // cutoff their `tolerant` equals their exact recall — so the upper bound
+    // errs downward rather than inventing a tie.
+    // Every query that can contribute a tie to EITHER bucket: a non-empty
+    // ground truth with a derived cutoff. Deliberately NOT restricted to the
+    // full bucket — under a selective filter a shallow ground truth is the
+    // norm, and those cutoffs are the most likely to be tied.
+    let cutoffs: Vec<u32> = vectors
+        .iter()
+        .filter(|v| v.ground_truth.as_ref().is_some_and(|g| !g.is_empty()))
+        .filter_map(|v| v.gt_cutoff.map(|c| c.ties))
+        .collect();
+    let ties = (!cutoffs.is_empty()).then(|| TieStats {
+        mean: cutoffs.iter().map(|t| *t as f64).sum::<f64>() / cutoffs.len() as f64,
+        max: cutoffs.iter().copied().max().unwrap_or(0),
+        fraction_of_queries: cutoffs.iter().filter(|t| **t > 1).count() as f64
+            / cutoffs.len() as f64,
+        queries: cutoffs.len() as u64,
+    });
     let vectors = Arc::new(vectors);
     let (tx, mut rx) = mpsc::unbounded_channel::<DispatchSample>();
 
@@ -468,6 +939,8 @@ pub async fn run_storm(
         let mut recalls = Vec::new();
         let mut empty_gt = 0u64;
         let mut over_gt = 0u64;
+        let mut short_ret = 0u64;
+        let mut missing_gt = 0u64;
         let mut n_ok = 0u64;
         let mut n_err = 0u64;
         let mut n_timeout = 0u64;
@@ -479,6 +952,8 @@ pub async fn run_storm(
             recalls.extend(s.recalls.iter().copied());
             empty_gt += s.empty_ground_truth;
             over_gt += s.filter_overreturn;
+            short_ret += s.short_returns;
+            missing_gt += s.missing_from_gt;
             if s.ok {
                 n_ok += 1;
             } else {
@@ -501,7 +976,10 @@ pub async fn run_storm(
         }
         // Drop the sender so the writer thread's `recv` ends and it runs finish().
         drop(writer_tx);
-        (latencies, recalls, empty_gt, over_gt, n_ok, n_err, n_timeout, dropped)
+        (
+            latencies, recalls, empty_gt, over_gt, short_ret, missing_gt, n_ok, n_err, n_timeout,
+            dropped,
+        )
     });
 
     let started = Instant::now();
@@ -511,19 +989,55 @@ pub async fn run_storm(
     let error_reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     if profile.target_rps > 0.0 {
-        run_paced(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx, &error_reported)
-            .await;
+        run_paced(
+            &target,
+            &vectors,
+            profile,
+            started,
+            stop_at,
+            top_k,
+            cmp.epsilon,
+            scores_comparable,
+            engine_higher_is_better,
+            filtered,
+            &tx,
+            &error_reported,
+        )
+        .await;
     } else {
-        run_closed_loop(&target, &vectors, profile, started, stop_at, top_k, filtered, &tx, &error_reported)
-            .await;
+        run_closed_loop(
+            &target,
+            &vectors,
+            profile,
+            started,
+            stop_at,
+            top_k,
+            cmp.epsilon,
+            scores_comparable,
+            engine_higher_is_better,
+            filtered,
+            &tx,
+            &error_reported,
+        )
+        .await;
     }
 
     // Drop the last sender so the collector's `recv` loop ends.
     drop(tx);
     let wall_s = started.elapsed().as_secs_f64();
 
-    let (latencies_ms, recalls, empty_ground_truth, filter_overreturn, n_ok, n_err, n_timeout, dropped_samples) =
-        collector.await.unwrap_or_default();
+    let (
+        latencies_ms,
+        recalls,
+        empty_ground_truth,
+        filter_overreturn,
+        short_returns,
+        missing_from_gt,
+        n_ok,
+        n_err,
+        n_timeout,
+        dropped_samples,
+    ) = collector.await.unwrap_or_default();
     // Join the writer thread so its `finish()` (final flush) completes before we
     // return — otherwise a caller reading the file back could race the flush.
     // Cheap: the load is done and the channel is closed, so the thread is already
@@ -544,6 +1058,15 @@ pub async fn run_storm(
         latencies_ms,
         recalls,
         empty_ground_truth,
+        short_returns,
+        missing_from_gt,
+        full_recall_queries: queries,
+        ties,
+        top_k,
+        tie_epsilon: cmp.epsilon,
+        tie_epsilon_source: cmp.epsilon_source.clone(),
+        tie_disabled_reason: cmp.disabled_reason.clone(),
+        scores_configured: cmp.configured,
         filter_overreturn,
         n_ok,
         n_err,
@@ -564,6 +1087,9 @@ async fn run_closed_loop(
     started: Instant,
     stop_at: Instant,
     top_k: u64,
+    tie_epsilon: f64,
+    scores_comparable: bool,
+    engine_higher_is_better: bool,
     filtered: bool,
     tx: &mpsc::UnboundedSender<DispatchSample>,
     error_reported: &Arc<std::sync::atomic::AtomicBool>,
@@ -605,7 +1131,16 @@ async fn run_closed_loop(
                 let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
                 let out = target.query_batch(&queries).await;
                 let _ = tx.send(dispatch_sample(
-                    &out, &idxs, &vectors, top_k, filtered, started, &error_reported,
+                    &out,
+                    &idxs,
+                    &vectors,
+                    top_k,
+                    tie_epsilon,
+                    scores_comparable,
+                    engine_higher_is_better,
+                    filtered,
+                    started,
+                    &error_reported,
                 ));
             }
         });
@@ -627,6 +1162,9 @@ async fn run_paced(
     started: Instant,
     stop_at: Instant,
     top_k: u64,
+    tie_epsilon: f64,
+    scores_comparable: bool,
+    engine_higher_is_better: bool,
     filtered: bool,
     tx: &mpsc::UnboundedSender<DispatchSample>,
     error_reported: &Arc<std::sync::atomic::AtomicBool>,
@@ -654,13 +1192,21 @@ async fn run_paced(
         } else if Instant::now() >= stop_at {
             break;
         }
-        let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore not closed");
         // acquire may have blocked; re-check the deadline before launching.
         if !fixed_work && Instant::now() >= stop_at {
             break;
         }
         let start = idx % n;
-        let size = if fixed_work { batch_size.min(total_firings - idx) } else { batch_size };
+        let size = if fixed_work {
+            batch_size.min(total_firings - idx)
+        } else {
+            batch_size
+        };
         idx += size;
         let idxs = batch_indices(start, size, n);
         let target = target.clone();
@@ -671,7 +1217,16 @@ async fn run_paced(
             let queries: Vec<&QueryVector> = idxs.iter().map(|&i| &vectors[i]).collect();
             let out = target.query_batch(&queries).await;
             let _ = tx.send(dispatch_sample(
-                &out, &idxs, &vectors, top_k, filtered, started, &error_reported,
+                &out,
+                &idxs,
+                &vectors,
+                top_k,
+                tie_epsilon,
+                scores_comparable,
+                engine_higher_is_better,
+                filtered,
+                started,
+                &error_reported,
             ));
             drop(permit); // release the in-flight slot
         });
@@ -719,14 +1274,18 @@ mod tests {
                     latency: Duration::from_micros(100),
                     ok: false,
                     ids: vec![None; queries.len()],
-                    error: Some("mock failure".into()), timed_out: false,
+                    scores: vec![None; queries.len()],
+                    error: Some("mock failure".into()),
+                    timed_out: false,
                 };
             }
             BatchOutcome {
                 latency: Duration::from_micros(100),
                 ok: true,
                 ids: vec![Some(self.ids.clone()); queries.len()],
-                error: None, timed_out: false,
+                scores: vec![None; queries.len()],
+                error: None,
+                timed_out: false,
             }
         }
     }
@@ -734,6 +1293,8 @@ mod tests {
     fn vectors() -> Vec<QueryVector> {
         (0..16)
             .map(|i| QueryVector {
+                gt_cutoff: None,
+                gt_depth: 2,
                 vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                 ground_truth: None,
                 filter_values: HashMap::new(),
@@ -743,9 +1304,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_loop_fires_many_and_records_each() {
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1, passes: 0 };
+        let profile = LoadProfile {
+            concurrency: 4,
+            duration_s: 0.2,
+            target_rps: 0.0,
+            batch_size: 1,
+            passes: 0,
+        };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results = run_storm(target, vectors(), &profile, 10, false, None).await;
+        let results = run_storm(target, vectors(), &profile, 10, cmp(None), false, None).await;
         let summary = results.summary();
 
         assert!(summary.requests > 0);
@@ -764,9 +1331,15 @@ mod tests {
     async fn paced_does_not_overshoot_target_rps() {
         let target_rps = 200.0;
         let duration_s = 0.5;
-        let profile = LoadProfile { concurrency: 16, duration_s, target_rps, batch_size: 1, passes: 0 };
+        let profile = LoadProfile {
+            concurrency: 16,
+            duration_s,
+            target_rps,
+            batch_size: 1,
+            passes: 0,
+        };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results = run_storm(target, vectors(), &profile, 10, false, None).await;
+        let results = run_storm(target, vectors(), &profile, 10, cmp(None), false, None).await;
         let summary = results.summary();
 
         // The whole point: pacing holds the offered rate at/under target. Allow a
@@ -789,9 +1362,16 @@ mod tests {
         // (recall@4 = 1/4 = 0.25 each); the other half have none.
         let vectors: Vec<QueryVector> = (0..10)
             .map(|i| QueryVector {
+                gt_cutoff: None,
+                gt_depth: 4, // matches the 4-id ground truth below
                 vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                 ground_truth: if i % 2 == 0 {
-                    Some(HashSet::from(["a".to_string(), "z".into(), "y".into(), "x".into()]))
+                    Some(HashSet::from([
+                        "a".to_string(),
+                        "z".into(),
+                        "y".into(),
+                        "x".into(),
+                    ]))
                 } else {
                     None
                 },
@@ -799,15 +1379,26 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1, passes: 0 };
-        let results = run_storm(target, vectors, &profile, 4, false, None).await;
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size: 1,
+            passes: 0,
+        };
+        let results = run_storm(target, vectors, &profile, 4, cmp(None), false, None).await;
         let summary = results.summary();
 
         // every recorded recall sample must be exactly 0.25 -- never 0, never
         // computed against a query that had no ground truth. Ground truth is 4
         // ids at k=4, so all samples are full-depth (not short).
         assert!(!results.recalls.is_empty());
-        assert!(results.recalls.iter().all(|s| !s.short && (s.recall - 0.25).abs() < 1e-9));
+        assert!(
+            results
+                .recalls
+                .iter()
+                .all(|s| !s.short && (s.recall - 0.25).abs() < 1e-9)
+        );
         let full = summary.full_recall.expect("full-depth queries present");
         assert!((full.mean - 0.25).abs() < 1e-9);
         assert!(summary.short_recall.is_none()); // no short ground truth in this run
@@ -823,17 +1414,28 @@ mod tests {
         // mean_recall=0.0 -- that would read as "search is bad" when the real
         // finding is "every request errored," which `errors`/`requests_per_sec`
         // already surface distinctly.
-        let target = Arc::new(MockTarget { ids: vec![], fail: true });
+        let target = Arc::new(MockTarget {
+            ids: vec![],
+            fail: true,
+        });
         let vectors: Vec<QueryVector> = (0..8)
             .map(|i| QueryVector {
+                gt_cutoff: None,
+                gt_depth: 1, // matches the 1-id ground truth on this fixture
                 vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                 ground_truth: Some(HashSet::from(["a".to_string()])),
                 filter_values: HashMap::new(),
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1, passes: 0 };
-        let results = run_storm(target, vectors, &profile, 1, false, None).await;
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size: 1,
+            passes: 0,
+        };
+        let results = run_storm(target, vectors, &profile, 1, cmp(None), false, None).await;
         let summary = results.summary();
 
         assert_eq!(summary.errors, summary.requests); // every query failed
@@ -850,6 +1452,8 @@ mod tests {
         let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
         let vectors: Vec<QueryVector> = (0..10)
             .map(|i| QueryVector {
+                gt_cutoff: None,
+                gt_depth: 2,
                 vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                 // even: real ground truth (recall@2 = 1/2); odd: present-but-empty.
                 ground_truth: Some(if i % 2 == 0 {
@@ -861,15 +1465,26 @@ mod tests {
             })
             .collect();
 
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1, passes: 0 };
-        let results = run_storm(target, vectors, &profile, 2, false, None).await;
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size: 1,
+            passes: 0,
+        };
+        let results = run_storm(target, vectors, &profile, 2, cmp(None), false, None).await;
         let summary = results.summary();
 
         // The empty-gt firings are counted, not scored...
         assert!(summary.empty_ground_truth > 0);
         // ...and never leaked into a recall bucket: every recorded sample is the
         // 0.5 from the real-ground-truth queries, none a 0.0 or NaN.
-        assert!(results.recalls.iter().all(|s| (s.recall - 0.5).abs() < 1e-9));
+        assert!(
+            results
+                .recalls
+                .iter()
+                .all(|s| (s.recall - 0.5).abs() < 1e-9)
+        );
         assert!((summary.total_recall.unwrap().mean - 0.5).abs() < 1e-9);
     }
 
@@ -882,48 +1497,70 @@ mod tests {
         let vectors = || -> Vec<QueryVector> {
             (0..8)
                 .map(|i| QueryVector {
+                    gt_cutoff: None,
+                    gt_depth: 1, // matches the 1-id ground truth on this fixture
                     vector: crate::queries::VectorData::Dense(vec![i as f32; 4]),
                     ground_truth: Some(HashSet::from(["a".to_string()])), // 1 id, "a" is a hit
                     filter_values: HashMap::new(),
                 })
                 .collect()
         };
-        let profile = LoadProfile { concurrency: 2, duration_s: 0.15, target_rps: 0.0, batch_size: 1, passes: 0 };
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size: 1,
+            passes: 0,
+        };
 
         // With a filter: every firing over-returned relative to its 1-id ground
         // truth, so it's counted...
         let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
-        let filtered = run_storm(target, vectors(), &profile, 5, true, None).await;
+        let filtered = run_storm(target, vectors(), &profile, 5, cmp(None), true, None).await;
         let fs = filtered.summary();
         assert!(fs.filter_overreturn > 0);
         assert_eq!(fs.filter_overreturn, fs.total_recall.unwrap().n);
         // ...but recall is untouched: short bucket, 1 hit / 1 gt id = 1.0.
-        assert!(filtered.recalls.iter().all(|s| s.short && (s.recall - 1.0).abs() < 1e-9));
+        assert!(
+            filtered
+                .recalls
+                .iter()
+                .all(|s| s.short && (s.recall - 1.0).abs() < 1e-9)
+        );
         assert_eq!(fs.empty_ground_truth, 0); // a different signal
 
         // Same over-return WITHOUT a filter -> not a leak, count stays 0, while
         // recall is identical.
         let target = Arc::new(MockTarget::ok(vec!["a".into(), "b".into()]));
-        let unfiltered = run_storm(target, vectors(), &profile, 5, false, None).await;
+        let unfiltered = run_storm(target, vectors(), &profile, 5, cmp(None), false, None).await;
         let us = unfiltered.summary();
         assert_eq!(us.filter_overreturn, 0);
-        assert!(unfiltered.recalls.iter().all(|s| (s.recall - 1.0).abs() < 1e-9));
+        assert!(
+            unfiltered
+                .recalls
+                .iter()
+                .all(|s| (s.recall - 1.0).abs() < 1e-9)
+        );
     }
 
     #[test]
     fn recall_at_k_full_depth_divides_by_k_and_is_not_short() {
         let returned = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let ground_truth =
-            HashSet::from(["a".to_string(), "b".to_string(), "z".to_string(), "y".to_string()]);
+        let ground_truth = HashSet::from([
+            "a".to_string(),
+            "b".to_string(),
+            "z".to_string(),
+            "y".to_string(),
+        ]);
         // gt has 4 ids (>= k), so denominator is k, not gt len or returned len.
         // 2 of the 3 returned ids are in ground_truth, k=4 -> 2/4.
-        let r = recall_at_k(&returned, &ground_truth, 4).unwrap();
+        let r = recall_at_k(&returned, None, &ground_truth, 4, None, 4, 2e-4, true).unwrap();
         assert_eq!((r.recall, r.short), (0.5, false));
         // k=2 (<= gt len) still divides by k -> 2/2 = 1.0, still full-depth.
-        let r = recall_at_k(&returned, &ground_truth, 2).unwrap();
+        let r = recall_at_k(&returned, None, &ground_truth, 4, None, 2, 2e-4, true).unwrap();
         assert_eq!((r.recall, r.short), (1.0, false));
         // no returned ids -> 0 hits over k, still a real (full-depth) sample.
-        let r = recall_at_k(&[], &ground_truth, 4).unwrap();
+        let r = recall_at_k(&[], None, &ground_truth, 4, None, 4, 2e-4, true).unwrap();
         assert_eq!((r.recall, r.short), (0.0, false));
     }
 
@@ -933,11 +1570,11 @@ mod tests {
         // not k, and flag it short so the summary keeps it in its own bucket.
         let returned = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let ground_truth = HashSet::from(["a".to_string(), "b".to_string()]);
-        let r = recall_at_k(&returned, &ground_truth, 4).unwrap();
+        let r = recall_at_k(&returned, None, &ground_truth, 2, None, 4, 2e-4, true).unwrap();
         assert_eq!((r.recall, r.short), (1.0, true)); // 2 hits / 2 gt, NOT 2/4
         // one hit of the two -> 1/2, still short.
         let one = vec!["a".to_string(), "zzz".to_string()];
-        let r = recall_at_k(&one, &ground_truth, 4).unwrap();
+        let r = recall_at_k(&one, None, &ground_truth, 2, None, 4, 2e-4, true).unwrap();
         assert_eq!((r.recall, r.short), (0.5, true));
     }
 
@@ -946,7 +1583,7 @@ mod tests {
         // Dividing by an empty gt's length would be NaN and poison the mean;
         // an empty (or absent) ground truth is simply "nothing to measure".
         let returned = vec!["a".to_string()];
-        assert!(recall_at_k(&returned, &HashSet::new(), 4).is_none());
+        assert!(recall_at_k(&returned, None, &HashSet::new(), 0, None, 4, 2e-4, true).is_none());
     }
 
     #[test]
@@ -956,7 +1593,12 @@ mod tests {
         // fraction that's supposed to be capped at 1.0).
         let returned = vec!["a".to_string(), "a".to_string(), "a".to_string()];
         let ground_truth = HashSet::from(["a".to_string(), "b".to_string()]);
-        assert_eq!(recall_at_k(&returned, &ground_truth, 2).unwrap().recall, 0.5);
+        assert_eq!(
+            recall_at_k(&returned, None, &ground_truth, 2, None, 2, 2e-4, true)
+                .unwrap()
+                .recall,
+            0.5
+        );
     }
 
     #[test]
@@ -967,11 +1609,158 @@ mod tests {
         assert_eq!(percentile(&[], 99.0), 0.0);
     }
 
+    // ---- tie-aware recall (see `recall_at_k`) --------------------------
+
+    /// The comparison config these tests run under: a normal larger-is-better
+    /// engine with the tolerance configured explicitly.
+    fn cmp(disabled_reason: Option<String>) -> ScoreComparison {
+        ScoreComparison {
+            epsilon: 2e-4,
+            epsilon_source: "configured".to_string(),
+            disabled_reason,
+            configured: true,
+            engine_higher_is_better: true,
+        }
+    }
+
+    fn gt(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn without_scores_the_bounds_collapse_to_exact_recall() {
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let r = recall_at_k(&returned, None, &gt(&["a", "b"]), 2, None, 2, 2e-4, true).unwrap();
+        assert_eq!(r.recall, 0.5);
+        assert_eq!(r.tolerant, r.recall, "no scores -> nothing to call a tie");
+        assert_eq!(r.missing_from_gt, 0);
+    }
+
+    #[test]
+    fn a_result_tied_with_the_cutoff_counts_toward_the_upper_bound_only() {
+        // "z" isn't in the ground truth but scores exactly what its 2nd place
+        // does — the ground truth picked one member of a tie, the engine the
+        // other. Exact recall must not credit it; tolerant must.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.9f32, 0.5f32];
+        let cutoff = GtCutoff {
+            score: 0.5,
+            ties: 3,
+            ascending: Some(false),
+        };
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.recall, 0.5, "exact recall is the LOWER bound");
+        assert_eq!(r.tolerant, 1.0, "tied result is equally correct");
+        assert_eq!(r.missing_from_gt, 0, "a tie is not a mismatch");
+    }
+
+    #[test]
+    fn a_result_scoring_above_the_cutoff_is_a_mismatch_not_a_tie() {
+        // Scoring BETTER than the ground truth's k-th place while absent from
+        // it means the ground truth and the collection disagree. It must be
+        // counted, and must not inflate the tolerant bound.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.9f32, 0.8f32];
+        let cutoff = GtCutoff {
+            score: 0.5,
+            ties: 1,
+            ascending: Some(false),
+        };
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.recall, 0.5);
+        assert_eq!(r.tolerant, 0.5, "must NOT be credited as a tie");
+        assert_eq!(r.missing_from_gt, 1);
+    }
+
+    #[test]
+    fn tolerant_recall_is_capped_at_one() {
+        // Every result sits on the cutoff score: without a cap the ratio would
+        // exceed 1.0 and stop being a fraction.
+        let returned: Vec<String> = ["w", "x", "y", "z"].iter().map(|s| s.to_string()).collect();
+        let scores = [0.5f32; 4];
+        let cutoff = GtCutoff {
+            score: 0.5,
+            ties: 9,
+            ascending: Some(false),
+        };
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.recall, 0.0);
+        assert_eq!(r.tolerant, 1.0);
+    }
+
+    #[test]
+    fn the_tolerance_is_relative_and_respected() {
+        let returned = vec!["z".to_string()];
+        let cutoff = GtCutoff {
+            score: 1.0,
+            ties: 2,
+            ascending: Some(false),
+        };
+        // 1e-5 off the cutoff: inside a 2e-4 tolerance, outside a 1e-9 one.
+        let near = [1.000_01f32];
+        let loose = recall_at_k(
+            &returned,
+            Some(&near),
+            &gt(&["a"]),
+            1,
+            Some(cutoff),
+            1,
+            2e-4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(loose.tolerant, 1.0, "within tolerance -> tied");
+        let tight = recall_at_k(
+            &returned,
+            Some(&near),
+            &gt(&["a"]),
+            1,
+            Some(cutoff),
+            1,
+            1e-9,
+            true,
+        )
+        .unwrap();
+        assert_eq!(tight.tolerant, 0.0, "outside tolerance -> not tied");
+        assert_eq!(tight.missing_from_gt, 1, "and it scored above the cutoff");
+    }
+
     #[test]
     fn summary_display_appends_recall_lines_only_when_present() {
         let base = Summary {
             requests: 10,
-            errors: 0, timeouts: 0,
+            errors: 0,
+            timeouts: 0,
             batch_size: 1,
             requests_per_sec: 5.0,
             qps: 5.0,
@@ -984,38 +1773,634 @@ mod tests {
             total_recall: None,
             empty_ground_truth: 0,
             filter_overreturn: 0,
+            full_recall_tolerant: None,
+            short_recall_tolerant: None,
+            total_recall_tolerant: None,
+            short_returns: 0,
+            missing_from_gt: 0,
+            full_recall_queries: 10,
+            ties: None,
+            top_k: 10,
+            tie_epsilon: Some(2e-4),
+            tie_epsilon_source: Some("configured".to_string()),
+            tie_disabled_reason: None,
+            schema_version: 2,
         };
         assert!(!base.to_string().contains("recall"));
 
-        // A run with only full-depth queries: full + total print, short stays absent.
+        // Recall prints at the depth it was measured at, with the query and
+        // firing counts kept apart (queries cycle round-robin, so `n` firings
+        // is not a distinct-query count).
         let with_recall = Summary {
             full_recall: Some(RecallBucket { n: 8, mean: 0.87 }),
             total_recall: Some(RecallBucket { n: 8, mean: 0.87 }),
-            ..base
+            ..base.clone()
         };
         let s = with_recall.to_string();
-        assert!(s.contains("recall_full"));
-        assert!(s.contains("recall_total"));
-        assert!(!s.contains("recall_short")); // no short bucket -> still absent
-        assert!(s.contains("0.8700 (n=8)"));
-        assert!(!s.contains("recall_empty_gt")); // 0 empty -> line stays absent
+        assert!(s.contains("recall@10: 0.8700"), "{s}");
+        assert!(s.contains("(10 eligible queries, 8 firings)"), "{s}");
+        // No short bucket -> `recall_total` would just repeat the line above.
+        assert!(!s.contains("recall_total"), "{s}");
+        assert!(!s.contains("recall@10_short"), "{s}");
+        assert!(
+            !s.contains("ties_at_cutoff"),
+            "no scores configured -> no tie line: {s}"
+        );
+        assert!(!s.contains("recall_empty_gt"));
+        assert!(!s.contains("filter_overreturn"));
 
-        assert!(!s.contains("filter_overreturn")); // 0 -> line stays absent
+        // With BOTH buckets, the blended total earns its line back.
+        let both = Summary {
+            full_recall: Some(RecallBucket { n: 8, mean: 0.87 }),
+            short_recall: Some(RecallBucket { n: 2, mean: 0.40 }),
+            total_recall: Some(RecallBucket { n: 10, mean: 0.78 }),
+            ..base.clone()
+        };
+        let s = both.to_string();
+        assert!(s.contains("recall@10_short"), "{s}");
+        assert!(s.contains("recall_total"), "{s}");
 
-        // A non-zero empty-ground-truth count prints its own line.
-        let with_empty = Summary { empty_ground_truth: 3, ..base };
+        // Ties make recall a RANGE: exact id match .. tied scores also count.
+        let tied = Summary {
+            full_recall: Some(RecallBucket { n: 8, mean: 0.8814 }),
+            full_recall_tolerant: Some(0.9691),
+            short_recall_tolerant: None,
+            total_recall_tolerant: None,
+            ties: Some(TieStats {
+                mean: 6.8,
+                max: 41,
+                fraction_of_queries: 0.775,
+                queries: 10,
+            }),
+            ..base.clone()
+        };
+        let s = tied.to_string();
+        assert!(s.contains("0.8814 – 0.9691"), "{s}");
+        assert!(s.contains("ties_at_cutoff: 6.8 avg, 41 max"), "{s}");
+        assert!(s.contains("77.5% of 10 queries with a cutoff"), "{s}");
+        assert!(s.contains("tie_epsilon"), "{s}");
+
+        // No ties -> one number, not a degenerate range.
+        let untied = Summary {
+            full_recall: Some(RecallBucket { n: 8, mean: 0.8814 }),
+            full_recall_tolerant: Some(0.8814),
+            short_recall_tolerant: None,
+            total_recall_tolerant: None,
+            ..base.clone()
+        };
+        assert!(!untied.to_string().contains("–"), "{}", untied.to_string());
+
+        // Alarms appear only when they fire.
+        let with_empty = Summary {
+            empty_ground_truth: 3,
+            ..base.clone()
+        };
         assert!(with_empty.to_string().contains("recall_empty_gt: 3"));
-
-        // A non-zero returned-over-ground-truth count prints its own line.
-        let with_over = Summary { filter_overreturn: 7, ..base };
+        let with_over = Summary {
+            filter_overreturn: 7,
+            ..base.clone()
+        };
         assert!(with_over.to_string().contains("filter_overreturn: 7"));
+        let with_missing = Summary {
+            missing_from_gt: 4471,
+            ..base.clone()
+        };
+        assert!(with_missing.to_string().contains("missing_from_gt: 4471"));
+        let with_short_ret = Summary {
+            short_returns: 18,
+            ..base.clone()
+        };
+        assert!(with_short_ret.to_string().contains("short_returns: 18"));
+    }
+
+    #[test]
+    fn a_raw_distance_engine_is_normalized_before_comparing() {
+        // euclid/manhattan: the engine returns a RAW distance (smaller is
+        // nearer) while the cutoff is stored larger-is-nearer. "z" is at
+        // distance 0.5 against a cutoff of -0.5, i.e. exactly tied — but only
+        // once the engine's score is negated.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.2f32, 0.5f32]; // raw distances, ascending = better first
+        let cutoff = GtCutoff {
+            score: 0.5,
+            ties: 3,
+            ascending: Some(true),
+        }; // raw distance
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(r.recall, 0.5);
+        assert_eq!(r.tolerant, 1.0, "tied once both sides face the same way");
+        assert_eq!(r.missing_from_gt, 0);
+    }
+
+    #[test]
+    fn a_raw_distance_miss_is_not_flagged_as_a_mismatch() {
+        // The regression this whole orientation fix exists for: a legitimately
+        // WORSE result (larger distance) must not trip `missing_from_gt`.
+        // Without normalization `0.9 > -0.5` fires on essentially every miss,
+        // turning the stale-ground-truth alarm into noise.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.2f32, 0.9f32];
+        let cutoff = GtCutoff {
+            score: 0.5,
+            ties: 1,
+            ascending: Some(true),
+        }; // raw distance
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(r.missing_from_gt, 0, "a worse distance is an ordinary miss");
+        assert_eq!(r.tolerant, 0.5);
+
+        // And a genuinely BETTER one (smaller distance) still is flagged.
+        let better = [0.2f32, 0.1f32];
+        let r = recall_at_k(
+            &returned,
+            Some(&better),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(r.missing_from_gt, 1, "nearer than the k-th yet unknown");
+    }
+
+    #[test]
+    fn every_bucket_gets_a_tie_tolerant_bound() {
+        // Ties are not a full-bucket phenomenon. Under a selective filter a
+        // shallow ground truth is the norm, and those cutoffs are the ones
+        // most likely to be tied — so the short bucket and the blended total
+        // must carry an upper bound too, not just `full_recall`.
+        let results = StormResults {
+            latencies_ms: vec![1.0, 2.0],
+            recalls: vec![
+                RecallSample { recall: 0.50, tolerant: 0.90, short: false, missing_from_gt: 0 },
+                RecallSample { recall: 0.40, tolerant: 0.80, short: true, missing_from_gt: 0 },
+            ],
+            empty_ground_truth: 0,
+            filter_overreturn: 0,
+            short_returns: 0,
+            missing_from_gt: 0,
+            full_recall_queries: 1,
+            ties: Some(TieStats { mean: 3.0, max: 5, fraction_of_queries: 1.0, queries: 2 }),
+            top_k: 10,
+            tie_epsilon: 2e-3,
+            tie_epsilon_source: "auto, float16".to_string(),
+            tie_disabled_reason: None,
+            scores_configured: true,
+            n_ok: 2, n_err: 0, n_timeout: 0, wall_s: 1.0, batch_size: 1, dropped_samples: 0,
+        };
+        let summary = results.summary();
+        assert_eq!(summary.full_recall_tolerant, Some(0.90));
+        assert_eq!(summary.short_recall_tolerant, Some(0.80), "short bucket bounded too");
+        // float sum, so compare with a tolerance rather than for equality
+        assert!((summary.total_recall_tolerant.unwrap() - 0.85).abs() < 1e-9, "and the blend");
+
+        let text = summary.to_string();
+        assert!(text.contains("recall@10: 0.5000 – 0.9000"), "{text}");
+        assert!(text.contains("recall@10_short: 0.4000 – 0.8000"), "{text}");
+        assert!(text.contains("recall_total: 0.4500 – 0.8500"), "{text}");
+        // The tie line states its OWN denominator rather than borrowing the
+        // recall line's, which counts a different population.
+        assert!(text.contains("of 2 queries with a cutoff"), "{text}");
+    }
+
+    #[test]
+    fn a_run_without_a_score_column_emits_no_tie_fields() {
+        // Never asking for tie reporting is not the same as being refused it:
+        // no banner, but also no tolerance and no "upper bound" implying a
+        // comparison that never ran.
+        let results = StormResults {
+            latencies_ms: vec![1.0],
+            recalls: vec![RecallSample {
+                recall: 0.5,
+                tolerant: 0.5,
+                short: false,
+                missing_from_gt: 0,
+            }],
+            empty_ground_truth: 0,
+            filter_overreturn: 0,
+            short_returns: 0,
+            missing_from_gt: 0,
+            full_recall_queries: 1,
+            ties: None,
+            top_k: 10,
+            tie_epsilon: 2e-3,
+            tie_epsilon_source: "auto, float32".to_string(),
+            tie_disabled_reason: None,
+            scores_configured: false,
+            n_ok: 1,
+            n_err: 0,
+            n_timeout: 0,
+            wall_s: 1.0,
+            batch_size: 1,
+            dropped_samples: 0,
+        };
+        let summary = results.summary();
+        assert!(
+            summary.tie_epsilon.is_none(),
+            "no tolerance was ever applied"
+        );
+        assert!(
+            summary.full_recall_tolerant.is_none(),
+            "no bound was ever computed"
+        );
+        let text = summary.to_string();
+        assert!(
+            !text.contains("tie_reporting"),
+            "not refused, just not asked for: {text}"
+        );
+        assert!(!text.contains("tie_epsilon"), "{text}");
+    }
+
+    #[test]
+    fn an_unknown_orientation_credits_ties_but_never_fires_the_alarm() {
+        // No ordering signal (single hit, or all scores equal) means the
+        // orientation is a guess. A tie only widens an upper bound, so it is
+        // still credited; `missing_from_gt` is a loud "stale ground truth"
+        // claim and must not rest on a guess.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.95f32, 0.90f32];
+        let cutoff = GtCutoff {
+            score: 0.10,
+            ties: 1,
+            ascending: None,
+        };
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.missing_from_gt, 0, "no alarm on a guessed orientation");
+
+        // With the orientation KNOWN, the same shape does fire it.
+        let known = GtCutoff {
+            score: 0.10,
+            ties: 1,
+            ascending: Some(false),
+        };
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(known),
+            2,
+            2e-4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.missing_from_gt, 1, "known orientation, genuine mismatch");
+    }
+
+    #[test]
+    fn a_short_bucket_recall_of_one_is_reachable_despite_duplicate_ids() {
+        // ["a","b","b"] at top_k=10: 3 positions, 2 distinct docs. A perfect
+        // engine returns both and must score 1.0 — dividing by the positional
+        // depth would cap it at 0.667 with no way to reach the top.
+        let returned = vec!["a".to_string(), "b".to_string()];
+        let r = recall_at_k(&returned, None, &gt(&["a", "b"]), 3, None, 10, 2e-4, true).unwrap();
+        assert!(r.short, "3 < top_k=10");
+        assert!(
+            (r.recall - 1.0).abs() < 1e-9,
+            "perfect engine, got {}",
+            r.recall
+        );
+    }
+
+    /// `short_returns` is decided in `dispatch_sample`, not `recall_at_k`, and
+    /// the `filtered` arm is what keeps the alarm from firing on an entire
+    /// selective run. Driven through `dispatch_sample` directly, since that is
+    /// where the rule lives.
+    #[test]
+    fn short_returns_bar_adapts_to_filter_and_ground_truth_depth() {
+        use crate::targets::BatchOutcome;
+        let reported = std::sync::atomic::AtomicBool::new(false);
+
+        let sample =
+            |gt: Option<HashSet<String>>, gt_depth: usize, returned: usize, filtered: bool| {
+                let vectors = vec![QueryVector {
+                    vector: crate::queries::VectorData::Dense(vec![0.0]),
+                    ground_truth: gt,
+                    gt_cutoff: None,
+                    gt_depth,
+                    filter_values: HashMap::new(),
+                }];
+                let ids: Vec<String> = (0..returned).map(|i| format!("h{i}")).collect();
+                let out = BatchOutcome {
+                    latency: Duration::from_micros(10),
+                    ok: true,
+                    ids: vec![Some(ids)],
+                    scores: vec![None],
+                    error: None,
+                    timed_out: false,
+                };
+                dispatch_sample(
+                    &out,
+                    &[0],
+                    &vectors,
+                    10,
+                    2e-4,
+                    true,
+                    true,
+                    filtered,
+                    Instant::now(),
+                    &reported,
+                )
+                .short_returns
+            };
+
+        let deep: HashSet<String> = (0..10).map(|i| format!("h{i}")).collect();
+        let shallow: HashSet<String> = ["h0".to_string(), "h1".to_string()].into();
+
+        // Full-depth ground truth, engine came up short -> a real finding.
+        assert_eq!(sample(Some(deep.clone()), 10, 4, false), 1);
+        assert_eq!(sample(Some(deep.clone()), 10, 10, false), 0);
+        // Shallow ground truth: the corpus only holds 2, so returning 2 is
+        // complete, not short.
+        assert_eq!(sample(Some(shallow.clone()), 2, 2, false), 0);
+        assert_eq!(sample(Some(shallow.clone()), 2, 1, false), 1);
+        // No ground truth at all: unknowable under a filter, so no alarm;
+        // without one, top_k is the honest bar.
+        assert_eq!(sample(None, 0, 3, true), 0);
+        assert_eq!(sample(None, 0, 3, false), 1);
+        // An empty ground truth is counted as `empty_ground_truth` instead.
+        assert_eq!(sample(Some(HashSet::new()), 0, 0, false), 0);
+    }
+
+    #[test]
+    fn a_distance_valued_ground_truth_against_a_similarity_engine_is_skipped() {
+        // Ascending through POSITIVE values against a larger-is-better engine
+        // means a distance-valued ground truth (e.g. `1 - cos`), not a negated
+        // similarity. Negating it would leave the two sides a constant apart
+        // and fire `missing_from_gt` on every result; the query is skipped
+        // instead, exactly as an unknown orientation is.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.95f32, 0.90f32]; // cosine similarities from the engine
+        let cutoff = GtCutoff {
+            score: 0.10,
+            ties: 1,
+            ascending: Some(true),
+        };
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.recall, 0.5, "exact recall is unaffected");
+        assert_eq!(r.tolerant, 0.5, "no bogus tie credit");
+        assert_eq!(
+            r.missing_from_gt, 0,
+            "and no false stale-ground-truth alarm"
+        );
+    }
+
+    #[test]
+    fn a_distance_valued_cutoff_of_exactly_zero_is_still_skipped() {
+        // A `1 - cos` ground truth over a near-duplicate corpus bottoms out AT
+        // zero. `> 0.0` would let that through, flip the cutoff to `-0.0`, and
+        // fire `missing_from_gt` on every returned result — the false alarm
+        // the guard exists to prevent, at the one value it is most likely to
+        // take on a duplicate-heavy corpus.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.99f32, 0.98f32]; // cosine similarities
+        let cutoff = GtCutoff { score: 0.0, ties: 4, ascending: Some(true) };
+        let r = recall_at_k(
+            &returned, Some(&scores), &gt(&["a", "b"]), 2, Some(cutoff), 2, 2e-4, true,
+        )
+        .unwrap();
+        assert_eq!(r.missing_from_gt, 0, "no alarm on an unreconcilable orientation");
+        assert_eq!(r.tolerant, 0.5, "and no bogus tie credit either");
+    }
+
+    #[test]
+    fn a_negated_similarity_ground_truth_is_still_recovered() {
+        // The quadrant negation IS for: ascending through NEGATIVE values is a
+        // negated similarity, and flipping it back is exact.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.95f32, 0.50f32];
+        let cutoff = GtCutoff {
+            score: -0.50,
+            ties: 2,
+            ascending: Some(true),
+        };
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.tolerant, 1.0, "-(-0.5) = 0.5 ties the returned 0.50");
+    }
+
+    #[test]
+    fn an_all_equal_ground_truth_falls_back_to_the_sign() {
+        // No ordering signal (every score identical, or a single hit under a
+        // selective filter). For a raw-distance engine a POSITIVE cutoff can
+        // only be a raw distance, since nova-bf stores those negated — so the
+        // fallback must still detect the tie rather than silently collapsing
+        // the tolerant bound onto exact recall.
+        let returned = vec!["a".to_string(), "z".to_string()];
+        let scores = [0.2f32, 0.5f32]; // raw distances
+        let cutoff = GtCutoff {
+            score: 0.5,
+            ties: 1,
+            ascending: None,
+        };
+        let r = recall_at_k(
+            &returned,
+            Some(&scores),
+            &gt(&["a", "b"]),
+            2,
+            Some(cutoff),
+            2,
+            2e-4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(r.tolerant, 1.0, "sign fallback must still see the tie");
+        assert_eq!(r.missing_from_gt, 0);
+    }
+
+    #[test]
+    fn duplicate_gt_ids_do_not_demote_a_full_depth_query_to_short() {
+        // The set holds 9 after a repeat inside the top-10, but the ground
+        // truth is still 10 deep. Classifying on the set length would move the
+        // query into the forgiving `short` bucket and divide by 9.
+        let returned: Vec<String> = (0..10).map(|i| format!("h{i}")).collect();
+        let truth: HashSet<String> = (0..9).map(|i| format!("h{i}")).collect();
+        let r = recall_at_k(&returned, None, &truth, 10, None, 10, 2e-4, true).unwrap();
+        assert!(!r.short, "10-deep ground truth is not short");
+        assert!(
+            (r.recall - 0.9).abs() < 1e-9,
+            "9 hits / k=10, got {}",
+            r.recall
+        );
+    }
+
+    #[test]
+    fn incomparable_scores_withhold_every_tie_derived_number() {
+        // A quantized collection queried with rescore=false returns scores from
+        // quantized space (measured 3.6e-02 .. 26.4 relative error). Reporting a
+        // tie-tolerant bound or a `missing_from_gt` count from those would be
+        // confidently wrong, so both are withheld and the reason is printed.
+        let results = StormResults {
+            latencies_ms: vec![1.0],
+            recalls: vec![RecallSample {
+                recall: 0.5,
+                tolerant: 0.9,
+                short: false,
+                missing_from_gt: 7,
+            }],
+            empty_ground_truth: 0,
+            filter_overreturn: 0,
+            short_returns: 0,
+            missing_from_gt: 7,
+            full_recall_queries: 1,
+            ties: Some(TieStats {
+                mean: 6.8,
+                max: 41,
+                fraction_of_queries: 0.9,
+                queries: 10,
+            }),
+            top_k: 10,
+            tie_epsilon: 2e-3,
+            tie_epsilon_source: "auto, float16".to_string(),
+            tie_disabled_reason: Some("test reason: scores are in quantized space".to_string()),
+            scores_configured: true,
+            n_ok: 1,
+            n_err: 0,
+            n_timeout: 0,
+            wall_s: 1.0,
+            batch_size: 1,
+            dropped_samples: 0,
+        };
+        let summary = results.summary();
+        assert!(summary.full_recall_tolerant.is_none(), "no tolerant bound");
+        assert!(summary.ties.is_none(), "no tie stats");
+        assert_eq!(
+            summary.missing_from_gt, 0,
+            "the stale-ground-truth alarm must not fire on incomparable scores"
+        );
+        // The tolerance was never applied, so reporting it beside a null bound
+        // would imply a comparison that did not happen. Checked on the struct
+        // serde serializes, so the JSON consumer sees the same thing.
+        assert!(
+            summary.tie_epsilon.is_none(),
+            "no tolerance when it went unused"
+        );
+        assert!(summary.tie_epsilon_source.is_none());
+        let json = serde_json::to_value(&summary).expect("serializes");
+        assert!(json["tie_epsilon"].is_null(), "{json}");
+        assert!(json["ties"].is_null(), "{json}");
+        assert!(json["full_recall_tolerant"].is_null(), "{json}");
+        assert_eq!(
+            summary.full_recall.unwrap().mean,
+            0.5,
+            "exact recall is unaffected"
+        );
+
+        let text = summary.to_string();
+        assert!(text.contains("tie_reporting"), "{text}");
+        // The reason travels from wherever it was decided to the summary
+        // verbatim, so a new suppression cause needs no display change.
+        assert!(
+            text.contains("test reason: scores are in quantized space"),
+            "must echo WHY it was disabled: {text}"
+        );
+        assert!(
+            !text.contains("–"),
+            "no range when there is no upper bound: {text}"
+        );
+        assert!(!text.contains("ties_at_cutoff"), "{text}");
+        assert!(!text.contains("tie_epsilon:"), "{text}");
+    }
+
+    #[test]
+    fn comparable_scores_still_report_ties() {
+        let results = StormResults {
+            latencies_ms: vec![1.0],
+            recalls: vec![RecallSample {
+                recall: 0.5,
+                tolerant: 0.9,
+                short: false,
+                missing_from_gt: 0,
+            }],
+            empty_ground_truth: 0,
+            filter_overreturn: 0,
+            short_returns: 0,
+            missing_from_gt: 0,
+            full_recall_queries: 1,
+            ties: Some(TieStats {
+                mean: 6.8,
+                max: 41,
+                fraction_of_queries: 0.9,
+                queries: 10,
+            }),
+            top_k: 10,
+            tie_epsilon: 2e-3,
+            tie_epsilon_source: "auto, float16".to_string(),
+            tie_disabled_reason: None,
+            scores_configured: true,
+            n_ok: 1,
+            n_err: 0,
+            n_timeout: 0,
+            wall_s: 1.0,
+            batch_size: 1,
+            dropped_samples: 0,
+        };
+        let summary = results.summary();
+        assert_eq!(summary.full_recall_tolerant, Some(0.9));
+        assert!(summary.ties.is_some());
+        let text = summary.to_string();
+        assert!(text.contains("0.5000 – 0.9000"), "{text}");
+        assert!(text.contains("ties_at_cutoff"), "{text}");
+        assert!(!text.contains("tie_reporting"), "{text}");
     }
 
     #[test]
     fn summary_serializes_to_json_for_a_calling_tool_to_parse() {
         let summary = Summary {
             requests: 10,
-            errors: 1, timeouts: 0,
+            errors: 1,
+            timeouts: 0,
             batch_size: 4,
             requests_per_sec: 5.0,
             qps: 20.0,
@@ -1028,6 +2413,23 @@ mod tests {
             total_recall: Some(RecallBucket { n: 8, mean: 0.87 }),
             empty_ground_truth: 5,
             filter_overreturn: 3,
+            full_recall_tolerant: Some(0.95),
+            short_recall_tolerant: None,
+            total_recall_tolerant: None,
+            short_returns: 1,
+            missing_from_gt: 0,
+            full_recall_queries: 8,
+            ties: Some(TieStats {
+                mean: 3.5,
+                max: 9,
+                fraction_of_queries: 0.5,
+                queries: 10,
+            }),
+            top_k: 10,
+            tie_epsilon: Some(2e-3),
+            tie_epsilon_source: Some("auto (float16)".to_string()),
+            tie_disabled_reason: None,
+            schema_version: 2,
         };
         let json = serde_json::to_string(&summary).expect("serializes");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
@@ -1060,25 +2462,68 @@ mod tests {
                 let ids = queries
                     .iter()
                     .map(|q| {
-                        Some(match q.vector.as_dense().expect("test queries are dense")[0] as i64 {
-                            0 => vec![], // 0/2 in ground truth -> recall 0.0
-                            1 => vec!["a".to_string()], // 1/2 -> recall 0.5
-                            _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
-                        })
+                        Some(
+                            match q.vector.as_dense().expect("test queries are dense")[0] as i64 {
+                                0 => vec![],                                 // 0/2 in ground truth -> recall 0.0
+                                1 => vec!["a".to_string()],                  // 1/2 -> recall 0.5
+                                _ => vec!["a".to_string(), "b".to_string()], // 2/2 -> recall 1.0
+                            },
+                        )
                     })
-                    .collect();
-                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None, timed_out: false, }
+                    .collect::<Vec<Option<Vec<String>>>>();
+                let scores = vec![None; ids.len()];
+                BatchOutcome {
+                    latency: Duration::from_micros(100),
+                    ok: true,
+                    scores,
+                    ids,
+                    error: None,
+                    timed_out: false,
+                }
             }
         }
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
         let vectors = vec![
-            QueryVector { vector: crate::queries::VectorData::Dense(vec![0.0]), ground_truth: gt.clone(), filter_values: HashMap::new() },
-            QueryVector { vector: crate::queries::VectorData::Dense(vec![1.0]), ground_truth: gt.clone(), filter_values: HashMap::new() },
-            QueryVector { vector: crate::queries::VectorData::Dense(vec![2.0]), ground_truth: gt, filter_values: HashMap::new() },
+            QueryVector {
+                vector: crate::queries::VectorData::Dense(vec![0.0]),
+                ground_truth: gt.clone(),
+                gt_cutoff: None,
+                gt_depth: 2,
+                filter_values: HashMap::new(),
+            },
+            QueryVector {
+                vector: crate::queries::VectorData::Dense(vec![1.0]),
+                ground_truth: gt.clone(),
+                gt_cutoff: None,
+                gt_depth: 2,
+                filter_values: HashMap::new(),
+            },
+            QueryVector {
+                vector: crate::queries::VectorData::Dense(vec![2.0]),
+                ground_truth: gt,
+                gt_cutoff: None,
+                gt_depth: 2,
+                filter_values: HashMap::new(),
+            },
         ];
         // duration long enough to cycle through all 3 at concurrency=1 several times
-        let profile = LoadProfile { concurrency: 1, duration_s: 0.1, target_rps: 0.0, batch_size: 1, passes: 0 };
-        let results = run_storm(Arc::new(PerQueryTarget), vectors, &profile, 2, false, None).await;
+        let profile = LoadProfile {
+            concurrency: 1,
+            duration_s: 0.1,
+            target_rps: 0.0,
+            batch_size: 1,
+            passes: 0,
+        };
+        let results = run_storm(
+            Arc::new(PerQueryTarget),
+            vectors,
+            &profile,
+            2,
+            cmp(None),
+            false,
+            None,
+        )
+        .await;
 
         // Only asserts the pipeline actually produced all 3 distinct values --
         // NOT their exact proportions, which depend on how many times each of
@@ -1088,9 +2533,24 @@ mod tests {
         // `summary_aggregates_recall_buckets_correctly` below. gt is 2 ids at
         // k=2, so every sample is full-depth (not short).
         assert!(results.recalls.iter().all(|s| !s.short));
-        assert!(results.recalls.iter().any(|s| (s.recall - 0.0).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|s| (s.recall - 0.5).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|s| (s.recall - 1.0).abs() < 1e-9));
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 0.0).abs() < 1e-9)
+        );
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 0.5).abs() < 1e-9)
+        );
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 1.0).abs() < 1e-9)
+        );
     }
 
     #[test]
@@ -1103,12 +2563,36 @@ mod tests {
         let results = StormResults {
             latencies_ms: vec![1.0, 2.0, 3.0],
             recalls: vec![
-                RecallSample { recall: 0.5, short: false },
-                RecallSample { recall: 1.0, short: false },
-                RecallSample { recall: 0.4, short: true },
+                RecallSample {
+                    recall: 0.5,
+                    tolerant: 0.5,
+                    short: false,
+                    missing_from_gt: 0,
+                },
+                RecallSample {
+                    recall: 1.0,
+                    tolerant: 1.0,
+                    short: false,
+                    missing_from_gt: 0,
+                },
+                RecallSample {
+                    recall: 0.4,
+                    tolerant: 0.4,
+                    short: true,
+                    missing_from_gt: 0,
+                },
             ],
             empty_ground_truth: 2,
             filter_overreturn: 0,
+            short_returns: 0,
+            missing_from_gt: 0,
+            full_recall_queries: 3,
+            ties: None,
+            top_k: 10,
+            tie_epsilon: 2e-4,
+            tie_epsilon_source: "configured".to_string(),
+            tie_disabled_reason: None,
+            scores_configured: true,
             n_ok: 3,
             n_err: 0,
             n_timeout: 0,
@@ -1137,13 +2621,31 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ts.csv").to_string_lossy().into_owned();
-        let cfg = ReportConfig { format: ReportFormat::Csv, path: path.clone() };
+        let cfg = ReportConfig {
+            format: ReportFormat::Csv,
+            path: path.clone(),
+        };
         let mut recorder = cfg.build();
         recorder.begin().expect("begin");
 
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1, passes: 0 };
+        let profile = LoadProfile {
+            concurrency: 4,
+            duration_s: 0.2,
+            target_rps: 0.0,
+            batch_size: 1,
+            passes: 0,
+        };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results = run_storm(target, vectors(), &profile, 10, false, Some(recorder)).await;
+        let results = run_storm(
+            target,
+            vectors(),
+            &profile,
+            10,
+            cmp(None),
+            false,
+            Some(recorder),
+        )
+        .await;
         let summary = results.summary();
 
         let text = std::fs::read_to_string(&path).expect("csv written");
@@ -1153,7 +2655,10 @@ mod tests {
         // raw run, minus any samples dropped when the writer queue was full
         // (with an instant mock target the load loop can briefly outrun the
         // writer; the summary still counts every dispatch).
-        assert_eq!(lines.len() as u64, 1 + summary.requests - results.dropped_samples);
+        assert_eq!(
+            lines.len() as u64,
+            1 + summary.requests - results.dropped_samples
+        );
         // timestamps are on the run's time axis: non-negative, within the
         // window (plus scheduling slack), and present on every row
         for line in &lines[1..] {
@@ -1180,15 +2685,35 @@ mod tests {
             }
         }
 
-        let profile = LoadProfile { concurrency: 4, duration_s: 0.2, target_rps: 0.0, batch_size: 1, passes: 0 };
+        let profile = LoadProfile {
+            concurrency: 4,
+            duration_s: 0.2,
+            target_rps: 0.0,
+            batch_size: 1,
+            passes: 0,
+        };
         let target = Arc::new(MockTarget::ok(vec![]));
-        let results =
-            run_storm(target, vectors(), &profile, 10, false, Some(Box::new(FailingRecorder))).await;
+        let results = run_storm(
+            target,
+            vectors(),
+            &profile,
+            10,
+            cmp(None),
+            false,
+            Some(Box::new(FailingRecorder)),
+        )
+        .await;
         let summary = results.summary();
 
         // Load ran to completion despite the sink failing on the very first row.
-        assert!(summary.requests > 0, "the load test must complete even with a dead sink");
-        assert_eq!(summary.errors, 0, "dispatch errors are unrelated to sink failure");
+        assert!(
+            summary.requests > 0,
+            "the load test must complete even with a dead sink"
+        );
+        assert_eq!(
+            summary.errors, 0,
+            "dispatch errors are unrelated to sink failure"
+        );
     }
 
     #[test]
@@ -1228,31 +2753,67 @@ mod tests {
                             _ => vec!["a".to_string(), "b".to_string()],
                         })
                     })
-                    .collect();
-                BatchOutcome { latency: Duration::from_micros(100), ok: true, ids, error: None, timed_out: false, }
+                    .collect::<Vec<Option<Vec<String>>>>();
+                let scores = vec![None; ids.len()];
+                BatchOutcome {
+                    latency: Duration::from_micros(100),
+                    ok: true,
+                    scores,
+                    ids,
+                    error: None,
+                    timed_out: false,
+                }
             }
         }
 
         let gt = Some(HashSet::from(["a".to_string(), "b".to_string()]));
         let vectors: Vec<QueryVector> = (0..9)
             .map(|i| QueryVector {
+                gt_cutoff: None,
+                gt_depth: 2,
                 vector: crate::queries::VectorData::Dense(vec![i as f32]),
                 ground_truth: gt.clone(),
                 filter_values: HashMap::new(),
             })
             .collect();
         let batch_size = 3;
-        let profile = LoadProfile { concurrency: 1, duration_s: 0.15, target_rps: 0.0, batch_size, passes: 0 };
-        let target = Arc::new(BatchCapturingTarget { call_lens: std::sync::Mutex::new(Vec::new()) });
-        let results = run_storm(target.clone(), vectors, &profile, 2, false, None).await;
+        let profile = LoadProfile {
+            concurrency: 1,
+            duration_s: 0.15,
+            target_rps: 0.0,
+            batch_size,
+            passes: 0,
+        };
+        let target = Arc::new(BatchCapturingTarget {
+            call_lens: std::sync::Mutex::new(Vec::new()),
+        });
+        let results = run_storm(target.clone(), vectors, &profile, 2, cmp(None), false, None).await;
 
         let call_lens = target.call_lens.lock().unwrap();
         assert!(!call_lens.is_empty());
-        assert!(call_lens.iter().all(|&len| len == batch_size), "{call_lens:?}");
+        assert!(
+            call_lens.iter().all(|&len| len == batch_size),
+            "{call_lens:?}"
+        );
 
-        assert!(results.recalls.iter().any(|s| (s.recall - 0.0).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|s| (s.recall - 0.5).abs() < 1e-9));
-        assert!(results.recalls.iter().any(|s| (s.recall - 1.0).abs() < 1e-9));
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 0.0).abs() < 1e-9)
+        );
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 0.5).abs() < 1e-9)
+        );
+        assert!(
+            results
+                .recalls
+                .iter()
+                .any(|s| (s.recall - 1.0).abs() < 1e-9)
+        );
         assert_eq!(results.summary().batch_size, batch_size);
     }
 
@@ -1280,7 +2841,9 @@ mod tests {
                 latency: std::time::Duration::from_micros(50),
                 ok: true,
                 ids: vec![None; queries.len()],
-                error: None, timed_out: false,
+                scores: vec![None; queries.len()],
+                error: None,
+                timed_out: false,
             }
         }
     }
@@ -1288,6 +2851,8 @@ mod tests {
     fn indexed_vectors(n: usize) -> Vec<QueryVector> {
         (0..n)
             .map(|i| QueryVector {
+                gt_cutoff: None,
+                gt_depth: 2,
                 vector: crate::queries::VectorData::Dense(vec![i as f32]),
                 ground_truth: None,
                 filter_values: HashMap::new(),
@@ -1301,11 +2866,27 @@ mod tests {
     /// fit this work; a timed run of 10000s would never end the test).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fixed_work_fires_each_query_exactly_passes_times() {
-        let target = Arc::new(CountingTarget { counts: std::sync::Mutex::new(HashMap::new()) });
+        let target = Arc::new(CountingTarget {
+            counts: std::sync::Mutex::new(HashMap::new()),
+        });
         let vectors = indexed_vectors(10);
-        let profile =
-            LoadProfile { concurrency: 4, duration_s: 0.001, target_rps: 0.0, batch_size: 3, passes: 2 };
-        let results = run_storm(target.clone(), vectors, &profile, 10, false, None).await;
+        let profile = LoadProfile {
+            concurrency: 4,
+            duration_s: 0.001,
+            target_rps: 0.0,
+            batch_size: 3,
+            passes: 2,
+        };
+        let results = run_storm(
+            target.clone(),
+            vectors,
+            &profile,
+            10,
+            cmp(None),
+            false,
+            None,
+        )
+        .await;
 
         let counts = target.counts.lock().unwrap();
         assert_eq!(counts.len(), 10);
@@ -1317,12 +2898,19 @@ mod tests {
     /// Fixed work, paced: the launch budget ends the run, not the clock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_work_paced_fires_each_query_exactly_once() {
-        let target = Arc::new(CountingTarget { counts: std::sync::Mutex::new(HashMap::new()) });
+        let target = Arc::new(CountingTarget {
+            counts: std::sync::Mutex::new(HashMap::new()),
+        });
         let vectors = indexed_vectors(5);
         // 1000 rps so the schedule is not the bottleneck; duration absurd both ways.
-        let profile =
-            LoadProfile { concurrency: 2, duration_s: 10_000.0, target_rps: 1000.0, batch_size: 2, passes: 1 };
-        let results = run_storm(target.clone(), vectors, &profile, 5, false, None).await;
+        let profile = LoadProfile {
+            concurrency: 2,
+            duration_s: 10_000.0,
+            target_rps: 1000.0,
+            batch_size: 2,
+            passes: 1,
+        };
+        let results = run_storm(target.clone(), vectors, &profile, 5, cmp(None), false, None).await;
 
         let counts = target.counts.lock().unwrap();
         assert_eq!(counts.len(), 5);

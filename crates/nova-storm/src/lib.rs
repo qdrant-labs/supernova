@@ -30,10 +30,41 @@ use errors::StormError;
 use queries::load_query_vectors;
 use runner::Summary;
 
+/// Whether the run explicitly disables quantization rescoring. Navigated
+/// defensively through the free-form `search_params` value: anything missing
+/// or the wrong shape means "not disabled", the same as the server default.
+fn rescore_disabled(search_params: &Option<serde_yaml::Value>) -> bool {
+    let Some(sp) = search_params.as_ref() else {
+        return false;
+    };
+    // Two sibling params make quantization irrelevant to the returned score,
+    // so `rescore: false` alongside either is not a reason to distrust it:
+    //   * `exact: true` scans the original vectors, skipping the index;
+    //   * `quantization.ignore: true` skips quantized storage outright.
+    let bypassed = |path: &[&str]| {
+        path.iter()
+            .try_fold(sp, |node, key| node.get(*key))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    if bypassed(&["exact"]) || bypassed(&["quantization", "ignore"]) {
+        return false;
+    }
+    sp.get("quantization")
+        .and_then(|q| q.get("rescore"))
+        .and_then(|r| r.as_bool())
+        .is_some_and(|rescore| !rescore)
+}
+
 /// Run a storm end to end: load the query set, connect the target, drive the
 /// load profile, and return this worker's latency summary.
 pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
-    let StormConfig { target, query, load, report } = config;
+    let StormConfig {
+        target,
+        query,
+        load,
+        report,
+    } = config;
 
     // Open the time-series sink FIRST: begin() creating the file (or a db
     // sink its tables) is exactly the step that fails on a bad path, and it
@@ -55,9 +86,114 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         query.vector_type,
         query.vector_name.as_deref().unwrap_or("(unnamed)"),
     );
-    let vectors =
-        load_query_vectors(&query.source, query.vector_type, query.filter.as_ref(), query.top_k)?;
+   
+    let target = target.into_target(&query).await?;
+    let scoring = target.scoring_profile().await;
+    // A failed probe downgrades the tolerance to the conservative default and
+    // disables tie reporting; an operator seeing those needs to know it was
+    // a probe failure rather than a property of their collection.
+    if scoring.distance.is_none() && query.source.ground_truth_score_column.is_some() {
+        tracing::warn!(
+            "could not read the collection's scoring config (distance/datatype/quantization) \
+             — score-based tie reporting is disabled and the conservative tolerance applies"
+        );
+    }
+    let probed_datatype = scoring.datatype.clone();
+    let tie_epsilon = query
+        .tie_epsilon
+        .unwrap_or_else(|| config::tie_epsilon_for_datatype(probed_datatype.as_deref()));
+    let tie_epsilon_source = match (&query.tie_epsilon, &probed_datatype) {
+        (Some(_), _) => "configured".to_string(),
+        (None, Some(dt)) => format!("auto, {dt}"),
+        (None, None) => "auto, datatype unknown".to_string(),
+    };
+    if query.source.ground_truth_score_column.is_some() {
+        match (&query.tie_epsilon, &probed_datatype) {
+            (Some(e), _) => tracing::info!("score tie tolerance: {e:.1e} (configured)"),
+            (None, Some(dt)) => {
+                tracing::info!("score tie tolerance: {tie_epsilon:.1e} (auto, datatype={dt})")
+            }
+            (None, None) => tracing::info!(
+                "score tie tolerance: {tie_epsilon:.1e} (auto, datatype unknown — conservative)"
+            ),
+        }
+    }
+    // If a query and corpus set live in different precision spaces and
+    // rescoring is not used, disable tie-aware reporting.
+    let tie_disabled_reason: Option<String> = if query.source.ground_truth_score_column.is_none()
+        || query.source.ground_truth_column.is_none()
+    {
+        None
+    } else if rescore_disabled(&query.search_params) && scoring.quantized {
+        Some(
+            "the collection is quantized and this run sets quantization.rescore=false, so \
+             returned scores are in quantized space"
+                .to_string(),
+        )
+    } else if scoring.distance.is_none() {
+        // Orientation decides the SIGN of every comparison. Guessing it wrong
+        // makes `missing_from_gt` fire on essentially every miss, so an
+        // unknown distance disables score-based reporting instead of assuming
+        // larger-is-better — the failure mode that assumption produces is a
+        // confident false alarm, not a missing number.
+        Some(
+            "the collection's distance function could not be determined, so the score \
+             orientation is unknown"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    // Determine the orientation of the engine's scores based on the distance function.
+    let engine_higher_is_better =
+        !matches!(scoring.distance.as_deref(), Some("euclid" | "manhattan"));
+    if tie_disabled_reason.is_some() {
+        // Collecting per-point scores costs an allocation per query inside the
+        // measured latency window; nothing will read them now.
+        target.disable_score_collection();
+    }
+    if query.source.ground_truth_score_column.is_some() {
+        if let Some(reason) = &tie_disabled_reason {
+            tracing::warn!(
+                "tie reporting disabled for this run: {reason}. Exact recall is unaffected."
+            );
+        }
+        if probed_datatype.as_deref() == Some("uint8") {
+            tracing::warn!(
+                "collection datatype is uint8: vector components are stored as integers, so \
+                 scores only match a ground truth built from the SAME quantized values — \
+                 otherwise the tie-tolerant bound and `missing_from_gt` are unreliable"
+            );
+        }
+    }
+    // A score column with no id column loads nothing and reports nothing —
+    // silently, which reads as "ties just didn't happen" rather than a config
+    // mistake.
+    if query.source.ground_truth_score_column.is_some()
+        && query.source.ground_truth_column.is_none()
+    {
+        tracing::warn!(
+            "query.source.ground_truth_score_column is set without ground_truth_column — \
+             scores are only meaningful alongside the ids they belong to, so no recall or \
+             tie reporting will be produced"
+        );
+    }
+    // The target is already connected by this point, so close it on the way
+    // out of the failure paths below rather than dropping a live connection.
+    let vectors = match load_query_vectors(
+        &query.source,
+        query.vector_type,
+        query.filter.as_ref(),
+        query.top_k,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = target.close().await;
+            return Err(e.into());
+        }
+    };
     if vectors.is_empty() {
+        let _ = target.close().await;
         return Err(StormError::Other(format!(
             "no query vectors loaded from {:?} (column {:?}) — NULL and empty vectors are \
              excluded; a file of only those loads nothing",
@@ -83,15 +219,16 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         );
     }
 
-    let target = target.into_target(&query).await?;
-
     let mode = if load.target_rps > 0.0 {
         format!(
             "paced {:.0} rps/worker (batch_size={}, cap {} in-flight)",
             load.target_rps, load.batch_size, load.concurrency
         )
     } else {
-        format!("closed-loop concurrency={} batch_size={}", load.concurrency, load.batch_size)
+        format!(
+            "closed-loop concurrency={} batch_size={}",
+            load.concurrency, load.batch_size
+        )
     };
     tracing::info!(
         target = %target,
@@ -112,17 +249,26 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         // length (not top_k) and land in the summary's separate `recall_short`
         // bucket — so they no longer read as an artificial regression, but the
         // split is worth flagging up front so the operator expects two buckets.
+        // Positional depth, matching how `recall_at_k` buckets: a duplicate id
+        // shrinks the deduplicated set without making the ground truth
+        // shallower, and this preflight must not promise a bucket the run will
+        // not produce.
         let short = vectors
             .iter()
-            .filter_map(|v| v.ground_truth.as_ref())
-            .filter(|gt| (gt.len() as u64) < query.top_k)
+            .filter(|v| {
+                // Non-empty only: an empty ground truth produces no recall
+                // sample at all and is tallied as `recall_empty_gt`, so
+                // promising it in the short bucket would be a lie.
+                v.ground_truth.as_ref().is_some_and(|g| !g.is_empty())
+                    && (v.gt_depth as u64) < query.top_k
+            })
             .count();
         if short > 0 {
             tracing::info!(
-                "{short}/{with_ground_truth} ground-truth lists hold fewer than top_k={} ids — \
-                 those queries are scored against their own ground-truth length and reported \
-                 separately as `recall_short`",
-                query.top_k,
+                "{short}/{with_ground_truth} ground-truth lists hold fewer than top_k={k} ids \
+                 — those queries are scored against their own ground-truth length and reported \
+                 separately as `recall@{k}_short`",
+                k = query.top_k,
             );
         }
     }
@@ -137,9 +283,65 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         ProgressBar::hidden()
     };
 
-    let results =
-        runner::run_storm(target, vectors, &load, query.top_k, query.filter.is_some(), recorder).await;
+    let results = runner::run_storm(
+        target,
+        vectors,
+        &load,
+        query.top_k,
+        runner::ScoreComparison {
+            epsilon: tie_epsilon,
+            epsilon_source: tie_epsilon_source,
+            disabled_reason: tie_disabled_reason,
+            // A score column with no id column compares nothing.
+            configured: query.source.ground_truth_score_column.is_some()
+                && query.source.ground_truth_column.is_some(),
+            engine_higher_is_better,
+        },
+        query.filter.is_some(),
+        recorder,
+    )
+    .await;
     spinner.finish_and_clear();
 
     Ok(results.summary())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rescore_disabled;
+
+    fn yaml(src: &str) -> Option<serde_yaml::Value> {
+        Some(serde_yaml::from_str(src).unwrap())
+    }
+
+    #[test]
+    fn quantization_bypasses_mean_rescore_false_is_not_a_concern() {
+        // `exact: true` and `quantization.ignore: true` both skip quantized
+        // storage, so the returned score is exact and `rescore: false` says
+        // nothing about it. Treating those as "scores are in quantized space"
+        // would withhold tie reporting from a run that never used it.
+        assert!(!rescore_disabled(&yaml(
+            "exact: true\nquantization:\n  rescore: false"
+        )));
+        assert!(!rescore_disabled(&yaml(
+            "quantization:\n  ignore: true\n  rescore: false"
+        )));
+        // …but the plain combination still is.
+        assert!(rescore_disabled(&yaml(
+            "exact: false\nquantization:\n  rescore: false"
+        )));
+    }
+
+    #[test]
+    fn rescore_disabled_only_when_explicitly_false() {
+        assert!(rescore_disabled(&yaml("quantization:\n  rescore: false")));
+        assert!(!rescore_disabled(&yaml("quantization:\n  rescore: true")));
+        // Absent, wrong shape, or no search_params at all -> server default.
+        assert!(!rescore_disabled(&yaml(
+            "quantization:\n  oversampling: 2.0"
+        )));
+        assert!(!rescore_disabled(&yaml("hnsw_ef: 128")));
+        assert!(!rescore_disabled(&yaml("quantization: notamap")));
+        assert!(!rescore_disabled(&None));
+    }
 }
