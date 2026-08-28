@@ -144,7 +144,14 @@ from nova_bf.filters import _condition_mask, _match_any_membership, _static_firs
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
 from nova_bf.ids import make_point_id
 from nova_bf.io import ParquetFile, Store, dense_to_2d, multivector_to_ragged, sparse_to_coo_parts
-from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
+from nova_bf.results import (
+    build_result_table,
+    partial_dir,
+    provenance,
+    result_name,
+    vector_dtype,
+    warn_if_short,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3255,6 +3262,43 @@ def run_compute(
                 all_files[e // MAX_ROWS_PER_FILE].key, e % MAX_ROWS_PER_FILE
             )
 
+    # Storage dtypes of the vectors that were actually scored, read from the
+    # file footers (schema only, no column data). Best-effort: this is
+    # provenance, so a store that cannot answer costs the metadata key, never
+    # the run.
+    def _dtypes_for(spec) -> dict[str, str]:
+        column = (
+            cfg.corpus.sparse_column
+            if spec.vector_type == "sparse"
+            else cfg.corpus.multivector_column
+            if spec.vector_type == "multivector"
+            else cfg.corpus.dense_column
+        )
+        qcolumn = (
+            cfg.queries.sparse_column
+            if spec.vector_type == "sparse"
+            else cfg.queries.multivector_column
+            if spec.vector_type == "multivector"
+            else cfg.queries.dense_column
+        )
+        out: dict[str, str] = {}
+        try:
+            if all_files:
+                out["corpus_dtype"] = vector_dtype(
+                    cstore.read_schema(all_files[0].read_path), column or ""
+                )
+        except Exception as exc:  # noqa: BLE001 - provenance must never fail a run
+            logger.debug("could not read corpus dtype for provenance: %s", exc)
+        try:
+            qfiles = qstore.list_parquets()
+            if qfiles:
+                out["queries_dtype"] = vector_dtype(
+                    qstore.read_schema(qfiles[0].read_path), qcolumn or ""
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not read queries dtype for provenance: %s", exc)
+        return out
+
     out = Store(cfg.output.path)
     results: dict[str, str] = {}
     for i, s in enumerate(specs):
@@ -3278,7 +3322,13 @@ def run_compute(
         else:
             out_ids = [query_ids[r] for r in rows_i]
             out_payload = {c: [v[r] for r in rows_i] for c, v in payload.items()}
-        table = build_result_table(out_ids, out_payload, hit_ids, hit_scores)
+        # Stamped on the PARTIALS too, not just the final file: a partial is a
+        # parquet someone can pick up on its own, and a merge that mixed
+        # partials from two different runs is exactly the mistake this makes
+        # visible.
+        table = build_result_table(
+            out_ids, out_payload, hit_ids, hit_scores, provenance(cfg, s, _dtypes_for(s))
+        )
         if num_jobs is not None:
             width = max(3, len(str(num_jobs - 1)))
             name = f"{partial_dir(cfg, s)}/rank{job_rank:0{width}d}.parquet"

@@ -90,6 +90,15 @@ class Store:
         out.sort(key=lambda f: f.read_path)
         return out
 
+    def read_schema(self, read_path: str) -> pa.Schema:
+        """The file's schema, footer only — no column data.
+
+        Used to record what dtype the vectors were STORED as (see
+        `results.provenance`), which the loaders can't report because they
+        upcast to float32 on the way in.
+        """
+        return pq.read_schema(read_path, filesystem=self.fs)
+
     def read_columns(self, read_path: str, columns: list[str] | None) -> pa.Table:
         if self.ranged_get:
             size = self.fs.get_file_info(read_path).size

@@ -35,7 +35,7 @@ from tqdm import tqdm
 
 from nova_bf.config import BruteForceConfig, SearchSpec
 from nova_bf.io import ParquetFile, Store
-from nova_bf.results import RESERVED, partial_dir, result_name, warn_if_short
+from nova_bf.results import RESERVED, partial_dir, provenance, result_name, warn_if_short
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +280,16 @@ def _reduce(
                 "(same queries, same order). A truncated/mismatched partial can't be merged."
             )
 
+    # Storage dtypes come FROM a partial rather than being re-derived: merge
+    # never opens the corpus, and the files being merged are the only thing
+    # that describes what actually produced these rows.
+    carried = readers[0].schema_arrow.metadata or {}
+    carried_dtypes = {
+        key: carried[f"nova_bf.{key}".encode()].decode()
+        for key in ("corpus_dtype", "queries_dtype")
+        if f"nova_bf.{key}".encode() in carried
+    }
+
     payload_cols = [c for c in readers[0].schema_arrow.names if c not in RESERVED]
     batch_rows = _resolve_batch_rows(cfg.params.merge_batch_size, n_rows, len(partials), k)
     logger.info(
@@ -330,6 +340,15 @@ def _reduce(
                 cols["hit_ids"] = ids_arr
                 cols["hit_scores"] = scores_arr
                 table = pa.table(cols)
+                # The merged file is the artifact people actually consume, so
+                # it carries the same provenance the partials do. The storage
+                # dtypes are read back FROM a partial rather than re-derived:
+                # merge never opens the corpus, and taking them from the files
+                # being merged is also the only reading that describes what
+                # actually produced these rows.
+                table = table.replace_schema_metadata(
+                    provenance(cfg, spec, carried_dtypes)
+                )
 
                 if writer is None:
                     writer = pq.ParquetWriter(sink, table.schema, compression="snappy")
