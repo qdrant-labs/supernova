@@ -1480,11 +1480,10 @@ def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_scores, spec_top_enc,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
+    spec_qsel: list, spec_qrows: list,
     encoded_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
-    spec_qsel: list | None = None,
-    spec_qrows: list | None = None,
 ) -> float:
     """The shared per-vector_type primitive behind `_process_shared_batch`:
     iterate `batch` in `batch_size`-row slices, transfer each slice once
@@ -1537,6 +1536,18 @@ def _process_batch_group(
     dict per r0-slice for `select` to memoize per-filter lookups shared
     across members — it does not persist across slices, since the mask is
     slice-relative.
+
+    `spec_qsel`/`spec_qrows` are the per-member `SearchSpec.rows` selectors
+    (one entry per spec, `None` for a spec that owns every query — see
+    `_row_selector`). They index the SAME rows in two different spaces
+    and are NOT interchangeable: `spec_qsel[m]` addresses the score matrix,
+    whose query axis spans this vector_type's row UNION, while `spec_qrows[m]`
+    addresses a per-query filter mask, whose query axis is the whole FILE (see
+    `_pack_query_axis`). Both are required arguments — a member that owns
+    every query passes `None` explicitly — because the two spaces coincide
+    often enough (whenever the union is the whole file) that a defaulted or
+    swapped selector reads plausible rows on most fixtures and the wrong ones
+    on the rest, with no error either way.
 
     Returns elapsed wall-clock seconds spent in this loop (folded into the
     caller's `gpu_secs`). A caller that pre-compacts `batch` must do so
@@ -1635,7 +1646,7 @@ def _process_batch_group(
             # vector_type's whole row union — every spec sharing the type reads
             # the same one — so a spec that owns only part of it slices here,
             # BEFORE the top-k.
-            qsel = None if spec_qsel is None else spec_qsel[m]
+            qsel = spec_qsel[m]
             if qsel is not None:
                 sel_scores = sel_scores[qsel]
             if cell_mask is not None:
@@ -2123,12 +2134,10 @@ def _process_shared_batch(
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
     query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
+    spec_qsel: list, spec_qrows: list, n_q_full: int,
     encoded_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
-    spec_qsel: list | None = None,
-    spec_qrows: list | None = None,
-    n_q_full: int | None = None,
 ) -> float:
     """Every search of this vector_type shares one batch grid: `orig_rows`
     is `None` when some search is unfiltered (`batch` is the raw, whole
@@ -2186,13 +2195,16 @@ def _process_shared_batch(
                     # slice's bytes ever get expanded back to
                     # one-bool-per-query, not the whole file's.
                     packed_np = keeps[s.filter][:, true_rows]
-                    # Height is the FULL query axis: `keeps` is packed over
-                    # every query in the file (see `_pack_query_axis`), which
-                    # is NOT `spec_Q[m].shape[0]` once a `rows` subset makes
-                    # this vector_type's matrix shorter than the file.
-                    cell_np = _unpack_query_axis(
-                        packed_np, spec_Q[m].shape[0] if n_q_full is None else n_q_full
-                    )
+                    # Height is the FULL query axis (`n_q_full`): `keeps` is
+                    # packed over every query in the file (see
+                    # `_pack_query_axis`), which is NOT `spec_Q[m].shape[0]`
+                    # once a `rows` subset makes this vector_type's matrix
+                    # shorter than the file. Deliberately a REQUIRED argument
+                    # with no `spec_Q`-derived fallback: that fallback WAS the
+                    # bug, and leaving it reachable lets a new call site
+                    # reintroduce it silently (a mask read at the wrong height
+                    # masks the wrong queries, it does not raise).
+                    cell_np = _unpack_query_axis(packed_np, n_q_full)
                     cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
                 if filter_share_count[s.filter] > 1:
                     cache[s.filter] = cell_mask
@@ -2302,14 +2314,44 @@ def _local_positions(
     return np.searchsorted(vt_rows, rows).astype(np.int64)
 
 
-def _validate_query_filter_cols(qstore: Store, filter_cols: list[str]) -> None:
+def _row_selector(idx: np.ndarray | None, device: str):
+    """One `SearchSpec.rows` index array -> the object the scoring path indexes
+    the query axis with: `None` (all rows — skip the indexing entirely), a
+    `slice` when `idx` is one CONTIGUOUS ascending run (indexing is then a
+    view, no gather-copy), or an on-device int64 index tensor otherwise.
+
+    Module-level, not a closure inside `run_compute`, so the contiguity guard
+    is directly testable: `slice(idx[0], idx[-1] + 1)` is only equivalent to
+    `idx` when `idx` has no gaps, and a run whose subsets are contiguous —
+    which is what you get from a queries file sorted by query set, i.e. most
+    fixtures — cannot tell the two apart.
+    """
+    if idx is None:
+        return None
+    if len(idx) and idx[-1] - idx[0] == len(idx) - 1:
+        return slice(int(idx[0]), int(idx[-1]) + 1)
+    import torch
+
+    return torch.from_numpy(np.ascontiguousarray(idx)).to(device)
+
+
+def _validate_query_filter_cols(
+    qstore: Store, filter_cols: list[str], subset_cols: list[str] = (),
+) -> None:
     """Fail fast with a clear message if a per-query filter condition
-    (`match_from_query`/`range_from_query`/`match_text_from_query`) names a
-    queries column that doesn't exist — rather than letting a typo surface
-    deep inside `load_queries`/`load_queries_sparse` as a generic pyarrow
-    `ArrowInvalid` about a missing `FieldRef`. Peeks at the FIRST queries
-    file's schema only (metadata read, no row data) since every queries
-    file in a run is assumed to share one schema."""
+    (`match_from_query`/`range_from_query`/`match_text_from_query`) or a
+    `SearchSpec.rows` selector (`rows.column`) names a queries column that
+    doesn't exist — rather than letting a typo surface deep inside
+    `load_queries`/`load_queries_sparse` as a generic pyarrow `ArrowInvalid`
+    about a missing `FieldRef`. Peeks at the FIRST queries file's schema only
+    (metadata read, no row data) since every queries file in a run is assumed
+    to share one schema.
+
+    `subset_cols` is the `rows.column` subset of `filter_cols` (they travel
+    together from here on — see `run_compute`), passed separately ONLY so the
+    error names the config key the reader actually has to go fix: pointing a
+    misspelled `rows: {column: …}` at `match_from_query` sends them looking in
+    the wrong place."""
     if not filter_cols:
         return
     files = qstore.list_parquets()
@@ -2320,9 +2362,19 @@ def _validate_query_filter_cols(qstore: Store, filter_cols: list[str]) -> None:
     schema_names = set(pq.ParquetFile(files[0].read_path, filesystem=qstore.fs).schema_arrow.names)
     missing = sorted(c for c in filter_cols if c not in schema_names)
     if missing:
+        subset = set(subset_cols)
+        missing_rows = sorted(c for c in missing if c in subset)
+        missing_filter = sorted(c for c in missing if c not in subset)
+        parts = []
+        if missing_filter:
+            parts.append(
+                f"{missing_filter} referenced by a per-query filter "
+                "(match_from_query/range_from_query/match_text_from_query)"
+            )
+        if missing_rows:
+            parts.append(f"{missing_rows} referenced by a `rows` selector (rows.column)")
         raise ValueError(
-            f"queries file is missing column(s) referenced by a per-query filter "
-            f"(match_from_query/range_from_query/match_text_from_query): {missing} "
+            f"queries file is missing column(s): {' and '.join(parts)} "
             f"— available columns: {sorted(schema_names)}"
         )
 
@@ -2409,12 +2461,13 @@ def run_compute(
     # get the same "referenced columns must exist" validation below.
     subset_cols = sorted({s.rows.column for s in specs if s.rows is not None})
     query_filter_cols = sorted(set(query_filter_cols) | set(subset_cols))
-    _validate_query_filter_cols(qstore, query_filter_cols)
+    _validate_query_filter_cols(qstore, query_filter_cols, subset_cols)
     # Row subsets must be known BEFORE the loaders run, because they decide how
     # tall each vector_type's query matrix is. The selector columns are a few
     # small columns, so reading them first is cheap next to the vector columns.
     spec_rows: list = [None] * len(specs)
     vt_rows: dict[str, np.ndarray | None] = {}
+    n_q_pre: int | None = None  # None = no selectors, so nothing to cross-check
     if subset_cols:
         pre = _load_query_columns(qstore, cfg.queries, subset_cols)
         n_q_pre = len(next(iter(pre.values())))
@@ -2484,11 +2537,29 @@ def run_compute(
                 "agree on row count and order"
             )
     n_q = len(query_ids)
-    for s in specs:
+    if n_q_pre is not None and n_q_pre != n_q:
+        # `spec_rows` indexes `Q`, `query_ids` and `payload` by FILE row, but it
+        # was resolved from a SEPARATE pass over the queries store
+        # (`_load_query_columns`) made before the vector loaders ran. The two
+        # walk the same `store.list_parquets()` order, so they agree — but if
+        # they ever stop agreeing, every subset silently addresses the wrong
+        # queries (or IndexErrors deep inside a loader). Same reason the
+        # cross-vector_type check above compares id IDENTITY, not just length.
+        raise RuntimeError(
+            f"queries store returned {n_q_pre} rows when reading the "
+            f"`rows` selector column(s) but {n_q} rows when loading vectors — "
+            "the query row set changed between the two reads, so a row subset "
+            "cannot be trusted to name the right queries"
+        )
+    for i_spec, s in enumerate(specs):
         dim = Q_np_by_vt[s.vector_type].shape[1]
+        # Per-spec query count, NOT the file's: with `rows` those differ, and
+        # this is the line someone scans to confirm a run covers what they meant.
+        s_n_q = n_q if spec_rows[i_spec] is None else len(spec_rows[i_spec])
         logger.info(
-            "search=%r queries=%d %s=%d metric=%s k=%d device=%s%s",
-            s.name, n_q, "vocab" if s.vector_type == "sparse" else "dim", dim,
+            "search=%r queries=%d%s %s=%d metric=%s k=%d device=%s%s",
+            s.name, s_n_q, "" if s_n_q == n_q else f" of {n_q}",
+            "vocab" if s.vector_type == "sparse" else "dim", dim,
             s.metric, s.k, device,
             f" rank={job_rank}/{num_jobs}" if num_jobs else "",
         )
@@ -2628,19 +2699,12 @@ def run_compute(
     #                   filter mask (see `_pack_query_axis`)
     # A contiguous run becomes a `slice` so the score matrix is sliced as a
     # view instead of gathered; `None` means "all rows", the historical path,
-    # which skips the indexing entirely.
-    def _sel(idx: np.ndarray | None):
-        if idx is None:
-            return None
-        if len(idx) and idx[-1] - idx[0] == len(idx) - 1:
-            return slice(int(idx[0]), int(idx[-1]) + 1)
-        return torch.from_numpy(np.ascontiguousarray(idx)).to(device)
-
+    # which skips the indexing entirely. See `_row_selector`.
     spec_qsel = [
-        _sel(_local_positions(spec_rows[m], vt_rows.get(specs[m].vector_type)))
+        _row_selector(_local_positions(spec_rows[m], vt_rows.get(specs[m].vector_type)), device)
         for m in range(len(specs))
     ]
-    spec_qrows = [_sel(spec_rows[m]) for m in range(len(specs))]
+    spec_qrows = [_row_selector(spec_rows[m], device) for m in range(len(specs))]
     if any(r is not None for r in spec_rows):
         logger.info(
             "query-row subsets active: %s (file has %d queries; per-spec top-K "

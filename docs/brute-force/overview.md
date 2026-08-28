@@ -129,6 +129,38 @@ Omit `rows` and the search covers every query, as before. The selector column is
   both is rejected at config load rather than silently ignored.
 - Order the unified query file rows based on the query_set value (i.e., keep the same values contiguous) to improve computational efficiency with row selection.
 
+#### What `rows` actually saves
+
+Specs of one vector_type share a single query matrix, and therefore a single
+score matrix per metric, built over the **union** of their `rows`. So when the
+specs' subsets between them cover the whole file — the usual two-halves case,
+including `ms_marco_10000_combined.yaml` — the union is every row and the big
+allocations do not shrink at all: the query matrix, the `queries × rows` score
+matrix, and the per-query filter masks are all still full height. What shrinks
+is per-spec running top-K state (`sum(len(subset))` rows instead of
+`n_specs × n_q`) and each spec's own `topk`/merge work, which is worth real
+time at a large `k` — at `k: 1000` and 10,000 queries the top-K state goes
+240 MB → 120 MB and the merge work halves. The other reason to reach for `rows`
+is ergonomic: the foreign half of each per-query filter column no longer needs
+a match-nothing sentinel, and each search's output covers only its own queries
+instead of needing a downstream filter on `query_set`.
+
+#### `rows` is not bit-exact against a full-file run
+
+When a subset *does* shorten the query matrix — i.e. the union of the run's
+`rows` is a strict subset of the file, so some rows no search owns — scores can
+differ from the same search run over the whole file by ~1 float32 ULP
+(observed ~5e-7 relative). Nothing is wrong: the matmul's query dimension
+changed, so BLAS picks a different kernel and accumulates in a different order.
+Hit **ids** are unaffected except where two documents' scores sit within that
+margin, in which case they can swap.
+
+Practically: two searches whose subsets cover every row (the layout above) stay
+bit-exact, but rerunning just *one* of them from the same queries file will not
+reproduce the combined run's scores to the last bit. Treat scores from a
+narrowed run as ~1e-6-comparable, not identical — the same caveat
+`params.allow_tf32` carries, at a much smaller magnitude.
+
 ### Sparse vectors
 
 Set a search's `vector_type: sparse` to score a `struct<indices: list<uint32>, values: list<float32>>` column instead of the dense one — the same schema `nova embed`'s sparse embedders write and `nova load` reads (default column name `sparse_embedding`, override via `corpus.sparse_column` / `queries.sparse_column`). Only `metric: dot` and `metric: cosine` are supported (`euclidean` has no real use case for sparse retrieval and is rejected at config load).

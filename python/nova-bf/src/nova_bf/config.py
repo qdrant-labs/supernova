@@ -492,6 +492,17 @@ class RowSelector(BaseModel):
     columns, so it does NOT need to be listed in `queries.payload_fields`
     (though it usually is, to carry through to the output). Values are compared
     as strings, so `isin: ["1"]` matches an integer 1 in the source column.
+
+    NOT bit-exact against a full-file run when the run's selectors leave some
+    rows unowned. Specs of one vector_type share one query matrix built over
+    the UNION of their `rows`; if that union is a strict subset of the file the
+    matrix is shorter, the scoring matmul's query dimension changes with it,
+    and BLAS accumulates in a different order — scores move by ~1 float32 ULP
+    (~5e-7 relative), enough to swap two documents scored within that margin.
+    Subsets that between them cover every row (the two-halves case `rows` was
+    added for) keep the matrix full height and stay bit-exact. See
+    docs/brute-force/overview.md; same class of caveat as
+    `ParamsConfig.allow_tf32`, several orders of magnitude smaller.
     """
 
     model_config = ConfigDict(extra="forbid")
