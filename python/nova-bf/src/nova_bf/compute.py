@@ -152,6 +152,15 @@ from nova_bf.results import (
     vector_dtype,
     warn_if_short,
 )
+from nova_bf.tiebreak import (
+    MAX_ROWS_PER_WORKER,
+    build_ordinals,
+    id_order_scalar,
+    pack,
+    pack_topk,
+    sentinel_key,
+    unpack_score,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1305,31 +1314,31 @@ def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "Mul
     return MultiVectorCorpusBatch(doc_offsets, flat)
 
 
-def _merge_topk(top_scores, top_enc, parts: list[tuple], k: int):
-    """Fold pending per-slice candidate columns into a spec's running
-    `(top_scores, top_enc)` top-k state with ONE topk, amortized.
+def _merge_topk(top_key, top_enc, parts: list[tuple], k: int):
+    """Merge pending candidate columns into the running `(top_key, top_enc)` top-k state.
 
-    `parts` is a list of `(scores, encoded)` pairs accumulated by
-    `_process_batch_group` across one or more slices, in slice (i.e. corpus)
-    order. Each `scores` is `(n_q, cols)` with `cols <= k` (any wider slice
-    was pre-topk'd down to `k` at append time — see `process_slice`); its
-    `encoded` is either the matching `(n_q, cols)` id tensor (a pre-topk'd
-    part) or the raw 1-D `(cols,)` fully-encoded
-    `global_file_idx * MAX_ROWS_PER_FILE + row` column ids, broadcast here.
-    Re-top-k'ing once per ~k accumulated columns instead of once per slice
-    is what makes the token-budget regime cheap: with ~65-doc slices and
-    k=1000, this cuts the number of `(n_q, ~2k)` radix-selects ~15x while
-    keeping peak transient memory the same order as the old per-slice merge
-    (the cat is bounded by k + ~2k columns). Candidate order inside the cat
-    is exactly arrival (corpus) order, so determinism for a fixed config is
-    unchanged; which of several EXACTLY tied candidates survives can differ
-    from the old one-merge-per-slice fold (both are deterministic)."""
+    The state stores packed keys rather than scores. `nova_bf.tiebreak.pack`
+    combines each score with its row ordinal into a single int64 whose ordering
+    defines both score order and deterministic tie-breaking. Because the
+    transform is bijective, the original score can be recovered exactly with
+    `unpack_score` during decode.
+
+    `parts` contains `(keys, encoded)` pairs accumulated across slices in corpus
+    order. Each `keys` tensor has shape `(n_q, cols)` with `cols <= k`; wider
+    slices are reduced to their local top-k before being appended. `encoded` is
+    either a matching `(n_q, cols)` tensor for an already-selected part or a
+    1-D `(cols,)` tensor of fully encoded corpus row IDs, which is broadcast
+    across queries here.
+
+    Pending parts are concatenated with the running state and reduced with a
+    single top-k operation. Since selection is performed on the packed key,
+    the final result is independent of slice boundaries, candidate grouping,
+    and flush timing.
+    """
     import torch
 
-    # Each intermediate is del'd as soon as the next line no longer needs it:
-    # at n_q=100k / k=1000 they are 0.4-1.6 GiB EACH, and Python locals would
-    # otherwise keep all of them alive until return.
-    merged_s = torch.cat([top_scores] + [p for p, _ in parts], dim=1)
+    # Each intermediate is del'd as soon as the next line no longer needs it
+    merged_k = torch.cat([top_key] + [p for p, _ in parts], dim=1)
     merged_e = torch.cat(
         [top_enc]
         + [
@@ -1338,9 +1347,9 @@ def _merge_topk(top_scores, top_enc, parts: list[tuple], k: int):
         ],
         dim=1,
     )
-    new_top_scores, idx = torch.topk(merged_s, k=k, dim=1)
-    del merged_s
-    return new_top_scores, merged_e.gather(1, idx)
+    new_top_key, idx = torch.topk(merged_k, k=k, dim=1)
+    del merged_k
+    return new_top_key, merged_e.gather(1, idx)
 
 
 def _sample_mean_doc_tokens(store: Store, mine: list, column: str) -> float:
@@ -1478,10 +1487,12 @@ def _ragged_batch_ranges(
 
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
-    spec_top_scores, spec_top_enc,
+    spec_top_key, spec_top_enc,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
     spec_qsel: list, spec_qrows: list,
     encoded_row_ids: np.ndarray | None = None,
+    ordinal_base: int = 0,
+    ordinal_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
 ) -> float:
@@ -1516,6 +1527,16 @@ def _process_batch_group(
     non-identity, per-source-file id encoding — the two purposes coincide
     for a single file but diverge once rows from several files share one
     batch.
+
+    `ordinal_base`/`ordinal_row_ids` carry the row's tie-break ordinal, which
+    rides in the low half of the packed selection key (see `nova_bf.tiebreak`)
+    and decides which of two EXACTLY-tied candidates survives. They split for
+    the same reason `encoded_row_ids` does: under `tiebreak='ordinal'` the
+    value is just this worker's running row counter, so a scalar base plus the
+    row index reconstructs it on device with no host array; under
+    `tiebreak='id'`, or for any coalesced batch whose rows came from several
+    files, no scalar covers it and the caller passes the array, already aligned
+    to batch position.
 
     `select(m, rows, true_rows, cache) -> (sel_rows, sel_cols, cell_mask)` is
     the per-member filtering strategy (see `_process_shared_batch`):
@@ -1602,8 +1623,8 @@ def _process_batch_group(
         parts = pending[m]
         pending[m] = []
         pending_cols[m] = 0
-        spec_top_scores[m], spec_top_enc[m] = _merge_topk(
-            spec_top_scores[m], spec_top_enc[m], parts, specs[m].k
+        spec_top_key[m], spec_top_enc[m] = _merge_topk(
+            spec_top_key[m], spec_top_enc[m], parts, specs[m].k
         )
 
     def _flush_all_pending() -> None:
@@ -1627,6 +1648,14 @@ def _process_batch_group(
         else:
             encoded_rows = torch.from_numpy(encoded_row_ids[r0 : r0 + sl.n_rows]).to(device, non_blocking=True)
 
+        # Tie-break ordinals for these rows (see `nova_bf.tiebreak`).
+        if ordinal_row_ids is None:
+            ordinals = ordinal_base + rows
+        else:
+            ordinals = torch.from_numpy(
+                ordinal_row_ids[r0 : r0 + sl.n_rows].astype(np.int64, copy=False)
+            ).to(device, non_blocking=True)
+
         score_cache: dict[str, object] = {}
         cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
         for m in member_idxs:
@@ -1642,6 +1671,7 @@ def _process_batch_group(
                 continue
             sel_scores = scores if sel_cols is None else scores[:, sel_cols]
             sel_encoded = encoded_rows if sel_cols is None else encoded_rows[sel_cols]
+            sel_ordinals = ordinals if sel_cols is None else ordinals[sel_cols]
             # Query-row subset (`SearchSpec.rows`). The score matrix spans this
             # vector_type's whole row union — every spec sharing the type reads
             # the same one — so a spec that owns only part of it slices here,
@@ -1662,14 +1692,19 @@ def _process_batch_group(
             # Append to the pending buffer (pre-topk wide slices down to k so
             # the buffer, and any slice score matrix it would otherwise pin
             # alive, stays bounded); merge only once >= k columns accumulate.
+            #
+            # This pre-top-K DISCARDS PERMANENTLY — a candidate dropped here is
+            # never seen again, by the fold or by `merge` — so it has to select
+            # on the packed key, not the score. It is the site where an
+            # unstable `topk` used to silently decide ties.
             if sel_scores.shape[1] > s.k:
-                part_scores, part_local = torch.topk(sel_scores, k=s.k, dim=1)
+                part_key, part_local = pack_topk(sel_scores, sel_ordinals, s.k)
                 part_enc = sel_encoded[part_local]
                 del part_local
             else:
-                part_scores, part_enc = sel_scores, sel_encoded
-            pending[m].append((part_scores, part_enc))
-            pending_cols[m] += part_scores.shape[1]
+                part_key, part_enc = pack(sel_scores, sel_ordinals), sel_encoded
+            pending[m].append((part_key, part_enc))
+            pending_cols[m] += part_key.shape[1]
             if pending_cols[m] >= s.k:
                 _flush_pending(m)
 
@@ -2129,13 +2164,15 @@ def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str)
 
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
-    spec_top_scores, spec_top_enc,
+    spec_top_key, spec_top_enc,
     keeps: dict[Filter | None, np.ndarray | None], filter_is_per_query: dict[Filter | None, bool],
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
     query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
     spec_qsel: list, spec_qrows: list, n_q_full: int,
     encoded_row_ids: np.ndarray | None = None,
+    ordinal_base: int = 0,
+    ordinal_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
 ) -> float:
@@ -2221,9 +2258,10 @@ def _process_shared_batch(
         return rows[local_idx], local_idx, None
 
     return _process_batch_group(
-        batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_scores, spec_top_enc,
+        batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_key, spec_top_enc,
         batch_size, gidx, device, orig_rows=orig_rows, select=select,
         encoded_row_ids=encoded_row_ids,
+        ordinal_base=ordinal_base, ordinal_row_ids=ordinal_row_ids,
         multivector_token_budget=multivector_token_budget,
         multivector_double_buffer=multivector_double_buffer,
         spec_qsel=spec_qsel, spec_qrows=spec_qrows,
@@ -2658,7 +2696,7 @@ def run_compute(
         vt: len({s.metric for s in specs if s.vector_type == vt}) for vt in vts_needed
     }
     q_norms_by_vt: dict[str, object] = {}
-    spec_Q, spec_q_norms, spec_top_scores, spec_top_enc = [], [], [], []
+    spec_Q, spec_q_norms, spec_top_key, spec_top_enc = [], [], [], []
     for i_spec, s in enumerate(specs):
         # Multivector cosine normalizes each TOKEN inside score() (not a
         # per-query scalar divide like dense/sparse), so it needs no `q_norms`
@@ -2689,7 +2727,10 @@ def run_compute(
         # specs over a unioned queries file that is the difference between
         # sum(len(subset)) and n_specs * n_q rows of running top-K state.
         h = n_q if spec_rows[i_spec] is None else len(spec_rows[i_spec])
-        spec_top_scores.append(torch.full((h, s.k), float("-inf"), device=device))
+        # The state holds packed keys, so the empty slot is the key for
+        # `(-inf, worst ordinal)` — every real candidate outranks it, and the
+        # decode gate recovers `-inf` from it exactly.
+        spec_top_key.append(sentinel_key((h, s.k), device))
         spec_top_enc.append(torch.zeros((h, s.k), dtype=torch.int64, device=device))
 
     # Device-side row selectors for `SearchSpec.rows`, built once per run:
@@ -2832,6 +2873,66 @@ def run_compute(
     dense_col, sparse_col = cfg.corpus.dense_column, cfg.corpus.sparse_column
     multivector_col = cfg.corpus.multivector_column
     id_col = cfg.corpus.id_column  # None → derive make_point_id(file_key, row) at decode
+
+    # --- tie-break ordinals (see `nova_bf.tiebreak`) --------------------------
+    #
+    # Every corpus row this worker reads gets a dense ordinal in
+    # `[0, rows_this_worker)`, which rides in the low half of the packed
+    # selection key and decides which of two EXACTLY-tied candidates wins.
+    #
+    #   ordinal  the row's position in CORPUS order — `rows_before` below is
+    #            just a running counter, so this costs nothing.
+    #   id       the row's position in SORTED-ID order, from one sort of this
+    #            worker's whole id column here at startup.
+    #
+    # The `id` sort spans the worker's entire file list rather than each file,
+    # because ordinals have to interleave across files to stay comparable when
+    # the running top-K folds a later file against an earlier one.
+    tiebreak = cfg.params.tiebreak
+    rows_before = 0                      # ordinal of this worker's next row
+    id_ordinals: dict[int, np.ndarray] | None = None
+    # Whether `tiebreak='id'` orders NUMERICALLY. Read from the corpus SCHEMA,
+    # not from any row, so every worker resolves the same rule — including one
+    # that drew no files at all (`--num-jobs` above the file count).
+    id_is_int = tie_unsigned = False
+    if tiebreak == "id" and all_files:
+        import pyarrow as _pa
+
+        _t = cstore.read_schema(all_files[0].read_path).field(id_col).type
+        id_is_int = _pa.types.is_integer(_t)
+        tie_unsigned = _pa.types.is_unsigned_integer(_t)
+        if not (
+            id_is_int or _pa.types.is_string(_t) or _pa.types.is_large_string(_t)
+        ):
+            # Binary is deliberately NOT accepted. The ordinals would order it
+            # by raw bytes, but `hit_ids` render it through Python's bytes
+            # repr — whose order differs (`str(b'\\x41z') < str(b'\\x0az')`,
+            # because 'A' < '\\') — and `merge` orders those reprs. The two
+            # sides would disagree and the winner would move with --num-jobs.
+            raise ValueError(
+                f"params.tiebreak='id' needs an integer or string "
+                f"corpus.id_column; {id_col!r} is {_t}. Use params.tiebreak='ordinal'."
+            )
+    if tiebreak == "id" and mine:
+        t_ord = time.perf_counter()
+        pool_n = max(1, min(io_workers or 8, 32))
+        with ThreadPoolExecutor(max_workers=pool_n) as pool:
+            # `map` preserves input order, which is what makes the ordinals
+            # line up with `mine` — and `mine` is ascending `gidx`, so the
+            # secondary "earliest corpus position wins" rule among duplicate
+            # ids means what it says.
+            id_arrays = list(pool.map(
+                lambda f: cstore.read_columns(f.read_path, [id_col])[id_col],
+                [f for _, f in mine],
+            ))
+        id_ordinals = dict(zip([g for g, _ in mine], build_ordinals(id_arrays)))
+        n_ids = sum(len(a) for a in id_arrays)
+        del id_arrays
+        logger.info(
+            "params.tiebreak='id': ranked %s ids from this worker's %d file(s) "
+            "in %.1fs; ties go to the lowest %r, then to the earliest corpus row.",
+            f"{n_ids:,}", len(mine), time.perf_counter() - t_ord, id_col,
+        )
     # Union of every spec's filter fields — read_cols below stays exactly (and only)
     # the columns some spec actually references, same guarantee the single-search
     # path always made.
@@ -3057,7 +3158,12 @@ def run_compute(
                 # here together) — see the `filter_secs` logging below, whose
                 # meaning widens accordingly.
                 t2 = time.perf_counter()
-                fq.put((gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, t1 - t0, t2 - t1))
+                # `n_rows` is the file's own row count, carried explicitly:
+                # the tie-break ordinal counter advances by it, and deriving it
+                # from `raw_stats` instead would tie that counter to whichever
+                # vector types this run happens to configure.
+                fq.put((gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays,
+                        n_rows, t1 - t0, t2 - t1))
             except Exception as exc:
                 # Permit deliberately NOT released: the consumer re-raises on
                 # fetching this, killing the run — holding it just stops the
@@ -3115,7 +3221,12 @@ def run_compute(
 
     def _flush_coalesce_group(vt: str) -> float:
         buf = coalesce_buf[vt]
+        # A file contributing no rows — an empty shard, or every row dropped by
+        # the union filter — must be dropped BEFORE concatenating.
+        buf = [e for e in buf if e[1].n_rows]
         if not buf:
+            coalesce_buf[vt] = []
+            coalesce_rows[vt] = 0
             return 0.0
         concat = {
             "dense": _concat_dense_batches,
@@ -3124,8 +3235,16 @@ def run_compute(
         }[vt]
         combined_batch = concat([entry[1] for entry in buf])
         encoded_ids = np.concatenate([
-            file_gidx * MAX_ROWS_PER_FILE + orig_rows for file_gidx, _, orig_rows, _ in buf
+            file_gidx * MAX_ROWS_PER_FILE + orig_rows
+            for file_gidx, _, orig_rows, _, _, _ in buf
         ])
+        # Tie-break ordinals for the SAME rows in the SAME concatenated order.
+        # A coalesced group mixes files, so no scalar base covers it even under
+        # `tiebreak='ordinal'` — each file's own base is applied here.
+        ordinal_ids = np.concatenate([
+            (f_ord[orig_rows] if f_ord is not None else f_base + orig_rows)
+            for _, _, orig_rows, _, f_base, f_ord in buf
+        ]).astype(np.int64, copy=False)
         # Rebuild each of this vt's (uniform-only, by `coalesce_eligible_
         # vts`' own precondition) filters' keep-mask, restricted to
         # survivor rows and concatenated in the SAME order as
@@ -3134,15 +3253,17 @@ def run_compute(
         # lookups with this GROUP's own row order, not any one file's
         # original per-file numbering.
         combined_keeps = {
-            f: np.concatenate([file_keeps[f][orig_rows] for _, _, orig_rows, file_keeps in buf])
+            f: np.concatenate([
+                file_keeps[f][orig_rows] for _, _, orig_rows, file_keeps, _, _ in buf
+            ])
             for f in vt_union_filters[vt]
         }
         elapsed = _process_shared_batch(
             combined_batch, vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
-            spec_top_scores, spec_top_enc,
+            spec_top_key, spec_top_enc,
             combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_gpu,
             filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
-            encoded_row_ids=encoded_ids,
+            encoded_row_ids=encoded_ids, ordinal_row_ids=ordinal_ids,
             spec_qsel=spec_qsel, spec_qrows=spec_qrows, n_q_full=n_q,
             multivector_token_budget=(
                 cfg.params.multivector_token_budget if vt == "multivector" else None
@@ -3158,7 +3279,7 @@ def run_compute(
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for want_gidx, _f in mine:
             w0 = time.perf_counter()
-            gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, rsec, fsec = _next_in_order(
+            gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, file_rows, rsec, fsec = _next_in_order(
                 want_gidx, pending, _fetch_or_raise
             )
             window.release()  # file consumed — a reader may start another
@@ -3209,6 +3330,25 @@ def run_compute(
             # retention for that file, so the missing entry costs nothing.
             if id_col and any(mask is None or mask.any() for mask in keeps.values()):
                 corpus_ids[gidx] = ids
+            # This file's tie-break ordinals. The counter advances by the file's
+            # PRE-compaction row count, so a row's ordinal is a property of the
+            # corpus alone — advancing by survivors instead would make it depend
+            # on which filters happened to run, and the specs sharing this file
+            # do not share a filter.
+            ordinal_base = rows_before
+            rows_before += file_rows
+            if rows_before > MAX_ROWS_PER_WORKER:
+                raise RuntimeError(
+                    f"this worker's corpus slice exceeds {MAX_ROWS_PER_WORKER:,} "
+                    "rows, which overflows the 32-bit tie-break field and would "
+                    "make ties non-deterministic again. Split the work further "
+                    "with a larger `--num-jobs`."
+                )
+            # Popped, not read: the worker's ordinals are ~4 bytes/row and each
+            # file is visited exactly once, so releasing them as they are
+            # consumed keeps only the unread tail resident.
+            file_ordinals = None if id_ordinals is None else id_ordinals.pop(gidx)
+
             for vt in vts_needed:
                 raw_rows, raw_bytes = raw_stats[vt]
                 rows_seen += raw_rows
@@ -3219,6 +3359,7 @@ def run_compute(
                     coalesce_buf[vt].append((
                         gidx, batches[vt], batch_orig_rows[vt],
                         {f: keeps[f] for f in vt_union_filters[vt]},
+                        ordinal_base, file_ordinals,
                     ))
                     coalesce_rows[vt] += batches[vt].n_rows
                     if coalesce_rows[vt] >= vt_batch_size[vt]:
@@ -3226,9 +3367,17 @@ def run_compute(
                 else:
                     gpu_secs += _process_shared_batch(
                         batches[vt], vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
-                        spec_top_scores, spec_top_enc,
+                        spec_top_key, spec_top_enc,
                         keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
                         filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=batch_orig_rows[vt],
+                        ordinal_base=ordinal_base,
+                        ordinal_row_ids=(
+                            None if file_ordinals is None
+                            else (
+                                file_ordinals if batch_orig_rows[vt] is None
+                                else file_ordinals[batch_orig_rows[vt]]
+                            )
+                        ),
                         spec_qsel=spec_qsel, spec_qrows=spec_qrows, n_q_full=n_q,
                         multivector_token_budget=(
                             cfg.params.multivector_token_budget
@@ -3320,6 +3469,11 @@ def run_compute(
             gidx = e // MAX_ROWS_PER_FILE
             row = e % MAX_ROWS_PER_FILE
             return str(corpus_ids[gidx][row].as_py())
+
+        def resolve_id_value(e: int):
+            """The id's RAW value, before stringification — what `merge` needs
+            to order a numeric id column, since `"10"` precedes `"9"`."""
+            return corpus_ids[e // MAX_ROWS_PER_FILE][e % MAX_ROWS_PER_FILE].as_py()
     else:
         def resolve_id(e: int) -> str:
             return make_point_id(
@@ -3365,9 +3519,38 @@ def run_compute(
 
     out = Store(cfg.output.path)
     results: dict[str, str] = {}
+    # A sharded run's partials must carry whatever `merge` needs to apply the
+    # SAME rule across workers that each worker applied within itself. The
+    # worker's ordinal cannot travel — it is a private relabelling, meaningless
+    # against another worker's — so:
+    #
+    #   ordinal          the row's GLOBAL corpus position, which `enc` already
+    #                    is (`gidx * MAX_ROWS_PER_FILE + row`, and `gidx`
+    #                    indexes the same path-sorted list in every worker).
+    #   id, string col   nothing: `merge` compares `hit_ids` directly.
+    #   id, numeric col  the id's numeric order image, because `hit_ids` reach
+    #                    `merge` already stringified.
+    #
+    # A string id column needs nothing at all, and a single-node run needs
+    # nothing either, since there is no reduce.
+    if tiebreak == "ordinal":
+        # `enc` IS the ordinate — no per-hit work, just write the column.
+        resolve_tie = None
+        needs_ordinate = True
+    elif id_is_int:
+        def resolve_tie(e: int) -> int:
+            return id_order_scalar(resolve_id_value(e), tie_unsigned)
+        needs_ordinate = True
+    else:
+        resolve_tie = None
+        needs_ordinate = False
+    want_tie_column = needs_ordinate and num_jobs is not None
+
     for i, s in enumerate(specs):
         enc = spec_top_enc[i].cpu().numpy()
-        sc = spec_top_scores[i].cpu().numpy()
+        # The state holds packed keys; the score is recovered from the key's
+        # high half, bit-for-bit (`score_order_key` is a bijection).
+        sc = unpack_score(spec_top_key[i]).cpu().numpy()
         valid = sc > float("-inf")
         # A spec with a `rows` subset wrote state for its OWN queries only, so
         # its output covers those rows — ids and payload are sliced to match.
@@ -3376,10 +3559,18 @@ def run_compute(
         rows_i = spec_rows[i]
         out_n = sc.shape[0]
         hit_ids, hit_scores = [], []
+        hit_tie: list[list[int]] | None = [] if want_tie_column else None
         for q in range(out_n):
             qe, qs = enc[q][valid[q]], sc[q][valid[q]]
             hit_ids.append([resolve_id(int(e)) for e in qe])
             hit_scores.append(qs.tolist())
+            if want_tie_column:
+                hit_tie.append(
+                    qe.tolist() if resolve_tie is None
+                    else [resolve_tie(int(e)) for e in qe]
+                    # `resolve_tie is None` here means ordinal mode, where the
+                    # encoded value already IS the global corpus position.
+                )
 
         if rows_i is None:
             out_ids, out_payload = query_ids, payload
@@ -3391,7 +3582,8 @@ def run_compute(
         # partials from two different runs is exactly the mistake this makes
         # visible.
         table = build_result_table(
-            out_ids, out_payload, hit_ids, hit_scores, provenance(cfg, s, _dtypes_for(s))
+            out_ids, out_payload, hit_ids, hit_scores, provenance(cfg, s, _dtypes_for(s)),
+            hit_tie=hit_tie,
         )
         if num_jobs is not None:
             width = max(3, len(str(num_jobs - 1)))

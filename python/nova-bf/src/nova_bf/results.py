@@ -9,7 +9,15 @@ import pyarrow as pa
 from nova_bf.config import BruteForceConfig, SearchSpec
 
 # Reserved output columns; everything else in a result row is carried payload.
-RESERVED = ("query_id", "hit_ids", "hit_scores")
+# `hit_tie` appears only on a SHARDED run's partials, and only when `merge`
+# cannot apply the tie-break rule from `hit_ids` alone — see `build_result_table`.
+RESERVED = ("query_id", "hit_ids", "hit_scores", "hit_tie")
+
+# Schema-metadata key recording which tie-break rule produced a result. `merge`
+# refuses partials whose rule disagrees with the config it was handed: editing
+# `params.tiebreak` between compute and merge would otherwise silently reduce
+# ties by a rule the partials were never built for.
+TIEBREAK_KEY = b"nova_bf_tiebreak"
 
 
 def queries_stem(queries_path: str) -> str:
@@ -120,7 +128,14 @@ def provenance(
         value = (dtypes or {}).get(key)
         if value:
             meta[f"nova_bf.{key}"] = value
-    return {k.encode(): v.encode() for k, v in meta.items()}
+    out = {k.encode(): v.encode() for k, v in meta.items()}
+    # Which tie-break rule decided the exact ties in these rows. Stamped HERE,
+    # rather than where the table is built, because there are two builders — a
+    # partial/single-node result in `compute` and the reduced artifact in
+    # `merge` — and only one of them used to do it, so a sharded run (the only
+    # kind that produces the artifacts anyone ships) lost the record.
+    out[TIEBREAK_KEY] = cfg.params.tiebreak.encode()
+    return out
 
 
 def build_result_table(
@@ -129,13 +144,18 @@ def build_result_table(
     hit_ids: list[list[str]],
     hit_scores: list[list[float]],
     metadata: dict[bytes, bytes] | None = None,
+    hit_tie: list[list[int]] | None = None,
 ) -> pa.Table:
     data: dict = {"query_id": pa.array(query_ids, pa.string())}
     for col, vals in payload.items():
         data[col] = pa.array(vals)
     data["hit_ids"] = pa.array(hit_ids, pa.list_(pa.string()))
     data["hit_scores"] = pa.array(hit_scores, pa.list_(pa.float32()))
+    if hit_tie is not None:
+        data["hit_tie"] = pa.array(hit_tie, pa.list_(pa.int64()))
     table = pa.table(data)
+    # No tie-break stamp here: `provenance` carries it, so both this builder and
+    # `merge`'s get it from one place.
     return table.replace_schema_metadata(metadata) if metadata else table
 
 

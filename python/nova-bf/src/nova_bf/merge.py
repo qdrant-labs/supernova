@@ -35,7 +35,14 @@ from tqdm import tqdm
 
 from nova_bf.config import BruteForceConfig, SearchSpec
 from nova_bf.io import ParquetFile, Store
-from nova_bf.results import RESERVED, partial_dir, provenance, result_name, warn_if_short
+from nova_bf.results import (
+    RESERVED,
+    TIEBREAK_KEY,
+    partial_dir,
+    provenance,
+    result_name,
+    warn_if_short,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +112,67 @@ def _fetch_range(store: Store, task: tuple[str, str, int, int]) -> int:
     return length
 
 
+def _string_ranks(ids: np.ndarray) -> np.ndarray:
+    """Replace string IDs with dense integer ranks preserving their order.
+
+    The distinct IDs in this block are sorted lexicographically and each ID is
+    replaced by its position in that ordering. Comparing the resulting ranks is
+    therefore exactly equivalent to comparing the full IDs, without truncation
+    or hashing.
+
+    IDs are converted to fixed-width byte strings when possible so `np.unique`
+    can rank them with a compact native representation. Non-ASCII IDs fall back
+    to fixed-width Unicode. The returned ranks are reshaped to match `ids`.
+    """
+    
+    # Fixed-width first either way: `np.unique` over an OBJECT array compares
+    # through Python, orders of magnitude slower than a fixed-width sort over
+    # the same values.
+    #
+    # `astype("S")` is ASCII-only and raises on anything else, so non-ASCII ids
+    # fall back to the wide form. The two orders agree wherever both apply:
+    # bytewise order over UTF-8 IS code-point order, which is also the order
+    # `compute` ranked on (pyarrow sorts strings bytewise) — so the fallback
+    # changes what this costs, never what it decides.
+    try:
+        keys = ids.astype("S")
+    except UnicodeEncodeError:
+        keys = ids.astype("U")
+    _, inv = np.unique(keys, return_inverse=True)
+    return inv.reshape(ids.shape)
+
+
+def _ambiguous_rows(scores: np.ndarray, top_s: np.ndarray) -> np.ndarray:
+    """Return rows whose score-only top-k result does not uniquely determine the hits.
+
+    A row is ambiguous if either:
+      * two selected hits have the same score, so their relative order requires
+        a tiebreak; or
+      * the cutoff score is shared by both selected and unselected candidates,
+        so the top-k membership requires a tiebreak.
+
+    `-inf` entries are padding for missing candidates and are ignored.
+    """
+    # `> -inf`, not `isfinite`: `-inf` is the padding, but `+inf` is a real hit
+    # that survives the write path below, so a tie between two of them still
+    # has to be resolved rather than declared unambiguous.
+    real = top_s > -np.inf
+    amb = ((top_s[:, 1:] == top_s[:, :-1]) & real[:, :-1]).any(axis=1)
+
+    tau = top_s[:, -1]
+    fin_tau = tau > -np.inf
+    if fin_tau.any():
+        n_all = (scores == tau[:, None]).sum(axis=1)
+        n_kept = (top_s == tau[:, None]).sum(axis=1)
+        amb |= fin_tau & (n_all > n_kept)
+    return amb
+
+
 def _topk_merge(
-    score_lists: list[pa.ListArray], id_lists: list[pa.ListArray], k: int
+    score_lists: list[pa.ListArray],
+    id_lists: list[pa.ListArray],
+    tie_lists: list[pa.ListArray] | None,
+    k: int,
 ) -> tuple[pa.ListArray, pa.ListArray]:
     """Fold W row-aligned (hit_scores, hit_ids) list columns into one global top-K.
 
@@ -114,6 +180,9 @@ def _topk_merge(
     them into a dense (B, W·k) score/id grid (padding empties with -inf/""), take
     the top-k per row, and re-pack as variable-length lists (dropping the -inf pad,
     so a query with fewer than k total candidates keeps only its real hits).
+
+    Ties are resolved by the SAME rule each worker applied within itself, so the
+    result does not depend on how many workers produced it. 
     """
     n_partials = len(score_lists)
     b = len(score_lists[0])
@@ -121,12 +190,24 @@ def _topk_merge(
     scores = np.full((b, width), -np.inf, dtype=np.float32)
     ids = np.empty((b, width), dtype=object)
     ids[:] = ""
+    # Only built when a numeric ordinate travelled with the partials. Skipped
+    # otherwise, since it is the same size as the score grid.
+    want_tie = tie_lists is not None
+    ties = np.full((b, width), np.iinfo(np.int64).max, dtype=np.int64) if want_tie else None
 
     for w, (sl, il) in enumerate(zip(score_lists, id_lists)):
         lengths = sl.value_lengths().to_numpy(zero_copy_only=False).astype(np.int64)
         total = int(lengths.sum())
         if total == 0:
             continue
+        # Guard against out-of-index access
+        # rather than an expected path.
+        if lengths.max() > k:
+            raise RuntimeError(
+                f"partial {w} has a query with {int(lengths.max())} hits but k={k}; "
+                "a partial must never hold more than k candidates per query. "
+                "Re-run `bf compute` for this search."
+            )
         flat_s = sl.flatten().to_numpy(zero_copy_only=False)
         flat_i = il.flatten().to_numpy(zero_copy_only=False)
         row_idx = np.repeat(np.arange(b), lengths)
@@ -136,6 +217,17 @@ def _topk_merge(
         col = w * k + within
         scores[row_idx, col] = flat_s
         ids[row_idx, col] = flat_i
+        if want_tie:
+            tl = tie_lists[w]
+            tie_lengths = tl.value_lengths().to_numpy(zero_copy_only=False)
+            if not np.array_equal(tie_lengths.astype(np.int64), lengths):
+                raise RuntimeError(
+                    f"partial {w}'s hit_tie rows are split differently from its "
+                    "hit_scores rows; the columns must line up row for row or ties "
+                    "would be broken against the wrong hits. Re-run `bf compute` "
+                    "for this search."
+                )
+            ties[row_idx, col] = tl.flatten().to_numpy(zero_copy_only=False)
 
     kk = min(k, width)
     if kk < width:
@@ -146,11 +238,27 @@ def _topk_merge(
     order = np.argsort(-np.take_along_axis(scores, part, axis=1), axis=1)
     top_idx = np.take_along_axis(part, order, axis=1)
     top_s = np.take_along_axis(scores, top_idx, axis=1)
+
+    # The score-only cut above is unstable, so redo exactly the rows where a
+    # real tie means it decided something arbitrarily.
+    amb = _ambiguous_rows(scores, top_s)
+    if amb.any():
+        rows = np.flatnonzero(amb)
+        tie = ties[rows] if want_tie else _string_ranks(ids[rows])
+        # Last key is primary: score descending, then tiebreak ascending. The
+        # -inf padding negates to +inf and so always sorts past every real hit.
+        exact = np.lexsort((tie, -scores[rows]), axis=1)[:, :kk]
+        top_idx[rows] = exact
+        top_s[rows] = np.take_along_axis(scores[rows], exact, axis=1)
+
     top_id = np.take_along_axis(ids, top_idx, axis=1)
 
     # -inf marks padding (a query with < k total candidates). Sorted descending, so
     # the real hits are a prefix of each row → boolean-mask flatten stays row-grouped.
-    valid = np.isfinite(top_s)
+    # The test is `> -inf`, not `isfinite`: a `+inf` score is a REAL hit that a
+    # single-node run emits, and dropping it here would make a sharded result
+    # differ from an unsharded one on the same corpus.
+    valid = top_s > -np.inf
     counts = valid.sum(axis=1).astype(np.int32)
     offsets = np.empty(b + 1, dtype=np.int32)
     offsets[0] = 0
@@ -290,6 +398,33 @@ def _reduce(
         if f"nova_bf.{key}".encode() in carried
     }
 
+    # Which tie-break rule produced these partials, and does it match the config
+    # merge was handed? Editing `params.tiebreak` between compute and merge would
+    # otherwise reduce ties by a rule the partials were never built for.
+    for f, r in zip(partials, readers):
+        stamped = (r.schema_arrow.metadata or {}).get(TIEBREAK_KEY)
+        stamped = stamped.decode() if stamped is not None else None
+        if stamped is not None and stamped != cfg.params.tiebreak:
+            raise RuntimeError(
+                f"partial {f.read_path} was computed with params.tiebreak="
+                f"{stamped!r}, but this merge was given {cfg.params.tiebreak!r}. "
+                "Ties would be reduced by a rule the partials were not built for. "
+                "Re-run `bf compute`, or merge with the config that produced them."
+            )
+
+    # `hit_tie` rides along only when `merge` cannot apply the rule from
+    # `hit_ids` alone — see `results.build_result_table`. Every partial must
+    # agree: half of them carrying it would mean two different rules.
+    has_tie = ["hit_tie" in r.schema_arrow.names for r in readers]
+    if any(has_tie) and not all(has_tie):
+        missing = [f.read_path for f, h in zip(partials, has_tie) if not h]
+        raise RuntimeError(
+            "some partials carry a hit_tie ordinate and others do not "
+            f"(missing from {missing[:3]}); they cannot have come from one run. "
+            "Re-run `bf compute` for this search."
+        )
+    want_tie = all(has_tie)
+
     payload_cols = [c for c in readers[0].schema_arrow.names if c not in RESERVED]
     batch_rows = _resolve_batch_rows(cfg.params.merge_batch_size, n_rows, len(partials), k)
     logger.info(
@@ -300,7 +435,7 @@ def _reduce(
     # Read query_id + payload only from partial 0; every partial contributes its
     # hit lists (and query_id, for a cheap per-batch alignment check).
     base_iter = readers[0].iter_batches(batch_size=batch_rows)
-    hit_cols = ["query_id", "hit_ids", "hit_scores"]
+    hit_cols = ["query_id", "hit_ids", "hit_scores"] + (["hit_tie"] if want_tie else [])
     rest_iters = [r.iter_batches(batch_size=batch_rows, columns=hit_cols) for r in readers[1:]]
 
     path = f"{out.root.rstrip('/')}/{result_name(cfg, spec)}"
@@ -329,7 +464,11 @@ def _reduce(
                         )
                 score_lists = [base.column("hit_scores")] + [o.column("hit_scores") for o in rest]
                 id_lists = [base.column("hit_ids")] + [o.column("hit_ids") for o in rest]
-                ids_arr, scores_arr = _topk_merge(score_lists, id_lists, k)
+                tie_lists = (
+                    [base.column("hit_tie")] + [o.column("hit_tie") for o in rest]
+                    if want_tie else None
+                )
+                ids_arr, scores_arr = _topk_merge(score_lists, id_lists, tie_lists, k)
 
                 lengths = ids_arr.value_lengths().to_numpy(zero_copy_only=False)
                 short_count += int((lengths < k).sum())

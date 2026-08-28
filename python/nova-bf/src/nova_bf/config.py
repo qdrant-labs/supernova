@@ -117,6 +117,23 @@ class QueriesConfig(BaseModel):
     # epoch µs so each query's bound compares against the (also-µs) corpus date.
     date_fields: list[str] | dict[str, str] = []
 
+    @model_validator(mode="after")
+    def _payload_fields_are_not_reserved(self) -> "QueriesConfig":
+        """A carried column cannot be named like an output column.
+        """
+        # Imported here, not at module scope: `results` imports this module.
+        from nova_bf.results import RESERVED
+
+        clash = [c for c in self.payload_fields if c in RESERVED]
+        if clash:
+            raise ValueError(
+                f"queries.payload_fields may not use the reserved output column "
+                f"name(s) {clash}; nova-bf writes {list(RESERVED)} itself, so "
+                "these would be silently overwritten. Rename the column(s) in the "
+                "queries file, or drop them from payload_fields."
+            )
+        return self
+
 
 class OutputConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -255,6 +272,11 @@ class ParamsConfig(BaseModel):
     # effect when the partials are already local. Default off (a laptop
     # controller may lack the disk).
     merge_prefetch: bool = False
+
+    # Which of two EXACTLY-tied candidates wins.
+    # Neither makes SCORES reproducible across batch sizes — re-tiling a matmul
+    # changes its reduction order, which can change whether a tie exists at all.
+    tiebreak: Literal["ordinal", "id"] = "ordinal"
 
 
 # A single scalar payload value, as it would appear in a corpus column.
@@ -628,6 +650,19 @@ class BruteForceConfig(BaseModel):
         names = [s.name for s in self.searches]
         if len(set(names)) != len(names):
             raise ValueError(f"`searches` names must be unique, got {names}")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tiebreak(self) -> "BruteForceConfig":
+        """`tiebreak: id` orders ties by the point id, so there has to be one.
+        """
+        if self.params.tiebreak == "id" and not self.corpus.id_column:
+            raise ValueError(
+                "params.tiebreak='id' orders ties by the point id, so it needs "
+                "`corpus.id_column`. Without one the ids are derived from a hash "
+                "of (file, row), whose order says nothing the default "
+                "params.tiebreak='ordinal' does not already say — use that."
+            )
         return self
 
     @model_validator(mode="after")

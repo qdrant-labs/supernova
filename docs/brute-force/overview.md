@@ -282,6 +282,32 @@ Do not confuse this with a negative `dot` or `cosine` score, which is **not** a 
 
 Whichever you pick, the corpus loaded into the vector store must use the **same** id scheme, or the id sets won't line up and recall reads ~0.
 
+## Ties
+
+Two documents can score **exactly** equal, and more often than you'd guess: duplicate documents embed to bit-identical vectors, sparse and filtered searches collide constantly, and at production `k` over thousands of candidates float32 stops separating scores deep in the tail. Something has to decide which one makes the cut, and left alone `torch.topk` (and numpy's `argpartition`/`argsort`, all unstable) decided by whatever the selector happened to visit first — so the answer moved with `dense_batch_size` and `--num-jobs`.
+
+`params.tiebreak` fixes the rule:
+
+| Value | Rule | Cost |
+|---|---|---|
+| `ordinal` *(default)* | Earlier in the corpus wins. | Free. No id column needed. |
+| `id` | Lower `corpus.id_column` wins; among equal ids, earlier in the corpus. | One sort of this worker's id column at startup. Requires `corpus.id_column`. |
+
+`id` is closer to a property of the data than of how it happens to be laid out on disk, so it survives re-sharding the corpus into different files; `ordinal` does not. Neither costs anything at scoring time.
+
+Ordering follows the column's **type**: a numeric id column compares numerically (9 before 10), a string column bytewise. There is no length or entropy limit — what is keyed is the id's *position* in sorted order, not its bytes, so 128-bit UUIDs, long shared prefixes like `<urn:uuid:…>`, zero-padded ids and the full `uint64` range all separate exactly. A null id is rejected under `id` (it has no ordering position, and every null row would report the same `"None"` hit id).
+
+### What this guarantees, and what it does not
+
+Given two candidates whose scores are equal **bit for bit**, which one survives and in what order they appear is invariant to `--num-jobs`, every batch size, `io_workers`, thread counts, device, and file arrival order.
+
+It does **not** make the scores themselves reproducible. A matmul's reduction order is part of its answer, so re-tiling can move a score by one ULP and change whether two documents tie *at all* — measured on a real corpus, `dense_batch_size: 64` and `512` disagreed in the last bit of a score, and `dot` is not immune. `--num-jobs` preserves batch shapes and so is safe; batch size is not. **Pin `dense_batch_size` (and leave `allow_tf32` off) if you need a bit-reproducible artifact across runs.**
+
+Two further limits worth knowing:
+
+- **4.29B rows per worker.** The rule rides in a 32-bit field, so one worker may hold at most that many rows — not a limit on the corpus, and not on how many distinct ids exist. Exceeding it is a hard error pointing at `--num-jobs`; at 10B rows over 64 workers there is 27× headroom.
+- **This makes the artifact reproducible, not the engines identical.** Qdrant's `ScoredPoint` compares score only and has no tie-break of its own, so nova-bf and Qdrant may still keep different points at a tie boundary. That is what nova-storm's tie-tolerant recall absorbs.
+
 ## Performance & tuning
 
 The work splits into three layers: **reading** corpus parquet from S3, **decoding** it (parquet → Arrow → numpy, on CPU), and **scoring** on the GPU. For typical query counts the GPU is light; the read + decode path dominates, so tune those first.
