@@ -200,18 +200,36 @@ def pack_topk(scores, ordinal, k):
     Chunked over query rows so the transient packed key never exceeds
     `PACK_TARGET_SLOTS` elements — the per-row top-K is independent, so
     chunking is exact, not an approximation.
+
+    On CUDA this hands off to `nova_bf.topk_triton`, which applies the same rule
+    INSIDE the select instead of encoding it into a doubled-width key. 
+
+    The body below stays the portable path, and runs whenever the kernel does
+    not apply: no triton, non-CUDA or non-float32 tensors, a slice wider than
+    the kernel's register budget, or an ordinal that is not the 1-D per-slice
+    vector. Both paths select the SAME SET of winners; only the cost differs.
     """
     import torch
+
+    from nova_bf import topk_triton
+
+    if topk_triton.available(scores, ordinal, k):
+        # Use the optimized Triton path when available; fall back permanently if
+        # compilation or launch fails.
+        try:
+            return topk_triton.topk(scores, ordinal, k)
+        except Exception as exc:
+            topk_triton.disable(exc)
 
     n_rows, n_cols = scores.shape
     chunk = max(1, min(n_rows, PACK_TARGET_SLOTS // max(1, n_cols)))
     if chunk >= n_rows:
-        return torch.topk(pack(scores, ordinal), k=k, dim=1)
+        return torch.topk(pack(scores, ordinal), k=k, dim=1, sorted=False)
 
     key_parts, idx_parts = [], []
     for r0 in range(0, n_rows, chunk):
         block = pack(scores[r0 : r0 + chunk], ordinal)
-        kp, ip = torch.topk(block, k=k, dim=1)
+        kp, ip = torch.topk(block, k=k, dim=1, sorted=False)
         del block
         key_parts.append(kp)
         idx_parts.append(ip)

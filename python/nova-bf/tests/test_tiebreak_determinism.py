@@ -292,3 +292,72 @@ def test_against_an_independent_oracle(tmp_path, seed):
         for n_jobs in (None, 2, 3):
             got = _run(cdir, tmp_path, f"o{seed}{tiebreak}{n_jobs}", k, tiebreak, n_jobs)
             assert got == want, f"{tiebreak} n_jobs={n_jobs}"
+
+
+# --------------------------------------------------------------------------
+# ordering of the emitted hits
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_jobs", [None, 3])
+def test_hits_come_out_in_tie_break_order(tmp_path, n_jobs):
+    """Every `topk` on the way in runs `sorted=False`, so the ONLY thing that
+    orders the output is the decode-time sort. If that ever regressed, hit_ids
+    would come out in whatever order the last fold happened to leave — which no
+    test of set membership would catch."""
+    cdir = _corpus(tmp_path, ANTI)
+    got = _run(cdir, tmp_path, f"ord{n_jobs}", 6, "id", n_jobs)
+    # every row scores identically here, so the tie-break alone fixes the order
+    assert got == sorted(ANTI_FLAT), got
+
+
+def test_scores_are_emitted_descending(tmp_path):
+    """Distinct scores: the decode sort must put them in descending order."""
+    cdir = tmp_path / "c"
+    cdir.mkdir()
+    ids = [f"s{i}" for i in range(6)]
+    pq.write_table(
+        pa.table({
+            "dense_embedding": pa.array(
+                [[float(i), 0.0, 0.0, 0.0] for i in range(6)], pa.list_(pa.float32())
+            ),
+            "sid": pa.array(ids),
+        }),
+        str(cdir / "f0.parquet"),
+    )
+    pq.write_table(
+        pa.table({
+            "dense_embedding": pa.array([[1.0, 0.0, 0.0, 0.0]], pa.list_(pa.float32())),
+            "qid": pa.array(["q0"]),
+        }),
+        str(tmp_path / "q.parquet"),
+    )
+    out = tmp_path / "desc"
+    out.mkdir()
+    cfg = _cfg(cdir, tmp_path, out, 6, "ordinal")
+    t = pq.read_table(run_compute(cfg)["t"]).to_pydict()
+    scores = t["hit_scores"][0]
+    assert scores == sorted(scores, reverse=True), scores
+    assert t["hit_ids"][0] == ["s5", "s4", "s3", "s2", "s1", "s0"]
+
+
+def test_the_decode_sort_is_exact_however_it_is_chunked(tmp_path, monkeypatch):
+    """The decode sort is chunked over query rows to bound its transient (it is
+    ~3x the top-K state live at once, and it scales with QUERY count — 100k
+    queries at k=1000 would be ~3 GiB unchunked). Per-row sorts are independent,
+    so chunking must be exact, not an approximation. Forced to one row per chunk
+    here so every boundary is crossed."""
+    import nova_bf.compute as cp
+
+    cdir = _corpus(tmp_path, ANTI)
+    pq.write_table(
+        pa.table({
+            "dense_embedding": pa.array([VEC] * 5, pa.list_(pa.float32())),
+            "qid": pa.array([f"q{i}" for i in range(5)]),
+        }),
+        str(tmp_path / "q.parquet"),
+    )
+    whole = _run(cdir, tmp_path, "whole", 4, "id")
+    monkeypatch.setattr(cp, "DECODE_CHUNK_SLOTS", 4)   # -> 1 row per chunk at k=4
+    chunked = _run(cdir, tmp_path, "chunked", 4, "id")
+    assert whole == chunked, "chunking changed the decoded output"

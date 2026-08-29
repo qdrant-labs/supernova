@@ -115,17 +115,32 @@ def test_every_real_candidate_outranks_the_sentinel():
 
 def test_pack_topk_matches_an_unchunked_pack(monkeypatch):
     """The chunking exists only to bound transient memory; per-row top-K is
-    independent, so it must be exact, not an approximation."""
+    independent, so it must be exact, not an approximation.
+
+    Compared as SETS per row, not sequences: `pack_topk` selects with
+    `sorted=False` (its caller re-selects the result, so ordering it would be
+    work nobody reads), and each chunk is its own `topk` call, so the order
+    within a row is not meaningful. What chunking must preserve is exactly
+    WHICH k candidates come back.
+    """
     import nova_bf.tiebreak as tb
 
     rng = np.random.default_rng(3)
     s = torch.from_numpy(rng.random((40, 60), dtype=np.float32))
     o = torch.from_numpy(rng.integers(0, 1000, 60).astype(np.int64))
-    whole = torch.topk(pack(s, o), k=7, dim=1)
+    whole_k, whole_i = torch.topk(pack(s, o), k=7, dim=1, sorted=False)
     monkeypatch.setattr(tb, "PACK_TARGET_SLOTS", 64)     # force many chunks
-    chunked = pack_topk(s, o, 7)
-    assert torch.equal(whole.values, chunked[0])
-    assert torch.equal(whole.indices, chunked[1])
+    chunk_k, chunk_i = pack_topk(s, o, 7)
+
+    assert torch.equal(
+        torch.sort(whole_k, dim=1).values, torch.sort(chunk_k, dim=1).values
+    )
+    assert torch.equal(
+        torch.sort(whole_i, dim=1).values, torch.sort(chunk_i, dim=1).values
+    )
+    # the returned key must still be the key OF the returned index — an
+    # order-insensitive comparison alone would not catch a mismatched pairing
+    assert torch.equal(chunk_k, pack(s, o).gather(1, chunk_i))
 
 
 # --------------------------------------------------------------------------
@@ -349,3 +364,45 @@ def test_the_negative_zero_fold_is_exact_over_the_bit_space():
     # the two zeros collapse, nothing else does
     z = torch.tensor([0.0, -0.0], dtype=torch.float32)
     assert score_order_key(z)[0].item() == score_order_key(z)[1].item()
+
+
+# --------------------------------------------------------------------------
+# the CUDA kernel path
+# --------------------------------------------------------------------------
+
+
+def test_the_kernel_declines_everything_it_cannot_serve():
+    """`available()` is the only thing standing between the kernel and inputs
+    it would answer WRONGLY (a per-cell ordinal) or slowly (a slice wider than
+    its register budget). Every false here sends the call to the portable path,
+    so a gate that wrongly returns True is a silent correctness bug, not a
+    performance one."""
+    import nova_bf.topk_triton as tk
+
+    s = torch.randn(4, 64)
+    o = torch.arange(64, dtype=torch.int64)
+    assert not tk.available(s, o, 8), "CPU tensors must never take the kernel"
+    assert not tk.available(s.double(), o, 8), "non-float32 must decline"
+    assert not tk.available(s, o.unsqueeze(0).expand(4, 64), 8), (
+        "a 2-D (per-cell) ordinal must decline — the kernel indexes it by COLUMN, "
+        "so it would silently break `_merge_topk`'s state"
+    )
+    assert not tk.available(s, torch.arange(63, dtype=torch.int64), 8), "length mismatch"
+    assert not tk.available(s[:, ::2], o[::2], 8), "non-contiguous must decline"
+    wide = torch.empty((1, tk.MAX_BLOCK + 1))
+    assert not tk.available(wide, torch.arange(tk.MAX_BLOCK + 1), 8), "over-wide must decline"
+
+
+def test_pack_topk_falls_back_when_the_kernel_declines(monkeypatch):
+    """The portable path must still be reachable and exact — it is what runs on
+    CPU, on a build without triton, and for every input `available()` refuses."""
+    import nova_bf.topk_triton as tk
+
+    monkeypatch.setattr(tk, "available", lambda *a: False)
+    rng = np.random.default_rng(11)
+    s = torch.from_numpy(rng.random((32, 128), dtype=np.float32))
+    o = torch.from_numpy(rng.integers(0, 10_000, 128).astype(np.int64))
+    key, idx = pack_topk(s, o, 9)
+    ref = torch.topk(pack(s, o), 9, dim=1, sorted=False)
+    assert torch.equal(torch.sort(idx, dim=1).values, torch.sort(ref.indices, dim=1).values)
+    assert torch.equal(key, pack(s, o).gather(1, idx)), "key must pair with its index"

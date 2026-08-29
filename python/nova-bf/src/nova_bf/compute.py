@@ -1,124 +1,35 @@
-"""The `compute` phase: intra-worker map-reduce to a per-query top-K.
+"""The `compute` phase: score corpus slices and produce an exact per-query top-K.
 
-Each worker:
-  1. loads the query embeddings (Q) onto the GPU,
-  2. iterates its slice of corpus files (a prefetch thread overlaps IO with
-     compute), scoring Q against each file's vectors and folding the file's
-     top-K into a running per-query top-K held on the GPU,
-  3. decodes the running top-K into hit ids and writes one parquet.
+Each worker loads its queries onto the GPU, streams its assigned corpus files, and
+incrementally merges each file's results into a running top-K. I/O is prefetched
+in parallel with GPU computation, and large files can be processed in row batches
+to bound GPU memory. The final top-K is written as one Parquet file per worker.
 
-Running top-K stores `(score, encoded)` where `encoded = global_file_idx *
-MAX_ROWS_PER_FILE + row`. Keeping an int on the GPU (instead of id strings) makes
-the per-file merge a cheap `torch.topk`; ids are recomputed only for the final
-K via `make_point_id`, so the whole corpus's ids never materialize.
+The running state stores `(score, encoded_row)` rather than materializing corpus
+IDs on the GPU. `encoded_row` identifies the source file and row; final IDs are
+resolved only for the winning K entries. If `corpus.id_column` is provided, those
+IDs are read from the corpus instead.
 
-If `corpus.id_column` is set, hit ids come from that pre-existing column instead
-of `make_point_id`. Such an id isn't recomputable from (file, row), so it's read
-alongside the dense column and kept in RAM per file (the worker's slice) to resolve
-the final top-K. Large files can be scored in row-batches (`params.dense_batch_size`/
-`sparse_batch_size`) to bound the per-file score matrix `(n_queries × rows)` on the GPU.
+One invocation may evaluate multiple independent `SearchSpec`s, including dense,
+sparse, multi-vector, filtered, and unfiltered searches. Searches remain
+independent ranked lists, but redundant work is shared: each required vector type
+is decoded and transferred once per batch, and searches using the same vector
+type reuse the same GPU-resident data and score computations.
 
-If a search's `filter` is set (see `nova_bf.filters`), each file's payload columns
-are read alongside the vector column and evaluated into a keep-mask *before*
-scoring, so filtered-out rows never reach the GPU. The mask compacts `arr` but
-never renumbers rows — `orig_rows` tracks each surviving row's true file-row
-number, since both `make_point_id` and the `id_column` lookup are keyed on it.
-Mask evaluation (and, since it happens in the same reader thread right
-afterward, the union-compaction fancy-index copy — see `run_compute`'s
-`reader()`) is timed separately from the read (`filter_secs`, reported
-alongside `read_secs`/`io_wait`/`gpu_secs`) so a slow filter is distinguishable
-from slow IO in the end-of-run timing log.
+For dense search, multiple metrics share one `Q @ C^T` product and derive dot,
+cosine, and Euclidean scores from it. Sparse dot and cosine similarly share their
+underlying sparse product.
 
-`run_compute` runs every `SearchSpec` in `cfg.searches` — one or more
-independent searches (own vector_type/metric/k/filter), e.g. dense-unfiltered
-AND sparse-filtered against the same corpus in one invocation. Each corpus
-file is read and decoded ONCE per vector_type any spec needs, not once per
-spec. This is purely a sharing of REDUNDANT work, never a fusion of scores:
-each search still gets its own independent ranked list, not a blended hybrid
-ranking.
+Filters are applied before or during scoring. Uniform filters compact the corpus
+to surviving rows before GPU transfer. When several filtered searches share a
+vector type, their surviving rows are unioned into one shared batch and each
+search masks that batch back to its own subset. If any search is unfiltered, the
+whole batch is scored once and filtered searches reuse those scores.
 
-Per vector_type, EVERY search sharing that vector_type shares ONE batch grid
-(see `run_compute`'s `has_baseline` and `_process_shared_batch`): the GPU
-transfer/CSR build and each distinct metric's score matrix are computed ONCE
-per batch, and every search merges its own top-K from those same columns,
-masking them down to its own filter's surviving rows first if it has one.
-Masking a raw, per-row-independent score matrix is exact, not an
-approximation, so a filtered search's metric never needs to already be used
-by anyone else — computing one more metric on a batch that's already
-resident on the GPU is cheap, unlike a second transfer.
-
-Several metrics on one batch also share the underlying PRODUCT, not just the
-transfer. Every dense metric is derivable from the same Gram `Q @ Cᵀ` plus
-per-vector norms (dot is the Gram; cosine divides by ‖c‖ and ‖q‖; euclidean is
-`−sqrt(‖q‖² + ‖c‖² − 2·Gram)`), so a batch scored by 2+ distinct dense metrics
-runs ONE GEMM and derives the rest — see `DenseBatchSlice`. `SparseBatchSlice`
-does the same for its own `dot`/`cosine` pair via `_masked_raw`. Both cost one
-extra `(n_q, rows)` matrix at peak and both leave the single-metric path
-untouched.
-
-What rows make up that shared grid depends on whether any search of the
-vector_type is unfiltered:
-
-- If ANY search is unfiltered (or has an explicit-but-empty filter — see
-  `_is_unfiltered`), the shared grid is the WHOLE file, uncompacted: an
-  unfiltered search needs every row anyway, so every OTHER (filtered) search
-  of the vector_type rides along for free, masking down to its own rows
-  afterward.
-- Otherwise (every search of the vector_type has an active filter — none
-  unfiltered), the shared grid is the UNION of every DISTINCT active
-  filter's surviving rows (`_union_keep`), compacted/transferred/scored
-  ONCE, with each search then masking down further to its own filter's
-  subset of that union. A per-query filter (see `_is_per_query`) has no
-  SINGLE row-subset to offer here (different queries need different rows
-  from the same batch) — it instead contributes a cheap, safe OVER-
-  approximation ("does at least one query's own leaf admit this row" — Front
-  B, see `_row_union_from_gpu_leaves`), so it still benefits from (and
-  contributes to) compaction; its own FINE per-query masking still applies
-  afterward, via `masked_fill`, same as when it rode the whole-file grid.
-  This never does MORE row-scoring than treating each distinct filter
-  independently would — in the worst case (fully disjoint filters) it's
-  exactly the same total rows, just one transfer/launch instead of several —
-  and strictly less whenever two filters' surviving rows overlap. The
-  tradeoff: unlike treating each filter independently (which bounds each
-  one's own transfer to its own, typically smaller, surviving-row count),
-  the union's peak transfer size is bounded by `params.dense_batch_size`/
-  `sparse_batch_size` alone when left at their None default — several large,
-  mostly-disjoint filters (or one loose per-query over-approximation) can
-  produce a union nearly the size of the whole file. Set that batch size
-  explicitly if you have many such filters (see `ParamsConfig`).
-
-Either way, `_process_shared_batch` does the per-search masking: an
-unfiltered search uses the shared grid as-is; a UNIFORMLY filtered one
-narrows it to its own filter's surviving COLUMNS (a gather), with two
-searches sharing an identical filter memoizing that lookup once (keyed by
-the `Filter` object itself, frozen+hashable) rather than repeating it. A
-PER-QUERY filter (`match_from_query`/`range_from_query`/
-`match_text_from_query` — see `nova_bf.filters`) can't be expressed as a
-column gather, since different queries keep different rows from the SAME
-columns: instead every column stays, and individual `(query, row)` cells get
-invalidated to `-inf` via `masked_fill` before the per-query `torch.topk` —
-needing no changes to the id-encoding scheme, since no column is ever
-dropped. `nova_bf.filters.evaluate()`'s result is `(rows,)` for a uniform
-filter (unchanged cost/shape from before per-query filters existed) or
-`(n_queries, rows)` the instant any condition, in any of `must`/`should`/
-`must_not`, is per-query.
-
-A per-query filter's `(n_queries, rows)` `cell_mask` is built one of two
-ways, decided once per distinct filter (`_gpu_eligible`): if every leaf is a
-static condition, `match_from_query` (scalar or list/MatchAny), or
-`range_from_query`, it's evaluated GPU-natively (`_gpu_evaluate`) straight
-from small per-file corpus arrays (vocab codes or raw numeric values,
-transferred to the GPU ONCE per file, then sliced per batch — see
-`_corpus_leaf_array`/`_build_gpu_leaf_state`) and small per-query GPU state
-built ONCE at setup — no `(n_queries, rows)` array is ever materialized on
-the CPU or shipped over PCIe. A filter with a `match_text`/
-`match_text_from_query` leaf anywhere falls back to `nova_bf.filters.
-evaluate()`'s CPU/numpy path unchanged (torch has no string tensor type) —
-its `(n_queries, rows)` result is the one CPU-fallback mask still held for a
-whole file's batch loop, so it's bit-packed along the query axis
-(`np.packbits`, 8 queries/byte) right after `evaluate()` returns, cutting
-that footprint 8x; each batch slice unpacks only its own row-slice
-(`np.unpackbits`) back to one bool per query, right before use.
+Per-query filters cannot be represented by one shared row subset, so they retain
+the necessary candidate columns and mask individual `(query, row)` scores to
+`-inf` before top-K selection. Numeric and categorical per-query filters are
+evaluated GPU-natively when possible; text predicates fall back to the CPU path.
 """
 
 from __future__ import annotations
@@ -165,8 +76,10 @@ from nova_bf.tiebreak import (
 logger = logging.getLogger(__name__)
 
 PREFETCH_QUEUE_SIZE = 4
-# Per-file id encoding: global_file_idx * MAX_ROWS_PER_FILE + row. Collision-free
-# and reversible as long as no single file has more rows than this.
+# Limit how many top-K entries are decoded/sorted at once to bound peak GPU
+# memory during final result decoding (~384 MiB of temporary storage).
+DECODE_CHUNK_SLOTS = 1 << 24
+# Maximum rows per corpus file; used to keep encoded row IDs collision-free.
 MAX_ROWS_PER_FILE = 100_000_000
 
 # Fraction of FREE CUDA memory a multivector batch's whole token matrix may
@@ -1347,7 +1260,7 @@ def _merge_topk(top_key, top_enc, parts: list[tuple], k: int):
         ],
         dim=1,
     )
-    new_top_key, idx = torch.topk(merged_k, k=k, dim=1)
+    new_top_key, idx = torch.topk(merged_k, k=k, dim=1, sorted=False)
     del merged_k
     return new_top_key, merged_e.gather(1, idx)
 
@@ -3547,10 +3460,25 @@ def run_compute(
     want_tie_column = needs_ordinate and num_jobs is not None
 
     for i, s in enumerate(specs):
-        enc = spec_top_enc[i].cpu().numpy()
-        # The state holds packed keys; the score is recovered from the key's
-        # high half, bit-for-bit (`score_order_key` is a bijection).
-        sc = unpack_score(spec_top_key[i]).cpu().numpy()
+       # Sort the final top-K by packed key so ties follow deterministic tie-break
+        # order. Process query rows in chunks to bound peak GPU memory during sorting.
+        h_i = spec_top_key[i].shape[0]
+        chunk = max(1, min(h_i, DECODE_CHUNK_SLOTS // max(1, s.k)))
+        enc_parts, sc_parts = [], []
+        for r0 in range(0, h_i, chunk):
+            kb, order = torch.sort(
+                spec_top_key[i][r0 : r0 + chunk], dim=1, descending=True
+            )
+            enc_parts.append(spec_top_enc[i][r0 : r0 + chunk].gather(1, order).cpu().numpy())
+            del order
+            # Recover scores from the packed keys.
+            sc_parts.append(unpack_score(kb).cpu().numpy())
+            del kb
+        enc = enc_parts[0] if len(enc_parts) == 1 else np.concatenate(enc_parts)
+        sc = sc_parts[0] if len(sc_parts) == 1 else np.concatenate(sc_parts)
+        del enc_parts, sc_parts
+        # Release this search's GPU state before decoding results on the CPU.
+        spec_top_key[i] = spec_top_enc[i] = None
         valid = sc > float("-inf")
         # A spec with a `rows` subset wrote state for its OWN queries only, so
         # its output covers those rows — ids and payload are sliced to match.
