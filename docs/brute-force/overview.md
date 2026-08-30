@@ -128,22 +128,75 @@ Omit `rows` and the search covers every query, as before. The selector column is
   per-query token offsets that a row subset would have to rebuild. Configuring
   both is rejected at config load rather than silently ignored.
 - Order the unified query file rows based on the query_set value (i.e., keep the same values contiguous) to improve computational efficiency with row selection.
+#### What `rows` saves
 
-#### What `rows` actually saves
+Specs sharing a `vector_type` still build queries and scores over the **union** of their `rows`, so those allocations only shrink if the union itself is smaller. When the subsets together cover the full query file, the main savings are per-spec top-K state and merge work.
 
-Specs of one vector_type share a single query matrix, and therefore a single
-score matrix per metric, built over the **union** of their `rows`. So when the
-specs' subsets between them cover the whole file — the usual two-halves case,
-including `ms_marco_10000_combined.yaml` — the union is every row and the big
-allocations do not shrink at all: the query matrix, the `queries × rows` score
-matrix, and the per-query filter masks are all still full height. What shrinks
-is per-spec running top-K state (`sum(len(subset))` rows instead of
-`n_specs × n_q`) and each spec's own `topk`/merge work, which is worth real
-time at a large `k` — at `k: 1000` and 10,000 queries the top-K state goes
-240 MB → 120 MB and the merge work halves. The other reason to reach for `rows`
-is ergonomic: the foreign half of each per-query filter column no longer needs
-a match-nothing sentinel, and each search's output covers only its own queries
-instead of needing a downstream filter on `query_set`.
+For example, with `k=1000` and 10,000 queries, splitting queries between two specs cuts top-K state from 240 MB to 120 MB and roughly halves merge work.
+
+`rows` also simplifies per-query filters and output: each spec only needs filter values and results for its own queries.
+
+Per-query **filter masks** are the exception, and they shrink by a different
+rule — see below.
+
+#### Per-query filter masks shrink with the FILTER's rows, not the vector_type's
+
+A per-query filter whose leaves are all `match_from_query` / `range_from_query`
+/ static is evaluated GPU-natively, per corpus batch, and never materializes a
+CPU-side mask at all. One with a `match_text` / `match_text_from_query` leaf
+cannot be (torch has no string tensor type), so it falls back to
+`filters.evaluate`'s numpy path and materializes a real
+`(n_queries, file_rows)` boolean mask — bit-packed 8 queries/byte, but built
+once per corpus file and held for that file's whole batch loop, once per
+in-flight reader. It is the only allocation in a run that scales as
+`n_queries × file_rows`, which makes its query axis worth being precise about.
+
+That axis is the **union of the `rows` of the specs that use that filter** —
+not the queries file's height, and not the vector_type's row union either.
+Three consequences:
+
+- Unioning an unrelated query set into the file does not enlarge it. A
+  5,000-query text search costs the same whether it sits in its own 10,000-row
+  queries file or in a 110,000-row union file. (Measured: 65.6 MiB → 3.0 MiB of
+  packed mask for 5,000 owned queries out of 110,000 over a 5,000-row corpus
+  file — a 22× drop, exactly the row ratio.)
+- Two specs **sharing one filter** pool their rows, since they share one
+  `keeps` entry. Give them distinct filter values and each narrows on its own.
+- A spec with no `rows` pins that filter back to full file height, because it
+  really does look at every query.
+
+The one thing this does not narrow is a GPU-eligible filter, deliberately: its
+per-query state is shared across filters by `FilterCondition`, and its mask is
+per-batch (`n_queries × dense_batch_size`) rather than per-file, so it is
+roughly three orders of magnitude smaller to begin with.
+
+#### Sentinels are optional, but a GPU-eligible filter still wants one
+
+`rows` means a foreign row's per-query filter value is never read for that
+search, so the match-nothing sentinels the two-halves pattern needed
+(`zzznomatchzzz`, a token-less phrase) are not required for correctness.
+
+They still buy something for a **GPU-eligible** per-query filter. Such a filter
+contributes a row-union over-approximation to the shared corpus batch grid
+("does at least one query's own leaf admit this row" —
+`_row_union_from_gpu_leaves`), and that reduction runs over the full query
+axis. For `match_from_query` / `range_from_query` a **null** value reads as *no
+restriction*, so leaving foreign rows null makes the union admit every corpus
+row and quietly costs that search its corpus pruning — invisible in a run that
+also contains an unfiltered search (which scans everything anyway), then
+surprising when the filtered search is rerun alone. An explicit match-nothing
+value (`dump_set: [zzznomatchzzz]`) keeps the union tight and costs nothing.
+
+A **text** filter never had this problem, before or after the narrowing above,
+and it is worth being precise about why rather than crediting `rows` for it: a
+null or empty phrase is *token-less*, and a token-less phrase in a `must`
+matches nothing while a null slot in a `should` contributes nothing. Either
+way such a query's mask row is all-`False` and adds nothing to the OR. So for
+a text filter whose foreign rows carry sentinels or nulls — i.e. every
+configuration in this repo — narrowing the mask changes the corpus-row union
+by exactly zero. Its payoff is the allocation, not the union. Foreign rows
+holding *real* values in the filter's own columns are the only case where the
+union genuinely tightens.
 
 #### `rows` is not bit-exact against a full-file run
 
@@ -272,6 +325,18 @@ Recover a distance with `distance = -score`. This matters when comparing against
 Do not confuse this with a negative `dot` or `cosine` score, which is **not** a sign convention — it is the real similarity of two vectors pointing in opposing directions, written through unmodified (`cosine` spans `[-1, 1]`; `dot` is unbounded). The tell is the proportion: `euclidean` is negative for *every* hit by construction, while `dot`/`cosine` are negative only where the data says so. A positive value in a `euclidean` column means something is wrong.
 
 **Sanity check:** if a query also appears in the corpus, its top hit should be itself — with score ≈ 1.0 for cosine, or ≈ 0.0 for euclidean. Expect the euclidean self-hit to be a small negative number rather than exactly `-0.0`: it is computed as `‖q‖² + ‖c‖² − 2q·c`, whose cancellation resolves a true zero to roughly `sqrt(float32 eps) · ‖q‖` (~1e-2 at `‖q‖≈35`). That is inherent to the expansion — `torch.cdist` uses the same one at any real corpus size — and it bounds how finely euclidean *distances* can be trusted between near-duplicates, though not the ranking of ordinary neighbours.
+
+### One run's partials, and all of them
+
+A search's partial directory is addressed by `(queries stem, search name, k)` alone, so **any two runs agreeing on those three write into the same directory**, and rank files overwrite only the ranks the newer run has. A 32-way run landing on a 64-rank run's leftovers leaves 32 fresh partials beside 32 stale ones. Nothing about the rows says so — same schema, same query rows, same hit-id shape — and the merge is clean: the corpus gets double-counted where the two strides overlap and missed where neither covered, producing a top-K that looks entirely normal and is wrong.
+
+Every partial therefore carries a **run fingerprint** in its parquet metadata, and `merge` refuses to reduce a directory whose partials disagree on it. The fingerprint is content-derived rather than a per-invocation id: every rank computes the same value from the same inputs without coordinating, and re-running one failed rank later reproduces it exactly, so the documented recovery path still works. It covers the config (`nova_bf.config_fingerprint` — spec, metric, `k`, filter, `rows`, input paths and columns, `allow_tf32`), the corpus file list *in index order*, `num_jobs`, the tie-break rule, and whether `--max-files` truncated the slice — so a benchmarking partial can never merge with a real one.
+
+Sharded partials also stamp `nova_bf.num_jobs` and `nova_bf.job_rank`, and merge checks the ranks present are exactly `0..num_jobs-1`. This is what catches a **missing** rank: the older "every search has the same partial count" check cannot, because a rank that dies before writing anything leaves every search short by exactly one. A missing rank's slice is simply absent from the merged top-K, silently lowering every recall number computed against it.
+
+Merge also recomputes the config fingerprint from the config *it* was handed and compares — the generalization of the existing `tiebreak` guard to every other field that changes results. Only result-affecting fields are in it: `io_workers`, batch sizes and `output.path` are not, so two runs differing only in those still merge.
+
+Partials written before fingerprinting log a loud warning rather than failing — refusing them would strand hours of legitimate GPU work over a check that would have passed. A directory where only *some* partials carry the stamp is an error, since that mixture is itself the failure.
 
 ### Run manifest
 

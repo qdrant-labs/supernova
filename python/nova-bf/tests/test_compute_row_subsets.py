@@ -309,10 +309,12 @@ def test_unknown_selector_column_is_rejected(union_ds):
 def test_rows_subset_with_text_filter_equals_sentinel_pattern(tmp_path):
     """`match_text_from_query` is NOT gpu-eligible (torch has no string tensor
     type), so its per-query mask takes the packed `keeps` path and is unpacked
-    over the FULL query axis — a different height from this vector_type's
-    query matrix once a subset shrinks it. That makes this the branch the
-    `n_q_full` plumbing exists for, and the one `match_from_query` tests do
-    NOT reach (they go through `_gpu_evaluate` instead).
+    over that FILTER's query axis — a third height, distinct from both the
+    file's query count and this vector_type's query matrix. That makes this
+    the branch the `filter_n_q` plumbing exists for, and the one
+    `match_from_query` tests do NOT reach (they go through `_gpu_evaluate`
+    instead). See tests/test_compute_filter_mask_height.py for the height
+    itself; this test is about the RESULTS being unchanged either way.
 
     It is also the real filtered_text config: `field: text,
     match_text_from_query: keyword_phrase`.
@@ -333,10 +335,10 @@ def test_rows_subset_with_text_filter_equals_sentinel_pattern(tmp_path):
     )
 
     # rows 2-3 own the text search; rows 0-1 are foreign (sentinel = "").
-    # The owned rows are deliberately NOT a prefix: if the per-query mask were
-    # unpacked at this spec's subset height (2) instead of the full query axis
-    # (4), indexing it by FILE row 2/3 would run off the end. A prefix subset
-    # would silently paper over that.
+    # The owned rows are deliberately NOT a prefix: the mask is now unpacked at
+    # this filter's own height (2), so indexing it by FILE row 2/3 instead of
+    # by position within the filter's row union (0/1) runs off the end. A
+    # prefix subset would make the two coincide and silently paper over it.
     query_set = ["other", "other", "kw", "kw"]
     keyword = ["", "", "physics", "dna"]
     n_q = len(query_set)

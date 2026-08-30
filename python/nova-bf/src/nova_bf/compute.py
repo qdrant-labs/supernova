@@ -30,6 +30,12 @@ Per-query filters cannot be represented by one shared row subset, so they retain
 the necessary candidate columns and mask individual `(query, row)` scores to
 `-inf` before top-K selection. Numeric and categorical per-query filters are
 evaluated GPU-natively when possible; text predicates fall back to the CPU path.
+
+The CPU-fallback mask is the one `(n_queries, file_rows)` array a run
+materializes, held for a whole corpus file's batch loop. Its query axis is that
+FILTER's own row union (`run_compute`'s `filter_rows`), not the queries file's
+height, so it does not grow when unrelated query sets are unioned into one file
+behind a `SearchSpec.rows` selector.
 """
 
 from __future__ import annotations
@@ -1374,7 +1380,10 @@ def _pack_query_axis(mask: np.ndarray) -> np.ndarray:
     still held on the CPU for a whole file's batch loop, 8x. Rows aren't the
     packed axis, so slicing by `true_rows` (`keeps[f][:, true_rows]`) stays a
     plain column slice — no unpacking needed just to select rows. Inverse:
-    `_unpack_query_axis`."""
+    `_unpack_query_axis`.
+
+    `n_queries` here is that FILTER's query-row union, not the queries file's
+    (see `run_compute`'s `filter_rows`)."""
     return np.packbits(mask, axis=0)
 
 
@@ -1409,7 +1418,20 @@ def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | N
     heuristic, since a packed byte is 0 iff every query bit it holds is 0, so
     byte-truthiness IS "does any query this byte covers want this row"; OR-ing
     that across bytes is exactly "does any query want this row", simply read
-    off the packed array rather than approximated."""
+    off the packed array rather than approximated.
+
+    "any query" means any query the filter's own specs OWN, since that is what
+    its mask now spans (`run_compute`'s `filter_rows`). Never LOOSER than when
+    the mask covered the whole queries file, and still a superset of what the
+    per-query `cell_mask` keeps, which is all the union has to be.
+
+    Tighter only when the foreign rows held REAL values, though — don't sell
+    it as a win it usually isn't. A null or empty phrase is token-less, and a
+    token-less phrase in a `must` matches nothing while a null `should` slot
+    contributes nothing, so a sentinel-filled foreign row's mask was already
+    all-False and added nothing to this OR. Every filtered config in this repo
+    is that case, so for them the narrowing changes this union by zero; its
+    payoff is `keeps[f]`'s allocation, not the shared grid."""
     parts = [m.any(axis=0) if m.ndim == 2 else m for m in (keeps[f] for f in filters)]
     return np.logical_or.reduce(parts)
 
@@ -1517,12 +1539,13 @@ def _process_batch_group(
     `_row_selector`). They index the SAME rows in two different spaces
     and are NOT interchangeable: `spec_qsel[m]` addresses the score matrix,
     whose query axis spans this vector_type's row UNION, while `spec_qrows[m]`
-    addresses a per-query filter mask, whose query axis is the whole FILE (see
-    `_pack_query_axis`). Both are required arguments — a member that owns
-    every query passes `None` explicitly — because the two spaces coincide
-    often enough (whenever the union is the whole file) that a defaulted or
-    swapped selector reads plausible rows on most fixtures and the wrong ones
-    on the rest, with no error either way.
+    addresses a per-query filter mask, whose query axis spans that FILTER's
+    row union (`run_compute`'s `filter_rows`; the whole file for a filter that
+    kept full height — see `_pack_query_axis`). Both are required arguments —
+    a member that owns every query passes `None` explicitly — because the two
+    spaces coincide often enough (whenever both unions are the whole file)
+    that a defaulted or swapped selector reads plausible rows on most fixtures
+    and the wrong ones on the rest, with no error either way.
 
     Returns elapsed wall-clock seconds spent in this loop (folded into the
     caller's `gpu_secs`). A caller that pre-compacts `batch` must do so
@@ -2123,7 +2146,7 @@ def _process_shared_batch(
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
     query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
-    spec_qsel: list, spec_qrows: list, n_q_full: int,
+    spec_qsel: list, spec_qrows: list, filter_n_q: dict[Filter | None, int],
     encoded_row_ids: np.ndarray | None = None,
     ordinal_base: int = 0,
     ordinal_row_ids: np.ndarray | None = None,
@@ -2186,16 +2209,9 @@ def _process_shared_batch(
                     # slice's bytes ever get expanded back to
                     # one-bool-per-query, not the whole file's.
                     packed_np = keeps[s.filter][:, true_rows]
-                    # Height is the FULL query axis (`n_q_full`): `keeps` is
-                    # packed over every query in the file (see
-                    # `_pack_query_axis`), which is NOT `spec_Q[m].shape[0]`
-                    # once a `rows` subset makes this vector_type's matrix
-                    # shorter than the file. Deliberately a REQUIRED argument
-                    # with no `spec_Q`-derived fallback: that fallback WAS the
-                    # bug, and leaving it reachable lets a new call site
-                    # reintroduce it silently (a mask read at the wrong height
-                    # masks the wrong queries, it does not raise).
-                    cell_np = _unpack_query_axis(packed_np, n_q_full)
+                    # Height is THIS FILTER's query axis (`filter_n_q[s.filter]`
+                    # — the union of its own specs' `rows` selectors)
+                    cell_np = _unpack_query_axis(packed_np, filter_n_q[s.filter])
                     cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
                 if filter_share_count[s.filter] > 1:
                     cache[s.filter] = cell_mask
@@ -2276,19 +2292,37 @@ def _resolve_spec_rows(
             )
         spec_rows.append(idx)
 
-    vt_rows: dict[str, np.ndarray | None] = {}
-    for s, rows in zip(specs, spec_rows):
-        vt = s.vector_type
-        if vt not in vt_rows:
-            vt_rows[vt] = rows
-        elif vt_rows[vt] is None or rows is None:
-            vt_rows[vt] = None
+    return spec_rows, _union_rows_by_key([s.vector_type for s in specs], spec_rows, n_q)
+
+
+def _union_rows_by_key(keys: list, spec_rows: list, n_q: int) -> dict:
+    """`key -> union of the `spec_rows` of every spec carrying that key`, or
+    `None` when any of them takes every row (and likewise when the union turns
+    out to cover the whole file, so the caller can skip indexing entirely).
+
+    Two callers, same shape of question — "how tall does the thing these specs
+    SHARE have to be?":
+
+      * keyed by `vector_type`  -> the shared query/score matrix's height
+        (see `_resolve_spec_rows`)
+      * keyed by `SearchSpec.filter` -> the shared per-query filter mask's
+        height (see `run_compute`'s `filter_rows`)
+
+    `keys` must be hashable; `Filter` is frozen for exactly this reason, and
+    `None` (the unfiltered entry) is a legitimate key.
+    """
+    out: dict = {}
+    for key, rows in zip(keys, spec_rows):
+        if key not in out:
+            out[key] = rows
+        elif out[key] is None or rows is None:
+            out[key] = None
         else:
-            vt_rows[vt] = np.union1d(vt_rows[vt], rows)
-    for vt, rows in vt_rows.items():
+            out[key] = np.union1d(out[key], rows)
+    for key, rows in out.items():
         if rows is not None and len(rows) == n_q:
-            vt_rows[vt] = None  # covers everything; skip the indexing entirely
-    return spec_rows, vt_rows
+            out[key] = None  # covers everything; skip the indexing entirely
+    return out
 
 
 def _local_positions(
@@ -2704,7 +2738,8 @@ def run_compute(
         _row_selector(_local_positions(spec_rows[m], vt_rows.get(specs[m].vector_type)), device)
         for m in range(len(specs))
     ]
-    spec_qrows = [_row_selector(spec_rows[m], device) for m in range(len(specs))]
+    # spec_qrows is built further down, once `filter_rows` is known: its base is
+    # the per-FILTER mask height, not the file's. See there.
     if any(r is not None for r in spec_rows):
         logger.info(
             "query-row subsets active: %s (file has %d queries; per-spec top-K "
@@ -2760,6 +2795,46 @@ def run_compute(
     # to skip caching a per-query cell_mask when nobody else will reuse it
     # (Front A's memory-shrinking complement).
     filter_share_count: dict[Filter | None, int] = Counter(spec_filter)
+
+    # Narrow CPU per-query filter masks to the query rows that actually use them.
+    # This keeps unrelated query sets in a unified file from increasing mask memory.
+    filter_rows: dict[Filter | None, np.ndarray | None] = _union_rows_by_key(
+        spec_filter, spec_rows, n_q
+    )
+
+    # GPU, uniform, and unfiltered paths do not use a narrowed per-file query mask.
+    for f in list(filter_rows):
+        if f is None or filter_is_gpu_eligible[f] or not filter_is_per_query[f]:
+            filter_rows[f] = None
+
+    # Query-axis height of each filter mask.
+    filter_n_q: dict[Filter | None, int] = {
+        f: (n_q if r is None else len(r)) for f, r in filter_rows.items()
+    }
+
+    # Slice per-query filter values to the same rows used by each mask.
+    filter_query_vals: dict[Filter, dict[str, np.ndarray]] = {
+        f: (
+            query_filter_vals if r is None
+            else {c: v[r] for c, v in query_filter_vals.items()}
+        )
+        for f, r in filter_rows.items() if f is not None
+    }
+
+    # Map each spec's query rows into its filter mask's local row numbering
+    spec_qrows = [
+        _row_selector(_local_positions(spec_rows[m], filter_rows[specs[m].filter]), device)
+        for m in range(len(specs))
+    ]
+    if any(r is not None for r in filter_rows.values()):
+        logger.info(
+            "per-query filter mask height: %s (file has %d queries)",
+            "; ".join(
+                "+".join(s.name for s in specs if s.filter == f) + f"={filter_n_q[f]}"
+                for f, r in filter_rows.items() if r is not None
+            ),
+            n_q,
+        )
 
     vt_spec_idxs: dict[str, list[int]] = {vt: [] for vt in vts_needed}
     for i, s in enumerate(specs):
@@ -3040,13 +3115,16 @@ def run_compute(
                 cpu_fallback_filters = [
                     f for f in distinct_filters if f is not None and not filter_is_gpu_eligible[f]
                 ]
+
+                # `filter_query_vals[f]` is already narrowed to this filter's query rows,
+                # so `evaluate` builds a mask with `filter_n_q[f]` rows.
                 if len(cpu_fallback_filters) > 1:
                     with ThreadPoolExecutor(max_workers=len(cpu_fallback_filters)) as pool:
                         masks = list(pool.map(
-                            lambda f: evaluate(f, table, query_filter_vals), cpu_fallback_filters
+                            lambda f: evaluate(f, table, filter_query_vals[f]), cpu_fallback_filters
                         ))
                 else:
-                    masks = [evaluate(f, table, query_filter_vals) for f in cpu_fallback_filters]
+                    masks = [evaluate(f, table, filter_query_vals[f]) for f in cpu_fallback_filters]
                 for f, mask in zip(cpu_fallback_filters, masks):
                     keeps[f] = _pack_query_axis(mask) if mask.ndim == 2 else mask
 
@@ -3223,7 +3301,7 @@ def run_compute(
             combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_gpu,
             filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
             encoded_row_ids=encoded_ids, ordinal_row_ids=ordinal_ids,
-            spec_qsel=spec_qsel, spec_qrows=spec_qrows, n_q_full=n_q,
+            spec_qsel=spec_qsel, spec_qrows=spec_qrows, filter_n_q=filter_n_q,
             multivector_token_budget=(
                 cfg.params.multivector_token_budget if vt == "multivector" else None
             ),
@@ -3337,7 +3415,7 @@ def run_compute(
                                 else file_ordinals[batch_orig_rows[vt]]
                             )
                         ),
-                        spec_qsel=spec_qsel, spec_qrows=spec_qrows, n_q_full=n_q,
+                        spec_qsel=spec_qsel, spec_qrows=spec_qrows, filter_n_q=filter_n_q,
                         multivector_token_budget=(
                             cfg.params.multivector_token_budget
                             if vt == "multivector"
