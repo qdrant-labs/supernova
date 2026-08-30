@@ -3480,6 +3480,11 @@ def run_compute(
     results: dict[str, str] = {}
     # Per-search rows for the run manifest, filled as each output is written.
     manifest_searches: list[dict] = []
+    # The corpus as an ordered file list, hashed once: it identifies which run
+    # these partials belong to (see results.run_identity) AND goes in the
+    # manifest. Computed over `all_files` — post include/exclude, PRE stride —
+    # so every rank of one run derives the identical value without coordinating.
+    corpus_fp = run_manifest.corpus_fingerprint(all_files)
     # A sharded run's partials must carry whatever `merge` needs to apply the
     # SAME rule across workers that each worker applied within itself. The
     # worker's ordinal cannot travel — it is a private relabelling, meaningless
@@ -3559,7 +3564,18 @@ def run_compute(
         # visible.
         dtypes = _dtypes_for(s)
         table = build_result_table(
-            out_ids, out_payload, hit_ids, hit_scores, provenance(cfg, s, dtypes),
+            out_ids, out_payload, hit_ids, hit_scores,
+            provenance(
+                cfg, s, dtypes,
+                corpus_sha=corpus_fp["sha256"],
+                num_jobs=num_jobs,
+                job_rank=job_rank,
+                # A `--max-files` run read only part of its own slice, so its
+                # output is not ground truth. Fingerprinting it separately is
+                # what stops a benchmarking partial from ever merging with a
+                # real one.
+                partial_slice=max_files is not None,
+            ),
             hit_tie=hit_tie,
         )
         short_i = sum(1 for h in hit_ids if len(h) < s.k)
@@ -3610,7 +3626,7 @@ def run_compute(
     # Fingerprinted over `all_files` (post include/exclude, PRE stride), so
     # every rank of one run reports the identical hash and a mismatch means
     # the ranks disagreed about the corpus, not about their slice of it.
-    doc["source"]["corpus"]["fingerprint"] = run_manifest.corpus_fingerprint(all_files)
+    doc["source"]["corpus"]["fingerprint"] = corpus_fp
     # `params` records what RAN, so the CLI overrides and the sizes resolved at
     # runtime replace the configured values (which are `null` whenever a knob
     # was left to be derived — see `_resolve_vt_batch_size` and the

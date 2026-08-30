@@ -39,8 +39,13 @@ from nova_bf import manifest as run_manifest
 from nova_bf.config import BruteForceConfig, SearchSpec
 from nova_bf.io import ParquetFile, Store
 from nova_bf.results import (
+    CONFIG_KEY,
+    JOB_RANK_KEY,
+    NUM_JOBS_KEY,
     RESERVED,
+    RUN_KEY,
     TIEBREAK_KEY,
+    config_identity,
     partial_dir,
     provenance,
     result_name,
@@ -401,6 +406,119 @@ def _prefetch_all(
         readers_by_name[name] = [pq.ParquetFile(p) for p in dsts]
 
 
+def _validate_one_run(
+    cfg: BruteForceConfig,
+    spec: SearchSpec,
+    partials: list[ParquetFile],
+    readers: list[pq.ParquetFile],
+) -> str | None:
+    """Refuse to merge partials that did not come from ONE run, and refuse a
+    run that is missing a rank. Returns the run fingerprint to carry onto the
+    merged artifact.
+
+    A search's partial directory is addressed by (queries stem, search name, k)
+    alone, so any two runs agreeing on those three write into it. Files are
+    named `rank<NNN>.parquet`, so a re-run overwrites only the ranks it has:
+    32 ranks landing on a 64-rank run's leftovers produce a directory of 64
+    partials, half of them stale. Nothing about the rows says so — the stale
+    slices merge cleanly, double-counting the corpus regions they overlap and
+    missing the ones nobody covered, and the output is a wrong top-K that looks
+    entirely normal.
+
+    Three checks, in the order a failure is most likely:
+
+    1. every partial carries the same `run_fingerprint` (see
+       `results.run_identity`) — this is the mixed-runs case;
+    2. every partial's `config_fingerprint` matches the config THIS merge was
+       handed — the same idea as the existing `tiebreak` check, extended to
+       every other field that changes results (tiebreak keeps its own check,
+       whose message is more specific than this one);
+    3. the ranks present are exactly `0..num_jobs-1` — this is the missing-rank
+       case, which the old "every search has the same partial count" check
+       cannot see, because a rank that dies before writing anything leaves
+       every search short by exactly one.
+    """
+    stamps = [(f, r.schema_arrow.metadata or {}) for f, r in zip(partials, readers)]
+
+    def _get(meta: dict, key: bytes) -> str | None:
+        value = meta.get(key)
+        return value.decode() if value is not None else None
+
+    runs = {f.read_path: _get(meta, RUN_KEY) for f, meta in stamps}
+    present = {sha for sha in runs.values() if sha is not None}
+    if not present:
+        # Every partial predates run fingerprinting. Nothing to compare, and
+        # refusing would strand hours of legitimately-produced GPU work over a
+        # check that would have passed — so this is loud, not fatal.
+        logger.warning(
+            "search=%r: none of the %d partials carry a run fingerprint (they "
+            "predate it) — cannot verify they came from a single run. Re-run "
+            "`bf compute` if this directory may hold partials from more than one.",
+            spec.name, len(partials),
+        )
+        return None
+    unstamped = sorted(p for p, sha in runs.items() if sha is None)
+    if unstamped or len(present) > 1:
+        by_run: dict[str, list[str]] = {}
+        for path, sha in runs.items():
+            by_run.setdefault(sha or "(unstamped)", []).append(path)
+        summary = "; ".join(
+            f"{sha[:12] if sha != '(unstamped)' else sha}: {len(paths)} partial(s) "
+            f"e.g. {sorted(paths)[0]}"
+            for sha, paths in sorted(by_run.items())
+        )
+        raise RuntimeError(
+            f"search={spec.name!r}: the partials under "
+            f"{cfg.output.path}/{partial_dir(cfg, spec)}/ come from MORE THAN ONE "
+            f"run — {summary}. Merging them would double-count the corpus where "
+            "their slices overlap and miss it where neither covered, producing a "
+            "wrong top-K that looks normal. Delete the directory and re-run "
+            "`bf compute` for this search."
+        )
+    run_sha = present.pop()
+
+    want_config = config_identity(cfg, spec)
+    mismatched = [
+        f.read_path for f, meta in stamps
+        if (_get(meta, CONFIG_KEY) or want_config) != want_config
+    ]
+    if mismatched:
+        raise RuntimeError(
+            f"search={spec.name!r}: partial {mismatched[0]} was computed from a "
+            "different config than this merge was given (metric/k/filter/rows, "
+            "the corpus or queries paths and columns, or `allow_tf32` differ). "
+            "Merge with the config that produced these partials, or re-run "
+            "`bf compute`."
+        )
+
+    declared = {_get(meta, NUM_JOBS_KEY) for _, meta in stamps}
+    if declared == {None}:
+        return run_sha  # single-node partials, or pre-stamp: no rank set to check
+    if len(declared) > 1:
+        raise RuntimeError(
+            f"search={spec.name!r}: partials disagree about how many ranks the "
+            f"run had ({sorted(str(d) for d in declared)}) — they cannot be from "
+            "one run. Delete the partial directory and re-run `bf compute`."
+        )
+    num_jobs = int(declared.pop())
+    ranks = sorted(
+        int(rank) for _, meta in stamps
+        if (rank := _get(meta, JOB_RANK_KEY)) is not None
+    )
+    missing = sorted(set(range(num_jobs)) - set(ranks))
+    if missing or len(ranks) != len(stamps) or len(set(ranks)) != len(ranks):
+        raise RuntimeError(
+            f"search={spec.name!r}: the run declared {num_jobs} ranks but this "
+            f"directory holds {len(stamps)} partial(s) covering ranks {ranks}"
+            + (f", missing {missing}" if missing else "")
+            + ". Each missing rank's slice of the corpus is simply absent from "
+            "the merged top-K, silently lowering every recall number computed "
+            "against it. Re-run `bf compute --num-jobs "
+            f"{num_jobs} --job-rank R` for the missing rank(s) before merging."
+        )
+    return run_sha
+
+
 def _reduce(
     cfg: BruteForceConfig, spec: SearchSpec, out: Store, partials: list[ParquetFile],
     readers: list[pq.ParquetFile],
@@ -413,6 +531,8 @@ def _reduce(
     its `{name: path}` return value and into the manifest.
     """
     k = spec.k
+    # BEFORE anything expensive: these partials must be one run's, complete.
+    run_sha = _validate_one_run(cfg, spec, partials, readers)
     n_rows = readers[0].metadata.num_rows
     for f, r in zip(partials, readers):
         if r.metadata.num_rows != n_rows:
@@ -520,7 +640,10 @@ def _reduce(
                 # being merged is also the only reading that describes what
                 # actually produced these rows.
                 table = table.replace_schema_metadata(
-                    provenance(cfg, spec, carried_dtypes)
+                    # `run_sha` is the partials' own fingerprint, carried
+                    # rather than recomputed: merge never lists the corpus, and
+                    # the run that matters is the one these rows came from.
+                    provenance(cfg, spec, carried_dtypes, run_sha=run_sha)
                 )
 
                 if writer is None:

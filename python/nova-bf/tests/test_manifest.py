@@ -1,4 +1,5 @@
-"""The run manifest each phase writes next to its outputs (see manifest.py).
+"""The run manifest each phase writes next to its outputs (see manifest.py),
+and the run fingerprint that decides whether partials may be merged at all.
 
 The parquet's schema metadata says what the ground truth IS; the manifest says
 what the RUN was — ranks, files, timings, hardware, the filter each search
