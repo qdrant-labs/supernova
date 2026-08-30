@@ -31,6 +31,7 @@ import numpy as np
 
 from nova_embed import media
 from nova_embed.config import EmbedderEntry
+from nova_embed.manifest import hf_revision, redact
 from nova_embed.media import Modality
 from nova_embed.models import Embedding, MultiVectorEmbedding, OutputKind
 from nova_embed.registry import EMBEDDERS, FUSED_EMBEDDERS
@@ -78,9 +79,12 @@ class OutputSpec:
     # multimodal entries: a "modality=column,…" display string, not one column
     input_column: str
     modality: Modality
-    # instruction baked into the embeddings (instruction-tuned backends): the
-    # query side must reproduce it exactly, so the manifest records it
     instruction: str | None = None
+    backend: str = ""
+    backend_kwargs: dict | None = None
+    model_revision: str | None = None
+    max_length: int | None = None
+    pooling: dict | None = None
 
 
 @dataclass
@@ -274,6 +278,23 @@ def _fusion_groups(
     return groups
 
 
+def _entry_provenance(e: EmbedderEntry, effective_kwargs: dict | None = None) -> dict:
+    """The manifest-only half of an OutputSpec: what produced this column.
+    Secrets are stripped (see `manifest.redact`): `backend_kwargs` is "every
+    unknown key in the entry", and the manifest is published next to the
+    embeddings.
+    """
+    kwargs = e.backend_kwargs() if effective_kwargs is None else dict(effective_kwargs)
+    return {
+        "backend": e.type,
+        "backend_kwargs": redact(kwargs),
+        # The pin, so the cache is asked for the snapshot this run actually
+        # loaded rather than for `main`.
+        "model_revision": hf_revision(e.model, kwargs.get("revision")),
+        "max_length": e.max_length,
+    }
+
+
 def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
     """Instantiate backends for every entry and assemble the engine.
 
@@ -365,6 +386,7 @@ def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
                     input_column=e.input_column,
                     modality=e.modality,
                     instruction=embedder.instruction,
+                    **_entry_provenance(e, kwargs),
                 )
             )
             if e.pooled_column:
@@ -379,6 +401,8 @@ def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
                         input_column=e.input_column,
                         modality=e.modality,
                         instruction=embedder.instruction,
+                        pooling=e.pooling.model_dump(mode="json"),
+                        **_entry_provenance(e, kwargs),
                     )
                 )
 
@@ -421,6 +445,7 @@ def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
                 input_column=e.input_column or e.input_display,
                 modality=e.modality,
                 instruction=embedder.instruction,
+                **_entry_provenance(e),
             )
         )
         if e.pooled_column:
@@ -435,6 +460,8 @@ def build_engine(entries: list[EmbedderEntry]) -> EmbeddingEngine:
                     input_column=e.input_column or e.input_display,
                     modality=e.modality,
                     instruction=embedder.instruction,
+                    pooling=e.pooling.model_dump(mode="json"),
+                    **_entry_provenance(e),
                 )
             )
 

@@ -140,11 +140,26 @@ class Store:
         """
         Write a table to root/filename (creating local parent dirs).
         """
+        path = self._prepare_write(filename)
+        with self.fs.open_output_stream(path) as sink:
+            pq.write_table(table, sink, compression="snappy")
+        return path
+
+    def write_bytes(self, filename: str, data: bytes) -> str:
+        """Write raw bytes to root/filename — the run manifest (see manifest.py).
+
+        Same path/parent-dir handling as `write`, so a manifest lands beside the
+        parquets it describes whether the root is local or s3://.
+        """
+        path = self._prepare_write(filename)
+        with self.fs.open_output_stream(path) as sink:
+            sink.write(data)
+        return path
+
+    def _prepare_write(self, filename: str) -> str:
         path = f"{self.root.rstrip('/')}/{filename}"
         if not self.is_s3:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        with self.fs.open_output_stream(path) as sink:
-            pq.write_table(table, sink, compression="snappy")
         return path
 
 

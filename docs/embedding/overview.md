@@ -42,7 +42,7 @@ storage:
 - **`type`** — the backend implementation. The same backend name may exist for several kinds (`sentence_transformer` is both a dense and a sparse backend).
 - **`modality`** — how the input column's values are decoded (`text` | `image`). **Required, no default**: the pipeline refuses to guess, so a wrong-modality run dies at launch instead of after hours of embedding file paths as prose. Transport is handled for you — an image column may hold file paths, raw bytes, or HuggingFace `{bytes, path}` structs.
 
-Unknown entry keys (`batch_size`, `dtype`, `device`, …) pass through to the backend constructor. See [Dense Embedders](dense-embedders.md) and [Sparse Embedders](sparse-embedders.md) for the available backends.
+Unknown entry keys (`batch_size`, `dtype`, `device`, `revision`, …) pass through to the backend constructor, and are recorded verbatim in the [run manifest](#run-manifest). See [Dense Embedders](dense-embedders.md) and [Sparse Embedders](sparse-embedders.md) for the available backends.
 
 Two automatic optimizations: entries pointing at the same model and input column are **fused into a single forward pass** when the model natively produces several output kinds (e.g. `bge_m3` — declare dense, sparse, and multivector entries on `BAAI/bge-m3` and it loads once and runs one forward pass for all three), and entries sharing an identical backend config share one loaded model instance. Fusion requires matching backend settings across the entries; `batch_size` is the exception — differing values fuse on the smallest, with a warning.
 
@@ -147,6 +147,37 @@ LIMIT 10;
 ```
 
 Unique row IDs are derived deterministically at **load time** from `(parquet_file_path, file_row_number)` using `vf_point_id`. The embed-side parquets do not carry an explicit `row_id` column; identity is anchored to physical row position so a re-read of the same parquet always produces the same IDs.
+
+### Run manifest
+
+Each run uploads a JSON manifest beside its parquets — `_manifest.json`, or `rank<NN>__manifest.json` per rank in a fleet run. The parquets say what the vectors are; the manifest says what the run was, and carries the facts that change the vectors but leave no trace in the output.
+
+| Block | |
+|-------|--|
+| `source` / `destination` / `created_at` / `started_at` | the dataset name, where the output went, and when |
+| `compute` | instance type, region, AZ, GPU and count (AWS IMDS + torch; `{}` off-cloud) |
+| `code` | supernova workspace version, `git describe` / commit / branch / dirty flag, and the versions of the libraries actually loaded (torch, transformers, sentence-transformers, vllm, fastembed). The model runtime *is* the model's behaviour — a transformers major bump can change tokenization or pooling defaults while the parquet looks identical |
+| `job` | SkyPilot task/cluster/job ids when present, plus hostname and pid — what ties a suspicious rank's manifest back to its log |
+| `embedders` | one entry per output column: `kind`, `column`, `model_name`, `dimensions`, `max_tokens`, `modality`, `instruction`, plus `backend` and its resolved `backend_kwargs` — credential-shaped values (`api_key`, `*_token`, `*_secret`, …) are redacted, since the manifest is published beside the embeddings — (**`dtype` above all** — an fp16 and an fp32 run of one model are otherwise indistinguishable), `model_revision`, `max_length`, and `pooling` |
+| `chunking` | the chunker's **resolved settings**, not just its strategy name: window and overlap decide where rows begin and end, so two runs of one strategy with different overlap produced different corpora |
+| `sharding` | `num_jobs`, `job_rank`, `mode` (`row_window` or `file_shard`), `filename_prefix`, and the row window (`offset`, `limit`, `dataset_total`) this rank owned |
+| counts | `source_rows_seen` against `rows_expected`, with a `complete` boolean; plus `total_records` (records WRITTEN — a splitting chunker makes several per source row), `rows_skipped_empty_input` and `total_batches` |
+| `output_files` | every file this rank wrote — with content-addressed names, the only record of which files are its own |
+| timing | `elapsed_seconds` and `records_per_second` |
+
+`rows_expected` and `complete` are what make a short rank visible: without them a rank that died at 80% is indistinguishable from one that was given 80% as much work, and finding the gap means diffing object listings. Completeness is measured in **source rows consumed** (`source_rows_seen`), not records written — under a splitting chunker those differ by the chunks-per-row factor, and comparing written records against a row window would call a rank complete at a fraction of its work. `complete` is `null` when the row count was never knowable up front — a file-sharded source is not row-addressable, and counting its rows is the corpus scan file sharding exists to avoid.
+
+`model_revision` is the resolved Hub commit sha the weights were loaded from, read from the local cache. A bare repo id is a *moving* reference: the owner can push new weights or a changed pooling config and every later run embeds into a different space with no config change. Pin it explicitly where the backend supports it:
+
+```yaml
+embedders:
+  - name: gte
+    type: sentence_transformer
+    model: Alibaba-NLP/gte-multilingual-base
+    revision: 7fc06782350c1a83f88b15dd4b38ef853d3b8503
+```
+
+`sentence_transformer` (dense and sparse) takes `revision:` directly; `vllm` forwards it with its other engine kwargs. Pinned or not, the sha that was used is recorded.
 
 ## Running locally
 

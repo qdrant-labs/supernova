@@ -42,6 +42,7 @@ import time
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import cached_property
 from queue import Empty, Queue
 from threading import Semaphore, Thread
@@ -50,6 +51,7 @@ import numpy as np
 
 from tqdm import tqdm
 
+from nova_bf import manifest as run_manifest
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import _condition_mask, _match_any_membership, _static_first, evaluate
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
@@ -2393,6 +2395,11 @@ def run_compute(
     except ImportError:
         raise RuntimeError("torch is required for `compute`: install nova-bf[compute]")
 
+    # Whole-invocation timing for the manifest. The scan's own `wall0` (set much
+    # further down) covers only the corpus pass, so it misses query loading and
+    # result decoding.
+    started_at = datetime.now(timezone.utc)
+    run_t0 = time.perf_counter()
     job_rank = _resolve_rank(num_jobs, job_rank)
     specs = cfg.searches
     vts_needed = sorted({s.vector_type for s in specs})  # ["dense"] / ["sparse"] / both
@@ -3471,6 +3478,8 @@ def run_compute(
 
     out = Store(cfg.output.path)
     results: dict[str, str] = {}
+    # Per-search rows for the run manifest, filled as each output is written.
+    manifest_searches: list[dict] = []
     # A sharded run's partials must carry whatever `merge` needs to apply the
     # SAME rule across workers that each worker applied within itself. The
     # worker's ordinal cannot travel — it is a private relabelling, meaningless
@@ -3548,10 +3557,12 @@ def run_compute(
         # parquet someone can pick up on its own, and a merge that mixed
         # partials from two different runs is exactly the mistake this makes
         # visible.
+        dtypes = _dtypes_for(s)
         table = build_result_table(
-            out_ids, out_payload, hit_ids, hit_scores, provenance(cfg, s, _dtypes_for(s)),
+            out_ids, out_payload, hit_ids, hit_scores, provenance(cfg, s, dtypes),
             hit_tie=hit_tie,
         )
+        short_i = sum(1 for h in hit_ids if len(h) < s.k)
         if num_jobs is not None:
             width = max(3, len(str(num_jobs - 1)))
             name = f"{partial_dir(cfg, s)}/rank{job_rank:0{width}d}.parquet"
@@ -3562,8 +3573,98 @@ def run_compute(
             # the true final count, so that's the only place worth warning.
         else:
             name = result_name(cfg, s)
-            warn_if_short(sum(1 for h in hit_ids if len(h) < s.k), len(hit_ids), s.k, s.name, logger)
+            warn_if_short(short_i, len(hit_ids), s.k, s.name, logger)
         path = out.write(name, table)
         logger.info("search=%r wrote %s (%d queries)", s.name, path, out_n)
         results[s.name] = path
+        entry = run_manifest.search_entry(s)
+        entry.update({
+            "queries": out_n,
+            "output_file": name,
+            "output_path": path,
+            "hit_tie_column": want_tie_column,
+            # Storage dtypes of the vectors actually scored.
+            "corpus_dtype": dtypes.get("corpus_dtype"),
+            "queries_dtype": dtypes.get("queries_dtype"),
+        })
+        if num_jobs is None:
+            # Only a whole-corpus run can say anything true about short top-Ks.
+            # On a partial, "fewer than k hits" is the normal state of a stride
+            # slice, so reporting it would read as a defect that isn't one.
+            entry["queries_short_of_k"] = short_i
+        manifest_searches.append(entry)
+
+    # The run manifest — written LAST, so it only ever describes outputs that
+    # actually landed, and best-effort, so it cannot fail a run that produced
+    # them (see manifest.py).
+    # See `counts.queries_searched`: any unsubsetted search covers every query,
+    # otherwise it is the union of the subsets (searches may overlap, so this is
+    # a set union, not a sum).
+    queries_searched = (
+        n_q if any(r is None for r in spec_rows)
+        else len(set().union(*(set(r.tolist()) for r in spec_rows)))
+    )
+    doc = run_manifest.base_manifest(cfg, "compute", device=device)
+    doc["compute"].update(run_manifest.gpu_peak(device))
+    # Which corpus, as an ordered file list — the ids depend on that order.
+    # Fingerprinted over `all_files` (post include/exclude, PRE stride), so
+    # every rank of one run reports the identical hash and a mismatch means
+    # the ranks disagreed about the corpus, not about their slice of it.
+    doc["source"]["corpus"]["fingerprint"] = run_manifest.corpus_fingerprint(all_files)
+    # `params` records what RAN, so the CLI overrides and the sizes resolved at
+    # runtime replace the configured values (which are `null` whenever a knob
+    # was left to be derived — see `_resolve_vt_batch_size` and the
+    # multivector token-budget derivation).
+    doc["params"].update({
+        "io_workers": io_workers,
+        "io_thread_count": itc,
+        "batch_size_by_vector_type": vt_batch_size,
+        "multivector_batch_size": mv_batch_size,
+        "multivector_query_block": mv_query_block,
+    })
+    doc.update({
+        "started_at": started_at.isoformat(),
+        "sharding": {
+            "num_jobs": num_jobs,
+            "job_rank": job_rank,
+            "corpus_files_total": len(all_files),
+            "corpus_files_this_worker": len(mine),
+            "max_files": max_files,
+            # A `--max-files` run read only part of its own slice, so its output
+            # is NOT valid ground truth. That has to survive into the artifact
+            # record — it is exactly the file someone later mistakes for real.
+            "partial_slice": max_files is not None,
+        },
+        "searches": manifest_searches,
+        "counts": {
+            # The queries FILE's row count. With `rows` subsets a search covers
+            # fewer than this (each search's own count is in `searches[]`), so
+            # the name says which number this is rather than letting a reader
+            # take it for "queries searched".
+            "queries_in_file": n_q,
+            # The union across searches of the rows any search actually scored.
+            # A search with no `rows` covers the whole file, so one of those
+            # makes the union the whole file regardless of what the others subset.
+            "queries_searched": queries_searched,
+            "corpus_rows_scanned": rows_seen,
+            "corpus_bytes_decoded": bytes_seen,
+        },
+        # `elapsed_seconds` is the whole invocation; `scan_seconds` and the four
+        # splits below cover the corpus pass only (see the bf-bench log line).
+        # read/filter seconds are SUMMED across io_workers reader threads, so
+        # divide by io_workers to compare either with wall time.
+        "timing": {
+            "elapsed_seconds": round(time.perf_counter() - run_t0, 2),
+            "scan_seconds": round(wall, 2),
+            "io_wait_seconds": round(io_wait, 2),
+            "gpu_seconds": round(gpu_secs, 2),
+            "read_seconds_summed": round(read_secs, 2),
+            "filter_seconds_summed": round(filter_secs, 2),
+            "rows_per_second": round(rows_seen / wall, 1) if wall > 0 else 0,
+            "wall_mbps": round(wall_mbps, 1),
+            "stream_mbps": round(stream_mbps, 1),
+        },
+        "output_files": [e["output_file"] for e in manifest_searches],
+    })
+    run_manifest.write(out, run_manifest.manifest_name(cfg, "compute", job_rank, num_jobs), doc)
     return results

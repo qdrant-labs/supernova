@@ -186,6 +186,13 @@ def embed(config, num_jobs, job_rank, dry_run):
     source = None
     expected_total_rows = None
     filename_prefix = ""
+    # What this rank was told to cover, for the run manifest. Filled in below
+    # by whichever sharding protocol applies; a single-node run keeps the
+    # nulls, which is itself the answer ("this run was the whole dataset").
+    sharding: dict = {
+        "num_jobs": num_jobs, "job_rank": None, "mode": None,
+        "filename_prefix": "", "offset": None, "limit": None, "dataset_total": None,
+    }
     if num_jobs is not None:
         if job_rank is None:
             # SkyPilot pools set these env vars automatically
@@ -205,6 +212,10 @@ def embed(config, num_jobs, job_rank, dry_run):
             set_file_shard(job_rank, num_jobs)
             source = built_source
             expected_total_rows = None  # unknown without scanning; runner tolerates None
+            # No row window to record: this rank owns whole FILES, and counting
+            # their rows up front is the corpus scan file sharding exists to
+            # avoid. The manifest says so rather than leaving it ambiguous.
+            sharding["mode"] = "file_shard"
             logging.getLogger("nova_embed").info(
                 "Job %d/%d: file-sharded source", job_rank + 1, num_jobs
             )
@@ -224,6 +235,12 @@ def embed(config, num_jobs, job_rank, dry_run):
                 dataset_total,
             )
             expected_total_rows = slice_limit
+            sharding.update({
+                "mode": "row_window",
+                "offset": slice_offset,
+                "limit": slice_limit,
+                "dataset_total": dataset_total,
+            })
 
             # Re-scope the counting instance instead of building a second source:
             # for HF sources a fresh instance re-reads every parquet footer, and at
@@ -238,6 +255,7 @@ def embed(config, num_jobs, job_rank, dry_run):
 
         rank_width = max(2, len(str(num_jobs - 1)))
         filename_prefix = f"rank{job_rank:0{rank_width}d}_"
+        sharding.update({"job_rank": job_rank, "filename_prefix": filename_prefix})
 
     if source is None:
         source = SOURCES.build(dict(source_dict))
@@ -273,7 +291,8 @@ def embed(config, num_jobs, job_rank, dry_run):
             drop_columns=pipeline.drop_columns,
             filename_prefix=filename_prefix,
             expected_total_rows=expected_total_rows,
-            chunking_strategy=chunking.strategy,
+            chunking=chunking.build_dict(),
+            sharding=sharding,
             content_addressed_files=pipeline.content_addressed_files,
             shard_output_buckets=pipeline.shard_output_buckets,
         )

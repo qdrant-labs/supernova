@@ -148,10 +148,16 @@ class DatasetSource(ABC):
 
 @dataclass
 class EmptyInputStats:
-    """Rows dropped by the empty-input policy. Reported in the manifest — a
-    skipped row is quiet, never silent."""
+    """Source-row accounting for the manifest — a skipped row is quiet, never
+    silent, and a rank that consumed only half its window must be able to say so.
+
+    `rows_seen` counts rows read FROM THE SOURCE, which is not the number of
+    records written: a splitting chunker turns one row into N records. Only
+    this counter is comparable with a rank's assigned row window, and only it
+    gives an honest skip RATE."""
 
     rows_skipped: int = 0
+    rows_seen: int = 0
 
 
 def iter_chunks(
@@ -191,6 +197,8 @@ def iter_chunks(
     checked_columns = False
 
     for raw_row in source.stream():
+        if stats is not None:
+            stats.rows_seen += 1
         row = source.format_record(raw_row).row
 
         # Harass at launch: a wrong input_column (or one eaten by

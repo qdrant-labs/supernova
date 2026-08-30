@@ -273,6 +273,33 @@ Do not confuse this with a negative `dot` or `cosine` score, which is **not** a 
 
 **Sanity check:** if a query also appears in the corpus, its top hit should be itself — with score ≈ 1.0 for cosine, or ≈ 0.0 for euclidean. Expect the euclidean self-hit to be a small negative number rather than exactly `-0.0`: it is computed as `‖q‖² + ‖c‖² − 2q·c`, whose cancellation resolves a true zero to roughly `sqrt(float32 eps) · ‖q‖` (~1e-2 at `‖q‖≈35`). That is inherent to the expansion — `torch.cdist` uses the same one at any real corpus size — and it bounds how finely euclidean *distances* can be trusted between near-duplicates, though not the ranking of ordinary neighbours.
 
+### Run manifest
+
+Each phase also writes one JSON manifest next to its outputs. The parquet's schema metadata (`nova_bf.*` keys: corpus/queries path, metric, `k`, `allow_tf32`, the stored vector dtypes, the tie-break rule) says what the ground truth **is**; the manifest says what the **run** was — how many ranks, which files this worker took, how long each phase took, what hardware it ran on, and the full filter each search used. It is the same shape `nova embed` writes (`source` / `destination` / `created_at` / `compute` / settings / counts / timing / `output_files`), so both toolsets' artifacts read the same way.
+
+```
+{output.path}/_bf_manifest_<queries-stem>_compute.json            # single-GPU compute
+{output.path}/_bf_manifest_<queries-stem>_compute/rank<NNN>.json  # one per rank when sharded
+{output.path}/_bf_manifest_<queries-stem>_merge.json              # merge
+```
+
+| Block | |
+|-------|--|
+| `source` / `destination` | corpus + queries paths, `include`/`exclude`, and the id/vector/payload columns actually read |
+| `source.corpus.fingerprint` (compute) | file count and a sha256 over the corpus file list **in the order the run indexed it** — with no `corpus.id_column` the hit ids are `make_point_id(file_key, row)`, so that order is part of the id scheme: add or rename one file and every later file's ids shift. Comparing this hash proves two runs saw the same corpus, and catches `include`/`exclude` drift between ranks. Merge has no corpus listing of its own, so it carries no fingerprint |
+| `compute` | instance type, region, AZ, GPU + count and total memory, torch/CUDA version, the device scoring really ran on, and this run's peak GPU allocated/reserved bytes |
+| `code` | supernova workspace version, `git describe` / commit / branch / dirty flag, and the python, numpy and pyarrow versions — the scoring and tie-break kernels *are* the ground truth, so the revision that produced it is part of the record |
+| `job` | SkyPilot task/cluster/job ids when present, plus hostname and pid — what ties a suspicious rank's manifest back to its log |
+| `params` | every run-level knob **as resolved** — CLI overrides like `--io-workers`, the per-vector-type batch sizes in `batch_size_by_vector_type`, and the multivector tile sizes derived from `multivector_token_budget` all replace the configured (often `null`) values, so it records what ran, not what the YAML said |
+| `searches` | per search: `vector_type`, `metric`, `k`, the **full filter** and `rows` selector, query count, output file, and the corpus/queries storage dtypes |
+| `sharding` (compute) | `num_jobs`, `job_rank`, corpus files total vs. this worker's, and `partial_slice: true` when `--max-files` made the output invalid as ground truth |
+| `counts` / `timing` | `queries_in_file` and `queries_searched` (they differ when a search uses `rows`), corpus rows scanned, bytes decoded; elapsed vs. scan seconds and the `io_wait` / `gpu` / `read` / `filter` split behind the `bf-bench` log line |
+| `output_files` | the files this phase wrote — the only record of which are a given rank's once names collide across ranks |
+
+The filter is dumped in full because for a filtered GT the filter *is* the search: recall numbers from two runs are comparable only if the predicates were identical, and a YAML edit between runs is otherwise invisible in the artifacts. A merge manifest also records `partials` per search — how many ranks' candidates were actually folded in, which the final parquet cannot tell you and which a dead rank silently changes.
+
+Writing a manifest is best-effort: it is a record *of* outputs that already landed, so a failure to write one logs a warning and never fails the run.
+
 ## Hit IDs & recall evaluation
 
 `hit_ids` are how you join ground truth back to a loaded collection, so they must match the point ids the store holds. Two modes:

@@ -14,6 +14,7 @@ from nova_embed.chunkers import Chunker
 from nova_embed.embedders.engine import EmbeddingEngine
 from nova_embed.embedders.buffer import ResultBuffer
 from nova_embed.embedders.worker import worker
+from nova_embed.manifest import code_versions, job_identity
 from nova_embed.storage.base import StorageBackend
 from nova_embed.storage.writer import write_batch
 
@@ -82,9 +83,10 @@ async def run_embedder(
     filename_prefix: str = "",
     expected_total_rows: int | None = None,
     row_group_size: int | None = None,
-    chunking_strategy: str = "passthrough",
+    chunking: dict | None = None,
     content_addressed_files: bool = False,
     shard_output_buckets: int | None = None,
+    sharding: dict | None = None,
 ):
     logger.info(
         "Starting pipeline: source=%s outputs=%s storage=%s chunk_size=%d num_workers=%d flush_threshold=%d",
@@ -96,6 +98,7 @@ async def run_embedder(
         flush_threshold,
     )
     start_time = time.time()
+    started_at = datetime.now(timezone.utc)
     total_records = 0
 
     await storage.ensure_ready()
@@ -210,8 +213,7 @@ async def run_embedder(
     # Loud, not silent: skipped rows are counted into the manifest below, and a
     # high rate gets a warning — it usually means a wrong input_column.
     if empty_stats.rows_skipped:
-        source_rows_seen = total_records + empty_stats.rows_skipped
-        skip_rate = empty_stats.rows_skipped / source_rows_seen
+        skip_rate = empty_stats.rows_skipped / max(1, empty_stats.rows_seen)
         log = (
             logger.warning
             if skip_rate > SKIP_RATE_WARN_THRESHOLD
@@ -227,26 +229,51 @@ async def run_embedder(
     manifest = {
         "source": source.source_name,
         "compute": _detect_compute(),
+        # Which build of the code, and which machine/launch, produced this —
+        # neither is derivable from the config, and the library versions decide
+        # what a vector IS (see manifest.code_versions).
+        "code": code_versions(),
+        "job": job_identity(),
         "embedders": [asdict(spec) for spec in engine.output_specs],
         "chunk_size": chunk_size,
-        "chunking_strategy": chunking_strategy,
+        # The chunker's RESOLVED settings, not just its strategy name: window
+        # and overlap decide where rows begin and end, so two runs with the same
+        # strategy and different overlap produced different corpora.
+        "chunking": chunking or {"strategy": "passthrough"},
         "num_workers": num_workers,
         "flush_threshold": flush_threshold,
         "on_empty_input": on_empty_input,
         "drop_columns": sorted(drop_columns or []),
         "content_addressed_files": content_addressed_files,
         "shard_output_buckets": shard_output_buckets,
+        # Which slice of the dataset this rank owned.
+        "sharding": sharding or {"num_jobs": None, "job_rank": None},
         "total_records": total_records,
+        "source_rows_seen": empty_stats.rows_seen,
+        "rows_expected": expected_total_rows,
+        "complete": (
+            None if expected_total_rows is None
+            else empty_stats.rows_seen >= expected_total_rows
+        ),
         "rows_skipped_empty_input": empty_stats.rows_skipped,
         "total_batches": batch_counter,
         "output_files": output_files,
+        "started_at": started_at.isoformat(),
         "elapsed_seconds": round(elapsed, 2),
         "records_per_second": round(total_records / elapsed, 1) if elapsed > 0 else 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "destination": storage.destination,
     }
-    await storage.upload_bytes(
-        json.dumps(manifest, indent=2).encode(),
-        f"{filename_prefix}_manifest.json" if filename_prefix else "_manifest.json",
-    )
-    logger.info("Uploaded manifest to %s", storage.destination)
+    # Best-effort, like nova-bf's: by the time this runs every parquet is
+    # already uploaded, so a manifest that cannot be written must not fail the
+    # job. `default=str` covers the arbitrary YAML values that reach
+    # `backend_kwargs` (PyYAML turns an unquoted 2024-01-01 into a date), which
+    # json.dumps would otherwise refuse — at the very last step of a long run.
+    name = f"{filename_prefix}_manifest.json" if filename_prefix else "_manifest.json"
+    try:
+        await storage.upload_bytes(
+            json.dumps(manifest, indent=2, default=str).encode(), name
+        )
+        logger.info("Uploaded manifest to %s", storage.destination)
+    except Exception as exc:  # noqa: BLE001 - a manifest must never fail a run
+        logger.warning("Could not upload the run manifest %s: %s", name, exc)

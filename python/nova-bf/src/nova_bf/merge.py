@@ -24,8 +24,10 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import numpy as np
 import pyarrow as pa
@@ -33,6 +35,7 @@ import pyarrow.parquet as pq
 
 from tqdm import tqdm
 
+from nova_bf import manifest as run_manifest
 from nova_bf.config import BruteForceConfig, SearchSpec
 from nova_bf.io import ParquetFile, Store
 from nova_bf.results import (
@@ -316,8 +319,11 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
                 "`bf compute --num-jobs N --job-rank R` before merging."
             )
 
+    started_at = datetime.now(timezone.utc)
+    t0 = time.perf_counter()
     staged_dirs: list[str] = []
     readers_by_name: dict[str, list[pq.ParquetFile]] = {}
+    entries: list[dict] = []
     try:
         if cfg.params.merge_prefetch and out.is_s3:
             _prefetch_all(cfg, out, partials_by_name, staged_dirs, readers_by_name)
@@ -329,13 +335,34 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
                     pq.ParquetFile(f.read_path, filesystem=out.fs) for f in partials_by_name[spec.name]
                 ]
 
-        return {
-            spec.name: _reduce(cfg, spec, out, partials_by_name[spec.name], readers_by_name[spec.name])
+        entries = [
+            _reduce(cfg, spec, out, partials_by_name[spec.name], readers_by_name[spec.name])
             for spec in cfg.searches
-        }
+        ]
     finally:
         for d in staged_dirs:
             shutil.rmtree(d, ignore_errors=True)
+
+    # The run manifest for the reduce half — the compute manifests describe one
+    # rank's slice each; this one describes the artifact people actually consume
+    # (see manifest.py). Written after the staging cleanup so it records a
+    # finished merge, and best-effort, so it cannot fail one.
+    doc = run_manifest.base_manifest(cfg, "merge")
+    doc.update({
+        "started_at": started_at.isoformat(),
+        "searches": entries,
+        "counts": {
+            # Partial COUNT is the merge's own sharding record: it is how many
+            # ranks' candidates were actually folded in, which the final parquet
+            # cannot tell you and a short merge (a dead rank) hinges on.
+            "partials_merged": sum(e["partials"] for e in entries),
+            "queries": max((e["queries"] for e in entries), default=0),
+        },
+        "timing": {"elapsed_seconds": round(time.perf_counter() - t0, 2)},
+        "output_files": [e["output_file"] for e in entries],
+    })
+    run_manifest.write(out, run_manifest.manifest_name(cfg, "merge"), doc)
+    return {e["name"]: e["output_path"] for e in entries}
 
 
 def _prefetch_all(
@@ -377,7 +404,14 @@ def _prefetch_all(
 def _reduce(
     cfg: BruteForceConfig, spec: SearchSpec, out: Store, partials: list[ParquetFile],
     readers: list[pq.ParquetFile],
-) -> str:
+) -> dict:
+    """Reduce one search's partials into its final parquet.
+
+    Returns the run-manifest row for this search — the output path plus what
+    the reduce actually saw (partial count, queries, dtypes carried off the
+    partials, how many queries ended short of k). `run_merge` turns those into
+    its `{name: path}` return value and into the manifest.
+    """
     k = spec.k
     n_rows = readers[0].metadata.num_rows
     for f, r in zip(partials, readers):
@@ -500,4 +534,17 @@ def _reduce(
 
     warn_if_short(short_count, n_rows, k, spec.name, logger)
     logger.info("search=%r wrote %s (%d queries)", spec.name, path, n_rows)
-    return path
+    entry = run_manifest.search_entry(spec)
+    entry.update({
+        "queries": n_rows,
+        "output_file": result_name(cfg, spec),
+        "output_path": path,
+        "partials": len(partials),
+        "partial_dir": partial_dir(cfg, spec),
+        "merge_batch_rows": batch_rows,
+        "hit_tie_column": want_tie,
+        "queries_short_of_k": short_count,
+        "corpus_dtype": carried_dtypes.get("corpus_dtype"),
+        "queries_dtype": carried_dtypes.get("queries_dtype"),
+    })
+    return entry

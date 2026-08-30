@@ -71,14 +71,20 @@ class SentenceTransformerDenseEmbedder(Embedder):
         dtype: str = "float32",
         trust_remote_code: bool = False,
         max_tokens: int | None = None,
+        # Pin the Hub revision (a commit sha, tag or branch)
+        revision: str | None = None,
     ):
         self._device = device or detect_device()
         torch_dtype = DTYPE_MAP.get(dtype, torch.float32)
-        logger.info("Loading %s on %s (dtype=%s)", model, self._device, dtype)
+        logger.info(
+            "Loading %s on %s (dtype=%s, revision=%s)",
+            model, self._device, dtype, revision or "default",
+        )
         self._model = SentenceTransformer(
             model,
             device=self._device,
             trust_remote_code=trust_remote_code,
+            revision=revision,
             model_kwargs={"dtype": torch_dtype},
         )
         self._model_name = model
@@ -137,15 +143,18 @@ class SentenceTransformerSparseEmbedder(Embedder):
         device: str | None = None,
         dtype: str = "float32",
         trust_remote_code: bool = False,
+        revision: str | None = None,  # see the dense embedder's `revision`
     ):
         self._device = device or detect_device()
         logger.info(
-            "Loading sparse encoder %s on %s (dtype=%s)", model, self._device, dtype
+            "Loading sparse encoder %s on %s (dtype=%s, revision=%s)",
+            model, self._device, dtype, revision or "default",
         )
         self._model = SparseEncoder(
             model,
             device=self._device,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
         self._model_name = model
         self._batch_size = batch_size
