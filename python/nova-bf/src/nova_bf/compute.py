@@ -2405,6 +2405,26 @@ def _validate_query_filter_cols(
         )
 
 
+def _select_device(torch) -> str:
+    """Which torch device this run scores on: CUDA when present, else CPU.
+
+    `NOVA_BF_DEVICE` overrides the choice (`cpu` or `cuda`). It exists for the
+    parity harness (tests/parity), which needs to pin a GPU box to `cpu` to
+    check that both devices produce the same ground truth from the same input.
+    """
+    want = os.environ.get("NOVA_BF_DEVICE", "").strip().lower()
+    if not want:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if want not in ("cpu", "cuda"):
+        raise ValueError(
+            f"NOVA_BF_DEVICE={want!r} is not a device nova-bf scores on "
+            "— use 'cpu' or 'cuda' (or unset it to auto-select)"
+        )
+    if want == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("NOVA_BF_DEVICE='cuda' but torch reports no CUDA device")
+    return want
+
+
 def run_compute(
     cfg: BruteForceConfig,
     num_jobs: int | None = None,
@@ -2437,7 +2457,7 @@ def run_compute(
     job_rank = _resolve_rank(num_jobs, job_rank)
     specs = cfg.searches
     vts_needed = sorted({s.vector_type for s in specs})  # ["dense"] / ["sparse"] / both
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _select_device(torch)
     if device == "cpu":
         logger.warning("No GPU detected — brute force on CPU will be slow.")
     if "multivector" in vts_needed and cfg.params.multivector_kernel != "torch":
