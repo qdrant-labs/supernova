@@ -130,6 +130,29 @@ except Exception as exc:  # no triton, or a version whose API moved
 MAX_BLOCK = 8192
 
 
+def _warps_for(block: int) -> int:
+    """Chosen number of warps to launch for a given BLOCK.
+    """
+    return max(1, min(8, block // 128))
+
+
+# Kernel offsets are computed as `base + row * row_stride + col`. Both `row`
+# (`tl.program_id`) and sufficiently small strides are int32, so the product
+# can overflow once the largest row offset exceeds 2**31 - 1, silently
+# addressing the wrong row.
+#
+# Promoting `row` to int64 avoids the overflow but significantly increases
+# register pressure and reduces performance on production shapes. Instead,
+# reject shapes whose offsets cannot be represented safely in int32 and let
+# them use the portable path, which has no such limitation.
+_INT32_MAX = (1 << 31) - 1
+
+
+def _offsets_fit_int32(n_q: int, *strides: int) -> bool:
+    """Can `(n_q - 1) * stride + col` be computed in int32 for every pointer?"""
+    return n_q <= 0 or (n_q - 1) * max(strides) + MAX_BLOCK <= _INT32_MAX
+
+
 def disable(exc: BaseException) -> None:
     """Turn the kernel off for the rest of the process after a launch failure.
 
@@ -149,17 +172,53 @@ def disable(exc: BaseException) -> None:
     )
 
 
+def _shape_of(t) -> str:
+    """Return `t`'s shape for logging without raising.
+    """
+    try:
+        return str(tuple(t.shape))
+    except Exception:
+        return "?"
+
+
+# Whether the first decline has been reported. `available()` is consulted once
+# per slice per search — millions of times in a run — so this is logged exactly
+# once; the interesting fact is THAT the run fell back, not how often.
+_DECLINE_LOGGED = False
+
+
 def available(scores, ordinal, k) -> bool:
     """Is the kernel usable for THIS call? Anything false falls back.
+    """
+    ok = _available(scores, ordinal, k)
+    global _DECLINE_LOGGED
+    if not ok and not _DECLINE_LOGGED:
+        _DECLINE_LOGGED = True
+        logger.info(
+            "tie-break top-K: the Triton kernel does not apply to this run "
+            "(scores %s, k=%s) — using the portable path, which computes the "
+            "identical answer roughly 4x slower. Logged once.",
+            _shape_of(scores), k,
+        )
+    return ok
+
+
+def _available(scores, ordinal, k) -> bool:
+    """`available`'s body — see there.
 
     This is the contract boundary: everything the kernel ASSUMES is checked
     here, because a wrong `True` is a silent correctness bug while a wrong
     `False` only costs speed. See `topk` for the invariants callers must hold
     that are too expensive to verify per call (uniqueness, ordinal range).
     """
+    import os
+
     import torch
 
-    if _cutfill is None:
+    # `NOVA_BF_NO_TOPK_KERNEL` mirrors the fold's `NOVA_BF_NO_FOLD_KERNEL`, so an
+    # operator suspecting either kernel on their hardware can switch it off in
+    # the field. Without this one, disabling BOTH needed a code change.
+    if _cutfill is None or os.environ.get("NOVA_BF_NO_TOPK_KERNEL"):
         return False
     # `torch.cuda` also fronts ROCm, so `is_cuda` alone would let an AMD tensor
     # through. Triton may well compile for HIP, but `num_warps` and MAX_BLOCK
@@ -179,6 +238,8 @@ def available(scores, ordinal, k) -> bool:
         return False
     n_q, n_cols = scores.shape
     if n_q <= 0:
+        return False
+    if not _offsets_fit_int32(n_q, scores.stride(0), k):
         return False
     return ordinal.numel() == n_cols and 0 < k <= n_cols <= MAX_BLOCK
 
@@ -212,6 +273,7 @@ def topk(scores, ordinal, k):
     rank = torch.empty(n_cols, dtype=torch.int32, device=scores.device)
     rank.scatter_(0, perm, torch.arange(n_cols, dtype=torch.int32, device=scores.device))
 
+    _block = _triton.next_power_of_2(n_cols)
     outk = torch.empty((n_q, k), dtype=torch.int64, device=scores.device)
     outi = torch.empty((n_q, k), dtype=torch.int32, device=scores.device)
     # Triton launches on the CURRENT device; pin it to the tensors' own so a
@@ -220,8 +282,8 @@ def topk(scores, ordinal, k):
         _cutfill[(n_q,)](
             scores, rank, ordinal.contiguous(), outk, outi,
             scores.stride(0), n_cols, k,
-            BLOCK=_triton.next_power_of_2(n_cols),
+            BLOCK=_block,
             RBITS=max(1, int(n_cols).bit_length()),   # w lands in [1, n_cols]
-            num_warps=8,   # 4 spills at BLOCK=8192; 8 does not. See MAX_BLOCK.
+            num_warps=_warps_for(_block),  # 4 spills at BLOCK=8192; 8 does not.
         )
     return outk, outi.to(torch.int64)

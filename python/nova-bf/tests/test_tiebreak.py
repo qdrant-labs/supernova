@@ -406,3 +406,155 @@ def test_pack_topk_falls_back_when_the_kernel_declines(monkeypatch):
     ref = torch.topk(pack(s, o), 9, dim=1, sorted=False)
     assert torch.equal(torch.sort(idx, dim=1).values, torch.sort(ref.indices, dim=1).values)
     assert torch.equal(key, pack(s, o).gather(1, idx)), "key must pair with its index"
+
+
+# --------------------------------------------------------------------------
+# the int32 offset guard both Triton gates share
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mod_name", ["topk_triton", "merge_triton"])
+def test_the_gate_declines_shapes_whose_offsets_overflow_int32(mod_name):
+    """Inside both kernels every pointer is `base + row * row_stride + col`, and
+    BOTH factors are int32 — `tl.program_id` is `tl.int32`, and Triton types a
+    kernel int argument as i32 whenever its VALUE fits (verified: `mangle_type`
+    returns i32 at 2**31 - 1 and i64 at 2**31). So the product wraps and the
+    load silently reads a different query's row: wrong ground truth, no error.
+
+    Widening the row index to int64 fixes it and was measured to cost 27% — it
+    took `topk_triton` from 104 registers to 156 on an A10G — so the gate
+    declines the oversized shape instead and the portable torch path, which has
+    no such limit, takes over.
+
+    Lives here rather than in the GPU-gated kernel suites because it is pure
+    arithmetic: it must run on every box, and the shapes it describes are far
+    too large to allocate.
+    """
+    import importlib
+
+    mod = importlib.import_module(f"nova_bf.{mod_name}")
+
+    # everything production actually runs must still be accepted — a false
+    # decline is a silent ~4x slowdown that no test or log would show
+    assert mod._offsets_fit_int32(10_000, 4096, 1000)
+    assert mod._offsets_fit_int32(110_000, 4096, 1000), "the largest real query set"
+    assert mod._offsets_fit_int32(110_000, 1024, 1000)
+
+    # w=4096 wraps at n_q >= 2**31 / 4096 = 524,288
+    assert not mod._offsets_fit_int32(600_000, 4096, 1000)
+    # the k-strided output pointers wrap later, but they do wrap
+    assert not mod._offsets_fit_int32(3_000_000, 1000, 1000)
+    # an empty query axis has no row to multiply
+    assert mod._offsets_fit_int32(0, 4096, 1000)
+
+    # the boundary itself: the guard leaves MAX_BLOCK of slack for the in-row
+    # column offset, so the last accepted n_q is that much below the naive one
+    limit = (2**31 - 1 - mod.MAX_BLOCK) // 4096 + 1
+    assert mod._offsets_fit_int32(limit, 4096)
+    assert not mod._offsets_fit_int32(limit + 1, 4096)
+
+
+def test_triton_really_does_type_a_small_int_argument_as_int32():
+    """The premise of the guard above, pinned against the installed Triton so a
+    version that changed it would fail loudly here rather than silently reopen
+    the overflow."""
+    jit = pytest.importorskip("triton.runtime.jit")
+    assert jit.mangle_type(4096) == "i32"
+    assert jit.mangle_type(2**31 - 1) == "i32", "still i32 right up to the wrap"
+    assert jit.mangle_type(2**31) == "i64"
+
+
+@pytest.mark.parametrize(
+    "mod_name,env",
+    [("topk_triton", "NOVA_BF_NO_TOPK_KERNEL"), ("merge_triton", "NOVA_BF_NO_FOLD_KERNEL")],
+)
+def test_each_kernel_has_a_field_kill_switch(mod_name, env, monkeypatch):
+    """Both kernels are pure optimizations over a portable path that computes
+    the identical answer, so an operator who suspects one on their hardware must
+    be able to switch it off WITHOUT a code change — and must be able to switch
+    off both, not just one. Only the fold had a switch before."""
+    import importlib
+
+    mod = importlib.import_module(f"nova_bf.{mod_name}")
+    src = mod.__loader__.get_source(mod.__name__)
+    assert env in src, f"{mod_name} has no {env} kill switch"
+    monkeypatch.setenv(env, "1")
+    # the gate must decline on the env var alone, before it touches any tensor
+    args = (None,) * (3 if mod_name == "topk_triton" else 5)
+    assert mod.available(*args) is False
+
+
+@pytest.mark.parametrize("mod_name", ["topk_triton", "merge_triton"])
+def test_a_declining_gate_says_so_once(mod_name, monkeypatch, caplog):
+    """A wrong `available()` False costs a multiple of the select time and
+    nothing else — which is exactly why it has to be logged. `disable()`
+    announces a kernel that BROKE; a gate that quietly never matches (sparse's
+    transposed score matrices do this for the whole run) would otherwise leave
+    the job several times slower with nothing anywhere recording it.
+
+    Once, not per call: these gates are consulted on every slice of every
+    search, millions of times in a real run.
+    """
+    import importlib
+    import logging
+
+    mod = importlib.import_module(f"nova_bf.{mod_name}")
+    monkeypatch.setattr(mod, "_DECLINE_LOGGED", False)
+    monkeypatch.setattr(mod, "_available", lambda *a, **k: False)
+
+    shape = torch.zeros(2, 4)
+    args = (shape, shape, 1) if mod_name == "topk_triton" else (shape, shape, shape, shape, 1)
+    with caplog.at_level(logging.INFO, logger=mod.__name__):
+        for _ in range(5):
+            assert mod.available(*args) is False
+    lines = [r for r in caplog.records if "portable path" in r.getMessage()]
+    assert len(lines) == 1, f"expected exactly one decline log, got {len(lines)}"
+
+
+def test_two_real_candidates_can_never_share_a_packed_key():
+    """The invariant that makes "the kernel and the portable path agree" a
+    THEOREM rather than a coincidence.
+
+    Both paths pick k winners by packed key, but they break an exact key tie
+    differently — the Triton kernels resolve duplicates at the cut by lane
+    order, `torch.topk` by whatever its radix select happens to do. That
+    difference is harmless only because two REAL candidates cannot share a key:
+    the low half is `0xFFFFFFFF - ordinal` and a worker's ordinals are unique,
+    so the key is distinct regardless of how many candidates share a score.
+
+    The one deliberate exception is the `-inf` sentinel, whose duplicates are
+    interchangeable in key AND id, so any choice among them is the same answer.
+
+    If this ever stopped holding, the kernels would silently disagree with the
+    portable path on which of two equally-ranked hits to keep — and the
+    artifact-identity tests are the only thing that would notice.
+    """
+    rng = np.random.default_rng(0)
+    # Unique ordinals spanning the legal range, INCLUDING both edges. Built by
+    # sampling and de-duplicating rather than `rng.choice(TIE_WORST,
+    # replace=False)`, which would try to enumerate a 4.29-billion population
+    # (34 GB) to draw 50,000 values from it.
+    top = tb.TIE_WORST
+    ordinals_np = np.unique(
+        np.concatenate([
+            np.array([0, 1, top - 2, top - 1], dtype=np.int64),
+            rng.integers(0, top, size=50_000, dtype=np.int64),
+        ])
+    )
+    n = len(ordinals_np)
+    ordinals = torch.from_numpy(ordinals_np)
+    # the adversarial case for uniqueness: EVERY candidate has the same score,
+    # so the ordinal alone has to separate them
+    same = pack(torch.zeros(n, dtype=torch.float32), ordinals)
+    assert len(set(same.tolist())) == n, "equal scores collided despite unique ordinals"
+
+    # and with scores that themselves repeat heavily
+    coarse = torch.from_numpy(rng.integers(0, 4, size=n).astype(np.float32))
+    mixed = pack(coarse, ordinals)
+    assert len(set(mixed.tolist())) == n, "a real key collision is possible"
+
+    # the sentinel is the sole duplicate-by-design, and it sits below every
+    # real candidate rather than tying with one
+    sent = int(pack(torch.tensor([float("-inf")]), torch.tensor([top]))[0])
+    assert sent not in set(mixed.tolist()), "a real candidate collided with the sentinel"
+    assert sent < int(mixed.min()), "the sentinel must lose to every real candidate"

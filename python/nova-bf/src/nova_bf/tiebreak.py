@@ -218,6 +218,11 @@ def pack_topk(scores, ordinal, k):
         # compilation or launch fails.
         try:
             return topk_triton.topk(scores, ordinal, k)
+        except torch.cuda.OutOfMemoryError:
+            # OOM does not indicate an unsupported kernel configuration, and
+            # the portable path requires even more temporary memory. Preserve
+            # the original error rather than permanently disabling Triton.
+            raise
         except Exception as exc:
             topk_triton.disable(exc)
 

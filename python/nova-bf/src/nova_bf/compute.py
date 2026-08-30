@@ -1250,6 +1250,45 @@ def _merge_topk(top_key, top_enc, parts: list[tuple], k: int):
     """
     import torch
 
+    from nova_bf import merge_triton
+
+    # Check whether the Triton fold is viable before preparing its inputs.
+    #  This is especially important for large query counts, where the temporary
+    # copies can be substantial.
+    pending_width = sum(int(p.shape[1]) for p, _ in parts)
+    if merge_triton.enabled(top_key) and k + pending_width <= merge_triton.MAX_BLOCK:
+        # A single part is the common case. Multiple parts arise from narrow
+        # slices, such as file tails or heavily filtered batches; combine them once
+        # here rather than concatenating each with the full running state.
+        if len(parts) > 1:
+            pk = torch.cat([p for p, _ in parts], dim=1)
+            pe = torch.cat(
+                [e if e.ndim == 2 else e.unsqueeze(0).expand(p.shape[0], -1) for p, e in parts],
+                dim=1,
+            )
+        else:
+            pk, pe = parts[0]
+        # The Triton kernel requires contiguous inputs. Sparse scoring can produce
+        # transposed/non-contiguous tensors, so materialize them here rather than
+        # forcing the more expensive portable merge.
+        if not pk.is_contiguous():
+            pk = pk.contiguous()
+        if not pe.is_contiguous():
+            pe = pe.contiguous()
+        if merge_triton.available(top_key, top_enc, pk, pe, k):
+            try:
+                return merge_triton.fold(top_key, top_enc, pk, pe, k)
+            except torch.cuda.OutOfMemoryError:
+                # OOM does not indicate an unsupported kernel configuration, and
+                # the portable path requires even more temporary memory. Preserve
+                # the original error rather than permanently disabling Triton.
+                raise
+            except Exception as exc:
+                merge_triton.disable(exc)
+        # Preparation has already combined the pending inputs, so reuse that result
+        # if execution falls through to the portable path.
+        parts = [(pk, pe)]
+
     # Each intermediate is del'd as soon as the next line no longer needs it
     merged_k = torch.cat([top_key] + [p for p, _ in parts], dim=1)
     merged_e = torch.cat(
