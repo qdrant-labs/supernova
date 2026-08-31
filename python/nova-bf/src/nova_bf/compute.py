@@ -238,10 +238,51 @@ def _build_query_vocab(indices: np.ndarray) -> np.ndarray:
     return np.unique(indices)
 
 
+# Maximum size of `_vocab_lookup`'s id-indexed LUT. Its size depends on the
+# largest id, not vocabulary length, so sparse/hashed id spaces can be huge.
+# Fall back to binary search beyond this budget.
+_VOCAB_LUT_MAX_BYTES = 256 << 20
+
+
+def _lut_applies(vocab: np.ndarray, ids: np.ndarray) -> bool:
+    """Whether an id-indexed LUT is valid and within budget.
+
+    Requires integer, non-negative ids and a bounded maximum vocabulary id.
+    """
+    if not (np.issubdtype(vocab.dtype, np.integer)
+            and np.issubdtype(ids.dtype, np.integer)):
+        return False
+    if int(vocab[0]) < 0:  # sorted ascending, so this is the smallest
+        return False
+    if (int(vocab[-1]) + 2) * 8 > _VOCAB_LUT_MAX_BYTES:
+        return False
+    return (np.issubdtype(ids.dtype, np.unsignedinteger)
+            or len(ids) == 0
+            or int(ids.min()) >= 0)
+
+
 def _vocab_lookup(vocab: np.ndarray, ids: np.ndarray) -> np.ndarray:
-    """`ids` -> compact column position in `vocab`, or -1 if not present."""
+    """Map `ids` to positions in sorted `vocab`, or -1 if absent.
+
+    Uses a direct lookup table for suitable non-negative integer ids and
+    `searchsorted` otherwise. The LUT path is much faster for large sparse
+    remaps; the search path also supports strings and other id types.
+    """
     if len(vocab) == 0:
         return np.full(len(ids), -1, dtype=np.int64)
+    if _lut_applies(vocab, ids):
+        top = int(vocab[-1])
+
+        # Extra slot maps all ids above the vocabulary to -1.
+        lut = np.full(top + 2, -1, dtype=np.int64)
+        lut[vocab] = np.arange(len(vocab), dtype=np.int64)
+        cap = top + 1
+        if cap <= np.iinfo(ids.dtype).max:
+            # Keep the clip in `ids`' dtype to avoid a wider temporary.
+            ids = np.minimum(ids, ids.dtype.type(cap))
+        
+        return lut[ids]
+
     pos = np.minimum(np.searchsorted(vocab, ids), len(vocab) - 1)
     return np.where(vocab[pos] == ids, pos, -1).astype(np.int64)
 
@@ -265,8 +306,30 @@ def _coalesce_by_row_col(
 
     `np.lexsort`'s LAST key is primary: `(col_ids, row_ids)` sorts by row
     first, then col within each row — the reverse of the argument order.
+
+    Both properties are usually already TRUE on arrival — a sparse embedder
+    that emits each row's token ids ascending and deduped (which the gte
+    scheme does, and `_vocab_lookup` preserves, being monotone) has nothing
+    here to fix — so the arrival case is tested for directly. It has to be
+    tested for rather than assumed: the sort and the sum are what make a
+    hash-colliding embedder correct, and this is the only place that happens.
+
+    When the fast path is taken the INPUT ARRAYS THEMSELVES are returned, not
+    copies (no caller mutates the result; `_remap_sparse_file` and
+    `_sparse_file_norms` both only read it). That is also bit-identical to
+    what the slow path would have returned, not merely equal: with no
+    duplicates every group receives exactly one value, and float32 -> float64
+    -> float32 round-trips exactly, so `np.add.at`'s float64 accumulator gives
+    back the input value unchanged.
     """
     if len(row_ids) == 0:
+        return row_ids, col_ids, values
+    # Strictly increasing in (row, col) lexicographic order <=> sorted by row
+    # then col AND no (row, col) pair repeated. One test, both invariants.
+    if np.all(
+        (row_ids[1:] > row_ids[:-1])
+        | ((row_ids[1:] == row_ids[:-1]) & (col_ids[1:] > col_ids[:-1]))
+    ):
         return row_ids, col_ids, values
     perm = np.lexsort((col_ids, row_ids))
     row_ids, col_ids, values = row_ids[perm], col_ids[perm], values[perm]
@@ -1431,7 +1494,8 @@ def _pack_query_axis(mask: np.ndarray) -> np.ndarray:
     still held on the CPU for a whole file's batch loop, 8x. Rows aren't the
     packed axis, so slicing by `true_rows` (`keeps[f][:, true_rows]`) stays a
     plain column slice — no unpacking needed just to select rows. Inverse:
-    `_unpack_query_axis`.
+    `_unpack_query_axis` (and `_unpack_query_axis_device`, which is the one
+    the run actually calls).
 
     `n_queries` here is that FILTER's query-row union, not the queries file's
     (see `run_compute`'s `filter_rows`)."""
@@ -1446,8 +1510,66 @@ def _unpack_query_axis(packed: np.ndarray, n_queries: int) -> np.ndarray:
     up to 7 extra all-`False` phantom queries, mismatching every real
     per-query tensor it's later combined with. `unpackbits` itself returns
     `uint8` 0/1, not `bool` — cast explicitly, since `~` on a `uint8` tensor
-    flips all 8 bits (`0 -> 255`) rather than negating logically."""
+    flips all 8 bits (`0 -> 255`) rather than negating logically.
+
+    No longer on the run's hot path — `select` expands on the compute device
+    instead (`_unpack_query_axis_device`). This stays as the definition of
+    what that expansion has to produce, and as the reference the equivalence
+    test compares against."""
     return np.unpackbits(packed, axis=0, count=n_queries).astype(bool)
+
+
+_BIT_SHIFTS: dict[object, object] = {}
+
+
+def _bit_shifts(device):
+    """The eight single-bit selectors `[0x80 ... 0x01]` as `uint8` on `device`,
+    built once per device — a tiny tensor, but rebuilding it inside
+    `_unpack_query_axis_device` would be a host-to-device copy per batch slice.
+
+    Selectors rather than shift counts (`[7 ... 0]`) so the expansion is one
+    `and` plus one `!= 0` — two device kernels, and bool straight out — where
+    shifting needs a third for the `uint8 -> bool` cast. Same bit order either
+    way: `packbits`'s big-endian bit `7 - (q % 8)` is mask `1 << (7 - q % 8)`.
+    """
+    got = _BIT_SHIFTS.get(device)
+    if got is None:
+        import torch
+
+        got = _BIT_SHIFTS[device] = torch.tensor(
+            [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01],
+            dtype=torch.uint8, device=device,
+        )
+    return got
+
+
+def _unpack_query_axis_device(packed: np.ndarray, n_queries: int, device):
+    """Unpack a query-axis bitmask on `device`.
+
+    Matches `_unpack_query_axis` exactly, including big-endian bit order,
+    truncation, and zero-padding when `n_queries` exceeds the packed height.
+    """
+    import torch
+
+    n_bytes, n_rows = packed.shape
+    n_bits = n_bytes * 8
+
+    # Column slicing can leave `packed` strided; compact before transfer.
+    p = torch.from_numpy(np.ascontiguousarray(packed)).to(device, non_blocking=True)
+    bits = (p.unsqueeze(1) & _bit_shifts(p.device).view(1, 8, 1)) != 0
+    out = bits.reshape(n_bits, n_rows)[:n_queries]
+    if n_queries > n_bits:
+        # Preserve `_unpack_query_axis`'s zero-padding behavior.
+        out = torch.cat([
+            out,
+            torch.zeros(n_queries - n_bits, n_rows, dtype=torch.bool, device=out.device),
+        ])
+    return out
+
+
+# `cache.get` sentinel: an EMPTY per-query mask caches as `None`, which is a
+# real cached value here, not a miss (see `_process_shared_batch`'s `select`).
+_UNCACHED = object()
 
 
 def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | None]) -> np.ndarray:
@@ -2248,25 +2370,29 @@ def _process_shared_batch(
         if _is_unfiltered(s.filter):
             return rows, None, None
         if filter_is_gpu_eligible[s.filter] or filter_is_per_query[s.filter]:
-            cell_mask = cache.get(s.filter)
-            if cell_mask is None:
+            # `None` means "this slice has no row any query wants" — a cached
+            # VALUE, so the miss test needs its own sentinel.
+            cell_mask = cache.get(s.filter, _UNCACHED)
+            if cell_mask is _UNCACHED:
                 if filter_is_gpu_eligible[s.filter]:
                     cell_mask = _gpu_evaluate(s.filter, leaf_gpu, rows, query_gpu, device)
+                    if not cell_mask.any():
+                        cell_mask = None
                 else:
-                    # `keeps[s.filter]` is bit-packed along the query axis
-                    # (see `run_compute`'s reader thread / `_pack_query_axis`)
-                    # — row-slice the packed bytes first (cheap: rows aren't
-                    # the packed axis), THEN unpack, so only this batch
-                    # slice's bytes ever get expanded back to
-                    # one-bool-per-query, not the whole file's.
+                    # Row-slice the query-axis-packed mask, then unpack on device to keep
+                    # host-to-device transfer packed and avoid materializing host booleans.
                     packed_np = keeps[s.filter][:, true_rows]
-                    # Height is THIS FILTER's query axis (`filter_n_q[s.filter]`
-                    # — the union of its own specs' `rows` selectors)
-                    cell_np = _unpack_query_axis(packed_np, filter_n_q[s.filter])
-                    cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
+                    if packed_np.any():
+                        cell_mask = _unpack_query_axis_device(
+                            packed_np, filter_n_q[s.filter], device,
+                        )
+                    else:
+                        # Exact empty-mask fast path; checking packed bytes avoids expansion
+                        # and a per-slice device sync.
+                        cell_mask = None
                 if filter_share_count[s.filter] > 1:
                     cache[s.filter] = cell_mask
-            if not cell_mask.any():
+            if cell_mask is None:
                 return None, None, None
             return rows, None, cell_mask
         local_idx = cache.get(s.filter)
@@ -3610,14 +3736,8 @@ def run_compute(
                 ([0], np.cumsum(lens)[:-1])
             ) if len(lens) else np.zeros(0, dtype=np.int64)
             values = pa.concat_arrays(arrays) if arrays else pa.array([])
-            # 32-bit offsets cap a `string` array's CHARACTER data at 2 GiB, and
-            # one search's decode is n_q*k hits: 100k queries at k=1000 is 1e8
-            # ids of ~47 bytes = ~4.7 GB. `take` does NOT raise on that - it
-            # returns an array whose offsets have WRAPPED NEGATIVE, which is only
-            # noticed later, as a SIGSEGV inside the parquet writer, after the
-            # whole scan has been paid for. `large_string`'s 64-bit offsets are
-            # the fix, applied here at the source so every `take` below inherits
-            # it. (Numeric id columns have no offsets and are left alone.)
+
+            # Prevent 32-bit offset overflow
             if pa.types.is_string(values.type):
                 values = values.cast(pa.large_string())
             elif pa.types.is_binary(values.type):
