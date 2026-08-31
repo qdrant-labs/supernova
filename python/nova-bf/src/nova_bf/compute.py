@@ -3609,7 +3609,20 @@ def run_compute(
             base[np.asarray(gidxs, dtype=np.int64)] = np.concatenate(
                 ([0], np.cumsum(lens)[:-1])
             ) if len(lens) else np.zeros(0, dtype=np.int64)
-            flat_ids[0] = (pa.concat_arrays(arrays) if arrays else pa.array([]), base)
+            values = pa.concat_arrays(arrays) if arrays else pa.array([])
+            # 32-bit offsets cap a `string` array's CHARACTER data at 2 GiB, and
+            # one search's decode is n_q*k hits: 100k queries at k=1000 is 1e8
+            # ids of ~47 bytes = ~4.7 GB. `take` does NOT raise on that - it
+            # returns an array whose offsets have WRAPPED NEGATIVE, which is only
+            # noticed later, as a SIGSEGV inside the parquet writer, after the
+            # whole scan has been paid for. `large_string`'s 64-bit offsets are
+            # the fix, applied here at the source so every `take` below inherits
+            # it. (Numeric id columns have no offsets and are left alone.)
+            if pa.types.is_string(values.type):
+                values = values.cast(pa.large_string())
+            elif pa.types.is_binary(values.type):
+                values = values.cast(pa.large_binary())
+            flat_ids[0] = (values, base)
         return flat_ids[0]
 
     if id_col is not None:
@@ -3746,7 +3759,9 @@ def run_compute(
                         + (flat_enc % MAX_ROWS_PER_FILE))
             raw_taken = values.take(pa.array(flat_idx))
             hit_ids = pa.ListArray.from_arrays(
-                offsets, raw_taken.cast(pa.string()).fill_null("None")
+                # `large_string`, NOT `string`: see `_flat_ids`. Casting down
+                # here would wrap the offsets again.
+                offsets, raw_taken.cast(pa.large_string()).fill_null("None")
             )
         else:
             # make_point_id is an md5 per hit and cannot be vectorized into
@@ -3755,7 +3770,7 @@ def run_compute(
             hit_ids = pa.ListArray.from_arrays(offsets, pa.array(
                 [make_point_id(keys[int(e) // MAX_ROWS_PER_FILE],
                                int(e) % MAX_ROWS_PER_FILE) for e in flat_enc],
-                type=pa.string(),
+                type=pa.large_string(),   # 1e8 x 36-byte UUIDs = 3.6 GB > 2 GiB
             ))
 
         hit_tie = None

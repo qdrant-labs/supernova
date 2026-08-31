@@ -125,3 +125,77 @@ def test_a_null_id_stringifies_to_None():
     ids = pa.array(["b", None])
     assert ids.cast(pa.string()).fill_null("None").to_pylist() == ["b", "None"]
     assert [str(v.as_py()) for v in ids] == ["b", "None"]
+
+
+# ---------------------------------------------------------------------------
+# 64-bit offsets on the id column
+# ---------------------------------------------------------------------------
+# A `string` array's 32-bit offsets cap its CHARACTER data at 2 GiB. One
+# search's decode is n_q*k ids: the production dense search is 100k queries at
+# k=1000 = 1e8 ids of ~47 bytes, i.e. ~4.7 GB. `Array.take` does not raise on
+# that -- it returns an array whose offsets have wrapped NEGATIVE, and nothing
+# notices until the parquet writer dereferences them and the process dies of
+# SIGSEGV, after the entire corpus scan has been paid for and with no output
+# written at all. (Observed on an A10G: 8 files scanned, `bf-bench` logged,
+# then signal 11 in `pyarrow.parquet.write_table`; the commit before the
+# vectorized decode wrote all four partials fine.)
+#
+# Reproducing the overflow itself would mean materializing >2 GiB of ids in a
+# unit test, so these pin the property that prevents it instead: the id column
+# reaches parquet with 64-bit offsets. If anything casts back down to
+# `pa.string()`, these fail.
+
+def _dense_run(tmp_path, *, id_column):
+    """A minimal end-to-end compute, returning the written parquet path."""
+    import pyarrow.parquet as pq
+    from nova_bf.compute import run_compute
+    from nova_bf.config import (
+        BruteForceConfig, CorpusConfig, OutputConfig, ParamsConfig,
+        QueriesConfig, SearchSpec,
+    )
+
+    vec = [1.0, 0.0, 0.0, 0.0]
+    cdir = tmp_path / "c"
+    cdir.mkdir()
+    cols = {"dense_embedding": pa.array([vec] * 6, pa.list_(pa.float32()))}
+    if id_column:
+        cols["sid"] = pa.array([f"id{i}" for i in range(6)])
+    pq.write_table(pa.table(cols), str(cdir / "f0.parquet"))
+    pq.write_table(
+        pa.table({"dense_embedding": pa.array([vec], pa.list_(pa.float32())),
+                  "qid": pa.array(["q0"])}),
+        str(tmp_path / "q.parquet"),
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column=id_column),
+        queries=QueriesConfig(path=str(tmp_path / "q.parquet"), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(io_workers=1),
+        searches=[SearchSpec(name="t", k=3, metric="dot")],
+    )
+    return pq.read_schema(run_compute(cfg)["t"])
+
+
+def test_hit_ids_use_64_bit_offsets_with_a_corpus_id_column():
+    import tempfile
+    import pathlib
+
+    with tempfile.TemporaryDirectory() as d:
+        schema = _dense_run(pathlib.Path(d), id_column="sid")
+    assert schema.field("hit_ids").type == pa.list_(pa.large_string()), (
+        "hit_ids must carry 64-bit offsets: at 1e8 hits a 32-bit `string` child "
+        "silently wraps and segfaults the parquet writer"
+    )
+
+
+def test_hit_ids_use_64_bit_offsets_for_synthesized_ids():
+    """The `make_point_id` branch has the same ceiling: 1e8 x 36-byte UUIDs is
+    3.6 GB, also past 2 GiB."""
+    import tempfile
+    import pathlib
+
+    with tempfile.TemporaryDirectory() as d:
+        schema = _dense_run(pathlib.Path(d), id_column=None)
+    assert schema.field("hit_ids").type == pa.list_(pa.large_string())
