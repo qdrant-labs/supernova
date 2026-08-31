@@ -306,6 +306,34 @@ def build_ordinals(id_arrays: list) -> list[np.ndarray]:
     return out
 
 
+def id_order_array(values, unsigned: bool):
+    """Vectorized `id_order_scalar`.
+
+    Used on the n_q*k decode hot path to avoid per-hit Python calls. The scalar
+    rule remains authoritative; tests pin this implementation to it.
+
+    Nulls sort last. Unsigned IDs flip the high bit, mapping uint64 to int64
+    while preserving unsigned order.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    # Fill nulls in Arrow: converting nullable uint64 through NumPy can route
+    # through float64 and lose precision. The filled values are masked below.
+    nulls = np.asarray(values.is_null()) if values.null_count else None
+    filled = values.fill_null(0) if values.null_count else values
+    if unsigned:
+        u = np.asarray(filled.cast(pa.uint64()).to_numpy(zero_copy_only=False),
+                       dtype=np.uint64)
+        out = (u ^ np.uint64(1 << 63)).astype(np.int64)
+    else:
+        out = np.asarray(filled.cast(pa.int64()).to_numpy(zero_copy_only=False),
+                         dtype=np.int64).copy()
+    if nulls is not None:
+        out[nulls] = np.int64(_INT64_MAX)
+    return pa.array(out, type=pa.int64())
+
+
 def id_order_scalar(v, unsigned: bool) -> int:
     """The int64 whose ascending order DEFINES `tiebreak='id'` for one id.
 

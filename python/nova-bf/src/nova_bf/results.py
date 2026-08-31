@@ -245,10 +245,17 @@ def build_result_table(
     data: dict = {"query_id": pa.array(query_ids, pa.string())}
     for col, vals in payload.items():
         data[col] = pa.array(vals)
-    data["hit_ids"] = pa.array(hit_ids, pa.list_(pa.string()))
-    data["hit_scores"] = pa.array(hit_scores, pa.list_(pa.float32()))
+    # `compute` hands these in as ready-built Arrow `ListArray`s — it decodes
+    # a whole (n_q, k) block at once rather than a Python list per query — but
+    # `merge` and the tests still pass lists of lists, so accept both rather
+    # than forcing either caller to convert.
+    def _list_col(v, ty):
+        return v if isinstance(v, (pa.Array, pa.ChunkedArray)) else pa.array(v, pa.list_(ty))
+
+    data["hit_ids"] = _list_col(hit_ids, pa.string())
+    data["hit_scores"] = _list_col(hit_scores, pa.float32())
     if hit_tie is not None:
-        data["hit_tie"] = pa.array(hit_tie, pa.list_(pa.int64()))
+        data["hit_tie"] = _list_col(hit_tie, pa.int64())
     table = pa.table(data)
     # No tie-break stamp here: `provenance` carries it, so both this builder and
     # `merge`'s get it from one place.

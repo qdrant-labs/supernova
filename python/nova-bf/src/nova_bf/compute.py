@@ -75,6 +75,7 @@ from nova_bf.tiebreak import (
     MAX_ROWS_PER_WORKER,
     build_ordinals,
     id_order_scalar,
+    id_order_array,
     pack,
     pack_topk,
     sentinel_key,
@@ -3584,6 +3585,33 @@ def run_compute(
     #    nothing corpus-wide — or, when an id column is configured, read it back
     #    from the in-RAM per-file arrays. Shared by every spec: depends only on
     #    id_col/corpus_ids/all_files, none of which is per-spec.
+    
+    # ID decoding is on the n_q*k hot path. Flatten per-file IDs once so encoded
+    # (gidx, row) pairs resolve as one vectorized `take` instead of scalar lookups.
+    # Built lazily and only when an ID column is configured.
+    flat_ids: list = [None]  # boxed so the closure can memoize into it
+
+    def _flat_ids():
+        if flat_ids[0] is None:
+            import pyarrow as pa
+
+            gidxs = sorted(corpus_ids)
+            arrays = [
+                corpus_ids[g].combine_chunks()
+                if isinstance(corpus_ids[g], pa.ChunkedArray) else corpus_ids[g]
+                for g in gidxs
+            ]
+            lens = np.fromiter((len(a) for a in arrays), dtype=np.int64,
+                               count=len(arrays))
+            # `base` is indexed by gidx, so it must span the largest gidx seen,
+            # not just len(arrays) — a filtered run can leave gaps.
+            base = np.zeros((max(gidxs) + 1) if gidxs else 1, dtype=np.int64)
+            base[np.asarray(gidxs, dtype=np.int64)] = np.concatenate(
+                ([0], np.cumsum(lens)[:-1])
+            ) if len(lens) else np.zeros(0, dtype=np.int64)
+            flat_ids[0] = (pa.concat_arrays(arrays) if arrays else pa.array([]), base)
+        return flat_ids[0]
+
     if id_col is not None:
         def resolve_id(e: int) -> str:
             gidx = e // MAX_ROWS_PER_FILE
@@ -3700,19 +3728,47 @@ def run_compute(
         # every row) precisely so this slice is the only place that has to know.
         rows_i = spec_rows[i]
         out_n = sc.shape[0]
-        hit_ids, hit_scores = [], []
-        hit_tie: list[list[int]] | None = [] if want_tie_column else None
-        for q in range(out_n):
-            qe, qs = enc[q][valid[q]], sc[q][valid[q]]
-            hit_ids.append([resolve_id(int(e)) for e in qe])
-            hit_scores.append(qs.tolist())
-            if want_tie_column:
-                hit_tie.append(
-                    qe.tolist() if resolve_tie is None
-                    else [resolve_tie(int(e)) for e in qe]
-                    # `resolve_tie is None` here means ordinal mode, where the
-                    # encoded value already IS the global corpus position.
-                )
+        import pyarrow as pa
+
+        counts = valid.sum(axis=1).astype(np.int64)
+        offsets = pa.array(
+            np.concatenate(([0], np.cumsum(counts))).astype(np.int32), type=pa.int32()
+        )
+        flat_enc = enc[valid]                       # row-major == list order
+        hit_scores = pa.ListArray.from_arrays(
+            offsets, pa.array(sc[valid], type=pa.float32())
+        )
+
+        raw_taken = None  # the id values for these hits, resolved ONCE
+        if id_col is not None:
+            values, base = _flat_ids()
+            flat_idx = (base[flat_enc // MAX_ROWS_PER_FILE]
+                        + (flat_enc % MAX_ROWS_PER_FILE))
+            raw_taken = values.take(pa.array(flat_idx))
+            hit_ids = pa.ListArray.from_arrays(
+                offsets, raw_taken.cast(pa.string()).fill_null("None")
+            )
+        else:
+            # make_point_id is an md5 per hit and cannot be vectorized into
+            # Arrow
+            keys = [f.key for f in all_files]
+            hit_ids = pa.ListArray.from_arrays(offsets, pa.array(
+                [make_point_id(keys[int(e) // MAX_ROWS_PER_FILE],
+                               int(e) % MAX_ROWS_PER_FILE) for e in flat_enc],
+                type=pa.string(),
+            ))
+
+        hit_tie = None
+        if want_tie_column:
+            if resolve_tie is None:
+                # ordinal mode: the encoded value already IS the global corpus
+                # position, so no resolution at all.
+                tie_vals = pa.array(flat_enc.astype(np.int64), type=pa.int64())
+            else:
+                # `id` mode over a numeric column. Reuses `raw_taken` rather
+                # than resolving every element a second time
+                tie_vals = id_order_array(raw_taken, tie_unsigned)
+            hit_tie = pa.ListArray.from_arrays(offsets, tie_vals)
 
         if rows_i is None:
             out_ids, out_payload = query_ids, payload
@@ -3739,7 +3795,7 @@ def run_compute(
             ),
             hit_tie=hit_tie,
         )
-        short_i = sum(1 for h in hit_ids if len(h) < s.k)
+        short_i = int((counts < s.k).sum())
         if num_jobs is not None:
             width = max(3, len(str(num_jobs - 1)))
             name = f"{partial_dir(cfg, s)}/rank{job_rank:0{width}d}.parquet"
@@ -3750,7 +3806,7 @@ def run_compute(
             # the true final count, so that's the only place worth warning.
         else:
             name = result_name(cfg, s)
-            warn_if_short(short_i, len(hit_ids), s.k, s.name, logger)
+            warn_if_short(short_i, out_n, s.k, s.name, logger)
         path = out.write(name, table)
         logger.info("search=%r wrote %s (%d queries)", s.name, path, out_n)
         results[s.name] = path
