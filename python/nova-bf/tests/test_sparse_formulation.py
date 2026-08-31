@@ -1,0 +1,115 @@
+"""`_sparse_scores` picks WHICH OPERAND IS SPARSE. Both choices must agree.
+
+Scoring `Cb @ Q.T` makes the per-slice corpus sparse and streams the densified
+query matrix as the dense operand; the swapped form makes the static query
+matrix sparse and densifies the corpus slice. They sum the same products in a
+different order, so they are not bit-identical — but they must agree on the
+one thing that decides which documents come back: the zero-gate set
+(`raw == 0` marks a structurally non-overlapping pair as a non-candidate).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+pytest.importorskip("torch")
+import torch
+
+from nova_bf.compute import (_SparseQueryCache, _dense_slice_t, _sparse_scores,
+                             _sparse_batch_to_csr)
+import nova_bf.compute as compute_mod
+
+
+def _slice(rng, n_rows, vocab, nnz, dtype=np.float32, signed=True):
+    """A coalesced CSR slice, built the way `_remap_sparse_file` leaves them:
+    per-row sorted, deduped column ids."""
+    rows, cols, vals = [], [], []
+    for r in range(n_rows):
+        c = np.sort(rng.choice(vocab, size=nnz, replace=False))
+        rows += [r] * nnz
+        cols += c.tolist()
+        v = rng.standard_normal(nnz) if signed else rng.random(nnz) + 0.1
+        vals += v.astype(dtype).tolist()
+    row_offsets = np.arange(0, n_rows * nnz + 1, nnz, dtype=np.int64)
+    return (row_offsets, np.asarray(cols, dtype=np.int64),
+            np.asarray(vals, dtype=dtype))
+
+
+def _Q(rng, n_q, vocab, nnz):
+    Q = np.zeros((n_q, vocab), dtype=np.float32)
+    for q in range(n_q):
+        Q[q, rng.choice(vocab, size=nnz, replace=False)] = rng.standard_normal(nnz)
+    return torch.from_numpy(Q)
+
+
+@pytest.fixture
+def case():
+    rng = np.random.default_rng(7)
+    n_rows, vocab, n_q = 64, 128, 40
+    ro, idx, val = _slice(rng, n_rows, vocab, nnz=9)
+    vocab_arr = np.arange(vocab)
+    Cb = _sparse_batch_to_csr(ro, idx, val, 0, n_rows, vocab_arr, "cpu")
+    return _Q(rng, n_q, vocab, nnz=5), Cb
+
+
+def test_both_formulations_agree(case, monkeypatch):
+    """The property that matters: same scores to float tolerance, and the same
+    zero-gate SET exactly. A disagreement in the gate would return different
+    documents, which for ground truth is disqualifying regardless of speed."""
+    Q, Cb = case
+    swapped = _sparse_scores(Q, Cb, _SparseQueryCache())
+    monkeypatch.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES", 0)
+    fallback = _sparse_scores(Q, Cb, _SparseQueryCache())
+
+    assert swapped.shape == fallback.shape == (Q.shape[0], Cb.shape[0])
+    assert torch.equal(swapped == 0, fallback == 0), "zero-gate sets differ"
+    assert torch.allclose(swapped, fallback, rtol=1e-5, atol=1e-6)
+
+
+def test_swapped_output_is_contiguous(case):
+    """The swap returns `(n_q, n_rows)` natively; the old path returned a
+    transposed view. Downstream (mask, top-K, merge) reads it row-major, so
+    this is a small free win — and a regression here would be silent."""
+    Q, Cb = case
+    assert _sparse_scores(Q, Cb, _SparseQueryCache()).is_contiguous()
+
+
+def test_budget_selects_the_fallback(case, monkeypatch):
+    """A wide-vocab query set would want a slice-sized dense operand; the
+    budget must send it to the transpose form instead of allocating it."""
+    Q, Cb = case
+    monkeypatch.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES", 0)
+    out = _sparse_scores(Q, Cb, _SparseQueryCache())
+    assert out.shape == (Q.shape[0], Cb.shape[0])
+
+
+def test_dense_slice_t_marks_stored_zeros(case):
+    """`_dense_slice_t`'s `values` argument exists so the structural gate can
+    scatter ONES. A stored 0.0 is still an overlap; deriving the indicator
+    from `Cb.values() != 0` would miss it and wrongly call the pair a
+    non-candidate."""
+    _, Cb = case
+    vals = Cb.values().clone()
+    vals[0] = 0.0                                    # a stored, explicit zero
+    Cb0 = torch.sparse_csr_tensor(Cb.crow_indices(), Cb.col_indices(), vals,
+                                  size=Cb.shape, check_invariants=False)
+    ones = torch.ones(vals.numel(), dtype=vals.dtype)
+    ind = _dense_slice_t(Cb0, ones)
+    col0, row0 = int(Cb.col_indices()[0]), 0
+    assert ind[col0, row0] == 1.0, "stored zero lost from the structural indicator"
+    assert _dense_slice_t(Cb0, vals)[col0, row0] == 0.0
+
+
+def test_query_cache_builds_once(case):
+    """Run-wide by design: the CSR is built on first use and reused by every
+    slice thereafter (see `_SparseQueryCache`'s shared-Q invariant)."""
+    Q, _ = case
+    c = _SparseQueryCache()
+    assert c.values(Q) is c.values(Q)
+    assert c.transpose(Q) is c.transpose(Q)
+    assert c.indicator(Q) is c.indicator(Q)
+    assert c.values(Q).values().numel() == int((Q != 0).sum())
+    # indicator carries ones; values carries Q's actual numbers
+    assert torch.equal(c.indicator(Q).values(),
+                       torch.ones_like(c.indicator(Q).values()))

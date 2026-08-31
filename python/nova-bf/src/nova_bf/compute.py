@@ -535,18 +535,24 @@ def _sparse_batch_to_csr(
     return Cb.to(device, non_blocking=True)
 
 
-def _sparse_scores(Q, Cb):
-    """`Cb` (RAW, unnormalized sparse CSR, batch × vocab) against dense `Q`
-    (n_q × vocab) via the documented, stable `sparse_csr @ dense -> dense` path
-    (cuSPARSE SpMM) — deliberately not sparse-sparse matmul, which torch has no
-    stable binding for. Returns the raw dot-product score matrix; the caller
-    applies any metric-specific transform (e.g. dividing by each row's L2 norm
-    for cosine) afterward — see `SparseBatchSlice.score`, which shares one
-    `Cb` across every search scoring it regardless of metric, so this
-    function itself must stay metric-agnostic."""
+def _sparse_scores(Q, Cb, q_cache=None):
+    """Raw `(n_q, n_rows)` sparse dot-product scores for one corpus slice.
+
+    Uses `Q_csr @ dense(Cb).T` when the dense corpus slice fits in memory. This
+    is much faster than `Cb @ Q.T`, whose dense query operand is a poorly
+    strided transposed view. Falls back to the contiguous-transpose path when
+    densifying `Cb` would exceed `_SPARSE_SWAP_MAX_DENSE_BYTES`.
+
+    Returns raw scores; metric-specific transforms are applied by the caller.
+    """
     import torch
 
-    return torch.matmul(Cb, Q.T).T
+    n_rows, vocab = Cb.shape
+    cache = q_cache or _SparseQueryCache()
+    if vocab * n_rows * Q.element_size() <= _SPARSE_SWAP_MAX_DENSE_BYTES:
+        # Produces the `(n_q, n_rows)` layout downstream consumers expect.
+        return torch.matmul(cache.values(Q), _dense_slice_t(Cb, Cb.values()))
+    return torch.matmul(Cb, cache.transpose(Q)).T
 
 
 def _scores(Q, C, metric: str, q_norms=None):
@@ -710,7 +716,7 @@ class SparseCorpusBatch:
 
     def __init__(
         self, row_offsets, indices, values, norms, vocab: np.ndarray, need_row_norms: bool,
-        zero_gate_ok: bool = False, q_indicator=None,
+        zero_gate_ok: bool = False, q_cache=None,
     ):
         self.row_offsets = row_offsets
         self.indices = indices
@@ -719,11 +725,11 @@ class SparseCorpusBatch:
         self.vocab = vocab
         self.need_row_norms = need_row_norms
         # Whether this file's slices may use the cheap `raw == 0` no-overlap
-        # gate (see `_zero_gate_file_ok`), and the run-wide `_QueryIndicator`
+        # gate (see `_zero_gate_file_ok`), and the run-wide `_SparseQueryCache`
         # for the signed fallback — both fixed per file / per run, carried
         # through `.compact()`/`_concat_sparse_batches` like `vocab`.
         self.zero_gate_ok = zero_gate_ok
-        self.q_indicator = q_indicator
+        self.q_cache = q_cache
 
     @property
     def n_rows(self) -> int:
@@ -743,7 +749,7 @@ class SparseCorpusBatch:
         return (
             SparseCorpusBatch(
                 row_offsets, indices, values, norms, self.vocab, self.need_row_norms,
-                self.zero_gate_ok, self.q_indicator,
+                self.zero_gate_ok, self.q_cache,
             ),
             orig_rows,
         )
@@ -756,7 +762,7 @@ class SparseCorpusBatch:
             torch.from_numpy(self.norms[r0:r1]).to(device, non_blocking=True)
             if self.need_row_norms else None
         )
-        return SparseBatchSlice(Cb, row_norms, self.zero_gate_ok, self.q_indicator)
+        return SparseBatchSlice(Cb, row_norms, self.zero_gate_ok, self.q_cache)
 
 
 # The zero-score no-overlap gate (`raw == 0` in `SparseBatchSlice.score`) is
@@ -765,6 +771,11 @@ class SparseCorpusBatch:
 # miss): require min_positive(Q) * min_positive(C_file) above this. Real
 # embedder weights (~1e-4..10) clear it by >20 orders of magnitude.
 _ZERO_GATE_MIN_PRODUCT = 1e-30
+
+# Max size of the dense `(vocab, slice_rows)` corpus operand used by swapped 
+# sparse scoring. Larger slices fall back to the contiguous-transpose path to 
+# avoid excessive temporary memory.
+_SPARSE_SWAP_MAX_DENSE_BYTES = 512 << 20
 
 
 def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> bool:
@@ -791,31 +802,73 @@ def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> 
     return q_min_pos * vmin > _ZERO_GATE_MIN_PRODUCT
 
 
-class _QueryIndicator:
-    """Run-wide, lazily-built sparse-CSR indicator of Q's nonzero pattern
-    (ones), for the SIGNED-data structural no-overlap gate. Built at most
-    once per run, on the first slice whose file fails `_zero_gate_file_ok`
-    (never for all-positive embedders like ReLU'd mGTE); shared by every
-    slice thereafter. ~nnz(Q) entries (~120 MB at 100k × ~100 nnz queries) —
-    replaces the old per-slice re-materialization of a dense `(Q != 0)`
-    float copy (~7.2 GB of writes per slice at fineweb scale)."""
+def _dense_slice_t(Cb, values):
+    """Densify a CSR corpus slice as `(vocab, n_rows)`.
+
+    `values` controls what is scattered at each stored entry: use `Cb.values()`
+    for scoring or ones for structural overlap checks. Direct assignment is safe
+    because `Cb` is coalesced, so each `(row, col)` pair is unique.
+    """
+    import torch
+
+    crow, col = Cb.crow_indices(), Cb.col_indices()
+    row_ids = torch.repeat_interleave(
+        torch.arange(Cb.shape[0], device=col.device), crow.diff()
+    )
+    out = torch.zeros((Cb.shape[1], Cb.shape[0]), dtype=values.dtype, device=values.device)
+    out[col, row_ids] = values
+    return out
+
+
+class _SparseQueryCache:
+    """Lazily cached representations of the run-wide sparse query matrix.
+
+    Assumes every sparse spec shares the same `Q`; `rows` subsets are applied
+    after scoring. If specs can ever receive different query tensors, this cache
+    must be keyed by `Q`.
+
+    Caches:
+      values:    CSR query values for swapped sparse scoring.
+      transpose: contiguous `Q.T` for the fallback scoring path.
+      indicator: CSR query structure with ones for overlap checks.
+    """
 
     def __init__(self):
-        self.csr = None
+        self._values = None
+        self._transpose = None
+        self._indicator = None
 
-    def get(self, Q):
-        if self.csr is None:
+    def _csr(self, Q, vals_from_pattern):
+        import torch
+
+        nz = Q != 0  # (n_q, vocab) bool — one-time transient
+        crow = torch.zeros(Q.shape[0] + 1, dtype=torch.int64, device=Q.device)
+        torch.cumsum(nz.sum(1), 0, out=crow[1:])
+        r, c = nz.nonzero(as_tuple=True)  # row-major order == valid CSR order
+        return torch.sparse_csr_tensor(
+            crow, c, vals_from_pattern(Q, r, c), size=tuple(Q.shape),
+            check_invariants=False,
+        )
+
+    def values(self, Q):
+        if self._values is None:
+            self._values = self._csr(Q, lambda Q, r, c: Q[r, c])
+        return self._values
+
+    def transpose(self, Q):
+        """Contiguous `Q.T` for the fallback sparse-scoring path."""
+        if self._transpose is None:
+            self._transpose = Q.t().contiguous()
+        return self._transpose
+
+    def indicator(self, Q):
+        if self._indicator is None:
             import torch
 
-            nz = Q != 0  # (n_q, vocab) bool — one-time transient
-            crow = torch.zeros(Q.shape[0] + 1, dtype=torch.int64, device=Q.device)
-            torch.cumsum(nz.sum(1), 0, out=crow[1:])
-            cols = nz.nonzero(as_tuple=True)[1]  # row-major order == valid CSR order
-            self.csr = torch.sparse_csr_tensor(
-                crow, cols, torch.ones(cols.numel(), dtype=Q.dtype, device=Q.device),
-                size=tuple(Q.shape), check_invariants=False,
+            self._indicator = self._csr(
+                Q, lambda Q, r, c: torch.ones(c.numel(), dtype=Q.dtype, device=Q.device)
             )
-        return self.csr
+        return self._indicator
 
 
 @dataclass
@@ -843,7 +896,7 @@ class SparseBatchSlice:
       impossible, so `raw == 0` IS the structural gate — free, no extra
       matmul, underflow fenced by `_ZERO_GATE_MIN_PRODUCT`.
     - Signed data: an indicator spmm — the run-wide query-pattern CSR
-      (`_QueryIndicator`, built once) against this slice's densified
+      (`_SparseQueryCache.indicator`, built once) against this slice's densified
       indicator, counting shared dims exactly as before.
 
     The scoring spmm itself runs ONCE per slice regardless of how many
@@ -860,7 +913,7 @@ class SparseBatchSlice:
     Cb: object  # torch.Tensor, sparse CSR (n_rows, vocab)
     row_norms: object  # torch.Tensor | None
     zero_gate_ok: bool = False  # may `raw == 0` stand in for the structural gate?
-    q_indicator: object = None  # run-wide _QueryIndicator (signed fallback); lazy local if None
+    q_cache: object = None  # run-wide _SparseQueryCache; lazy local if None
     _masked_raw: object = None  # lazy dot-scale masked (n_q, n_rows) — see docstring
 
     @property
@@ -875,18 +928,15 @@ class SparseBatchSlice:
         re-materialization of the multi-GB query side."""
         import torch
 
-        crow, col = self.Cb.crow_indices(), self.Cb.col_indices()
-        row_ids = torch.repeat_interleave(
-            torch.arange(self.n_rows, device=col.device), crow.diff()
-        )
-        c_ind_t = torch.zeros((self.Cb.shape[1], self.n_rows), dtype=Q.dtype, device=Q.device)
-        c_ind_t[col, row_ids] = 1.0  # Cb is coalesced: (col, row) pairs are unique
-        q_ind = (self.q_indicator or _QueryIndicator()).get(Q)
+        ones = torch.ones(self.Cb.values().numel(), dtype=Q.dtype, device=Q.device)
+        c_ind_t = _dense_slice_t(self.Cb, ones)  # ones, not values: a stored 0.0
+                                                 # is still a structural overlap
+        q_ind = (self.q_cache or _SparseQueryCache()).indicator(Q)
         return torch.matmul(q_ind, c_ind_t) == 0
 
     def score(self, Q, metric: str, q_norms=None):
         if self._masked_raw is None:
-            raw = _sparse_scores(Q, self.Cb)
+            raw = _sparse_scores(Q, self.Cb, self.q_cache)
             no_overlap = (raw == 0) if self.zero_gate_ok else self._structural_no_overlap(Q)
             self._masked_raw = raw.masked_fill_(no_overlap, float("-inf"))
         if metric == "dot":
@@ -930,7 +980,7 @@ def _concat_sparse_batches(batches: list[SparseCorpusBatch]) -> SparseCorpusBatc
         row_offsets, indices, values, norms, batches[0].vocab, batches[0].need_row_norms,
         # A coalesced group may mix files: the cheap gate needs EVERY part
         # to qualify; the indicator holder is run-wide, any part's copy works.
-        all(b.zero_gate_ok for b in batches), batches[0].q_indicator,
+        all(b.zero_gate_ok for b in batches), batches[0].q_cache,
     )
 
 
@@ -2527,11 +2577,11 @@ def run_compute(
     Q_np_by_vt: dict[str, np.ndarray] = {}
     query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
     mv_q_offsets = None  # multivector only: (n_q+1,) query-token offsets (see load_queries_multivector)
-    # Sparse no-overlap gate state (see _zero_gate_file_ok/_QueryIndicator):
+    # Sparse gate + query-representation state (see _zero_gate_file_ok/_SparseQueryCache):
     # query-side flags fixed run-wide; the indicator holder is shared by every
     # file's batch and builds its CSR lazily, only if a signed file appears.
     sparse_q_nonneg, sparse_q_min_pos = False, float("inf")
-    sparse_q_indicator = _QueryIndicator()
+    sparse_q_cache = _SparseQueryCache()
     query_ids: list[str] | None = None
     payload: dict[str, list] | None = None
     query_filter_vals: dict[str, np.ndarray] | None = None
@@ -3215,7 +3265,7 @@ def run_compute(
                     sp_offsets, sp_idx, sp_val, sp_norms, sp_gate = arrs["sparse"]
                     b = SparseCorpusBatch(
                         sp_offsets, sp_idx, sp_val, sp_norms, query_vocab, need_sparse_norms,
-                        sp_gate, sparse_q_indicator,
+                        sp_gate, sparse_q_cache,
                     )
                     raw_stats["sparse"] = (b.n_rows, b.nbytes)
                     if has_baseline["sparse"]:
