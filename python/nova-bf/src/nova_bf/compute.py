@@ -2431,6 +2431,7 @@ def run_compute(
     job_rank: int | None = None,
     io_workers: int | None = None,
     io_thread_count: int | None = None,
+    cpu_thread_count: int | None = None,
     max_files: int | None = None,
 ) -> dict[str, str]:
     """Runs every search in `cfg.searches` — independent vector_type/metric/k/
@@ -3013,6 +3014,18 @@ def run_compute(
         import pyarrow as pa
         pa.set_io_thread_count(itc)
         logger.info("pyarrow IO thread pool set to %d (true S3 fetch concurrency)", itc)
+    # The OTHER pyarrow pool: parquet DECODE parallelism
+    cpu_n = (cpu_thread_count if cpu_thread_count is not None
+             else cfg.params.cpu_thread_count)
+    if not cpu_n or cpu_n <= 0:
+        cpu_n = os.cpu_count() or 1
+    import pyarrow as pa
+    if pa.cpu_count() != cpu_n:
+        logger.info(
+            "pyarrow CPU thread pool %d -> %d (parquet decode parallelism)",
+            pa.cpu_count(), cpu_n,
+        )
+    pa.set_cpu_count(cpu_n)
     work: Queue = Queue()
     for item in mine:
         work.put(item)
@@ -3486,10 +3499,10 @@ def run_compute(
     read_wall = read_secs / max(1, io_workers)
     filter_wall = filter_secs / max(1, io_workers)
     logger.info(
-        "bf-bench io_workers=%d files=%d rows=%d gb=%.3f wall_s=%.1f "
+        "bf-bench io_workers=%d cpu_threads=%d files=%d rows=%d gb=%.3f wall_s=%.1f "
         "wall_mbps=%.1f stream_mbps=%.1f io_wait_s=%.1f gpu_s=%.1f filter_s=%.1f "
         "read_wall_s=%.1f filter_wall_s=%.1f",
-        io_workers, len(mine), rows_seen, gb, wall,
+        io_workers, cpu_n, len(mine), rows_seen, gb, wall,
         wall_mbps, stream_mbps, io_wait, gpu_secs, filter_secs,
         read_wall, filter_wall,
     )

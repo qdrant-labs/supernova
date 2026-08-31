@@ -39,6 +39,7 @@ output:
 params:
   io_workers: 16             # concurrent corpus-file reader threads
   io_thread_count: 0         # pyarrow IO-pool size (0 = pyarrow's default ~8)
+  cpu_thread_count: 0        # pyarrow CPU-pool size = decode + compute kernels (0 = all cores)
   # dense_batch_size: 4096   # bound GPU memory on huge files; omit = whole file at once
   # sparse_batch_size: 4096  # same, for vector_type: sparse searches
   # merge_batch_size: null   # merge tuning, see Performance & tuning
@@ -407,6 +408,7 @@ The work splits into three layers: **reading** corpus parquet from S3, **decodin
 | Knob | Default | Guidance |
 |------|---------|----------|
 | `params.io_thread_count` | `0` (≈8) | **The real S3 fetch concurrency.** pyarrow funnels every read through one global IO pool, so this — not `io_workers` — is what raises throughput once decode keeps up. Try `64`–`128` on a fat NIC. |
+| `params.cpu_thread_count` | `0` (all cores) | **pyarrow's CPU pool** — the compute half of the pair above (named to match pyarrow's own `set_cpu_count`/`set_io_thread_count`): `io_thread_count` fetches bytes, this one works on them. Parquet decode dominates, but Arrow compute kernels run here too, so it also moves filter evaluation. Left to the environment it defaults to `OMP_NUM_THREADS`, which GPU images commonly pin to `1`; a decode pool of 1 throttles every reader thread at once and looks exactly like an IO bottleneck (idle CPU, `read_wall_s` flat however you tune the two knobs above). Measured on a g5.8xlarge whose image set `OMP_NUM_THREADS=1`: one 5 GB file parsed in 32.0s at `1` vs 2.8s at `32`, and a real run's `read_wall_s` fell 242s → 166s. nova-bf now sets it explicitly and reports it on the `bf-bench` line. |
 | `params.io_workers` | `16` | Concurrent corpus-file reader threads (each holds ~one file in RAM, so `io_workers × file_size` must fit host memory — **double that if any run mixes `vector_type: dense` and `vector_type: sparse` searches**, since each in-flight file then decodes both columns at once). Useful, but caps at `io_thread_count` — raising it alone won't lift throughput. |
 | instance vCPUs | — | Parquet decode is CPU-bound and scales ~linearly with cores. The brute-force matmul is light, so **pick the instance for vCPUs, not the GPU** (e.g. a single-GPU, high-core `g5.16xlarge`). |
 | `params.dense_batch_size` / `sparse_batch_size` | `None` | The per-file score matrix is `queries × rows`. Big files (or very large query sets) can OOM the GPU; set this to score in row-batches. Omit for the whole-file (fastest) path. One value per vector_type, run-wide — every search of a vector_type ends up sharing one GPU pass over the corpus (see [One search, or several in one pass](#one-search-or-several-in-one-pass)). When some search of that vector_type is unfiltered (the shared-pass case), your configured value is always kept as-is — it's a memory bound, so it's never silently raised, even if some search's `k` exceeds it (that search just takes a few extra merge rounds). Otherwise, each filter group's own batch size floors at the largest `k` among that group's own members. |

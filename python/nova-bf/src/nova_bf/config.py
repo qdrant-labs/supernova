@@ -165,6 +165,10 @@ class ParamsConfig(BaseModel):
     # pool-bound; if it stays flat you're network-bound. Applied via
     # pa.set_io_thread_count() once at startup.
     io_thread_count: int = 0
+    # PyArrow CPU threads used for Parquet decoding/decompression, separate from
+    # the I/O thread pool. 0 uses os.cpu_count() rather than PyArrow's default,
+    # which may inherit OMP_NUM_THREADS and unintentionally serialize decoding.
+    cpu_thread_count: int = 0
     # Opt-in: read each large corpus/queries parquet as MANY concurrent byte
     # ranges before parsing (the `aws s3 cp` strategy). Files written with a
     # large flush threshold hold ~ONE row group, so a single-column read
