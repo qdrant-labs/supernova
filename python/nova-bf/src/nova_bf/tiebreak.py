@@ -120,18 +120,15 @@ _compiled_pack = None
 _compiled_proven = False
 
 
-def pack(scores, ordinal):
-    """Pack each score and ordinal into one int64 key.
+def pack(scores, ordinal, scale=None):
+    """Pack scores and ordinals into sortable int64 keys.
 
-    Keys sort by higher score first, then lower ordinal for exact ties.
-    `ordinal` broadcasts against `scores`, so a 1-D ordinal vector can be used
-    for all queries in a slice.
+    Higher scores sort first; exact ties use lower ordinals. `scale`, if given,
+    is a per-query-row divisor applied before packing so the key encodes the
+    final score. `ordinal` broadcasts against `scores`.
 
-    The score occupies the high 32 bits and the inverted ordinal occupies the
-    low 32 bits. The construction stays within the int64 range.
-
-    The elementwise operations are compiled into a single kernel when possible;
-    the uncompiled path is used if compilation is unavailable.
+    Scores occupy the high 32 bits and inverted ordinals the low 32 bits.
+    Elementwise operations are compiled into one kernel when available.
     """
     import torch
 
@@ -145,6 +142,12 @@ def pack(scores, ordinal):
             "silently reshapes the packed key. nova-bf upcasts every vector to "
             "float32 before scoring, so this means something upstream did not."
         )
+
+    
+    if scale is not None:
+        # scale before the score is generated, so the result matches
+        # `topk_triton._cutfill`'s fused `s / n` bit-for-bit.
+        scores = scores / scale[:, None]
 
     global _compiled_pack, _compiled_proven
 
@@ -194,8 +197,8 @@ def sentinel_key(shape, device):
 PACK_TARGET_SLOTS = 1 << 28
 
 
-def pack_topk(scores, ordinal, k):
-    """`torch.topk` over `pack(scores, ordinal)`, returning `(keys, idx)`.
+def pack_topk(scores, ordinal, k, scale=None):
+    """`torch.topk` over `pack(scores, ordinal, scale)`, returning `(keys, idx)`.
 
     Chunked over query rows so the transient packed key never exceeds
     `PACK_TARGET_SLOTS` elements — the per-row top-K is independent, so
@@ -213,11 +216,11 @@ def pack_topk(scores, ordinal, k):
 
     from nova_bf import topk_triton
 
-    if topk_triton.available(scores, ordinal, k):
+    if topk_triton.available(scores, ordinal, k, scale):
         # Use the optimized Triton path when available; fall back permanently if
         # compilation or launch fails.
         try:
-            return topk_triton.topk(scores, ordinal, k)
+            return topk_triton.topk(scores, ordinal, k, scale)
         except torch.cuda.OutOfMemoryError:
             # OOM does not indicate an unsupported kernel configuration, and
             # the portable path requires even more temporary memory. Preserve
@@ -229,11 +232,13 @@ def pack_topk(scores, ordinal, k):
     n_rows, n_cols = scores.shape
     chunk = max(1, min(n_rows, PACK_TARGET_SLOTS // max(1, n_cols)))
     if chunk >= n_rows:
-        return torch.topk(pack(scores, ordinal), k=k, dim=1, sorted=False)
+        return torch.topk(pack(scores, ordinal, scale), k=k, dim=1, sorted=False)
 
     key_parts, idx_parts = [], []
     for r0 in range(0, n_rows, chunk):
-        block = pack(scores[r0 : r0 + chunk], ordinal)
+        # `scale` is indexed by QUERY ROW, so it is sliced with the rows
+        block = pack(scores[r0 : r0 + chunk], ordinal,
+                     None if scale is None else scale[r0 : r0 + chunk])
         kp, ip = torch.topk(block, k=k, dim=1, sorted=False)
         del block
         key_parts.append(kp)

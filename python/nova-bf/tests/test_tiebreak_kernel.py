@@ -327,8 +327,11 @@ def test_run_compute_actually_uses_the_kernel(tmp_path, tiebreak, monkeypatch):
     seen = {"calls": 0, "declined": 0}
     real_avail, real_topk = tkm.available, tkm.topk
 
-    def spy_available(scores, ordinal, k):
-        ok = real_avail(scores, ordinal, k)
+    def spy_available(scores, ordinal, k, scale=None):
+        # `scale` is cosine's per-query divisor, fused into the kernel's read
+        # (see `topk_triton._cutfill`); forward it or the gate would be asked a
+        # different question than the real call site asks.
+        ok = real_avail(scores, ordinal, k, scale)
         if not ok:
             seen["declined"] += 1
             # surface WHY, so a regression names itself instead of just being slow

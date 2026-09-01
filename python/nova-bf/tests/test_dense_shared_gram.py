@@ -362,9 +362,12 @@ def test_euclidean_only_run_builds_no_query_norms(ds, metrics, euclid_gets_norms
     seen: list[tuple[str, bool]] = []
     real = DenseBatchSlice.score
 
-    def spy(self, Q, metric, q_norms=None):
+    def spy(self, Q, metric, q_norms=None, **kw):
+        # **kw forwards `scale_in_packer` (see `topk_triton._cutfill`, which
+        # fuses cosine's per-query divide into the packer);
+        # this spy is about whether q_norms was BUILT, not about scoring.
         seen.append((metric, q_norms is not None))
-        return real(self, Q, metric, q_norms)
+        return real(self, Q, metric, q_norms, **kw)
 
     monkeypatch.setattr(DenseBatchSlice, "score", spy)
     specs = [

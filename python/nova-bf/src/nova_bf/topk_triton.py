@@ -47,13 +47,21 @@ try:
     _triton, _tl = _load()
 
     @_triton.jit
-    def _cutfill(S, RANK, ORD, OUTK, OUTI, stride_s, n_cols, k,
-                 BLOCK: _tl.constexpr, RBITS: _tl.constexpr):
+    def _cutfill(S, NRM, RANK, ORD, OUTK, OUTI, stride_s, n_cols, k,
+                 BLOCK: _tl.constexpr, RBITS: _tl.constexpr,
+                 HAS_NRM: _tl.constexpr):
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
         m = offs < n_cols
 
         s = _tl.load(S + row * stride_s + offs, mask=m, other=float("-inf"))
+        if HAS_NRM:
+            # Fuse cosine's per-query norm divide into the score load, avoiding a
+            # separate read/write pass over the score matrix.
+            #
+            # Divide before building the order key so ties reflect the final reported
+            # score. Use div_rn to match torch division bit-for-bit across fallback paths.
+            s = _tl.math.div_rn(s, _tl.load(NRM + row))
         # Fold -0.0 onto +0.0 before the bit transform, exactly as
         # `score_order_key` does. They are numerically EQUAL, so the ordinal
         # must decide between them -- but their bit patterns differ, and
@@ -187,10 +195,10 @@ def _shape_of(t) -> str:
 _DECLINE_LOGGED = False
 
 
-def available(scores, ordinal, k) -> bool:
+def available(scores, ordinal, k, scale=None) -> bool:
     """Is the kernel usable for THIS call? Anything false falls back.
     """
-    ok = _available(scores, ordinal, k)
+    ok = _available(scores, ordinal, k, scale)
     global _DECLINE_LOGGED
     if not ok and not _DECLINE_LOGGED:
         _DECLINE_LOGGED = True
@@ -203,7 +211,7 @@ def available(scores, ordinal, k) -> bool:
     return ok
 
 
-def _available(scores, ordinal, k) -> bool:
+def _available(scores, ordinal, k, scale=None) -> bool:
     """`available`'s body — see there.
 
     This is the contract boundary: everything the kernel ASSUMES is checked
@@ -239,20 +247,29 @@ def _available(scores, ordinal, k) -> bool:
     n_q, n_cols = scores.shape
     if n_q <= 0:
         return False
+    if scale is not None and not (
+        scale.ndim == 1 and scale.numel() == n_q
+        and scale.dtype is torch.float32 and scale.is_contiguous()
+        and scale.device == scores.device
+    ):
+        return False
     if not _offsets_fit_int32(n_q, scores.stride(0), k):
         return False
     return ordinal.numel() == n_cols and 0 < k <= n_cols <= MAX_BLOCK
 
 
-def topk(scores, ordinal, k):
+def topk(scores, ordinal, k, scale=None):
     """(n_q, n_cols) float32 -> `(packed_keys, column_indices)`, both (n_q, k).
 
     Highest score wins; among bit-identical scores, the smallest ordinal wins.
     Unordered within a row (the caller re-selects). The keys are bit-identical
-    to `tiebreak.pack(scores, ordinal).gather(1, idx)`.
+    to `tiebreak.pack(scores, ordinal, scale).gather(1, idx)`.
 
-    CALLER INVARIANTS — checked by tests, not per call, because verifying them
-    here would cost a reduction and a host sync on every slice:
+    `scale`, when given, is a per-QUERY-ROW positive divisor applied to each
+    score as it is read (cosine's query norm). Selecting on the divided value
+    is what keeps the packed key an encoding of the reported score.
+
+    CALLER INVARIANTS
 
       ordinal values are UNIQUE within the slice. Descent 2 selects on the
         ordinal's RANK, so duplicates would be given an arbitrary order by the
@@ -280,10 +297,13 @@ def topk(scores, ordinal, k):
     # process whose current device differs (multi-GPU) cannot launch elsewhere.
     with torch.cuda.device(scores.device):
         _cutfill[(n_q,)](
-            scores, rank, ordinal.contiguous(), outk, outi,
+            # `scores` doubles as the NRM placeholder when unscaled
+            scores, scale if scale is not None else scores,
+            rank, ordinal.contiguous(), outk, outi,
             scores.stride(0), n_cols, k,
             BLOCK=_block,
             RBITS=max(1, int(n_cols).bit_length()),   # w lands in [1, n_cols]
+            HAS_NRM=scale is not None,
             num_warps=_warps_for(_block),  # 4 spills at BLOCK=8192; 8 does not.
         )
     return outk, outi.to(torch.int64)

@@ -619,14 +619,17 @@ def _sparse_scores(Q, Cb, q_cache=None):
     return torch.matmul(Cb, cache.transpose(Q)).T
 
 
-def _scores(Q, C, metric: str, q_norms=None):
+def _scores(Q, C, metric: str, q_norms=None, scale_in_packer: bool = False):
     import torch.nn.functional as F
 
     if metric == "cosine":
-        # C is normalized per file; Q stays RAW (shared with dot searches —
-        # see run_compute's `q_norms_by_vt`), so divide each query's row of
-        # the score matrix by its norm here instead.
-        return (Q @ F.normalize(C, dim=1).T).div_(q_norms[:, None])
+        # Keep queries raw for reuse with dot-product searches; normalize scores instead.
+        raw = Q @ F.normalize(C, dim=1).T
+        if scale_in_packer:
+            # The packer already scaled the scores, so no need to
+            # scale here
+            return raw
+        return raw.div_(q_norms[:, None])
     if metric == "dot":
         return Q @ C.T
     # euclidean: negate distance so larger = nearer (topk picks nearest).
@@ -725,9 +728,9 @@ class DenseBatchSlice:
     def n_rows(self) -> int:
         return self.Cb.shape[0]
 
-    def score(self, Q, metric: str, q_norms=None):
+    def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
         if not self.share_gram:
-            return _scores(Q, self.Cb, metric, q_norms)
+            return _scores(Q, self.Cb, metric, q_norms, scale_in_packer=scale_in_packer)
         if self._raw is None:
             self._raw = Q @ self.Cb.T
         raw = self._raw
@@ -742,9 +745,14 @@ class DenseBatchSlice:
                 # clamp matches F.normalize's eps, so a zero corpus row scores
                 # 0 rather than NaN — identical convention to `_scores`.
                 self._c_norms = self.Cb.norm(dim=1).clamp_min(1e-12)
-            # First div allocates (raw must survive for the other metrics);
-            # the second is in place on that fresh copy.
-            return raw.div(self._c_norms[None, :]).div_(q_norms[:, None])
+            # `raw` is shared with dot/euclidean scoring, so normalize out of place first,
+            # then in place on the resulting copy.
+            #
+            # Cosine divides by corpus norms per column and query norms per row. The
+            # column-wise divide affects candidate ordering and must happen before
+            # selection; the row-wise divide can be fused into the packer.
+            out = raw.div(self._c_norms[None, :])
+            return out if scale_in_packer else out.div_(q_norms[:, None])
         # euclidean: negate the distance so larger = nearer (topk picks
         # nearest), matching `_scores`. Accumulated into ONE new tensor
         # (`raw.mul(-2)` then two broadcast adds in place) rather than the
@@ -998,7 +1006,7 @@ class SparseBatchSlice:
         q_ind = (self.q_cache or _SparseQueryCache()).indicator(Q)
         return torch.matmul(q_ind, c_ind_t) == 0
 
-    def score(self, Q, metric: str, q_norms=None):
+    def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
         if self._masked_raw is None:
             raw = _sparse_scores(Q, self.Cb, self.q_cache)
             no_overlap = (raw == 0) if self.zero_gate_ok else self._structural_no_overlap(Q)
@@ -1192,7 +1200,8 @@ class MultiVectorBatchSlice:
         self.flat.record_stream(stream)
         self.doc_offsets.record_stream(stream)
 
-    def score(self, Q: "MultiVectorQuery", metric: str, q_norms=None):
+    def score(self, Q: "MultiVectorQuery", metric: str, q_norms=None,
+              scale_in_packer: bool = False):
         # `q_norms` is unused: it's the per-query cosine scalar the dense/sparse
         # slices take, but multivector cosine normalizes each TOKEN (not a
         # per-query rescale), so there's no scalar to apply. The parameter stays
@@ -1638,7 +1647,7 @@ def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_key, spec_top_enc,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
-    spec_qsel: list, spec_qrows: list,
+    spec_qsel: list, spec_qrows: list, spec_cos_scale: list,
     encoded_row_ids: np.ndarray | None = None,
     ordinal_base: int = 0,
     ordinal_row_ids: np.ndarray | None = None,
@@ -1812,7 +1821,11 @@ def _process_batch_group(
             s = specs[m]
             scores = score_cache.get(s.metric)
             if scores is None:
-                scores = sl.score(spec_Q[m], s.metric, spec_q_norms[m])
+                # Dense cosine's query-norm divide happens in the packer
+                scores = sl.score(
+                    spec_Q[m], s.metric, spec_q_norms[m],
+                    scale_in_packer=spec_cos_scale[m] is not None,
+                )
                 if metric_share_count[s.metric] > 1:
                     score_cache[s.metric] = scores
 
@@ -1842,17 +1855,16 @@ def _process_batch_group(
             # Append to the pending buffer (pre-topk wide slices down to k so
             # the buffer, and any slice score matrix it would otherwise pin
             # alive, stays bounded); merge only once >= k columns accumulate.
-            #
-            # This pre-top-K DISCARDS PERMANENTLY — a candidate dropped here is
-            # never seen again, by the fold or by `merge` — so it has to select
-            # on the packed key, not the score. It is the site where an
-            # unstable `topk` used to silently decide ties.
+            cos_scale = spec_cos_scale[m]
+
             if sel_scores.shape[1] > s.k:
-                part_key, part_local = pack_topk(sel_scores, sel_ordinals, s.k)
+                part_key, part_local = pack_topk(
+                    sel_scores, sel_ordinals, s.k, cos_scale)
                 part_enc = sel_encoded[part_local]
                 del part_local
             else:
-                part_key, part_enc = pack(sel_scores, sel_ordinals), sel_encoded
+                part_key = pack(sel_scores, sel_ordinals, cos_scale)
+                part_enc = sel_encoded
             pending[m].append((part_key, part_enc))
             pending_cols[m] += part_key.shape[1]
             if pending_cols[m] >= s.k:
@@ -2242,6 +2254,19 @@ def _corpus_leaf_array(cond: FilterCondition, table, vocab_for_cond: np.ndarray 
     return _condition_mask(cond, table)
 
 
+def _narrow_gpu_leaf_state(state, idx):
+    """Restrict shared leaf state to the query rows in `idx`.
+
+    Leaf state is built once per condition at full query-file height, then
+    narrowed per filter so per-slice masks only cover that filter's queries.
+    """
+    if isinstance(state, tuple):            # match_from_query: (kind, tensor)
+        kind, qstate = state
+        return kind, qstate[idx]            # (n_q,) codes or (n_q, n_distinct)
+    # range_from_query: {bound name: (n_q,) tensor}
+    return {name: b[idx] for name, b in state.items()}
+
+
 def _gpu_cond_mask(cond: FilterCondition, leaf_gpu: dict, rows, query_gpu: dict):
     """torch-native per-condition mask for one GPU-eligible leaf — the Front
     A analog of `filters._condition_mask`. `leaf_gpu[cond]` is this
@@ -2317,9 +2342,10 @@ def _process_shared_batch(
     spec_top_key, spec_top_enc,
     keeps: dict[Filter | None, np.ndarray | None], filter_is_per_query: dict[Filter | None, bool],
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
-    query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
+    query_gpu_by_filter: dict[object, dict], filter_share_count: dict[Filter | None, int],
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
     spec_qsel: list, spec_qrows: list, filter_n_q: dict[Filter | None, int],
+    spec_cos_scale: list,
     encoded_row_ids: np.ndarray | None = None,
     ordinal_base: int = 0,
     ordinal_row_ids: np.ndarray | None = None,
@@ -2339,7 +2365,8 @@ def _process_shared_batch(
     - Per-query filter (either GPU-eligible via Front A, or the CPU fallback
       for a `match_text`/`match_text_from_query` leaf — see `_gpu_eligible`):
       builds this member's `(n_queries, batch_rows)` `cell_mask` — from
-      GPU-resident tensors via `_gpu_evaluate` (`leaf_gpu`/`query_gpu`, no
+      GPU-resident tensors via `_gpu_evaluate` (`leaf_gpu` plus this
+      filter's narrowed `query_gpu_by_filter` entry, no
       CPU-side mask, no per-slice host transfer) or from `keeps[s.filter]`
       (computed once per file in `filters.evaluate()`) — cached per filter
       in `cache` only when `filter_share_count[s.filter] > 1`: a filter used
@@ -2375,7 +2402,13 @@ def _process_shared_batch(
             cell_mask = cache.get(s.filter, _UNCACHED)
             if cell_mask is _UNCACHED:
                 if filter_is_gpu_eligible[s.filter]:
-                    cell_mask = _gpu_evaluate(s.filter, leaf_gpu, rows, query_gpu, device)
+                    cell_mask = _gpu_evaluate(
+                        s.filter, leaf_gpu, rows,
+                        # this filter's own query rows, so the mask is
+                        # filter_n_q[s.filter] tall (see
+                        # `_narrow_gpu_leaf_state`)
+                        query_gpu_by_filter[s.filter], device,
+                    )
                     if not cell_mask.any():
                         cell_mask = None
                 else:
@@ -2412,6 +2445,7 @@ def _process_shared_batch(
         multivector_token_budget=multivector_token_budget,
         multivector_double_buffer=multivector_double_buffer,
         spec_qsel=spec_qsel, spec_qrows=spec_qrows,
+        spec_cos_scale=spec_cos_scale,
     )
 
 
@@ -2936,6 +2970,16 @@ def run_compute(
         _row_selector(_local_positions(spec_rows[m], vt_rows.get(specs[m].vector_type)), device)
         for m in range(len(specs))
     ]
+    # Dense cosine's per-query divisor, restricted to each spec's OWN rows so it
+    # lines up with the score matrix after `spec_qsel`.
+    spec_cos_scale = [
+        None if (specs[m].metric != "cosine" or specs[m].vector_type != "dense"
+                 or spec_q_norms[m] is None)
+        else (spec_q_norms[m] if spec_qsel[m] is None
+              else spec_q_norms[m][spec_qsel[m]]).contiguous()
+        for m in range(len(specs))
+    ]
+
     # spec_qrows is built further down, once `filter_rows` is known: its base is
     # the per-FILTER mask height, not the file's. See there.
     if any(r is not None for r in spec_rows):
@@ -3000,9 +3044,11 @@ def run_compute(
         spec_filter, spec_rows, n_q
     )
 
-    # GPU, uniform, and unfiltered paths do not use a narrowed per-file query mask.
+    # Uniform and unfiltered paths have no query axis to narrow. Per-query filters
+    # are restricted to their own rows, avoiding oversized (queries x slice) masks
+    # and unnecessary leaf/combine work. See `_narrow_gpu_leaf_state`.
     for f in list(filter_rows):
-        if f is None or filter_is_gpu_eligible[f] or not filter_is_per_query[f]:
+        if f is None or not filter_is_per_query[f]:
             filter_rows[f] = None
 
     # Query-axis height of each filter mask.
@@ -3018,6 +3064,22 @@ def run_compute(
         )
         for f, r in filter_rows.items() if f is not None
     }
+
+    # Per-FILTER view of the shared per-condition GPU query state, narrowed to
+    # that filter's own query rows.
+    gpu_query_by_filter: dict[object, dict] = {}
+    for f in distinct_filters:
+        if f is None or not filter_is_gpu_eligible[f]:
+            continue
+        r = filter_rows[f]
+        if r is None:
+            gpu_query_by_filter[f] = gpu_query_gpu   # full height: share as-is
+            continue
+        idx = torch.as_tensor(np.asarray(r), dtype=torch.long, device=device)
+        gpu_query_by_filter[f] = {
+            cond: _narrow_gpu_leaf_state(gpu_query_gpu[cond], idx)
+            for cond in f.all_conditions() if cond in gpu_query_gpu
+        }
 
     # Map each spec's query rows into its filter mask's local row numbering
     spec_qrows = [
@@ -3508,10 +3570,11 @@ def run_compute(
         elapsed = _process_shared_batch(
             combined_batch, vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
             spec_top_key, spec_top_enc,
-            combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_gpu,
+            combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_by_filter,
             filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
             encoded_row_ids=encoded_ids, ordinal_row_ids=ordinal_ids,
             spec_qsel=spec_qsel, spec_qrows=spec_qrows, filter_n_q=filter_n_q,
+            spec_cos_scale=spec_cos_scale,
             multivector_token_budget=(
                 cfg.params.multivector_token_budget if vt == "multivector" else None
             ),
@@ -3615,7 +3678,7 @@ def run_compute(
                     gpu_secs += _process_shared_batch(
                         batches[vt], vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
                         spec_top_key, spec_top_enc,
-                        keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
+                        keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_by_filter,
                         filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=batch_orig_rows[vt],
                         ordinal_base=ordinal_base,
                         ordinal_row_ids=(
@@ -3625,7 +3688,8 @@ def run_compute(
                                 else file_ordinals[batch_orig_rows[vt]]
                             )
                         ),
-                        spec_qsel=spec_qsel, spec_qrows=spec_qrows, filter_n_q=filter_n_q,
+                        spec_qsel=spec_qsel, spec_qrows=spec_qrows,
+                        filter_n_q=filter_n_q, spec_cos_scale=spec_cos_scale,
                         multivector_token_budget=(
                             cfg.params.multivector_token_budget
                             if vt == "multivector"
@@ -3735,20 +3799,17 @@ def run_compute(
             base[np.asarray(gidxs, dtype=np.int64)] = np.concatenate(
                 ([0], np.cumsum(lens)[:-1])
             ) if len(lens) else np.zeros(0, dtype=np.int64)
-            # Widen BEFORE the concat, not after. `concat_arrays` enforces the
-            # 32-bit offset limit ITSELF and raises "offset overflow while
-            # concatenating arrays" once the combined character data passes
-            # 2 GiB, so casting the result was too late to help: the call that
-            # produced it had already failed. One rank of the real run reaches
-            # that easily (317 files x ~1.9M ids x ~47 B is tens of GB), while
-            # an 8-file smoke stays under 1 GiB and never sees it — which is
-            # how it survived the earlier fix. Observed as a crash after a
-            # completed 64-file scan, with no output written at all.
+
+            # Prevent 32-bit offset overflow
             if arrays and pa.types.is_string(arrays[0].type):
                 arrays = [a.cast(pa.large_string()) for a in arrays]
             elif arrays and pa.types.is_binary(arrays[0].type):
                 arrays = [a.cast(pa.large_binary()) for a in arrays]
             values = pa.concat_arrays(arrays) if arrays else pa.array([])
+            if pa.types.is_string(values.type):
+                values = values.cast(pa.large_string())
+            elif pa.types.is_binary(values.type):
+                values = values.cast(pa.large_binary())
             flat_ids[0] = (values, base)
         return flat_ids[0]
 
