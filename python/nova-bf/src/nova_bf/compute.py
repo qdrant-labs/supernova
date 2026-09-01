@@ -3735,13 +3735,20 @@ def run_compute(
             base[np.asarray(gidxs, dtype=np.int64)] = np.concatenate(
                 ([0], np.cumsum(lens)[:-1])
             ) if len(lens) else np.zeros(0, dtype=np.int64)
+            # Widen BEFORE the concat, not after. `concat_arrays` enforces the
+            # 32-bit offset limit ITSELF and raises "offset overflow while
+            # concatenating arrays" once the combined character data passes
+            # 2 GiB, so casting the result was too late to help: the call that
+            # produced it had already failed. One rank of the real run reaches
+            # that easily (317 files x ~1.9M ids x ~47 B is tens of GB), while
+            # an 8-file smoke stays under 1 GiB and never sees it — which is
+            # how it survived the earlier fix. Observed as a crash after a
+            # completed 64-file scan, with no output written at all.
+            if arrays and pa.types.is_string(arrays[0].type):
+                arrays = [a.cast(pa.large_string()) for a in arrays]
+            elif arrays and pa.types.is_binary(arrays[0].type):
+                arrays = [a.cast(pa.large_binary()) for a in arrays]
             values = pa.concat_arrays(arrays) if arrays else pa.array([])
-
-            # Prevent 32-bit offset overflow
-            if pa.types.is_string(values.type):
-                values = values.cast(pa.large_string())
-            elif pa.types.is_binary(values.type):
-                values = values.cast(pa.large_binary())
             flat_ids[0] = (values, base)
         return flat_ids[0]
 
