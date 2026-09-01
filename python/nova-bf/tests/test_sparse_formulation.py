@@ -84,6 +84,41 @@ def test_budget_selects_the_fallback(case, monkeypatch):
     assert out.shape == (Q.shape[0], Cb.shape[0])
 
 
+def test_fallback_retains_no_dense_query_copy(case, monkeypatch):
+    """The regression this pins: the fallback used to cache a contiguous `Q.T`
+    on the RUN-WIDE cache. That is a second full copy of the largest resident
+    tensor (`n_q x vocab` float32), allocated on the branch taken precisely
+    when the slice is already too big for the dense operand, and never freed —
+    7.2 -> 14.4 GiB at the fineweb shape on a 24 GB card.
+
+    The existing fallback tests could not catch it: each passes a FRESH cache,
+    so nothing crosses slices. This one reuses one cache across several slices
+    and asserts only sparse representations survive.
+    """
+    Q, Cb = case
+    monkeypatch.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES", 0)
+    cache = _SparseQueryCache()
+    for _ in range(3):
+        _sparse_scores(Q, Cb, cache)
+
+    dense = [name for name, v in vars(cache).items()
+             if isinstance(v, torch.Tensor) and v.layout is torch.strided]
+    assert not dense, f"run-wide query cache retained dense tensor(s): {dense}"
+
+
+def test_fallback_scores_are_unchanged_across_slices(case, monkeypatch):
+    """Dropping the cache must change allocation lifetime and nothing else:
+    a shared cache and a fresh one have to produce identical scores."""
+    Q, Cb = case
+    monkeypatch.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES", 0)
+    shared = _SparseQueryCache()
+    first = _sparse_scores(Q, Cb, shared).clone()
+    again = _sparse_scores(Q, Cb, shared)
+    fresh = _sparse_scores(Q, Cb, _SparseQueryCache())
+    assert torch.equal(first, again), "reusing a cache changed the scores"
+    assert torch.equal(first, fresh), "a fresh cache changed the scores"
+
+
 def test_dense_slice_t_marks_stored_zeros(case):
     """`_dense_slice_t`'s `values` argument exists so the structural gate can
     scatter ONES. A stored 0.0 is still an overlap; deriving the indicator
@@ -107,8 +142,12 @@ def test_query_cache_builds_once(case):
     Q, _ = case
     c = _SparseQueryCache()
     assert c.values(Q) is c.values(Q)
-    assert c.transpose(Q) is c.transpose(Q)
     assert c.indicator(Q) is c.indicator(Q)
+    # Only SPARSE representations may be cached here. A dense `(vocab, n_q)`
+    # transpose used to be, and doubled peak GPU memory on the branch that is
+    # taken precisely when memory is tightest.
+    assert not hasattr(c, "transpose"), \
+        "a dense representation was re-added to the run-wide query cache"
     assert c.values(Q).values().numel() == int((Q != 0).sum())
     # indicator carries ones; values carries Q's actual numbers
     assert torch.equal(c.indicator(Q).values(),

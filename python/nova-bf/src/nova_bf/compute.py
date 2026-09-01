@@ -618,7 +618,10 @@ def _sparse_scores(Q, Cb, q_cache=None):
     if vocab * n_rows * Q.element_size() <= _SPARSE_SWAP_MAX_DENSE_BYTES:
         # Produces the `(n_q, n_rows)` layout downstream consumers expect.
         return torch.matmul(cache.values(Q), _dense_slice_t(Cb, Cb.values()))
-    return torch.matmul(Cb, cache.transpose(Q)).T
+    # Built per slice, not cached. This path is used only when the dense corpus
+    # operand is already too large, so caching `(vocab, n_q)` would keep another
+    # large float32 copy resident. The copy cost is amortized by the matmul.
+    return torch.matmul(Cb, Q.t().contiguous()).T
 
 
 def _scores(Q, C, metric: str, q_norms=None, scale_in_packer: bool = False):
@@ -903,13 +906,18 @@ class _SparseQueryCache:
 
     Caches:
       values:    CSR query values for swapped sparse scoring.
-      transpose: contiguous `Q.T` for the fallback scoring path.
       indicator: CSR query structure with ones for overlap checks.
+
+    Both are SPARSE — they cost nnz, not `n_q * vocab`. Nothing dense-shaped
+    belongs here: a cached `(vocab, n_q)` float32 doubles the biggest resident
+    tensor on the GPU, which is what OOM'd the dot+cosine fineweb run (see the
+    note on `Q_gpu_by_vt` in `run_compute`). The fallback path's contiguous
+    `Q.T` used to live here and was removed for exactly that reason — see
+    `_sparse_scores`.
     """
 
     def __init__(self):
         self._values = None
-        self._transpose = None
         self._indicator = None
 
     def _csr(self, Q, vals_from_pattern):
@@ -928,12 +936,6 @@ class _SparseQueryCache:
         if self._values is None:
             self._values = self._csr(Q, lambda Q, r, c: Q[r, c])
         return self._values
-
-    def transpose(self, Q):
-        """Contiguous `Q.T` for the fallback sparse-scoring path."""
-        if self._transpose is None:
-            self._transpose = Q.t().contiguous()
-        return self._transpose
 
     def indicator(self, Q):
         if self._indicator is None:
