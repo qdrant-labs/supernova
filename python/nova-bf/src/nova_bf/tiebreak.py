@@ -190,6 +190,49 @@ def sentinel_key(shape, device):
     return pack(neg_inf, torch.tensor(TIE_WORST, dtype=torch.int64, device=device))
 
 
+# Packed key for `(-inf, worst ordinal)`, kept as a Python int for module-level
+# fills/comparisons without importing torch. Pinned to `sentinel_key` by test.
+SENTINEL_KEY = -2139095041 << 32
+
+
+def live_rows(keys, thr):
+    """Return rows containing any candidate that could enter the current top-K.
+
+    A row is live when its best SCORE key is >= the threshold score key.
+    Comparing score halves only is deliberately conservative: exact score ties
+    remain live for ordinal tie-breaking, and an under-filled row whose state
+    still holds a -inf sentinel stays live against any real candidate. The one
+    exception is a negative NaN (0xFFC00000), whose order key sorts BELOW
+    `SENTINEL_KEY` and so is dead even against a sentinel-only state — still
+    correct, since a sub-sentinel key loses to the sentinel unpruned too.
+
+    Dead rows are safe to prune because every candidate is strictly below the
+    state's weakest key. Returns a uint8 0/1 vector.
+
+    `thr` is validated HERE because the kernel gate rejects a malformed `thr`
+    by declining, which lands on this path — where a wrong length would
+    broadcast into a silently wrong mask instead of failing.
+    """
+    import torch
+
+    if keys.ndim != 2:
+        raise ValueError(f"live_rows expects 2-D keys, got {tuple(keys.shape)}")
+    if not (
+        thr.ndim == 1 and thr.numel() == keys.shape[0]
+        and thr.dtype is torch.int64 and thr.device == keys.device
+    ):
+        raise ValueError(
+            f"live_rows: thr must be int64, 1-D, length {keys.shape[0]}, on "
+            f"{keys.device}; got dtype={thr.dtype} shape={tuple(thr.shape)} "
+            f"device={thr.device}"
+        )
+    if keys.shape[1] == 0:
+        # No candidates: nothing can displace anything, so no row is live.
+        # `amax` raises on an empty reduction dim, where `cat` was a no-op.
+        return torch.zeros(keys.shape[0], dtype=torch.uint8, device=keys.device)
+    return ((keys.amax(dim=1) >> 32) >= (thr >> 32)).to(torch.uint8)
+
+
 # Materializing the packed key doubles a score matrix's footprint (int64 next
 # to float32). Where the key is only an intermediate — the wide pre-top-K in
 # `compute.process_slice` — rows are processed in chunks so that transient
@@ -197,30 +240,28 @@ def sentinel_key(shape, device):
 PACK_TARGET_SLOTS = 1 << 28
 
 
-def pack_topk(scores, ordinal, k, scale=None):
-    """`torch.topk` over `pack(scores, ordinal, scale)`, returning `(keys, idx)`.
+def pack_topk(scores, ordinal, k, scale=None, thr=None):
+    """Run top-K over `pack(scores, ordinal, scale)`, returning `(keys, idx, live)`.
 
-    Chunked over query rows so the transient packed key never exceeds
-    `PACK_TARGET_SLOTS` elements — the per-row top-K is independent, so
-    chunking is exact, not an approximation.
+    Query rows are chunked to bound temporary packed-key memory; this is exact
+    because top-K is independent per row.
 
-    On CUDA this hands off to `nova_bf.topk_triton`, which applies the same rule
-    INSIDE the select instead of encoding it into a doubled-width key. 
+    CUDA float32 inputs may use `topk_triton`; otherwise the portable packed-key
+    path is used. Both produce the same winners.
 
-    The body below stays the portable path, and runs whenever the kernel does
-    not apply: no triton, non-CUDA or non-float32 tensors, a slice wider than
-    the kernel's register budget, or an ordinal that is not the 1-D per-slice
-    vector. Both paths select the SAME SET of winners; only the cost differs.
+    If `thr` is given, `live` marks rows that can still affect the running top-K.
+    Dead rows may contain unspecified `keys` and must not be read. With `thr=None`,
+    `live` is `None` and all outputs are valid.
     """
     import torch
 
     from nova_bf import topk_triton
 
-    if topk_triton.available(scores, ordinal, k, scale):
+    if topk_triton.available(scores, ordinal, k, scale, thr):
         # Use the optimized Triton path when available; fall back permanently if
         # compilation or launch fails.
         try:
-            return topk_triton.topk(scores, ordinal, k, scale)
+            return topk_triton.topk(scores, ordinal, k, scale, thr)
         except torch.cuda.OutOfMemoryError:
             # OOM does not indicate an unsupported kernel configuration, and
             # the portable path requires even more temporary memory. Preserve
@@ -232,18 +273,21 @@ def pack_topk(scores, ordinal, k, scale=None):
     n_rows, n_cols = scores.shape
     chunk = max(1, min(n_rows, PACK_TARGET_SLOTS // max(1, n_cols)))
     if chunk >= n_rows:
-        return torch.topk(pack(scores, ordinal, scale), k=k, dim=1, sorted=False)
-
-    key_parts, idx_parts = [], []
-    for r0 in range(0, n_rows, chunk):
-        # `scale` is indexed by QUERY ROW, so it is sliced with the rows
-        block = pack(scores[r0 : r0 + chunk], ordinal,
-                     None if scale is None else scale[r0 : r0 + chunk])
-        kp, ip = torch.topk(block, k=k, dim=1, sorted=False)
-        del block
-        key_parts.append(kp)
-        idx_parts.append(ip)
-    return torch.cat(key_parts, dim=0), torch.cat(idx_parts, dim=0)
+        keys, idx = torch.topk(pack(scores, ordinal, scale), k=k, dim=1, sorted=False)
+    else:
+        key_parts, idx_parts = [], []
+        for r0 in range(0, n_rows, chunk):
+            # `scale` is indexed by QUERY ROW, so it is sliced with the rows
+            block = pack(scores[r0 : r0 + chunk], ordinal,
+                         None if scale is None else scale[r0 : r0 + chunk])
+            kp, ip = torch.topk(block, k=k, dim=1, sorted=False)
+            del block
+            key_parts.append(kp)
+            idx_parts.append(ip)
+        keys, idx = torch.cat(key_parts, dim=0), torch.cat(idx_parts, dim=0)
+    # The slice max lives in its top-k, so deciding from `keys` is the same
+    # decision the kernel makes from the full row.
+    return keys, idx, None if thr is None else live_rows(keys, thr)
 
 
 # --- id-order ordinals --------------------------------------------------------

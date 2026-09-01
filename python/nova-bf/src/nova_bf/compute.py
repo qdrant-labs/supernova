@@ -73,9 +73,11 @@ from nova_bf.results import (
 )
 from nova_bf.tiebreak import (
     MAX_ROWS_PER_WORKER,
+    SENTINEL_KEY,
     build_ordinals,
     id_order_scalar,
     id_order_array,
+    live_rows,
     pack,
     pack_topk,
     sentinel_key,
@@ -1358,47 +1360,69 @@ def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "Mul
     return MultiVectorCorpusBatch(doc_offsets, flat)
 
 
-def _merge_topk(top_key, top_enc, parts: list[tuple], k: int):
-    """Merge pending candidate columns into the running `(top_key, top_enc)` top-k state.
+def _merge_topk(top_key, top_enc, parts: list[tuple], k: int, thr=None):
+    """Merge pending candidates into the running (top_key, top_enc) top-k state.
 
-    The state stores packed keys rather than scores. `nova_bf.tiebreak.pack`
-    combines each score with its row ordinal into a single int64 whose ordering
-    defines both score order and deterministic tie-breaking. Because the
-    transform is bijective, the original score can be recovered exactly with
-    `unpack_score` during decode.
+    parts contains (keys, encoded, live) triples accumulated in corpus order.
+    Keys are packed (score, ordinal) int64 values, providing score order and
+    deterministic tie-breaking.
 
-    `parts` contains `(keys, encoded)` pairs accumulated across slices in corpus
-    order. Each `keys` tensor has shape `(n_q, cols)` with `cols <= k`; wider
-    slices are reduced to their local top-k before being appended. `encoded` is
-    either a matching `(n_q, cols)` tensor for an already-selected part or a
-    1-D `(cols,)` tensor of fully encoded corpus row IDs, which is broadcast
-    across queries here.
+    With thr, live masks prune rows that cannot improve the current state.
+    Dead rows that may still be read are replaced with SENTINEL_KEY; stale masks
+    are safe because the threshold only increases. thr is updated in place.
 
-    Pending parts are concatenated with the running state and reduced with a
-    single top-k operation. Since selection is performed on the packed key,
-    the final result is independent of slice boundaries, candidate grouping,
-    and flush timing.
+    Pending parts are folded with the current state using top-k over packed keys,
+    making results independent of slice boundaries and flush timing. With
+    thr=None, pruning is disabled.
     """
     import torch
 
     from nova_bf import merge_triton
 
+    live_any = None
+    if thr is None:
+        # Unpruned flushes cannot contain parts with dead/uninitialized rows.
+        # A real raise, not `assert`: `python -O` drops asserts, and what this
+        # guards is silently wrong ground truth rather than a crash.
+        if any(l is not None for _, _, l in parts):
+            raise RuntimeError(
+                "pruned parts reached an unpruned flush — dead rows would be read"
+            )
+    else:
+        # Fold a row if any part marks it live; no mask means all rows are live.
+        live_any = None
+        for p, _, l in parts:
+            if l is None:
+                live_any = torch.ones(p.shape[0], dtype=torch.uint8, device=p.device)
+                break
+        if live_any is None:
+            live_any = parts[0][2]
+            for _, _, l in parts[1:]:
+                live_any = live_any | l
+
     # Check whether the Triton fold is viable before preparing its inputs.
     #  This is especially important for large query counts, where the temporary
     # copies can be substantial.
-    pending_width = sum(int(p.shape[1]) for p, _ in parts)
+    pending_width = sum(int(p.shape[1]) for p, _, _ in parts)
     if merge_triton.enabled(top_key) and k + pending_width <= merge_triton.MAX_BLOCK:
-        # A single part is the common case. Multiple parts arise from narrow
-        # slices, such as file tails or heavily filtered batches; combine them once
-        # here rather than concatenating each with the full running state.
+        # Multiple parts only occur for narrow slices; combine them before folding
+        # with the full running state.
         if len(parts) > 1:
-            pk = torch.cat([p for p, _ in parts], dim=1)
+            if thr is not None:
+                # If another part keeps a row live, neutralize dead rows here so
+                # the fold never reads uninitialized keys.
+                for p, _, l in parts:
+                    if l is not None:
+                        p.masked_fill_(
+                            ((live_any != 0) & (l == 0)).unsqueeze(1), SENTINEL_KEY
+                        )
+            pk = torch.cat([p for p, _, _ in parts], dim=1)
             pe = torch.cat(
-                [e if e.ndim == 2 else e.unsqueeze(0).expand(p.shape[0], -1) for p, e in parts],
+                [e if e.ndim == 2 else e.unsqueeze(0).expand(p.shape[0], -1) for p, e, _ in parts],
                 dim=1,
             )
         else:
-            pk, pe = parts[0]
+            pk, pe = parts[0][0], parts[0][1]
         # The Triton kernel requires contiguous inputs. Sparse scoring can produce
         # transposed/non-contiguous tensors, so materialize them here rather than
         # forcing the more expensive portable merge.
@@ -1406,9 +1430,9 @@ def _merge_topk(top_key, top_enc, parts: list[tuple], k: int):
             pk = pk.contiguous()
         if not pe.is_contiguous():
             pe = pe.contiguous()
-        if merge_triton.available(top_key, top_enc, pk, pe, k):
+        if merge_triton.available(top_key, top_enc, pk, pe, k, live_any, thr):
             try:
-                return merge_triton.fold(top_key, top_enc, pk, pe, k)
+                return merge_triton.fold(top_key, top_enc, pk, pe, k, live_any, thr)
             except torch.cuda.OutOfMemoryError:
                 # OOM does not indicate an unsupported kernel configuration, and
                 # the portable path requires even more temporary memory. Preserve
@@ -1416,22 +1440,33 @@ def _merge_topk(top_key, top_enc, parts: list[tuple], k: int):
                 raise
             except Exception as exc:
                 merge_triton.disable(exc)
-        # Preparation has already combined the pending inputs, so reuse that result
-        # if execution falls through to the portable path.
-        parts = [(pk, pe)]
+
+        # Reuse the combined pending inputs if Triton falls back to the portable path.
+        # Portable top-k reads every row, so neutralize rows dead in all parts too.
+        if thr is not None:
+            pk.masked_fill_((live_any == 0).unsqueeze(1), SENTINEL_KEY)
+        parts = [(pk, pe, live_any)]
+    elif thr is not None:
+        # Portable top-k reads every row; neutralize dead rows first.
+        for p, _, l in parts:
+            if l is not None:
+                p.masked_fill_((l == 0).unsqueeze(1), SENTINEL_KEY)
 
     # Each intermediate is del'd as soon as the next line no longer needs it
-    merged_k = torch.cat([top_key] + [p for p, _ in parts], dim=1)
+    merged_k = torch.cat([top_key] + [p for p, _, _ in parts], dim=1)
     merged_e = torch.cat(
         [top_enc]
         + [
             e if e.ndim == 2 else e.unsqueeze(0).expand(p.shape[0], -1)
-            for p, e in parts
+            for p, e, _ in parts
         ],
         dim=1,
     )
     new_top_key, idx = torch.topk(merged_k, k=k, dim=1, sorted=False)
     del merged_k
+    if thr is not None:
+        # Match the kernel path by keeping `thr` equal to the current state min.
+        thr.copy_(new_top_key.min(dim=1).values)
     return new_top_key, merged_e.gather(1, idx)
 
 
@@ -1582,38 +1617,18 @@ _UNCACHED = object()
 
 
 def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | None]) -> np.ndarray:
-    """OR-reduce of every DISTINCT active filter's keep-mask in `filters` —
-    the shared row-set for a vector_type where no search is unfiltered (see
-    `run_compute`). Never called with `None` in `filters` (that's the
-    `has_baseline` case, handled by leaving the whole file uncompacted
-    instead), so every `keeps[f]` here is a real `np.ndarray`, not `None`.
-    `filters` is never empty (a vt only reaches this function once
-    `vt_spec_idxs` has established it has at least one spec, each with a
-    real filter).
+    """Return the union of all distinct filtered row masks.
 
-    A UNIFORM filter's (or a GPU-eligible per-query filter's — Front B, see
-    `_row_union_from_gpu_leaves`) `keeps[f]` is already `(rows,)`, used as
-    -is. A CPU-fallback per-query filter's (`match_text`/
-    `match_text_from_query` leaf present) is bit-packed along the query axis,
-    `(ceil(n_queries / 8), rows)` (see `run_compute`'s reader thread) —
-    reduced to `(rows,)` via `.any(axis=0)` first: still EXACT, not a
-    heuristic, since a packed byte is 0 iff every query bit it holds is 0, so
-    byte-truthiness IS "does any query this byte covers want this row"; OR-ing
-    that across bytes is exactly "does any query want this row", simply read
-    off the packed array rather than approximated.
+    Uniform and GPU-eligible filters provide `(rows,)` masks directly.
+    CPU per-query filters provide bit-packed `(query_bytes, rows)` masks,
+    which are reduced with `.any(axis=0)` to exactly recover "any query keeps
+    this row."
 
-    "any query" means any query the filter's own specs OWN, since that is what
-    its mask now spans (`run_compute`'s `filter_rows`). Never LOOSER than when
-    the mask covered the whole queries file, and still a superset of what the
-    per-query `cell_mask` keeps, which is all the union has to be.
-
-    Tighter only when the foreign rows held REAL values, though — don't sell
-    it as a win it usually isn't. A null or empty phrase is token-less, and a
-    token-less phrase in a `must` matches nothing while a null `should` slot
-    contributes nothing, so a sentinel-filled foreign row's mask was already
-    all-False and added nothing to this OR. Every filtered config in this repo
-    is that case, so for them the narrowing changes this union by zero; its
-    payoff is `keeps[f]`'s allocation, not the shared grid."""
+    This is only used when every spec for the vector type is filtered, so
+    `filters` is non-empty, contains no `None`, and every `keeps[f]` is a real
+    mask. Restricting per-query masks to their owning queries mainly reduces
+    mask allocation; for token-less foreign rows it does not change the union.
+    """
     parts = [m.any(axis=0) if m.ndim == 2 else m for m in (keeps[f] for f in filters)]
     return np.logical_or.reduce(parts)
 
@@ -1645,7 +1660,7 @@ def _ragged_batch_ranges(
 
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
-    spec_top_key, spec_top_enc,
+    spec_top_key, spec_top_enc, spec_thr,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
     spec_qsel: list, spec_qrows: list, spec_cos_scale: list,
     encoded_row_ids: np.ndarray | None = None,
@@ -1654,86 +1669,26 @@ def _process_batch_group(
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
 ) -> float:
-    """The shared per-vector_type primitive behind `_process_shared_batch`:
-    iterate `batch` in `batch_size`-row slices, transfer each slice once
-    (`batch.transfer`), score it once per
-    DISTINCT metric among `member_idxs` (`score_cache` — every member needing
-    that metric reads the same tensor), and merge each member's own top-k
-    from those shared columns via `_merge_topk`.
+    """Process one vector-type batch, sharing transfer and scoring across members.
 
-    `orig_rows` maps a slice position to its TRUE file-row number (used to
-    index a filter's keep-mask, and — when `encoded_row_ids` is `None` — to
-    build `_merge_topk`'s output-id encoding too): `None` means position IS
-    the true row, either because `batch` is the raw, whole file (some search
-    of this vector_type is unfiltered and needs every row), or because
-    `batch` is several files' rows COALESCED into one (see `run_compute`'s
-    `_flush_coalesce_group`) whose keep-masks were already rebuilt to align
-    with the coalesced batch's own row order — either way, nothing to remap
-    for keep-mask indexing. An array means `batch` is a SINGLE file's own
-    compacted batch (the union of every active filter's surviving rows —
-    see `run_compute`'s `has_baseline` and `_union_keep`) and this maps back
-    to that one file's true rows.
+    The batch is sliced by `batch_size`; each slice is transferred once, scored
+    once per distinct metric, then merged into each member's top-k state.
 
-    `encoded_row_ids`, independently, is `_merge_topk`'s output-id source:
-    `None` means single-file — `gidx * MAX_ROWS_PER_FILE + rows` is computed
-    here (cheaply, directly on device, no CPU round-trip); a caller-supplied
-    array means it's already the fully-encoded id per row (needed for a
-    coalesced batch, where different rows came from different files, so no
-    single scalar `gidx` can encode all of them). This is deliberately a
-    SEPARATE concept from `orig_rows`: a coalesced batch needs identity
-    keep-mask indexing (rebuilt masks already match its own row order) but
-    non-identity, per-source-file id encoding — the two purposes coincide
-    for a single file but diverge once rows from several files share one
-    batch.
+    `orig_rows` maps compacted single-file rows back to true file rows for
+    filtering. `encoded_row_ids` separately provides output IDs when rows cannot
+    be encoded from `gidx` alone, as in coalesced multi-file batches.
 
-    `ordinal_base`/`ordinal_row_ids` carry the row's tie-break ordinal, which
-    rides in the low half of the packed selection key (see `nova_bf.tiebreak`)
-    and decides which of two EXACTLY-tied candidates survives. They split for
-    the same reason `encoded_row_ids` does: under `tiebreak='ordinal'` the
-    value is just this worker's running row counter, so a scalar base plus the
-    row index reconstructs it on device with no host array; under
-    `tiebreak='id'`, or for any coalesced batch whose rows came from several
-    files, no scalar covers it and the caller passes the array, already aligned
-    to batch position.
+    `ordinal_base`/`ordinal_row_ids` similarly provide deterministic tie-break
+    ordinals: the scalar form is used when they can be derived from row position,
+    otherwise the caller supplies per-row values.
 
-    `select(m, rows, true_rows, cache) -> (sel_rows, sel_cols, cell_mask)` is
-    the per-member filtering strategy (see `_process_shared_batch`):
-    `sel_rows is None` skips the merge entirely for this member/slice (e.g.
-    a filter keeping zero rows here); `sel_cols` is either `None` (member is
-    unfiltered or per-query-filtered — use the slice's rows unchanged) or a
-    column-index tensor used to mask the score matrix (and `encoded_rows`,
-    identically) down to that member's own (uniform) filter's surviving
-    columns; `cell_mask` is either `None` (no per-(query,row) masking
-    needed) or a `(n_queries, len(rows))` boolean tensor applied via
-    `masked_fill` — a per-query filter's own rows vary BY QUERY, so unlike a
-    uniform filter it can't be expressed as one shared column selection;
-    every column stays, and individual (query, row) cells get invalidated
-    instead. `true_rows` indexes a filter's keep-mask (sized to match
-    `batch`'s own row order, not necessarily one whole file — see above): a
-    plain `slice(r0, r1)` when `orig_rows is None` (a cheap view, no copy),
-    or `orig_rows`'s corresponding array slice otherwise. `cache` is a fresh
-    dict per r0-slice for `select` to memoize per-filter lookups shared
-    across members — it does not persist across slices, since the mask is
-    slice-relative.
+    `select(...)` returns optional row/column selection and a per-query cell mask.
+    `spec_qsel` selects queries in the shared score matrix, while `spec_qrows`
+    selects queries in a filter's own mask; these are distinct query spaces.
 
-    `spec_qsel`/`spec_qrows` are the per-member `SearchSpec.rows` selectors
-    (one entry per spec, `None` for a spec that owns every query — see
-    `_row_selector`). They index the SAME rows in two different spaces
-    and are NOT interchangeable: `spec_qsel[m]` addresses the score matrix,
-    whose query axis spans this vector_type's row UNION, while `spec_qrows[m]`
-    addresses a per-query filter mask, whose query axis spans that FILTER's
-    row union (`run_compute`'s `filter_rows`; the whole file for a filter that
-    kept full height — see `_pack_query_axis`). Both are required arguments —
-    a member that owns every query passes `None` explicitly — because the two
-    spaces coincide often enough (whenever both unions are the whole file)
-    that a defaulted or swapped selector reads plausible rows on most fixtures
-    and the wrong ones on the rest, with no error either way.
-
-    Returns elapsed wall-clock seconds spent in this loop (folded into the
-    caller's `gpu_secs`). A caller that pre-compacts `batch` must do so
-    BEFORE calling this function — its own timer starts only once this loop
-    begins, so CPU-side compaction time never counts as GPU time (see the
-    `io_wait`/`gpu_secs` split docs at the top of this module)."""
+    Returns wall-clock time spent in the processing loop. Any CPU-side compaction
+    must happen before this call and is therefore excluded from this timing.
+    """
     import torch
 
     n_rows = batch.n_rows
@@ -1776,6 +1731,10 @@ def _process_batch_group(
     pending: dict[int, list[tuple]] = {m: [] for m in member_idxs}
     pending_cols: dict[int, int] = {m: 0 for m in member_idxs}
 
+    # Decide pruning once per batch group so pruned parts are never flushed
+    # through an unpruned path. A stale threshold only prunes less, never wrongly.
+    prune = not os.environ.get("NOVA_BF_NO_PRUNE")
+
     def _flush_pending(m: int) -> None:
         if not pending[m]:
             return
@@ -1783,7 +1742,8 @@ def _process_batch_group(
         pending[m] = []
         pending_cols[m] = 0
         spec_top_key[m], spec_top_enc[m] = _merge_topk(
-            spec_top_key[m], spec_top_enc[m], parts, specs[m].k
+            spec_top_key[m], spec_top_enc[m], parts, specs[m].k,
+            thr=spec_thr[m] if prune else None,
         )
 
     def _flush_all_pending() -> None:
@@ -1858,14 +1818,18 @@ def _process_batch_group(
             cos_scale = spec_cos_scale[m]
 
             if sel_scores.shape[1] > s.k:
-                part_key, part_local = pack_topk(
-                    sel_scores, sel_ordinals, s.k, cos_scale)
+                part_key, part_local, live = pack_topk(
+                    sel_scores, sel_ordinals, s.k, cos_scale,
+                    thr=spec_thr[m] if prune else None)
                 part_enc = sel_encoded[part_local]
                 del part_local
             else:
                 part_key = pack(sel_scores, sel_ordinals, cos_scale)
                 part_enc = sel_encoded
-            pending[m].append((part_key, part_enc))
+                # Narrow slices skip the pre-top-K, so the prune decision the
+                # kernel would have made is applied here by the same rule.
+                live = live_rows(part_key, spec_thr[m]) if prune else None
+            pending[m].append((part_key, part_enc, live))
             pending_cols[m] += part_key.shape[1]
             if pending_cols[m] >= s.k:
                 _flush_pending(m)
@@ -2339,7 +2303,7 @@ def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str)
 
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
-    spec_top_key, spec_top_enc,
+    spec_top_key, spec_top_enc, spec_thr,
     keeps: dict[Filter | None, np.ndarray | None], filter_is_per_query: dict[Filter | None, bool],
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
     query_gpu_by_filter: dict[object, dict], filter_share_count: dict[Filter | None, int],
@@ -2439,6 +2403,7 @@ def _process_shared_batch(
 
     return _process_batch_group(
         batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_key, spec_top_enc,
+        spec_thr,
         batch_size, gidx, device, orig_rows=orig_rows, select=select,
         encoded_row_ids=encoded_row_ids,
         ordinal_base=ordinal_base, ordinal_row_ids=ordinal_row_ids,
@@ -2922,6 +2887,7 @@ def run_compute(
     }
     q_norms_by_vt: dict[str, object] = {}
     spec_Q, spec_q_norms, spec_top_key, spec_top_enc = [], [], [], []
+    spec_thr = []
     for i_spec, s in enumerate(specs):
         # Multivector cosine normalizes each TOKEN inside score() (not a
         # per-query scalar divide like dense/sparse), so it needs no `q_norms`
@@ -2957,6 +2923,9 @@ def run_compute(
         # decode gate recovers `-inf` from it exactly.
         spec_top_key.append(sentinel_key((h, s.k), device))
         spec_top_enc.append(torch.zeros((h, s.k), dtype=torch.int64, device=device))
+        # Per-query prune threshold: the weakest key currently in each top-k state.
+        # Starts at the sentinel so nothing is pruned before the state fills.
+        spec_thr.append(sentinel_key((h,), device))
 
     # Device-side row selectors for `SearchSpec.rows`, built once per run:
     #   spec_qsel[m]  — indexes this spec's rows in its vector_type's SCORE
@@ -3569,7 +3538,7 @@ def run_compute(
         }
         elapsed = _process_shared_batch(
             combined_batch, vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
-            spec_top_key, spec_top_enc,
+            spec_top_key, spec_top_enc, spec_thr,
             combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_by_filter,
             filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
             encoded_row_ids=encoded_ids, ordinal_row_ids=ordinal_ids,
@@ -3677,7 +3646,7 @@ def run_compute(
                 else:
                     gpu_secs += _process_shared_batch(
                         batches[vt], vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
-                        spec_top_key, spec_top_enc,
+                        spec_top_key, spec_top_enc, spec_thr,
                         keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_by_filter,
                         filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=batch_orig_rows[vt],
                         ordinal_base=ordinal_base,

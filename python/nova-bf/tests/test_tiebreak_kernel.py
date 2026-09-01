@@ -39,7 +39,7 @@ def _assert_matches_oracle(sc, od, k, label=""):
     exactly, for every kernel variant."""
     ref_idx = _portable(sc, od, k)
     ref_key = pack(sc, od)
-    key, idx = tk.topk(sc, od, k)
+    key, idx, _ = tk.topk(sc, od, k)
     assert _same_set(idx, ref_idx), f"{label}: wrong winners"
     assert torch.equal(key, ref_key.gather(1, idx)), (
         f"{label}: key does not match its own index"
@@ -120,11 +120,11 @@ def test_pack_topk_routes_through_the_kernel_and_matches(monkeypatch):
     sc = _scores("few-values", n_q, n_cols).contiguous()
     od = torch.randperm(n_cols, device=DEV).to(torch.int64)
 
-    key_gpu, idx_gpu = pack_topk(sc, od, k)
+    key_gpu, idx_gpu, _ = pack_topk(sc, od, k)
     assert torch.equal(key_gpu, pack(sc, od).gather(1, idx_gpu))
 
     monkeypatch.setattr(tk, "available", lambda *a: False)
-    key_cpu, idx_cpu = pack_topk(sc, od, k)
+    key_cpu, idx_cpu, _ = pack_topk(sc, od, k)
     assert _same_set(idx_gpu, idx_cpu), "kernel and portable path must agree"
 
 
@@ -327,11 +327,11 @@ def test_run_compute_actually_uses_the_kernel(tmp_path, tiebreak, monkeypatch):
     seen = {"calls": 0, "declined": 0}
     real_avail, real_topk = tkm.available, tkm.topk
 
-    def spy_available(scores, ordinal, k, scale=None):
+    def spy_available(scores, ordinal, k, scale=None, thr=None):
         # `scale` is cosine's per-query divisor, fused into the kernel's read
         # (see `topk_triton._cutfill`); forward it or the gate would be asked a
         # different question than the real call site asks.
-        ok = real_avail(scores, ordinal, k, scale)
+        ok = real_avail(scores, ordinal, k, scale, thr)
         if not ok:
             seen["declined"] += 1
             # surface WHY, so a regression names itself instead of just being slow

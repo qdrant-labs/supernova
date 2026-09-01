@@ -47,9 +47,9 @@ try:
     _triton, _tl = _load()
 
     @_triton.jit
-    def _cutfill(S, NRM, RANK, ORD, OUTK, OUTI, stride_s, n_cols, k,
+    def _cutfill(S, NRM, RANK, ORD, OUTK, OUTI, THR, LIVE, stride_s, n_cols, k,
                  BLOCK: _tl.constexpr, RBITS: _tl.constexpr,
-                 HAS_NRM: _tl.constexpr):
+                 HAS_NRM: _tl.constexpr, HAS_THR: _tl.constexpr):
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
         m = offs < n_cols
@@ -77,6 +77,23 @@ try:
         # u == 0 is also a REAL value (key INT32_MIN, i.e. a negative NaN), so an
         # unmasked compare could let a pad lane consume a winner slot.
         u = _tl.where(m, u, 0)
+
+        if HAS_THR:
+            # Prune rows whose best score cannot reach the running top-K threshold.
+            # `>=` preserves exact ties and under-filled sentinel states; see
+            # `tiebreak.live_rows`.
+            thr_hi = (_tl.load(THR + row) >> 32).to(_tl.int32)
+            thr_u = thr_hi.to(_tl.uint32, bitcast=True) ^ 0x80000000
+            # "any lane >= thr_u" == "row max >= thr_u", using the same
+            # masked-compare-and-sum idiom as the descents below. Pad lanes
+            # sit at u == 0 and are excluded by `m` regardless.
+            alive = _tl.sum((m & (u >= thr_u)).to(_tl.int32)) > 0
+            _tl.store(LIVE + row, alive.to(_tl.uint8))
+            if alive == 0:
+                # Dead-row keys are unspecified, but indices must remain gather-safe.
+                _tl.store(OUTI + row * k + offs, _tl.zeros([BLOCK], _tl.int32),
+                          mask=offs < k)
+                return
 
         prefix = _tl.zeros([], dtype=_tl.uint32)
         for i in _tl.static_range(32):
@@ -195,10 +212,10 @@ def _shape_of(t) -> str:
 _DECLINE_LOGGED = False
 
 
-def available(scores, ordinal, k, scale=None) -> bool:
+def available(scores, ordinal, k, scale=None, thr=None) -> bool:
     """Is the kernel usable for THIS call? Anything false falls back.
     """
-    ok = _available(scores, ordinal, k, scale)
+    ok = _available(scores, ordinal, k, scale, thr)
     global _DECLINE_LOGGED
     if not ok and not _DECLINE_LOGGED:
         _DECLINE_LOGGED = True
@@ -211,7 +228,7 @@ def available(scores, ordinal, k, scale=None) -> bool:
     return ok
 
 
-def _available(scores, ordinal, k, scale=None) -> bool:
+def _available(scores, ordinal, k, scale=None, thr=None) -> bool:
     """`available`'s body — see there.
 
     This is the contract boundary: everything the kernel ASSUMES is checked
@@ -253,35 +270,29 @@ def _available(scores, ordinal, k, scale=None) -> bool:
         and scale.device == scores.device
     ):
         return False
+    if thr is not None and not (
+        thr.ndim == 1 and thr.numel() == n_q
+        and thr.dtype is torch.int64 and thr.is_contiguous()
+        and thr.device == scores.device
+    ):
+        return False
     if not _offsets_fit_int32(n_q, scores.stride(0), k):
         return False
     return ordinal.numel() == n_cols and 0 < k <= n_cols <= MAX_BLOCK
 
 
-def topk(scores, ordinal, k, scale=None):
-    """(n_q, n_cols) float32 -> `(packed_keys, column_indices)`, both (n_q, k).
+def topk(scores, ordinal, k, scale=None, thr=None):
+    """Select top-K from `(n_q, n_cols)` float32 scores.
 
-    Highest score wins; among bit-identical scores, the smallest ordinal wins.
-    Unordered within a row (the caller re-selects). The keys are bit-identical
-    to `tiebreak.pack(scores, ordinal, scale).gather(1, idx)`.
+    Returns `(packed_keys, column_indices, live)`, with the first two shaped
+    `(n_q, k)`. Higher scores win; exact ties use the smallest ordinal.
+    Results are unordered within each row and match `tiebreak.pack(...)`.
 
-    `scale`, when given, is a per-QUERY-ROW positive divisor applied to each
-    score as it is read (cosine's query norm). Selecting on the divided value
-    is what keeps the packed key an encoding of the reported score.
+    `scale` is an optional per-query divisor applied before selection.
+    `thr` enables per-row pruning; dead rows have uninitialized keys but
+    gather-safe zero indices. With `thr=None`, `live` is `None`.
 
-    CALLER INVARIANTS
-
-      ordinal values are UNIQUE within the slice. Descent 2 selects on the
-        ordinal's RANK, so duplicates would be given an arbitrary order by the
-        underlying (unstable) argsort while the portable path leaves them
-        genuinely equal — the two would diverge. Both modes satisfy this by
-        construction: `ordinal` is `base + row` and `id` is a permutation rank,
-        and a subset of distinct values stays distinct under filtering.
-
-      0 <= ordinal <= 0xFFFFFFFF. The packed key puts the ordinal in the low
-        32 bits as `0xFFFFFFFF - ordv`; anything outside that range makes the
-        low half negative or overflowing and corrupts the score half. Held by
-        `tiebreak.MAX_ROWS_PER_WORKER`, which is exactly `0xFFFFFFFF`.
+    Requires unique ordinals in `[0, 0xFFFFFFFF]`.
     """
     import torch
 
@@ -293,17 +304,22 @@ def topk(scores, ordinal, k, scale=None):
     _block = _triton.next_power_of_2(n_cols)
     outk = torch.empty((n_q, k), dtype=torch.int64, device=scores.device)
     outi = torch.empty((n_q, k), dtype=torch.int32, device=scores.device)
+    live = None if thr is None else torch.empty(n_q, dtype=torch.uint8, device=scores.device)
     # Triton launches on the CURRENT device; pin it to the tensors' own so a
     # process whose current device differs (multi-GPU) cannot launch elsewhere.
     with torch.cuda.device(scores.device):
         _cutfill[(n_q,)](
-            # `scores` doubles as the NRM placeholder when unscaled
+            # `scores` doubles as the NRM placeholder when unscaled,
+            # and as the THR/LIVE placeholders when unpruned.
             scores, scale if scale is not None else scores,
             rank, ordinal.contiguous(), outk, outi,
+            thr if thr is not None else scores,
+            live if live is not None else scores,
             scores.stride(0), n_cols, k,
             BLOCK=_block,
             RBITS=max(1, int(n_cols).bit_length()),   # w lands in [1, n_cols]
             HAS_NRM=scale is not None,
+            HAS_THR=thr is not None,
             num_warps=_warps_for(_block),  # 4 spills at BLOCK=8192; 8 does not.
         )
-    return outk, outi.to(torch.int64)
+    return outk, outi.to(torch.int64), live

@@ -130,7 +130,7 @@ def test_pack_topk_matches_an_unchunked_pack(monkeypatch):
     o = torch.from_numpy(rng.integers(0, 1000, 60).astype(np.int64))
     whole_k, whole_i = torch.topk(pack(s, o), k=7, dim=1, sorted=False)
     monkeypatch.setattr(tb, "PACK_TARGET_SLOTS", 64)     # force many chunks
-    chunk_k, chunk_i = pack_topk(s, o, 7)
+    chunk_k, chunk_i, _ = pack_topk(s, o, 7)
 
     assert torch.equal(
         torch.sort(whole_k, dim=1).values, torch.sort(chunk_k, dim=1).values
@@ -402,7 +402,7 @@ def test_pack_topk_falls_back_when_the_kernel_declines(monkeypatch):
     rng = np.random.default_rng(11)
     s = torch.from_numpy(rng.random((32, 128), dtype=np.float32))
     o = torch.from_numpy(rng.integers(0, 10_000, 128).astype(np.int64))
-    key, idx = pack_topk(s, o, 9)
+    key, idx, _ = pack_topk(s, o, 9)
     ref = torch.topk(pack(s, o), 9, dim=1, sorted=False)
     assert torch.equal(torch.sort(idx, dim=1).values, torch.sort(ref.indices, dim=1).values)
     assert torch.equal(key, pack(s, o).gather(1, idx)), "key must pair with its index"

@@ -12,9 +12,10 @@ Padding lanes are excluded explicitly. Duplicate sentinel keys require an exact
 cumulative fill at the cutoff so a real candidate cannot be displaced by an
 under-filled state's sentinels.
 
-An early-out for converged rows is intentionally omitted: the kernel remains
-memory-bound because the pending part must still be read, and the current
-out-of-place design must still write the result.
+With live/thr, rows that cannot improve the current top-k skip selection
+entirely, leaving the state unchanged without reading potentially uninitialized
+part keys. Live rows also update thr with the new row minimum, providing the
+threshold for the next slice at no extra reduction cost.
 """
 
 
@@ -31,11 +32,23 @@ try:
     import triton.language as _tl
 
     @_triton.jit
-    def _fold(SK, SE, PK, PE, OK, OE,
+    def _fold(SK, SE, PK, PE, OK, OE, LIVE, THR,
               sk_s, se_s, pk_s, pe_s, ok_s, oe_s,
-              k, w, BLOCK: _tl.constexpr):
+              k, w, BLOCK: _tl.constexpr, HAS_LIVE: _tl.constexpr):
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
+
+        if HAS_LIVE:
+            if _tl.load(LIVE + row) == 0:
+                # Dead rows cannot improve the state; copy it through without reading
+                # the potentially uninitialized part row. `thr` is unchanged.
+                mk = offs < k
+                _tl.store(OK + row * ok_s + offs,
+                          _tl.load(SK + row * sk_s + offs, mask=mk, other=0), mask=mk)
+                _tl.store(OE + row * oe_s + offs,
+                          _tl.load(SE + row * se_s + offs, mask=mk, other=0), mask=mk)
+                return
+
         n = k + w
         m = offs < n
         from_state = offs < k
@@ -96,6 +109,14 @@ try:
         pos = _tl.cumsum(keep.to(_tl.int32)) - 1
         _tl.store(OK + row * ok_s + pos, key, mask=keep & (pos < k))
         _tl.store(OE + row * oe_s + pos, enc, mask=keep & (pos < k))
+
+        if HAS_LIVE:
+            # Update the row's prune threshold from keys already in registers, avoiding
+            # a separate reduction over the full top-k state.
+            _tl.store(THR + row, _tl.min(
+                _tl.where(keep, key, _tl.full([BLOCK], 0x7FFFFFFFFFFFFFFF, _tl.int64)),
+                axis=0,
+            ))
 
 except Exception as exc:
     _triton = _tl = None
@@ -182,10 +203,10 @@ def _shape_of(t) -> str:
 _DECLINE_LOGGED = False
 
 
-def available(state_key, state_enc, part_key, part_enc, k) -> bool:
+def available(state_key, state_enc, part_key, part_enc, k, live=None, thr=None) -> bool:
     """Is the kernel usable for THIS fold? Anything false falls back.
     """
-    ok = _available(state_key, state_enc, part_key, part_enc, k)
+    ok = _available(state_key, state_enc, part_key, part_enc, k, live, thr)
     global _DECLINE_LOGGED
     if not ok and not _DECLINE_LOGGED:
         _DECLINE_LOGGED = True
@@ -239,7 +260,7 @@ def _why_declined(state_key, state_enc, part_key, part_enc, k) -> str:
         return "reason unavailable"
 
 
-def _available(state_key, state_enc, part_key, part_enc, k) -> bool:
+def _available(state_key, state_enc, part_key, part_enc, k, live=None, thr=None) -> bool:
     """`available`'s body — see there."""
     import os
 
@@ -247,6 +268,22 @@ def _available(state_key, state_enc, part_key, part_enc, k) -> bool:
 
     if _fold is None or os.environ.get("NOVA_BF_NO_FOLD_KERNEL"):
         return False
+    # Pruning inputs travel as a pair: `live` decides the skip, `thr` receives
+    # the by-product min. 
+    if (live is None) != (thr is None):
+        return False
+    if live is not None:
+        n_q = state_key.shape[0] if state_key.ndim == 2 else -1
+        if not (
+            live.ndim == 1 and live.numel() == n_q and live.dtype is torch.uint8
+            and live.is_contiguous() and live.device == state_key.device
+        ):
+            return False
+        if not (
+            thr.ndim == 1 and thr.numel() == n_q and thr.dtype is torch.int64
+            and thr.is_contiguous() and thr.device == state_key.device
+        ):
+            return False
     if getattr(torch.version, "hip", None) is not None:
         return False
     for t in (state_key, state_enc, part_key):
@@ -289,7 +326,7 @@ def _available(state_key, state_enc, part_key, part_enc, k) -> bool:
     return 0 < w and k + w <= MAX_BLOCK
 
 
-def fold(state_key, state_enc, part_key, part_enc, k):
+def fold(state_key, state_enc, part_key, part_enc, k, live=None, thr=None):
     """Select the top-k of `state ++ part` on the packed key.
 
     PRECONDITION: `available(...)` must have returned True for these exact
@@ -300,6 +337,12 @@ def fold(state_key, state_enc, part_key, part_enc, k):
     whose failure mode is silently wrong ground truth rather than an exception —
     a transposed `part_key` reads across query rows and still returns k
     plausible hits per row.
+
+    `live`/`thr` (both or neither) turn on per-query pruning: a row with
+    `live[row] == 0` keeps its state unchanged and ITS PART ROW IS NEVER READ
+    (it may be uninitialized — see `topk_triton.topk`); a live row folds
+    normally and writes its new row-min key into `thr[row]` IN PLACE, keeping
+    `thr` the exact state min for the caller's next prune decision.
 
     Returns `(new_key, new_enc)`, each `(n_q, k)`. Unordered within a row — the
     caller either folds again or sorts once at decode.
@@ -318,10 +361,14 @@ def fold(state_key, state_enc, part_key, part_enc, k):
     with torch.cuda.device(state_key.device):
         _fold[(n_q,)](
             state_key, state_enc, part_key, pe, out_k, out_e,
+            # state_key doubles as the LIVE/THR placeholder when unpruned
+            live if live is not None else state_key,
+            thr if thr is not None else state_key,
             state_key.stride(0), state_enc.stride(0), part_key.stride(0), pe_s,
             out_k.stride(0), out_e.stride(0),
             k, w,
             BLOCK=block,
+            HAS_LIVE=live is not None,
             num_warps=_warps_for(block),
         )
     return out_k, out_e

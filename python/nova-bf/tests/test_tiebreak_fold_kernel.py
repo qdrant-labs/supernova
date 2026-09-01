@@ -379,8 +379,8 @@ def test_run_compute_reaches_the_fold_kernel(tmp_path, tiebreak, monkeypatch):
     seen = {"calls": 0, "declined": 0, "why": None}
     real_avail, real_fold = mtm.available, mtm.fold
 
-    def spy_avail(sk, se, pk, pe, k):
-        ok = real_avail(sk, se, pk, pe, k)
+    def spy_avail(sk, se, pk, pe, k, live=None, thr=None):
+        ok = real_avail(sk, se, pk, pe, k, live, thr)
         if not ok:
             seen["declined"] += 1
             seen["why"] = dict(

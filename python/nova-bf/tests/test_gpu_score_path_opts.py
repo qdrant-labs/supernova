@@ -160,8 +160,8 @@ def test_fused_divide_matches_dividing_first():
         nrm = torch.tensor(rng.uniform(0.3, 30.0, size=7), dtype=torch.float32)
         o = torch.arange(33, dtype=torch.int64)
         assert torch.equal(pack(sc, o, nrm), pack(sc / nrm[:, None], o))
-        ka, _ = pack_topk(sc, o, 5, nrm)
-        kb, _ = pack_topk(sc / nrm[:, None], o, 5)
+        ka, _, _ = pack_topk(sc, o, 5, nrm)
+        kb, _, _ = pack_topk(sc / nrm[:, None], o, 5)
         assert torch.equal(ka.sort(1).values, kb.sort(1).values)
 
 
@@ -423,11 +423,11 @@ def test_fused_kernel_divide_matches_the_portable_divide_bit_for_bit():
         nrm = torch.tensor(nrm, dtype=torch.float32, device="cuda").contiguous()
         o = torch.arange(n_cols, dtype=torch.int64, device="cuda")
 
-        kk, ik = pack_topk(sc, o, k, nrm)                      # Triton kernel
+        kk, ik, _ = pack_topk(sc, o, k, nrm)                      # Triton kernel
         prev = os.environ.get("NOVA_BF_NO_TOPK_KERNEL")
         os.environ["NOVA_BF_NO_TOPK_KERNEL"] = "1"
         try:
-            kp, ip = pack_topk(sc, o, k, nrm)                  # portable
+            kp, ip, _ = pack_topk(sc, o, k, nrm)                  # portable
         finally:
             if prev is None:
                 os.environ.pop("NOVA_BF_NO_TOPK_KERNEL", None)
