@@ -665,8 +665,8 @@ class DenseCorpusBatch:
     `SparseCorpusBatch` so `run_compute`'s per-file loop never branches on
     vector_type.
 
-    `share_gram` is set by `_process_batch_group` (from `metric_share_count`)
-    once it knows how many DISTINCT metrics will score this batch, and is
+    `share_gram` is set by `_process_batch_group` once it knows how many
+    DISTINCT metrics will score this batch, and is
     handed to every slice `transfer` produces — carried on the batch rather
     than passed as a `transfer` argument so the `transfer(r0, r1, device)`
     surface stays identical across vector_types. See `DenseBatchSlice`."""
@@ -702,8 +702,8 @@ class DenseCorpusBatch:
 class DenseBatchSlice:
     """One on-device slice of a dense corpus batch.
 
-    When two or more DISTINCT metrics score this slice (`share_gram`, set from
-    `metric_share_count` — see `_process_batch_group`), all of them are derived
+    When two or more DISTINCT metrics score this slice (`share_gram` — see
+    `_process_batch_group`), all of them are derived
     from ONE raw Gram matrix `Q @ Cbᵀ` instead of each running its own GEMM:
 
         dot        the Gram itself, returned WITHOUT a copy
@@ -1711,25 +1711,20 @@ def _process_batch_group(
         ranges = _ragged_batch_ranges(batch.doc_offsets, step, max_doc_tokens)
     else:
         ranges = [(r0, min(r0 + step, n_rows)) for r0 in range(0, n_rows, step)]
-    # How many members read each distinct metric's score matrix — used below
-    # to skip caching one nobody else will reuse (the score-matrix analog of
-    # `filter_share_count`): a single-reader (n_q, rows) matrix — 1.6 GiB at
-    # n_q=100k / rows=4096 — gets collected right after its own merge instead
-    # of sitting in `score_cache` through every later member's matmul+merge.
-    metric_share_count = Counter(specs[m].metric for m in member_idxs)
-    # Dense only: when 2+ DISTINCT metrics score this batch, derive all of them
-    # from ONE raw Gram instead of one GEMM each (see `DenseBatchSlice`). A
-    # single-metric batch keeps the unshared path, so it pays neither the extra
-    # resident matrix nor any change in its float32 output.
-    if isinstance(batch, DenseCorpusBatch):
-        batch.share_gram = len(metric_share_count) > 1
+    # Count consumers of each distinct score matrix so single-use matrices are
+    # not cached. Include `scale_in_packer` because it changes score semantics,
+    # even when the metric is the same.
+    score_share_count = Counter(
+        (specs[m].metric, spec_cos_scale[m] is not None) for m in member_idxs
+    )
 
-    # Amortized running top-k (see _merge_topk): per-slice candidates are
-    # buffered (each part pre-topk'd to <= k columns, so the buffer holds at
-    # most ~2k columns per member) and folded with ONE topk once >= k pending
-    # columns accumulate, instead of one topk per slice. Flushed for every
-    # member before this function returns, so callers still observe a fully
-    # merged running state per batch.
+    # Dense only: if multiple metrics score this batch, derive them from one shared
+    # Gram matrix instead of one GEMM per metric. Count metrics, not score keys.
+    if isinstance(batch, DenseCorpusBatch):
+        batch.share_gram = len({specs[m].metric for m in member_idxs}) > 1
+
+    # Amortize running top-k by buffering pre-topk'd slice candidates and merging
+    # once >= k columns are pending. All members are flushed before returning.
     pending: dict[int, list[tuple]] = {m: [] for m in member_idxs}
     pending_cols: dict[int, int] = {m: 0 for m in member_idxs}
 
@@ -1777,19 +1772,22 @@ def _process_batch_group(
                 ordinal_row_ids[r0 : r0 + sl.n_rows].astype(np.int64, copy=False)
             ).to(device, non_blocking=True)
 
-        score_cache: dict[str, object] = {}
+        score_cache: dict[tuple, object] = {}
         cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
         for m in member_idxs:
             s = specs[m]
-            scores = score_cache.get(s.metric)
+            # Dense cosine's query-norm divide happens in the packer, so the
+            # flag is part of the cache key — see `score_share_count`.
+            scale_in_packer = spec_cos_scale[m] is not None
+            score_key = (s.metric, scale_in_packer)
+            scores = score_cache.get(score_key)
             if scores is None:
-                # Dense cosine's query-norm divide happens in the packer
                 scores = sl.score(
                     spec_Q[m], s.metric, spec_q_norms[m],
-                    scale_in_packer=spec_cos_scale[m] is not None,
+                    scale_in_packer=scale_in_packer,
                 )
-                if metric_share_count[s.metric] > 1:
-                    score_cache[s.metric] = scores
+                if score_share_count[score_key] > 1:
+                    score_cache[score_key] = scores
 
             sel_rows, sel_cols, cell_mask = select(m, rows, true_rows, cache)
             if sel_rows is None:
