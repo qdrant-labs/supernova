@@ -246,43 +246,75 @@ def _build_query_vocab(indices: np.ndarray) -> np.ndarray:
 _VOCAB_LUT_MAX_BYTES = 256 << 20
 
 
-def _lut_applies(vocab: np.ndarray, ids: np.ndarray) -> bool:
-    """Whether an id-indexed LUT is valid and within budget.
-
-    Requires integer, non-negative ids and a bounded maximum vocabulary id.
-    """
-    if not (np.issubdtype(vocab.dtype, np.integer)
-            and np.issubdtype(ids.dtype, np.integer)):
+def _lut_vocab_ok(vocab: np.ndarray) -> bool:
+    """The vocabulary half of `_lut_applies` — depends only on `vocab`, so it
+    is what `_build_vocab_lut` can decide once for a whole run."""
+    if not np.issubdtype(vocab.dtype, np.integer):
         return False
     if int(vocab[0]) < 0:  # sorted ascending, so this is the smallest
         return False
-    if (int(vocab[-1]) + 2) * 8 > _VOCAB_LUT_MAX_BYTES:
+    return (int(vocab[-1]) + 2) * 8 <= _VOCAB_LUT_MAX_BYTES
+
+
+def _lut_ids_ok(ids: np.ndarray) -> bool:
+    """The ids half of `_lut_applies` — must be re-checked per call, since a
+    prebuilt LUT says nothing about the ids it will be indexed with."""
+    if not np.issubdtype(ids.dtype, np.integer):
         return False
     return (np.issubdtype(ids.dtype, np.unsignedinteger)
             or len(ids) == 0
             or int(ids.min()) >= 0)
 
 
-def _vocab_lookup(vocab: np.ndarray, ids: np.ndarray) -> np.ndarray:
+def _lut_applies(vocab: np.ndarray, ids: np.ndarray) -> bool:
+    """Whether an id-indexed LUT is valid and within budget.
+
+    Requires integer, non-negative ids and a bounded maximum vocabulary id.
+    """
+    return _lut_vocab_ok(vocab) and _lut_ids_ok(ids)
+
+
+def _build_vocab_lut(vocab: np.ndarray) -> np.ndarray | None:
+    """Build the id-indexed LUT for `vocab`, or return `None` when unsupported.
+
+    The LUT is run-wide and reused by `_vocab_lookup`; rebuilding it per corpus
+    file can otherwise add substantial allocation and initialization overhead.
+    """
+    if len(vocab) == 0 or not _lut_vocab_ok(vocab):
+        return None
+    top = int(vocab[-1])
+    # Final slot maps ids above the vocabulary to -1.
+    lut = np.full(top + 2, -1, dtype=np.int64)
+    lut[vocab] = np.arange(len(vocab), dtype=np.int64)
+    return lut
+
+
+def _vocab_lookup(vocab: np.ndarray, ids: np.ndarray, lut=None) -> np.ndarray:
     """Map `ids` to positions in sorted `vocab`, or -1 if absent.
 
     Uses a direct lookup table for suitable non-negative integer ids and
     `searchsorted` otherwise. The LUT path is much faster for large sparse
     remaps; the search path also supports strings and other id types.
+
+    `lut` is an optional prebuilt table from `_build_vocab_lut(vocab)`. Passing
+    one skips the per-call build; omitting it keeps the original behaviour.
     """
     if len(vocab) == 0:
         return np.full(len(ids), -1, dtype=np.int64)
-    if _lut_applies(vocab, ids):
-        top = int(vocab[-1])
-
-        # Extra slot maps all ids above the vocabulary to -1.
-        lut = np.full(top + 2, -1, dtype=np.int64)
-        lut[vocab] = np.arange(len(vocab), dtype=np.int64)
-        cap = top + 1
+    if lut is not None and len(lut) != int(vocab[-1]) + 2:
+        # A LUT from a different vocabulary would silently remap every token to
+        # the wrong column, so this is a hard error rather than a fallback.
+        raise ValueError(
+            f"vocab LUT has {len(lut)} slots but this vocabulary needs "
+            f"{int(vocab[-1]) + 2} — it was built for a different vocab"
+        )
+    if _lut_ids_ok(ids) and (lut is not None or _lut_vocab_ok(vocab)):
+        if lut is None:
+            lut = _build_vocab_lut(vocab)
+        cap = len(lut) - 1              # the extra slot, which maps to -1
         if cap <= np.iinfo(ids.dtype).max:
             # Keep the clip in `ids`' dtype to avoid a wider temporary.
             ids = np.minimum(ids, ids.dtype.type(cap))
-        
         return lut[ids]
 
     pos = np.minimum(np.searchsorted(vocab, ids), len(vocab) - 1)
@@ -539,6 +571,7 @@ def _compact_multivector_rows(
 
 def _remap_sparse_file(
     row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray, vocab: np.ndarray,
+    lut=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Remap one whole file's raw CSR parts into the query vocabulary:
     out-of-vocab entries dropped (see `_build_query_vocab`), duplicate
@@ -553,7 +586,7 @@ def _remap_sparse_file(
     the raw pre-truncation values (see its docstring)."""
     n_rows = len(row_offsets) - 1
     row_ids = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(row_offsets))
-    idx = _vocab_lookup(vocab, indices)
+    idx = _vocab_lookup(vocab, indices, lut)
     keep_nnz = idx >= 0
     row_ids, idx, val = row_ids[keep_nnz], idx[keep_nnz], values[keep_nnz]
     row_ids, idx, val = _coalesce_by_row_col(row_ids, idx, val)
@@ -2762,6 +2795,7 @@ def run_compute(
         spec_rows, vt_rows = _resolve_spec_rows(specs, pre, n_q_pre)
     Q_np_by_vt: dict[str, np.ndarray] = {}
     query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
+    query_vocab_lut = None  # built once from `query_vocab` (see _build_vocab_lut)
     mv_q_offsets = None  # multivector only: (n_q+1,) query-token offsets (see load_queries_multivector)
     # Sparse gate + query-representation state (see _zero_gate_file_ok/_SparseQueryCache):
     # query-side flags fixed run-wide; the indicator holder is shared by every
@@ -2781,6 +2815,11 @@ def run_compute(
                     "sparse query vocabulary is empty (every query has zero nonzero entries) — "
                     "every corpus row will score 0; check queries.sparse_column is correct."
                 )
+            # ONE table for the whole run. `_remap_sparse_file` looks up against
+            # this same vocabulary once per corpus file, in the reader threads;
+            # rebuilding it there costs a full-width memset per file and, with
+            # several readers, several of them resident at once.
+            query_vocab_lut = _build_vocab_lut(query_vocab)
             # Query side of the zero-score no-overlap gate (see
             # `_zero_gate_file_ok`): computed on Q as SCORED (post-densify,
             # duplicates summed), once per run.
@@ -3355,7 +3394,7 @@ def run_compute(
                     sp_norms = _sparse_file_norms(sp_offsets, sp_idx, sp_val) if need_sparse_norms else None
                     sp_gate = _zero_gate_file_ok(sp_val, sparse_q_nonneg, sparse_q_min_pos)
                     sp_offsets, sp_idx, sp_val = _remap_sparse_file(
-                        sp_offsets, sp_idx, sp_val, query_vocab
+                        sp_offsets, sp_idx, sp_val, query_vocab, query_vocab_lut
                     )
                     arrs["sparse"] = (sp_offsets, sp_idx, sp_val, sp_norms, sp_gate)
                 # carry the id column (combined to one contiguous array) to decode;
