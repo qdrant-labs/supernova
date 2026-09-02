@@ -199,3 +199,99 @@ def test_hit_ids_use_64_bit_offsets_for_synthesized_ids():
     with tempfile.TemporaryDirectory() as d:
         schema = _dense_run(pathlib.Path(d), id_column=None)
     assert schema.field("hit_ids").type == pa.list_(pa.large_string())
+
+
+# ---------------------------------------------------------------------------
+# the merged artifact must keep the partials' 64-bit id offsets
+# ---------------------------------------------------------------------------
+
+
+def test_merged_hit_ids_keep_64_bit_offsets():
+    """`compute` writes `list<large_string>` partials, but `merge` rebuilt the
+    ids as plain `string` — a 32-bit-offset child that caps one batch at 2 GiB
+    of characters (~44 M ids at 47 B) and silently narrowed the schema between
+    the partials and the artifact they merge into."""
+    import pathlib
+    import tempfile
+
+    import numpy as np
+    import pyarrow.parquet as pq
+    from nova_bf.compute import run_compute
+    from nova_bf.merge import run_merge
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        cfg = _cfg_for_merge(tmp)
+        for r in range(2):
+            run_compute(cfg, num_jobs=2, job_rank=r)
+        merged = run_merge(cfg)["t"]
+        part_dir = pathlib.Path(str(tmp / "out"))
+        parts = sorted(part_dir.rglob("*.parquet"))
+        merged_schema = pq.read_schema(merged)
+
+    assert merged_schema.field("hit_ids").type == pa.list_(pa.large_string()), (
+        "merge narrowed hit_ids back to 32-bit offsets")
+    assert parts, "no partials were written"
+
+
+def _cfg_for_merge(tmp):
+    import numpy as np
+    import pyarrow as _pa
+    import pyarrow.parquet as _pq
+    from nova_bf.config import (
+        BruteForceConfig, CorpusConfig, OutputConfig, ParamsConfig,
+        QueriesConfig, SearchSpec,
+    )
+
+    cdir = tmp / "c"
+    cdir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(3)
+    for f in range(4):
+        v = rng.normal(size=(25, 4)).astype(np.float32)
+        _pq.write_table(_pa.table({
+            "dense_embedding": _pa.array(v.tolist(), _pa.list_(_pa.float32())),
+            "sid": _pa.array([f"c{f}_{j}" for j in range(25)]),
+        }), str(cdir / f"f{f}.parquet"))
+    qv = rng.normal(size=(3, 4)).astype(np.float32)
+    qp = tmp / "q.parquet"
+    _pq.write_table(_pa.table({
+        "dense_embedding": _pa.array(qv.tolist(), _pa.list_(_pa.float32())),
+        "qid": _pa.array(["q0", "q1", "q2"]),
+    }), str(qp))
+    return BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="sid"),
+        queries=QueriesConfig(path=str(qp), id_column="qid"),
+        output=OutputConfig(path=str(tmp / "out")),
+        params=ParamsConfig(io_workers=1),
+        searches=[SearchSpec(name="t", k=3, metric="dot")],
+    )
+
+
+def test_explicit_merge_batch_size_is_clamped_not_obeyed_blindly(caplog):
+    """`_topk_merge` allocates `(rows, n_partials * k)` grids, so the knob is
+    quadratic in the fan-in. An explicit value past the candidate-slot ceiling
+    is clamped — and says so — rather than turning into a host OOM."""
+    import logging
+
+    from nova_bf.merge import _TARGET_CANDIDATE_SLOTS, _resolve_batch_rows
+
+    n_partials, k, n_rows = 64, 1000, 1_000_000
+    ceiling = _TARGET_CANDIDATE_SLOTS // (n_partials * k)
+
+    with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
+        got = _resolve_batch_rows(50_000, n_rows, n_partials, k)
+    assert got == ceiling, f"expected clamp to {ceiling}, got {got}"
+    assert "clamping" in caplog.text, "the clamp must be logged"
+
+    # under the ceiling: honoured exactly, and silent
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
+        assert _resolve_batch_rows(10, n_rows, n_partials, k) == 10
+    assert "clamping" not in caplog.text
+
+    # auto path unchanged
+    assert _resolve_batch_rows(None, n_rows, n_partials, k) == ceiling
+    # a tiny corpus still bounds by n_rows
+    assert _resolve_batch_rows(None, 5, n_partials, k) == 5
+    # never zero
+    assert _resolve_batch_rows(None, 1_000_000, 100_000, 100_000) == 1

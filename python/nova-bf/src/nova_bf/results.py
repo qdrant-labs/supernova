@@ -250,9 +250,18 @@ def build_result_table(
     # `merge` and the tests still pass lists of lists, so accept both rather
     # than forcing either caller to convert.
     def _list_col(v, ty):
-        return v if isinstance(v, (pa.Array, pa.ChunkedArray)) else pa.array(v, pa.list_(ty))
+        """Normalize input to `list<ty>` for consistent Parquet output.
 
-    data["hit_ids"] = _list_col(hit_ids, pa.string())
+        Prebuilt Arrow arrays are cast when needed so all producers use the same
+        child type; same-type casts are free.
+        """
+        want = pa.list_(ty)
+        if isinstance(v, (pa.Array, pa.ChunkedArray)):
+            return v if v.type == want else v.cast(want)
+        return pa.array(v, want)
+
+    # `large_string` avoids the 2 GiB child-data limit of plain `string`.
+    data["hit_ids"] = _list_col(hit_ids, pa.large_string())
     data["hit_scores"] = _list_col(hit_scores, pa.float32())
     if hit_tie is not None:
         data["hit_tie"] = _list_col(hit_tie, pa.int64())

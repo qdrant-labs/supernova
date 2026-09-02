@@ -60,10 +60,27 @@ _TARGET_CANDIDATE_SLOTS = 20_000_000
 
 
 def _resolve_batch_rows(explicit: int | None, n_rows: int, n_partials: int, k: int) -> int:
-    if explicit is not None:
-        return max(1, min(explicit, n_rows))
+    """Choose merge batch rows under the candidate-grid memory limit.
+
+    `_topk_merge` scales with `batch_rows * n_partials * k`, so explicit and
+    automatic batch sizes are both clamped to the same safe ceiling.
+    """
     per_row = max(1, n_partials * k)
-    return max(1, min(_TARGET_CANDIDATE_SLOTS // per_row, n_rows))
+    ceiling = max(1, min(_TARGET_CANDIDATE_SLOTS // per_row, n_rows))
+    if explicit is None:
+        return ceiling
+    want = max(1, min(explicit, n_rows))
+    if want > ceiling:
+        logger.warning(
+            "params.merge_batch_size=%d would hold %.1f M candidate slots per "
+            "batch (%d partials x k=%d); clamping to %d rows (%.1f M slots). "
+            "The grid is quadratic in the partial count, so a value tuned for "
+            "fewer shards does not carry over.",
+            explicit, want * per_row / 1e6, n_partials, k, ceiling,
+            ceiling * per_row / 1e6,
+        )
+        return ceiling
+    return want
 
 
 # Prefetch downloads in parallel RANGES (not one stream per file): a single S3
@@ -273,7 +290,8 @@ def _topk_merge(
     np.cumsum(counts, out=offsets[1:])
     off = pa.array(offsets, pa.int32())
     scores_arr = pa.ListArray.from_arrays(off, pa.array(top_s[valid], pa.float32()))
-    ids_arr = pa.ListArray.from_arrays(off, pa.array(top_id[valid], pa.string()))
+    ids_arr = pa.ListArray.from_arrays(
+        off, pa.array(top_id[valid], pa.large_string()))
     return ids_arr, scores_arr
 
 
