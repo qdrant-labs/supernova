@@ -267,10 +267,12 @@ def _cfg_for_merge(tmp):
     )
 
 
-def test_explicit_merge_batch_size_is_clamped_not_obeyed_blindly(caplog):
+def test_explicit_merge_batch_size_is_obeyed_and_warned_about(caplog):
     """`_topk_merge` allocates `(rows, n_partials * k)` grids, so the knob is
-    quadratic in the fan-in. An explicit value past the candidate-slot ceiling
-    is clamped — and says so — rather than turning into a host OOM."""
+    quadratic in the fan-in and a value tuned for fewer shards can ask for far
+    more memory than its author meant. That is worth SAYING; it is not worth
+    overriding. The operator knows their machine, and the auto ceiling is only
+    a heuristic — so an explicit value is obeyed, with a warning."""
     import logging
 
     from nova_bf.merge import _TARGET_CANDIDATE_SLOTS, _resolve_batch_rows
@@ -280,14 +282,28 @@ def test_explicit_merge_batch_size_is_clamped_not_obeyed_blindly(caplog):
 
     with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
         got = _resolve_batch_rows(50_000, n_rows, n_partials, k)
-    assert got == ceiling, f"expected clamp to {ceiling}, got {got}"
-    assert "clamping" in caplog.text, "the clamp must be logged"
+    assert got == 50_000, f"explicit value must be obeyed, got {got}"
+    assert "honoring it" in caplog.text, "going over the auto target must warn"
 
     # under the ceiling: honoured exactly, and silent
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
         assert _resolve_batch_rows(10, n_rows, n_partials, k) == 10
-    assert "clamping" not in caplog.text
+    assert caplog.text == "", "a value inside the target has nothing to warn about"
+
+    # The shape the clamp made unusable: the auto ceiling collapses to single
+    # digits, and `merge` writes one parquet row group per batch — so ~143k row
+    # groups for a 1M-query merge unless the operator can override it. They can.
+    assert _resolve_batch_rows(None, n_rows, 256, 10_000) == 7
+    with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
+        assert _resolve_batch_rows(20_000, n_rows, 256, 10_000) == 20_000
+
+    # still capped by the query count — asking for more rows than exist is not
+    # a memory question, it is just wrong
+    assert _resolve_batch_rows(50_000, 300, n_partials, k) == 300
+    # ...and never zero or negative
+    assert _resolve_batch_rows(0, n_rows, n_partials, k) == 1
+    assert _resolve_batch_rows(-5, n_rows, n_partials, k) == 1
 
     # auto path unchanged
     assert _resolve_batch_rows(None, n_rows, n_partials, k) == ceiling

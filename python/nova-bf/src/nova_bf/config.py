@@ -257,12 +257,10 @@ class ParamsConfig(BaseModel):
     # pathological score ties at your k). Affects every vector_type's dense
     # matmul (dense scoring, multivector MaxSim); sparse SpMM is unaffected.
     allow_tf32: bool = False
-    # `merge` reduces the W per-rank partials in row-batches of this many queries,
-    # streaming the result to disk so the full output never sits in RAM (that's what
-    # let the old merge OOM at 1M queries). Peak host memory is ~(this × W × k)
-    # candidate slots. None (default) → auto: sized so the working set stays near
-    # ~20M candidate slots regardless of W and k, floored at 1 and capped at the
-    # query count. Set it explicitly to trade memory for fewer, larger batches.
+    # Merge partials in row batches and stream results to disk to bound memory.
+    # `None` auto-sizes for ~20M candidate slots; set explicitly to trade more
+    # memory for larger batches and fewer parquet row groups. Merge warns when 
+    # your value is above its own target.
     merge_batch_size: int | None = None
     # `merge`: when the partials live on S3, first bulk-download them to local disk
     # (ranged reads, io_workers-many concurrent) and merge from there, instead of

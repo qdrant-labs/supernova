@@ -60,10 +60,13 @@ _TARGET_CANDIDATE_SLOTS = 20_000_000
 
 
 def _resolve_batch_rows(explicit: int | None, n_rows: int, n_partials: int, k: int) -> int:
-    """Choose merge batch rows under the candidate-grid memory limit.
+    """Choose how many query rows one merge batch covers.
 
-    `_topk_merge` scales with `batch_rows * n_partials * k`, so explicit and
-    automatic batch sizes are both clamped to the same safe ceiling.
+    Automatic sizing (`explicit is None`) targets `_TARGET_CANDIDATE_SLOTS`, so
+    peak memory stays flat as the partial count and `k` grow.
+
+    An EXPLICIT `params.merge_batch_size` is obeyed, bounded only by the query
+    count. However, if the value is above the auto target, a warning is logged.
     """
     per_row = max(1, n_partials * k)
     ceiling = max(1, min(_TARGET_CANDIDATE_SLOTS // per_row, n_rows))
@@ -72,14 +75,14 @@ def _resolve_batch_rows(explicit: int | None, n_rows: int, n_partials: int, k: i
     want = max(1, min(explicit, n_rows))
     if want > ceiling:
         logger.warning(
-            "params.merge_batch_size=%d would hold %.1f M candidate slots per "
-            "batch (%d partials x k=%d); clamping to %d rows (%.1f M slots). "
-            "The grid is quadratic in the partial count, so a value tuned for "
-            "fewer shards does not carry over.",
-            explicit, want * per_row / 1e6, n_partials, k, ceiling,
-            ceiling * per_row / 1e6,
+            "params.merge_batch_size=%d holds %.1f M candidate slots per batch "
+            "(%d partials x k=%d), above the ~%.1f M auto target — honoring it, "
+            "since you set it. The grid scales with BOTH the partial count and "
+            "k, so a value tuned for fewer shards asks for more here; drop the "
+            "setting to let merge size itself (%d rows) if this OOMs.",
+            explicit, want * per_row / 1e6, n_partials, k,
+            _TARGET_CANDIDATE_SLOTS / 1e6, ceiling,
         )
-        return ceiling
     return want
 
 
