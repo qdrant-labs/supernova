@@ -3573,6 +3573,13 @@ def run_compute(
                             union = _row_union_from_gpu_leaves(f, leaf_arrays, query_filter_vals, n_rows)
                             keeps[f] = union if union is not None else np.ones(n_rows, dtype=bool)
 
+                # Drop this file's raw inputs before compaction or blocking on the next 
+                # window. Python loop variables stay alive across iterations, otherwise 
+                # retaining the full Arrow table and masks until the next file. #
+                # Safe: `ids`, `leaf_arrays`, `arrs`, and `keeps` retain everything still 
+                # needed. Assign `None` instead of `del` because `mask` may be unbound.
+                table = masks = mask = None
+
                 # Wrap into the vector_type-agnostic batch abstraction and,
                 # per vt, compact to the union of every active filter's
                 # surviving rows RIGHT HERE — moved off the single consumer

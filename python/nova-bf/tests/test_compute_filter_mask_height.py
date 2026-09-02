@@ -1843,3 +1843,140 @@ def test_positions_are_in_range_for_every_union_the_helper_can_build():
             # and they must name the spec's own rows, not merely fit
             if union is not None:
                 np.testing.assert_array_equal(union[pos], rows)
+
+
+# --------------------------------------------------------------------------
+# reader-side lifetime: the raw table and the unpacked masks are released
+# --------------------------------------------------------------------------
+
+
+def test_the_reader_releases_the_table_and_unpacked_masks_before_compacting(
+    text_ds, monkeypatch
+):
+    """Python loop bodies do not scope, so `reader()` used to hold the previous
+    file's whole Arrow table AND its unpacked masks until they were rebound a
+    file later — measured at 6.4 GiB and 5.1 GiB on a 1.09M-row shard, mostly
+    while the thread was blocked on `window.acquire()`.
+
+    Pins the ORDERING that makes the fix worth anything: the table must already
+    be unreachable by the time the compaction copies run, not merely by the
+    time the thread exits (which would be true either way). A weakref is the
+    only honest probe — `sys.getrefcount` would see the probe's own reference.
+    """
+    import weakref
+
+    seen = {"tables": 0, "checked": 0, "alive_at_compact": 0}
+    refs: list = []
+
+    real_convert = compute_mod.convert_table_date_columns
+
+    def convert_spy(table, fmts):
+        out = real_convert(table, fmts)
+        seen["tables"] += 1
+        refs.append(weakref.ref(out))
+        return out
+
+    real_union = compute_mod._union_keep
+
+    def union_spy(*a, **kw):
+        # Runs inside the `.compact(...)` branch, i.e. AFTER the release line.
+        seen["checked"] += 1
+        seen["alive_at_compact"] += sum(1 for r in refs if r() is not None)
+        return real_union(*a, **kw)
+
+    monkeypatch.setattr(compute_mod, "convert_table_date_columns", convert_spy)
+    monkeypatch.setattr(compute_mod, "_union_keep", union_spy)
+
+    got = _run(text_ds, "lifetime", [
+        SearchSpec(name="kw", vector_type="dense", metric="dot", k=4,
+                   filter=KEYWORD_FILTER, rows={"column": "owner", "isin": ["kw"]}),
+    ])
+
+    assert seen["tables"] > 0, "no corpus table was read"
+    assert seen["checked"] > 0, "compaction never ran, so nothing was pinned"
+    assert seen["alive_at_compact"] == 0, (
+        f"{seen['alive_at_compact']} corpus table(s) still reachable when the "
+        "compaction copies ran — the reader is holding raw inputs it no longer "
+        "needs, on top of the copies it is about to make")
+    # and the run must still be correct with those references gone
+    assert got["kw"], "the filtered search returned nothing"
+
+
+def test_released_refs_still_produce_oracle_correct_filtered_hits(tmp_path):
+    """The correctness half of the release above, against an INDEPENDENT
+    expectation rather than self-consistency.
+
+    Exercises exactly what the release touches, end to end and across several
+    files so the reader loop reuses its frame:
+      * `id_column` set, so `hit_ids` are resolved from `ids`, a zero-copy view
+        into the `table` that is now dropped before hand-off;
+      * a `match_text_from_query` filter, the CPU-fallback path that builds the
+        2-D masks now dropped in favour of the packed `keeps`.
+
+    If dropping `table` freed a buffer `ids` or the leaf arrays still needed,
+    the ids would come back as garbage or the run would fault; if the packed
+    mask were wrong, the surviving row set would differ. Both show up here as
+    a mismatch against a plain f64 numpy oracle.
+    """
+    rng = np.random.default_rng(2024)
+    cdir = tmp_path / "c"
+    cdir.mkdir()
+
+    words = ["physics", "dna", "pottery", "baking"]
+    all_ids, all_vecs, all_texts = [], [], []
+    for fi in range(4):                       # several files: frame is reused
+        n = 7 + fi                            # ragged, so no row-count aliasing
+        vecs = rng.standard_normal((n, DIM)).astype(np.float32)
+        texts, ids = [], []
+        for j in range(n):
+            # every doc carries exactly one keyword, plus filler
+            texts.append(f"{words[(fi + j) % len(words)]} notes number {fi}{j}")
+            ids.append(f"f{fi}r{j}")
+        _write(cdir / f"f{fi}.parquet", vecs, id=ids, text=texts,
+               tenant=["A"] * n)
+        all_ids += ids
+        all_vecs.append(vecs)
+        all_texts += texts
+    corpus = np.concatenate(all_vecs)
+
+    n_q = 6
+    qv = rng.standard_normal((n_q, DIM)).astype(np.float32)
+    want_word = [words[i % len(words)] for i in range(n_q)]
+    qpath = tmp_path / "q.parquet"
+    _write(qpath, qv, qid=[f"q{i}" for i in range(n_q)],
+           owner=["kw"] * n_q, keyword_phrase=want_word,
+           tenant_want=["A"] * n_q)
+
+    K = 3
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid",
+                              payload_fields=["owner"]),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(io_workers=3, tiebreak="id"),
+        searches=[SearchSpec(name="kw", vector_type="dense", metric="dot",
+                             k=K, filter=KEYWORD_FILTER)],
+    )
+    # `_rows_of` -> {query_id: (hit_ids, hit_scores)}
+    by_q = {q: h for q, (h, _s) in _rows_of(run_compute(cfg)["kw"]).items()}
+
+    # --- independent oracle: f64 dot over the rows whose text has the word,
+    #     ties broken by ascending id (params.tiebreak="id").
+    for i in range(n_q):
+        word = want_word[i]
+        keep = [j for j, t in enumerate(all_texts) if word in t.split()]
+        assert keep, f"q{i}: fixture produced no matching docs for {word!r}"
+        sc = corpus[keep].astype(np.float64) @ qv[i].astype(np.float64)
+        order = sorted(range(len(keep)),
+                       key=lambda n: (-sc[n], all_ids[keep[n]]))
+        want = [all_ids[keep[n]] for n in order[:K]]
+        assert by_q[f"q{i}"] == want, (
+            f"q{i} ({word}): got {by_q[f'q{i}']} want {want}")
+
+    # and every returned id must be a real corpus id, not decoded garbage
+    known = set(all_ids)
+    for qid, hits in by_q.items():
+        bad = [h for h in hits if h not in known]
+        assert not bad, f"{qid}: ids not present in the corpus: {bad}"
