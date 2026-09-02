@@ -119,6 +119,76 @@ def test_fallback_scores_are_unchanged_across_slices(case, monkeypatch):
     assert torch.equal(first, fresh), "a fresh cache changed the scores"
 
 
+def _signed_case(n_q=6, n_rows=40, vocab=24, seed=3):
+    """SIGNED sparse data, so `zero_gate_ok` is False and the structural
+    overlap gate runs instead of the cheap `raw == 0` one."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    rows, cols, vals = [], [], []
+    for r in range(n_rows):
+        idx = sorted(rng.choice(vocab, 4, replace=False))
+        for c in idx:
+            rows.append(r); cols.append(int(c))
+            vals.append(float(rng.uniform(-2, 2)))
+    crow = np.zeros(n_rows + 1, dtype=np.int64)
+    np.add.at(crow, np.asarray(rows) + 1, 1)
+    crow = np.cumsum(crow)
+    Cb = torch.sparse_csr_tensor(
+        torch.tensor(crow), torch.tensor(cols, dtype=torch.int64),
+        torch.tensor(vals, dtype=torch.float32),
+        size=(n_rows, vocab), check_invariants=False)
+    Q = torch.zeros(n_q, vocab, dtype=torch.float32)
+    for q in range(n_q):
+        idx = rng.choice(vocab, 5, replace=False)
+        Q[q, torch.tensor(idx.copy())] = torch.tensor(
+            rng.uniform(-2, 2, 5), dtype=torch.float32)
+    return Q, Cb
+
+
+def test_structural_gate_is_chunked_but_identical(monkeypatch):
+    """The overlap gate densifies the same `(vocab, n_rows)` operand that
+    scoring gates behind `_SPARSE_SWAP_MAX_DENSE_BYTES` — it used to do so with
+    NO budget at all, so a slice that scoring refused to densify was densified
+    here anyway. It now chunks; chunking must not change the answer.
+    """
+    from nova_bf.compute import SparseBatchSlice
+
+    Q, Cb = _signed_case()
+    whole = SparseBatchSlice(Cb=Cb, row_norms=None,
+                             zero_gate_ok=False)._structural_no_overlap(Q)
+
+    # Force several chunks: budget of one row's worth of dense indicator.
+    monkeypatch.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES",
+                        Cb.shape[1] * 4)
+    per = compute_mod._dense_corpus_rows_per_chunk(Cb, 4)
+    assert per < Cb.shape[0], "budget did not actually force chunking"
+
+    chunked = SparseBatchSlice(Cb=Cb, row_norms=None,
+                               zero_gate_ok=False)._structural_no_overlap(Q)
+    assert chunked.shape == whole.shape == (Q.shape[0], Cb.shape[0])
+    assert torch.equal(chunked, whole), "chunking changed the overlap gate"
+    assert whole.any() and not whole.all(), "degenerate fixture: gate is constant"
+
+
+def test_structural_gate_and_scoring_share_one_budget(monkeypatch):
+    """The bug was that the two disagreed. Pin that one helper decides both:
+    whenever scoring declines to densify, the gate chunks rather than
+    allocating the operand scoring just refused."""
+    Q, Cb = _signed_case()
+    n_rows = Cb.shape[0]
+
+    monkeypatch.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES",
+                        Cb.shape[1] * 4)
+    per = compute_mod._dense_corpus_rows_per_chunk(Cb, Q.element_size())
+    scoring_densifies = per >= n_rows
+    assert not scoring_densifies, "expected scoring to take the fallback here"
+
+    # Same helper, same answer -> the gate cannot densify the whole slice.
+    assert compute_mod._dense_corpus_rows_per_chunk(Cb, Q.element_size()) == per
+    assert per >= 1, "budget must always allow at least one row"
+
+
 def test_dense_slice_t_marks_stored_zeros(case):
     """`_dense_slice_t`'s `values` argument exists so the structural gate can
     scatter ONES. A stored 0.0 is still an overlap; deriving the indicator

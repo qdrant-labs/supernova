@@ -615,7 +615,7 @@ def _sparse_scores(Q, Cb, q_cache=None):
 
     n_rows, vocab = Cb.shape
     cache = q_cache or _SparseQueryCache()
-    if vocab * n_rows * Q.element_size() <= _SPARSE_SWAP_MAX_DENSE_BYTES:
+    if _dense_corpus_rows_per_chunk(Cb, Q.element_size()) >= n_rows:
         # Produces the `(n_q, n_rows)` layout downstream consumers expect.
         return torch.matmul(cache.values(Q), _dense_slice_t(Cb, Cb.values()))
     # Built per slice, not cached. This path is used only when the dense corpus
@@ -879,6 +879,18 @@ def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> 
     return q_min_pos * vmin > _ZERO_GATE_MIN_PRODUCT
 
 
+def _dense_corpus_rows_per_chunk(Cb, element_size: int) -> int:
+    """How many corpus rows may be densified as `(vocab, rows)` at once.
+
+    ONE budget, shared by `_sparse_scores` and `SparseBatchSlice.
+    _structural_no_overlap`, so the two can never disagree — scoring refusing
+    the allocation while the overlap gate makes it anyway was a real hazard on
+    signed data.
+    """
+    vocab = Cb.shape[1]
+    return max(1, _SPARSE_SWAP_MAX_DENSE_BYTES // max(1, vocab * element_size))
+
+
 def _dense_slice_t(Cb, values):
     """Densify a CSR corpus slice as `(vocab, n_rows)`.
 
@@ -1004,11 +1016,31 @@ class SparseBatchSlice:
         re-materialization of the multi-GB query side."""
         import torch
 
-        ones = torch.ones(self.Cb.values().numel(), dtype=Q.dtype, device=Q.device)
-        c_ind_t = _dense_slice_t(self.Cb, ones)  # ones, not values: a stored 0.0
-                                                 # is still a structural overlap
         q_ind = (self.q_cache or _SparseQueryCache()).indicator(Q)
-        return torch.matmul(q_ind, c_ind_t) == 0
+        n_rows, vocab = self.Cb.shape
+        per = _dense_corpus_rows_per_chunk(self.Cb, Q.element_size())
+        if per >= n_rows:
+            # ones, not values: a stored 0.0 is still a structural overlap
+            ones = torch.ones(self.Cb.values().numel(), dtype=Q.dtype,
+                              device=Q.device)
+            return torch.matmul(q_ind, _dense_slice_t(self.Cb, ones)) == 0
+
+        # Too wide for one dense indicator. Chunk the CORPUS rows rather than
+        # switching to a query-side dense operand. Chunking keeps
+        # the transient at the budget no matter how wide the slice is.
+        crow, col = self.Cb.crow_indices(), self.Cb.col_indices()
+        parts = []
+        for r0 in range(0, n_rows, per):
+            r1 = min(r0 + per, n_rows)
+            lo, hi = int(crow[r0]), int(crow[r1])
+            sub = torch.sparse_csr_tensor(
+                (crow[r0 : r1 + 1] - crow[r0]).contiguous(),
+                col[lo:hi],
+                torch.ones(hi - lo, dtype=Q.dtype, device=Q.device),
+                size=(r1 - r0, vocab), check_invariants=False,
+            )
+            parts.append(torch.matmul(q_ind, _dense_slice_t(sub, sub.values())) == 0)
+        return torch.cat(parts, dim=1)
 
     def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
         if self._masked_raw is None:
