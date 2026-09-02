@@ -183,3 +183,55 @@ def test_live_rows_handles_a_zero_width_part():
     thr = torch.full((5,), SENTINEL_KEY, dtype=torch.int64)
     live = live_rows(keys, thr)
     assert live.shape == (5,) and int(live.sum()) == 0
+
+
+# ---------------------------------------------------------------------------
+# dead rows are DEFINED, not uninitialised
+# ---------------------------------------------------------------------------
+
+
+def test_kernel_sentinel_matches_tiebreak():
+    """`topk_triton` resolves `SENTINEL_KEY` lazily to dodge an import cycle,
+    so nothing structural keeps the two in step. Pin them."""
+    from nova_bf import topk_triton
+
+    assert topk_triton._sentinel_key() == SENTINEL_KEY
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="exercises the kernel")
+def test_dead_rows_carry_the_sentinel_not_garbage():
+    """The kernel used to `return` without writing `OUTK`, leaving whatever was
+    in GPU memory — values that decode to a plausible score and a plausible id,
+    so a consumer that read one produced wrong ground truth that looked normal.
+    Dead rows now hold `SENTINEL_KEY`, which loses to every real candidate.
+
+    Allocating the output pre-poisoned is what makes this test mean something:
+    if the kernel skipped the store, the poison would survive and be visible.
+    """
+    from nova_bf import topk_triton
+
+    dev = "cuda"
+    n_q, n_cols, k = 8, 64, 4
+    g = torch.Generator(device="cpu").manual_seed(11)
+    scores = torch.randn(n_q, n_cols, generator=g).float().to(dev)
+    ordinal = torch.arange(n_cols, dtype=torch.int64, device=dev)
+
+    # Threshold above every score for half the rows -> those rows are dead.
+    thr = pack(torch.full((n_q, 1), 1e9), torch.zeros(1, dtype=torch.int64))
+    thr = thr.squeeze(1).contiguous().to(dev)
+    thr[: n_q // 2] = SENTINEL_KEY          # keep the first half alive
+
+    keys, idx, live = topk_triton.topk(scores, ordinal, k, thr=thr)
+
+    dead = (live == 0).nonzero(as_tuple=True)[0]
+    assert dead.numel() > 0, "no row was pruned; the test proves nothing"
+    assert torch.equal(
+        keys[dead], torch.full_like(keys[dead], SENTINEL_KEY)
+    ), "a dead row's keys are not the sentinel"
+    assert torch.equal(
+        idx[dead], torch.zeros_like(idx[dead])
+    ), "a dead row's indices must stay gather-safe"
+
+    alive = (live != 0).nonzero(as_tuple=True)[0]
+    assert alive.numel() > 0
+    assert (keys[alive] != SENTINEL_KEY).all(), "a live row lost its real keys"

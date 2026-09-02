@@ -49,7 +49,8 @@ try:
     @_triton.jit
     def _cutfill(S, NRM, RANK, ORD, OUTK, OUTI, THR, LIVE, stride_s, n_cols, k,
                  BLOCK: _tl.constexpr, RBITS: _tl.constexpr,
-                 HAS_NRM: _tl.constexpr, HAS_THR: _tl.constexpr):
+                 HAS_NRM: _tl.constexpr, HAS_THR: _tl.constexpr,
+                 SENTINEL: _tl.constexpr = 0):
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
         m = offs < n_cols
@@ -90,7 +91,11 @@ try:
             alive = _tl.sum((m & (u >= thr_u)).to(_tl.int32)) > 0
             _tl.store(LIVE + row, alive.to(_tl.uint8))
             if alive == 0:
-                # Dead-row keys are unspecified, but indices must remain gather-safe.
+                # Dead rows skip selection, so initialize outputs explicitly: sentinel
+                # keys lose to all real candidates, and zero indices remain gather-safe.
+                _tl.store(OUTK + row * k + offs,
+                          _tl.full([BLOCK], SENTINEL, _tl.int64), mask=offs < k)
+                # Indices must stay gather-safe even though they mean nothing.
                 _tl.store(OUTI + row * k + offs, _tl.zeros([BLOCK], _tl.int32),
                           mask=offs < k)
                 return
@@ -281,6 +286,17 @@ def _available(scores, ordinal, k, scale=None, thr=None) -> bool:
     return ordinal.numel() == n_cols and 0 < k <= n_cols <= MAX_BLOCK
 
 
+def _sentinel_key() -> int:
+    """`tiebreak.SENTINEL_KEY`, fetched lazily.
+
+    `tiebreak` imports this module, so a module-level import here would be a
+    cycle. Pinned equal by `test_kernel_sentinel_matches_tiebreak`.
+    """
+    from nova_bf.tiebreak import SENTINEL_KEY
+
+    return SENTINEL_KEY
+
+
 def topk(scores, ordinal, k, scale=None, thr=None):
     """Select top-K from `(n_q, n_cols)` float32 scores.
 
@@ -289,8 +305,10 @@ def topk(scores, ordinal, k, scale=None, thr=None):
     Results are unordered within each row and match `tiebreak.pack(...)`.
 
     `scale` is an optional per-query divisor applied before selection.
-    `thr` enables per-row pruning; dead rows have uninitialized keys but
-    gather-safe zero indices. With `thr=None`, `live` is `None`.
+    `thr` enables per-row pruning; a dead row's keys are filled with
+    `tiebreak.SENTINEL_KEY` (so reading one is wasteful, never wrong) and its
+    indices are zero — gather-safe but meaningless. With `thr=None`, `live` is
+    `None`.
 
     Requires unique ordinals in `[0, 0xFFFFFFFF]`.
     """
@@ -320,6 +338,7 @@ def topk(scores, ordinal, k, scale=None, thr=None):
             RBITS=max(1, int(n_cols).bit_length()),   # w lands in [1, n_cols]
             HAS_NRM=scale is not None,
             HAS_THR=thr is not None,
+            SENTINEL=_sentinel_key(),
             num_warps=_warps_for(_block),  # 4 spills at BLOCK=8192; 8 does not.
         )
     return outk, outi.to(torch.int64), live

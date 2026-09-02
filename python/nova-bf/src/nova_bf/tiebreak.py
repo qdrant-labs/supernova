@@ -250,8 +250,12 @@ def pack_topk(scores, ordinal, k, scale=None, thr=None):
     path is used. Both produce the same winners.
 
     If `thr` is given, `live` marks rows that can still affect the running top-K.
-    Dead rows may contain unspecified `keys` and must not be read. With `thr=None`,
-    `live` is `None` and all outputs are valid.
+    Reading a dead row is wasteful, never wrong, on either path: the portable
+    path leaves its `keys` fully valid (it selects before deciding), and the
+    Triton kernel skips the selection but fills the row with `SENTINEL_KEY`,
+    which loses to every real candidate. A dead row's `idx` stays in range
+    (gather-safe) but means nothing on the kernel path. With `thr=None`, `live`
+    is `None` and all outputs are valid.
     """
     import torch
 

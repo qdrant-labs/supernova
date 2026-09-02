@@ -13,7 +13,9 @@ cumulative fill at the cutoff so a real candidate cannot be displaced by an
 under-filled state's sentinels.
 
 With live/thr, rows that cannot improve the current top-k skip selection
-entirely, leaving the state unchanged without reading potentially uninitialized
+entirely, leaving the state unchanged without reading the part's dead row
+(which the top-K kernel fills with `SENTINEL_KEY`, so a stray read would lose
+rather than corrupt — but skipping is still the point)
 part keys. Live rows also update thr with the new row minimum, providing the
 threshold for the next slice at no extra reduction cost.
 """
@@ -41,7 +43,8 @@ try:
         if HAS_LIVE:
             if _tl.load(LIVE + row) == 0:
                 # Dead rows cannot improve the state; copy it through without reading
-                # the potentially uninitialized part row. `thr` is unchanged.
+                # the part's dead row (sentinel-filled, not garbage, but
+                # still nothing worth reading). `thr` is unchanged.
                 mk = offs < k
                 _tl.store(OK + row * ok_s + offs,
                           _tl.load(SK + row * sk_s + offs, mask=mk, other=0), mask=mk)
@@ -340,7 +343,8 @@ def fold(state_key, state_enc, part_key, part_enc, k, live=None, thr=None):
 
     `live`/`thr` (both or neither) turn on per-query pruning: a row with
     `live[row] == 0` keeps its state unchanged and ITS PART ROW IS NEVER READ
-    (it may be uninitialized — see `topk_triton.topk`); a live row folds
+    (it holds `SENTINEL_KEY` on the kernel path — see `topk_triton.topk`);
+    a live row folds
     normally and writes its new row-min key into `thr[row]` IN PLACE, keeping
     `thr` the exact state min for the caller's next prune decision.
 
