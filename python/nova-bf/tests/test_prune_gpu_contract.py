@@ -198,6 +198,41 @@ def test_kernel_sentinel_matches_tiebreak():
     assert topk_triton._sentinel_key() == SENTINEL_KEY
 
 
+def test_kernel_sentinel_argument_has_no_default():
+    """`SENTINEL` must stay REQUIRED at the kernel's launch site.
+
+    This runs without CUDA on purpose. `test_dead_rows_carry_the_sentinel_not_
+    garbage` below is the real proof, but it is GPU-gated, so on a CPU box —
+    which is where this suite usually runs — nothing else here would notice a
+    default reappearing.
+
+    Why a default is worse than none: a `tl.constexpr` default is silently
+    applied to any launch that omits the keyword, and the value that would look
+    natural, 0, is the single worst choice. `0` is `pack(+0.0, TIE_WORST)` — a
+    score of POSITIVE ZERO. It outranks the -inf sentinel, it outranks every
+    negative score (all euclidean scores are negative, and dot routinely is),
+    and `0.0 > -inf` so the decode gate keeps it. A dead row would come back
+    holding k hits at score 0.0 pointing at one repeated id: wrong ground truth
+    that looks entirely normal, which is the exact failure the sentinel fill was
+    added to prevent. With no default, the same mistake is a TypeError.
+    """
+    import inspect
+
+    from nova_bf import topk_triton
+
+    if topk_triton._cutfill is None:
+        pytest.skip(f"triton did not import: {topk_triton._UNAVAILABLE}")
+
+    # `@triton.jit` wraps the function; the original is on `.fn`.
+    fn = getattr(topk_triton._cutfill, "fn", topk_triton._cutfill)
+    param = inspect.signature(fn).parameters["SENTINEL"]
+    assert param.default is inspect.Parameter.empty, (
+        f"topk_triton._cutfill's SENTINEL has default {param.default!r}; it must "
+        "stay required so a launch that forgets it fails loudly instead of "
+        "filling dead rows with a key that beats real candidates"
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="exercises the kernel")
 def test_dead_rows_carry_the_sentinel_not_garbage():
     """The kernel used to `return` without writing `OUTK`, leaving whatever was

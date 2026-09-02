@@ -50,7 +50,10 @@ try:
     def _cutfill(S, NRM, RANK, ORD, OUTK, OUTI, THR, LIVE, stride_s, n_cols, k,
                  BLOCK: _tl.constexpr, RBITS: _tl.constexpr,
                  HAS_NRM: _tl.constexpr, HAS_THR: _tl.constexpr,
-                 SENTINEL: _tl.constexpr = 0):
+                 # Required: every real candidate must outrank this sentinel.
+                 # A default like 0 is unsafe: it can survive decoding and beat valid negative
+                 # scores, producing plausible fake hits. Missing it should fail at launch.
+                 SENTINEL: _tl.constexpr):
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
         m = offs < n_cols
