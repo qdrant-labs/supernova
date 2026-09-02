@@ -854,6 +854,11 @@ _ZERO_GATE_MIN_PRODUCT = 1e-30
 # avoid excessive temporary memory.
 _SPARSE_SWAP_MAX_DENSE_BYTES = 512 << 20
 
+# Row-block height for `_SparseQueryCache._csr`, as bytes of the transient
+# `(rows, vocab)` bool it materializes per block. 64 MiB keeps the spike far
+# below the dense `Q` it is derived from at any realistic vocabulary.
+_CSR_BLOCK_BYTES = 64 << 20
+
 
 def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> bool:
     """Per corpus file: may `SparseBatchSlice.score` use the cheap
@@ -933,15 +938,38 @@ class _SparseQueryCache:
         self._indicator = None
 
     def _csr(self, Q, vals_from_pattern):
+        """Build CSR from `Q`'s nonzero pattern in row blocks.
+
+        Blocking avoids materializing the full `(n_q, vocab)` boolean mask, bounding
+        temporary memory by block height while producing identical CSR output.
+        """
         import torch
 
-        nz = Q != 0  # (n_q, vocab) bool — one-time transient
-        crow = torch.zeros(Q.shape[0] + 1, dtype=torch.int64, device=Q.device)
-        torch.cumsum(nz.sum(1), 0, out=crow[1:])
-        r, c = nz.nonzero(as_tuple=True)  # row-major order == valid CSR order
+        n_q, vocab = Q.shape
+        rows_per = max(1, _CSR_BLOCK_BYTES // max(1, vocab))
+        crow = torch.zeros(n_q + 1, dtype=torch.int64, device=Q.device)
+        cols, vals = [], []
+        base = 0
+        for r0 in range(0, n_q, rows_per):
+            r1 = min(r0 + rows_per, n_q)
+            blk = Q[r0:r1]
+            nz = blk != 0
+            # Blocks preserve row-major order, so concatenation remains valid CSR order.
+            counts = nz.sum(1)
+            torch.cumsum(counts, 0, out=crow[r0 + 1 : r1 + 1])
+            crow[r0 + 1 : r1 + 1] += base
+            base = int(crow[r1])
+            r, c = nz.nonzero(as_tuple=True)
+            cols.append(c)
+            vals.append(vals_from_pattern(blk, r, c))
+            del nz, counts, r, c, blk
         return torch.sparse_csr_tensor(
-            crow, c, vals_from_pattern(Q, r, c), size=tuple(Q.shape),
-            check_invariants=False,
+            crow,
+            torch.cat(cols) if cols else torch.zeros(0, dtype=torch.int64,
+                                                     device=Q.device),
+            torch.cat(vals) if vals else torch.zeros(0, dtype=Q.dtype,
+                                                     device=Q.device),
+            size=(n_q, vocab), check_invariants=False,
         )
 
     def values(self, Q):

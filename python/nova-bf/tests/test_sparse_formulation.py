@@ -189,6 +189,63 @@ def test_structural_gate_and_scoring_share_one_budget(monkeypatch):
     assert per >= 1, "budget must always allow at least one row"
 
 
+def _csr_parts(t):
+    return (t.crow_indices().clone(), t.col_indices().clone(),
+            t.values().clone())
+
+
+@pytest.mark.parametrize("n_q,vocab", [(37, 11), (64, 8), (5, 64), (1, 9)])
+@pytest.mark.parametrize("kind", ["values", "indicator"])
+def test_query_csr_is_identical_however_it_is_blocked(monkeypatch, n_q, vocab,
+                                                      kind):
+    """`_csr` builds the pattern in row blocks so the transient `(rows, vocab)`
+    bool is bounded by block height rather than by `n_q` (1.8 GiB at 100k x
+    18k, live next to the 7.2 GiB `Q` it comes from). Blocking must be a pure
+    memory optimisation: the crow prefix sum composes across blocks, so every
+    block height has to give the same CSR.
+    """
+    g = torch.Generator().manual_seed(n_q * 100 + vocab)
+    Q = torch.randn(n_q, vocab, generator=g)
+    Q[Q.abs() < 0.8] = 0.0                      # genuinely sparse
+    Q[0] = 0.0                                  # a wholly empty row
+    if n_q > 2:
+        Q[2] = torch.randn(vocab, generator=g).abs() + 1.0   # a wholly full row
+
+    def build():
+        c = compute_mod._SparseQueryCache()
+        return _csr_parts(getattr(c, kind)(Q))
+
+    monkeypatch.setattr(compute_mod, "_CSR_BLOCK_BYTES", 1 << 30)   # one block
+    whole = build()
+    for block_rows in (1, 2, 3, 7, n_q - 1 if n_q > 1 else 1):
+        monkeypatch.setattr(compute_mod, "_CSR_BLOCK_BYTES",
+                            max(1, block_rows * vocab))
+        got = build()
+        for a, b, name in zip(got, whole, ("crow", "col", "values")):
+            assert torch.equal(a, b), f"{name} differs at block_rows={block_rows}"
+
+
+def test_query_csr_matches_a_dense_roundtrip():
+    """Independent check that the blocked CSR really encodes Q: densifying it
+    must reproduce the original matrix exactly."""
+    g = torch.Generator().manual_seed(5)
+    Q = torch.randn(53, 17, generator=g)
+    Q[Q.abs() < 1.0] = 0.0
+    csr = compute_mod._SparseQueryCache().values(Q)
+    assert torch.equal(csr.to_dense(), Q)
+    assert int(csr.values().numel()) == int((Q != 0).sum())
+
+
+def test_query_csr_handles_an_all_zero_matrix():
+    """No nonzeros at all: crow must be all zeros and the arrays empty, not a
+    crash on `torch.cat([])`."""
+    Q = torch.zeros(9, 6)
+    csr = compute_mod._SparseQueryCache().values(Q)
+    assert int(csr.values().numel()) == 0
+    assert torch.equal(csr.crow_indices(), torch.zeros(10, dtype=torch.int64))
+    assert torch.equal(csr.to_dense(), Q)
+
+
 def test_dense_slice_t_marks_stored_zeros(case):
     """`_dense_slice_t`'s `values` argument exists so the structural gate can
     scatter ONES. A stored 0.0 is still an overlap; deriving the indicator
