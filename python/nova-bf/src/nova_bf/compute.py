@@ -648,7 +648,9 @@ def _sparse_scores(Q, Cb, q_cache=None):
 
     n_rows, vocab = Cb.shape
     cache = q_cache or _SparseQueryCache()
-    if _dense_corpus_rows_per_chunk(Cb, Q.element_size()) >= n_rows:
+    fits = _dense_corpus_rows_per_chunk(Cb, Q.element_size()) >= n_rows
+    _SPARSE_BRANCHES["scored_swapped" if fits else "scored_fallback"] += 1
+    if fits:
         # Produces the `(n_q, n_rows)` layout downstream consumers expect.
         return torch.matmul(cache.values(Q), _dense_slice_t(Cb, Cb.values()))
     # Built per slice, not cached. This path is used only when the dense corpus
@@ -887,6 +889,20 @@ _ZERO_GATE_MIN_PRODUCT = 1e-30
 # avoid excessive temporary memory.
 _SPARSE_SWAP_MAX_DENSE_BYTES = 512 << 20
 
+
+# Which sparse code paths a run actually took for the manifest
+_SPARSE_BRANCHES = {
+    "scored_swapped": 0,      # dense corpus operand fit the budget
+    "scored_fallback": 0,     # cuSPARSE transpose path
+    "gate_zero": 0,           # cheap `raw == 0` no-overlap gate
+    "gate_structural": 0,     # signed/stored-zero data: indicator spmm
+}
+
+
+def _reset_sparse_branches() -> None:
+    for key in _SPARSE_BRANCHES:
+        _SPARSE_BRANCHES[key] = 0
+
 # Row-block height for `_SparseQueryCache._csr`, as bytes of the transient
 # `(rows, vocab)` bool it materializes per block. 64 MiB keeps the spike far
 # below the dense `Q` it is derived from at any realistic vocabulary.
@@ -1106,6 +1122,8 @@ class SparseBatchSlice:
     def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
         if self._masked_raw is None:
             raw = _sparse_scores(Q, self.Cb, self.q_cache)
+            _SPARSE_BRANCHES["gate_zero" if self.zero_gate_ok
+                             else "gate_structural"] += 1
             no_overlap = (raw == 0) if self.zero_gate_ok else self._structural_no_overlap(Q)
             self._masked_raw = raw.masked_fill_(no_overlap, float("-inf"))
         if metric == "dot":
@@ -2724,6 +2742,9 @@ def run_compute(
     # result decoding.
     started_at = datetime.now(timezone.utc)
     run_t0 = time.perf_counter()
+    # Process-global, so a second `run_compute` in one process (every test, and
+    # the single-node path) would otherwise report the first run's branches too.
+    _reset_sparse_branches()
     job_rank = _resolve_rank(num_jobs, job_rank)
     specs = cfg.searches
     vts_needed = sorted({s.vector_type for s in specs})  # ["dense"] / ["sparse"] / both
@@ -4062,7 +4083,7 @@ def run_compute(
                 # output is not ground truth. Fingerprinting it separately is
                 # what stops a benchmarking partial from ever merging with a
                 # real one.
-                partial_slice=max_files is not None,
+                max_files=max_files,
             ),
             hit_tie=hit_tie,
         )
@@ -4110,6 +4131,9 @@ def run_compute(
     )
     doc = run_manifest.base_manifest(cfg, "compute", device=device)
     doc["compute"].update(run_manifest.gpu_peak(device))
+    doc["compute"].update(run_manifest.host_peak())
+    if "sparse" in vts_needed:
+        doc["params"]["sparse_branches"] = dict(_SPARSE_BRANCHES)
     # Which corpus, as an ordered file list — the ids depend on that order.
     # Fingerprinted over `all_files` (post include/exclude, PRE stride), so
     # every rank of one run reports the identical hash and a mismatch means
@@ -4122,9 +4146,12 @@ def run_compute(
     doc["params"].update({
         "io_workers": io_workers,
         "io_thread_count": itc,
+        # RESOLVED, not configured
+        "cpu_thread_count": cpu_n,
         "batch_size_by_vector_type": vt_batch_size,
         "multivector_batch_size": mv_batch_size,
         "multivector_query_block": mv_query_block,
+        "kernels": run_manifest.kernel_switches(),
     })
     doc.update({
         "started_at": started_at.isoformat(),

@@ -27,7 +27,9 @@ from nova_bf.config import (
     SearchSpec,
 )
 from nova_bf.merge import run_merge
-from nova_bf.results import RUN_KEY, partial_dir
+from nova_bf.results import (
+    RUN_KEY, config_identity, partial_dir, provenance, run_identity,
+)
 
 DIM, K = 8, 3
 
@@ -159,3 +161,138 @@ def test_single_node_output_carries_a_run_fingerprint(ds, tmp_path):
     meta = pq.read_table(run_compute(cfg)["dense"]).schema.metadata or {}
     assert len(meta[RUN_KEY].decode()) == 64
     assert b"nova_bf.num_jobs" not in meta  # a single-node run has no rank set
+
+
+# ---------------------------------------------------------------------------
+# what the fingerprints cover
+#
+# The tests above drive whole runs through `merge`. These pin the hash inputs
+# directly, so a field silently dropping out of a fingerprint fails here rather
+# than showing up as a merge that should have been refused.
+# ---------------------------------------------------------------------------
+
+
+def _ident_cfg(**corpus_kw):
+    return BruteForceConfig(
+        corpus=CorpusConfig(path="s3://c/", id_column="sid", **corpus_kw),
+        queries=QueriesConfig(path="s3://q/q.parquet", id_column="qid"),
+        output=OutputConfig(path="s3://o/"),
+        params=ParamsConfig(),
+        searches=[SearchSpec(name="t", k=10, metric="cosine")],
+    )
+
+
+def test_run_identity_separates_different_max_files():
+    """`--max-files` truncates each rank's OWN slice, so two ranks given
+    different values covered different corpora. As a boolean they hashed the
+    same and merged cleanly into a top-K short exactly where the truncated
+    ranks never reached."""
+    base = dict(config_sha="cfg", corpus_sha="corp", num_jobs=4, tiebreak="id")
+    a = run_identity(max_files=5, **base)
+    b = run_identity(max_files=50, **base)
+    assert a != b, "--max-files 5 and 50 must not share a run fingerprint"
+
+    full = run_identity(max_files=None, **base)
+    assert full not in (a, b), "a full run must differ from any truncated one"
+    assert run_identity(max_files=5, **base) == a, "hash must be stable"
+
+
+# --- 14: date_fields change what a filter compares ------------------------
+
+
+def test_config_identity_covers_date_fields():
+    """`convert_table_date_columns` rewrites declared date columns to int64
+    epoch us BEFORE any filter reads them, so the declaration decides which
+    rows survive."""
+    spec = _ident_cfg().searches[0]
+    plain = config_identity(_ident_cfg(), spec)
+    dated = config_identity(_ident_cfg(date_fields={"published": "%Y-%m-%d"}), spec)
+    assert plain != dated, "corpus.date_fields must reach the config fingerprint"
+
+    other = config_identity(_ident_cfg(date_fields={"published": "%d/%m/%Y"}), spec)
+    assert other != dated, "a different date FORMAT parses differently"
+
+
+def test_config_identity_covers_query_date_fields():
+    def cfg(qdates):
+        c = _ident_cfg()
+        c.queries.date_fields = qdates
+        return c
+
+    spec = _ident_cfg().searches[0]
+    assert config_identity(cfg(None), spec) != config_identity(
+        cfg({"asked_at": "%Y-%m-%d"}), spec)
+
+
+def test_config_identity_still_ignores_speed_only_knobs():
+    """Guard the guard: the fingerprint must not start tracking things that
+    only change speed, or every batch-size tweak invalidates a merge."""
+    spec = _ident_cfg().searches[0]
+    base = _ident_cfg()
+    fast = _ident_cfg()
+    fast.params.io_workers = 7
+    fast.params.dense_batch_size = 4096
+    fast.params.merge_batch_size = 99
+    assert config_identity(base, spec) == config_identity(fast, spec)
+
+
+# --- 16: git must be answering about THIS package -------------------------
+
+
+def _prov(**kw):
+    cfg = _ident_cfg()
+    return provenance(cfg, cfg.searches[0], **kw), RUN_KEY
+
+
+def test_merge_omits_the_run_key_when_no_partial_carried_one():
+    """Partials that predate the fingerprint leave `merge` with nothing to
+    record. Hashing its own empty inputs would mint a sha matching no compute
+    run, claiming `num_jobs=None` for what may have been a sharded one — a
+    later consumer then sees a mismatch it cannot explain."""
+    meta, RUN_KEY = _prov(run_sha=None, reducing=True)
+    assert RUN_KEY not in meta, "merge invented a run fingerprint"
+    # everything else it CAN vouch for must still be stamped
+    assert any(k.startswith(b"nova_bf.") for k in meta)
+
+
+def test_merge_passes_through_a_carried_run_key():
+    meta, RUN_KEY = _prov(run_sha="abc123", reducing=True)
+    assert meta[RUN_KEY] == b"abc123"
+
+
+def test_compute_still_mints_a_run_key_from_real_inputs():
+    """`compute` holds the actual identifying inputs, so it is the one place a
+    fingerprint is legitimately created — that must not regress."""
+    meta, RUN_KEY = _prov(corpus_sha="deadbeef", num_jobs=4, max_files=None)
+    assert RUN_KEY in meta and len(meta[RUN_KEY]) == 64
+
+    other, _ = _prov(corpus_sha="deadbeef", num_jobs=4, max_files=7)
+    assert other[RUN_KEY] != meta[RUN_KEY], "#13 must still hold"
+
+
+def test_merge_of_unstamped_partials_leaves_no_run_key_on_the_artifact(tmp_path):
+    """End to end: strip the fingerprint from every partial, merge, and check
+    the artifact does not claim one."""
+    pytest.importorskip("torch")
+
+    import pyarrow.parquet as pq
+    from nova_bf.compute import run_compute
+    from nova_bf.merge import run_merge
+    from nova_bf.results import RUN_KEY
+    from test_result_decode import _cfg_for_merge
+
+    cfg = _cfg_for_merge(tmp_path)
+    for r in range(2):
+        run_compute(cfg, num_jobs=2, job_rank=r)
+
+    stripped = 0
+    for part in sorted(tmp_path.rglob("rank*.parquet")):
+        t = pq.read_table(part)
+        md = {k: v for k, v in (t.schema.metadata or {}).items() if k != RUN_KEY}
+        stripped += 1
+        pq.write_table(t.replace_schema_metadata(md), part)
+    assert stripped >= 2, "no partials found to strip"
+
+    merged = run_merge(cfg)["t"]
+    md = pq.read_schema(merged).metadata or {}
+    assert RUN_KEY not in md, "merge stamped a fabricated run fingerprint"

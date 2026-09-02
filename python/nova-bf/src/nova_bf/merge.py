@@ -661,7 +661,8 @@ def _reduce(
                     # `run_sha` is the partials' own fingerprint, carried
                     # rather than recomputed: merge never lists the corpus, and
                     # the run that matters is the one these rows came from.
-                    provenance(cfg, spec, carried_dtypes, run_sha=run_sha)
+                    provenance(cfg, spec, carried_dtypes, run_sha=run_sha,
+                               reducing=True)
                 )
 
                 if writer is None:

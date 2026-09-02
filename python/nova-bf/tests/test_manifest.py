@@ -11,6 +11,7 @@ describes, and that the search-level detail survives from config to JSON.
 from __future__ import annotations
 
 import json
+import os
 
 import numpy as np
 import pytest
@@ -32,6 +33,7 @@ from nova_bf.config import (
     SearchSpec,
 )
 from nova_bf.io import ParquetFile
+from nova_bf import manifest as run_manifest
 from nova_bf.manifest import corpus_fingerprint, gpu_peak
 from nova_bf.merge import run_merge
 
@@ -265,3 +267,138 @@ def test_query_counts_distinguish_the_file_from_what_was_searched(ds, tmp_path):
     by_name = {s["name"]: s for s in doc["searches"]}
     assert by_name["a"]["queries"] == 2 and by_name["b"]["queries"] == 2
     assert by_name["a"]["rows"] == {"column": "qid", "isin": ["q0", "q1"]}
+
+
+# ---------------------------------------------------------------------------
+# provenance the document is supposed to carry
+# ---------------------------------------------------------------------------
+
+
+def test_code_versions_reports_git_for_an_in_repo_checkout():
+    info = run_manifest.code_versions()
+    assert info.get("git_commit"), "in-repo run should still report a commit"
+    assert len(info["git_commit"]) >= 7
+
+
+def test_code_versions_omits_git_when_the_repo_is_not_ours(monkeypatch, tmp_path):
+    """A wheel install inside an unrelated checkout: git walks upward and
+    answers about that repo. A plausible sha for the wrong code is worse than
+    no sha, so the whole git block must drop out."""
+    # Patch the module's own __file__ (which `pkg_dir` is derived from) rather
+    # than os.path.abspath — patching that also changes os.path.realpath, which
+    # calls it internally, so the check would compare two fake paths and agree.
+    pkg = tmp_path / "site-packages" / "nova_bf"
+    pkg.mkdir(parents=True)
+    monkeypatch.setattr(run_manifest, "__file__", str(pkg / "manifest.py"))
+
+    class R:
+        def __init__(self, out): self.stdout = out
+
+    def fake_run(cmd, **kw):
+        if "--show-toplevel" in cmd:
+            return R("/some/other/repo\n")     # does NOT contain pkg_dir
+        return R("deadbeef\n")
+
+    monkeypatch.setattr(run_manifest.subprocess, "run", fake_run)
+    info = run_manifest.code_versions()
+    assert "git_commit" not in info, (
+        "git answered about a repo that does not contain this package")
+    assert info.get("python_version"), "non-git fields must still be reported"
+
+
+# --- 18 + today's additions: the manifest records what RAN ----------------
+
+
+def test_kernel_switches_report_resolved_booleans(monkeypatch):
+    for var in ("NOVA_BF_NO_PRUNE", "NOVA_BF_NO_FOLD_KERNEL",
+                "NOVA_BF_NO_TOPK_KERNEL"):
+        monkeypatch.delenv(var, raising=False)
+    assert run_manifest.kernel_switches() == {
+        "prune": True, "fold_kernel": True, "topk_kernel": True}
+
+    monkeypatch.setenv("NOVA_BF_NO_PRUNE", "1")
+    monkeypatch.setenv("NOVA_BF_NO_FOLD_KERNEL", "1")
+    assert run_manifest.kernel_switches() == {
+        "prune": False, "fold_kernel": False, "topk_kernel": True}
+
+    # `""` is unset-shaped and must not read as "disabled"
+    monkeypatch.setenv("NOVA_BF_NO_PRUNE", "")
+    assert run_manifest.kernel_switches()["prune"] is True
+
+
+# --- peak host RSS, and which sparse paths actually ran -------------------
+
+
+def test_host_peak_reports_bytes_not_kib():
+    """Linux `ru_maxrss` is KiB, macOS is bytes. The field sits next to
+    `peak_gpu_allocated_bytes`, so a 1024x misread is easy and silent."""
+    import resource
+
+    got = run_manifest.host_peak()["peak_host_rss_bytes"]
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    expect = raw if os.sys.platform == "darwin" else raw * 1024
+    assert got == expect
+    assert got > 1_000_000, "a live process cannot peak under 1 MB"
+
+
+def test_sparse_branches_are_counted_and_reset_per_run(tmp_path):
+    """The swapped and cuSPARSE paths have DIFFERENT run-to-run determinism
+    (~1/10,000 vs ~1423/10,000), so which one ran decides whether two
+    artifacts may legitimately differ. Counters are process-global, so they
+    must also reset — otherwise run two reports run one's branches too."""
+    pytest.importorskip("torch")
+    import json
+
+    from nova_bf import compute as C
+    from nova_bf.compute import run_compute
+    from test_prune_search_paths import _sparse_cfg, _sparse_corpus
+
+    cdir, qpath = _sparse_corpus(tmp_path, n_files=3, per_file=60, seed=4)
+    run_compute(_sparse_cfg(cdir, qpath, tmp_path / "r1", k=5))
+    first = dict(C._SPARSE_BRANCHES)
+    assert sum(first.values()) > 0, "no sparse branch was recorded"
+    # positive-weight fixture -> the cheap gate, never the structural one
+    assert first["gate_zero"] > 0 and first["gate_structural"] == 0
+
+    run_compute(_sparse_cfg(cdir, qpath, tmp_path / "r2", k=5))
+    second = dict(C._SPARSE_BRANCHES)
+    assert second == first, f"counters accumulated across runs: {first} -> {second}"
+
+
+def test_params_record_the_resolved_cpu_thread_count(ds, tmp_path):
+    """`params` is what RAN. `cpu_thread_count: 0` means "use os.cpu_count()",
+    so the configured value answers nothing when you are reading a manifest
+    later asking why one rank was slow — the resolved number has to be here.
+    """
+    import os as _os
+
+    out = tmp_path / "cpu"
+    out.mkdir()
+    run_compute(_cfg(ds, out))
+
+    doc = _read(out / "_bf_manifest_queries_compute.json")
+    got = doc["params"]["cpu_thread_count"]
+    assert got == (_os.cpu_count() or 1), (
+        f"expected the RESOLVED thread count, got {got!r}")
+    assert got > 0
+
+
+def test_sparse_branches_reach_the_manifest(tmp_path):
+    pytest.importorskip("torch")
+    import json
+
+    from nova_bf.compute import run_compute
+    from test_prune_search_paths import _sparse_cfg, _sparse_corpus
+
+    out = tmp_path / "m"
+    cdir, qpath = _sparse_corpus(tmp_path, n_files=2, per_file=50, seed=9)
+    run_compute(_sparse_cfg(cdir, qpath, out, k=4))
+
+    manifests = list(out.rglob("*manifest*.json"))
+    assert manifests, "no manifest was written"
+    doc = json.loads(manifests[0].read_text())
+    assert "sparse_branches" in doc["params"], doc["params"].keys()
+    assert doc["compute"].get("peak_host_rss_bytes", 0) > 0
+
+
+# --- 15: never invent a run fingerprint ------------------------------------

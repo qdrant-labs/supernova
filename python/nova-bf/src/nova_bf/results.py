@@ -115,6 +115,8 @@ def config_identity(cfg: BruteForceConfig, spec: SearchSpec) -> str:
             else cfg.queries.dense_column
         ),
         "allow_tf32": cfg.params.allow_tf32,
+        "corpus_date_fields": cfg.corpus.date_fields,
+        "queries_date_fields": cfg.queries.date_fields,
     }
     return hashlib.sha256(
         json.dumps(fields, sort_keys=True, default=str).encode()
@@ -125,7 +127,7 @@ def run_identity(
     config_sha: str,
     corpus_sha: str | None,
     num_jobs: int | None,
-    partial_slice: bool,
+    max_files: int | None,
     tiebreak: str,
 ) -> str:
     """A Content-derived hash identifying the RUN a partial belongs to.
@@ -135,7 +137,7 @@ def run_identity(
             "config": config_sha,
             "corpus": corpus_sha,
             "num_jobs": num_jobs,
-            "partial_slice": partial_slice,
+            "max_files": max_files,
             "tiebreak": tiebreak,
         },
         sort_keys=True,
@@ -150,8 +152,9 @@ def provenance(
     corpus_sha: str | None = None,
     num_jobs: int | None = None,
     job_rank: int | None = None,
-    partial_slice: bool = False,
+    max_files: int | None = None,
     run_sha: str | None = None,
+    reducing: bool = False,
 ) -> dict[bytes, bytes]:
     """How this ground truth was computed, for the parquet schema metadata.
 
@@ -216,12 +219,15 @@ def provenance(
     # Which run this came from
     config_sha = config_identity(cfg, spec)
     out[CONFIG_KEY] = config_sha.encode()
-    out[RUN_KEY] = (
-        run_sha
-        or run_identity(
-            config_sha, corpus_sha, num_jobs, partial_slice, cfg.params.tiebreak
-        )
-    ).encode()
+    # `merge` gets run identity only from its partials. If old partials have no
+    # fingerprint, leave it unknown rather than inventing one from missing inputs.
+    # `compute` has the real inputs and is the only place that creates a fallback.
+    if run_sha is not None:
+        out[RUN_KEY] = run_sha.encode()
+    elif not reducing:
+        out[RUN_KEY] = run_identity(
+            config_sha, corpus_sha, num_jobs, max_files, cfg.params.tiebreak
+        ).encode()
     # Sharded runs only: absent on a single-node result, which has no ranks.
     # Together these let `merge` check the rank set is exactly 0..num_jobs-1,
     # which is how a MISSING rank is caught — a partial count that is uniform

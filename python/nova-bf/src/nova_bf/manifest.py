@@ -26,6 +26,7 @@ import logging
 import os
 import platform
 import socket
+import sys
 import subprocess
 
 from datetime import datetime, timezone
@@ -154,6 +155,16 @@ def _workspace_version(start: str) -> str | None:
     return None
 
 
+def kernel_switches() -> dict:
+    """Which GPU fast paths were ACTIVE, from the operator kill switches.
+    """
+    return {
+        "prune": not os.environ.get("NOVA_BF_NO_PRUNE"),
+        "fold_kernel": not os.environ.get("NOVA_BF_NO_FOLD_KERNEL"),
+        "topk_kernel": not os.environ.get("NOVA_BF_NO_TOPK_KERNEL"),
+    }
+
+
 def code_versions() -> dict:
     """WHICH CODE produced this ground truth: the supernova version and git
     commit, plus the versions of the libraries whose numerics it depends on.
@@ -198,6 +209,12 @@ def code_versions() -> dict:
                 ["git", "-C", pkg_dir, *args],
                 capture_output=True, text=True, timeout=5, check=True,
             ).stdout.strip()
+
+        # Only trust git if the repository it answers about actually CONTAINS
+        # this package.
+        toplevel = os.path.realpath(_git("rev-parse", "--show-toplevel"))
+        if os.path.commonpath([toplevel, os.path.realpath(pkg_dir)]) != toplevel:
+            raise RuntimeError("git toplevel does not contain the nova-bf package")
 
         info["git_commit"] = _git("rev-parse", "HEAD")
         # e.g. "v0.0.12-9-g659c42c-dirty" — the release-relative form of the
@@ -360,6 +377,22 @@ def gpu_peak(device: str | None) -> dict:
             "peak_gpu_allocated_bytes": int(torch.cuda.max_memory_allocated()),
             "peak_gpu_reserved_bytes": int(torch.cuda.max_memory_reserved()),
         }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def host_peak() -> dict:
+    """Peak resident set size for this process, in bytes.
+    """
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports KiB here, macOS reports bytes. Normalize so the field
+        # is comparable with `peak_gpu_allocated_bytes` and cannot be misread
+        # by a factor of 1024.
+        scale = 1 if sys.platform == "darwin" else 1024
+        return {"peak_host_rss_bytes": int(peak) * scale}
     except Exception:  # noqa: BLE001
         return {}
 

@@ -101,6 +101,12 @@ def code_versions() -> dict:
                 capture_output=True, text=True, timeout=5, check=True,
             ).stdout.strip()
 
+        # Only trust git if the repository it answers about actually CONTAINS
+        # this package.
+        toplevel = os.path.realpath(_git("rev-parse", "--show-toplevel"))
+        if os.path.commonpath([toplevel, os.path.realpath(pkg_dir)]) != toplevel:
+            raise RuntimeError("git toplevel does not contain the nova-embed package")
+
         info["git_commit"] = _git("rev-parse", "HEAD")
         # e.g. "v0.0.12-9-g659c42c-dirty" — the release-relative form of the
         # sha above, and the line a human reads first.
