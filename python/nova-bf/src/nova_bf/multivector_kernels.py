@@ -97,6 +97,32 @@ def _fused_ragged_reduce_kernel(
     tl.store(output_ptr + local_query * out_row_stride + document_index, score)
 
 
+# Triton forms these offsets in int32, so oversized shapes can wrap and read 
+# the wrong query's tokens without error. Decline those shapes instead.
+_INT32_MAX = (1 << 31) - 1
+
+
+def offsets_fit_int32(
+    n_query_tokens: int,
+    n_doc_tokens: int,
+    n_queries: int,
+    n_documents: int,
+    out_row_stride: int,
+    block_query: int = 8,
+    block_document: int = 128,
+) -> bool:
+    """Return whether all kernel pointer offsets fit in int32. 
+    Includes tile padding because masked lanes still form addresses. 
+    Pure arithmetic so oversized cases can be tested without a GPU. 
+    """
+    if n_query_tokens <= 0 or n_doc_tokens <= 0:
+        return True
+    
+    tile = (n_query_tokens + block_query) * n_doc_tokens + n_doc_tokens + block_document
+    out_max = max(0, n_queries - 1) * max(0, out_row_stride) + max(0, n_documents - 1)
+    return tile <= _INT32_MAX and out_max <= _INT32_MAX
+
+
 def fused_ragged_maxsim_reduce(
     similarity,
     query_offsets,
@@ -157,6 +183,19 @@ def fused_ragged_maxsim_reduce(
             raise ValueError("fused ragged reduction out must have a contiguous last dim")
     if n_queries == 0 or n_documents == 0:
         return out
+
+    if not offsets_fit_int32(
+        similarity.shape[0], similarity.shape[1], n_queries, n_documents,
+        out.stride(0), block_query, block_document,
+    ):
+        # Refuse rather than launch
+        raise ValueError(
+            f"fused ragged reduction: a {tuple(similarity.shape)} similarity "
+            f"tile makes the kernel's int32 pointer arithmetic overflow "
+            f"(> {_INT32_MAX} elements). Lower params.multivector_token_budget "
+            "(it sizes this matrix directly), or set params.multivector_kernel="
+            "'torch', whose reference path has no such limit."
+        )
 
     _fused_ragged_reduce_kernel[(n_queries * n_documents,)](
         similarity,

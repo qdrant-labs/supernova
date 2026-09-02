@@ -1413,7 +1413,10 @@ class MultiVectorBatchSlice:
         if selected_kernel != "torch":
             if triton_compatible:
                 try:
-                    from nova_bf.multivector_kernels import fused_ragged_maxsim_reduce
+                    from nova_bf.multivector_kernels import (
+                        fused_ragged_maxsim_reduce,
+                        offsets_fit_int32,
+                    )
                 except ImportError as exc:
                     if selected_kernel == "triton_reduce":
                         raise RuntimeError(
@@ -1456,7 +1459,11 @@ class MultiVectorBatchSlice:
                 continue  # every query in this block is zero-token -> left -inf (see below)
             Qb = q_source[t0:t1]
             P = Qb @ C.T                                   # (block_q_tokens, slice_doc_tokens)
-            if selected_kernel == "triton_reduce":
+            # Triton uses int32 pointer offsets, so oversized blocks could wrap. 
+            # Fall back only for that block; ragged token counts mean others may still fit.
+            if selected_kernel == "triton_reduce" and offsets_fit_int32(
+                P.shape[0], P.shape[1], qe - qs, n_rows, out.stride(0)
+            ):
                 # Written straight into this block's rows of `out` (the kernel
                 # takes a row stride) — no separate device-to-device copy.
                 fused_ragged_maxsim_reduce(
@@ -1469,6 +1476,20 @@ class MultiVectorBatchSlice:
                     out=out[qs:qe],
                 )
                 continue
+            if col_doc is None:
+                # Only reachable on the decline above: the kernel path skips
+                # building this map, so materialize it now and keep it for any
+                # later block that also declines.
+                logger.warning(
+                    "multivector: a %s similarity tile overflows the fused "
+                    "reducer's int32 pointer arithmetic; using the torch "
+                    "reference for this query block. Lower "
+                    "params.multivector_token_budget to keep the fast path.",
+                    tuple(P.shape),
+                )
+                col_doc = torch.repeat_interleave(
+                    torch.arange(n_rows, device=dev), self.doc_offsets.diff()
+                )
             M = _segment_max_over_cols(P, col_doc, n_rows)  # (block_q_tokens, n_rows)
             # Segment-SUM over each query's tokens, written STRAIGHT into this
             # block's output rows (zeroed first): `index_add_` into the `out`
