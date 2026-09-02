@@ -119,6 +119,98 @@ def test_fallback_scores_are_unchanged_across_slices(case, monkeypatch):
     assert torch.equal(first, fresh), "a fresh cache changed the scores"
 
 
+def _reset_branches():
+    for k in compute_mod._SPARSE_BRANCHES:
+        compute_mod._SPARSE_BRANCHES[k] = 0
+
+
+def test_batch_size_keeps_a_tail_slice_on_the_same_branch_as_full_slices(monkeypatch):
+    """A file's last slice (`n_rows % sparse_batch_size` rows) is narrower
+    than every other slice in the batch. Without a run-wide target, it can
+    independently decide the dense operand fits when the full-size slices'
+    own row count already ruled that out — scoring one file with two
+    different accumulation orders. Pinning `_SparseQueryCache.batch_size`
+    must make every slice of a run agree."""
+    rng = np.random.default_rng(11)
+    vocab, nnz = 128, 9
+    full_n_rows, tail_n_rows, batch_size = 64, 20, 64
+
+    def make_Cb(n_rows):
+        ro, idx, val = _slice(rng, n_rows, vocab, nnz=nnz)
+        return _sparse_batch_to_csr(ro, idx, val, 0, n_rows, np.arange(vocab), "cpu")
+
+    Q = _Q(rng, 10, vocab, nnz=5)
+    full_Cb, tail_Cb = make_Cb(full_n_rows), make_Cb(tail_n_rows)
+
+    # Budget covers the tail slice's own row count but not the full batch size.
+    budget = vocab * 4 * (tail_n_rows + batch_size) // 2
+    monkeypatch.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES", budget)
+    per = compute_mod._dense_corpus_rows_per_chunk(full_Cb, 4)
+    assert tail_n_rows <= per < batch_size, "fixture must sit between the two row counts"
+
+    cache = _SparseQueryCache(batch_size=batch_size)
+    _reset_branches()
+    _sparse_scores(Q, full_Cb, cache)
+    _sparse_scores(Q, tail_Cb, cache)
+    assert compute_mod._SPARSE_BRANCHES["scored_fallback"] == 2
+    assert compute_mod._SPARSE_BRANCHES["scored_swapped"] == 0
+
+    # Sanity: this is the bug being fixed. With no configured batch size (the
+    # only mode a bare cache — every other test in this file, and any direct
+    # caller — supports), the tail slice decides for itself and switches
+    # branch on its own.
+    _reset_branches()
+    bare = _SparseQueryCache()
+    _sparse_scores(Q, full_Cb, bare)
+    _sparse_scores(Q, tail_Cb, bare)
+    assert compute_mod._SPARSE_BRANCHES["scored_fallback"] == 1
+    assert compute_mod._SPARSE_BRANCHES["scored_swapped"] == 1
+
+
+def test_batch_size_keeps_the_structural_gate_on_the_same_branch_as_full_slices(monkeypatch):
+    """Same fix, for the signed-data overlap gate's whole-vs-chunked switch.
+
+    The whole-slice fast path calls `_dense_slice_t` with `self.Cb` itself;
+    the chunked path always rebuilds a fresh CSR sub-tensor, even when only
+    one chunk is needed. Recording object identity distinguishes them, so
+    this pins that the tail slice takes the SAME (chunked) branch as the
+    full-size slice instead of independently deciding it can afford the
+    whole-slice path."""
+    from nova_bf.compute import SparseBatchSlice
+
+    full_Q, full_Cb = _signed_case(n_q=6, n_rows=64, vocab=24, seed=9)
+    _, tail_Cb = _signed_case(n_q=6, n_rows=20, vocab=24, seed=10)
+    batch_size = 64
+
+    monkeypatch.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES", 24 * 4 * 42)
+    per = compute_mod._dense_corpus_rows_per_chunk(full_Cb, full_Q.element_size())
+    assert 20 <= per < batch_size, "fixture must sit between the two row counts"
+
+    real_dense_slice_t = compute_mod._dense_slice_t
+    took_whole_path = []
+
+    def spy(Cb, values):
+        took_whole_path.append(Cb is full_Cb or Cb is tail_Cb)
+        return real_dense_slice_t(Cb, values)
+
+    monkeypatch.setattr(compute_mod, "_dense_slice_t", spy)
+
+    cache = _SparseQueryCache(batch_size=batch_size)
+    full_slice = SparseBatchSlice(Cb=full_Cb, row_norms=None, zero_gate_ok=False,
+                                  q_cache=cache)
+    tail_slice = SparseBatchSlice(Cb=tail_Cb, row_norms=None, zero_gate_ok=False,
+                                  q_cache=cache)
+    full_slice._structural_no_overlap(full_Q)
+    full_took_whole_path = any(took_whole_path)
+    took_whole_path.clear()
+    tail_slice._structural_no_overlap(full_Q)
+    tail_took_whole_path = any(took_whole_path)
+
+    assert not full_took_whole_path, "full slice unexpectedly took the whole-slice fast path"
+    assert tail_took_whole_path == full_took_whole_path, \
+        "tail slice took a different branch than the full-size slice"
+
+
 def _signed_case(n_q=6, n_rows=40, vocab=24, seed=3):
     """SIGNED sparse data, so `zero_gate_ok` is False and the structural
     overlap gate runs instead of the cheap `raw == 0` one."""

@@ -648,7 +648,9 @@ def _sparse_scores(Q, Cb, q_cache=None):
 
     n_rows, vocab = Cb.shape
     cache = q_cache or _SparseQueryCache()
-    fits = _dense_corpus_rows_per_chunk(Cb, Q.element_size()) >= n_rows
+    # Decided once per run, not per slice — see `_SparseQueryCache.batch_size`.
+    target_rows = cache.batch_size or n_rows
+    fits = _dense_corpus_rows_per_chunk(Cb, Q.element_size()) >= target_rows
     _SPARSE_BRANCHES["scored_swapped" if fits else "scored_fallback"] += 1
     if fits:
         # Produces the `(n_q, n_rows)` layout downstream consumers expect.
@@ -1028,9 +1030,10 @@ class _SparseQueryCache:
     `_sparse_scores`.
     """
 
-    def __init__(self):
+    def __init__(self, batch_size: int | None = None):
         self._values = None
         self._indicator = None
+        self.batch_size = batch_size
 
     def _csr(self, Q, vals_from_pattern):
         """Build CSR from `Q`'s nonzero pattern in row blocks.
@@ -1142,7 +1145,10 @@ class SparseBatchSlice:
         q_ind = (self.q_cache or _SparseQueryCache()).indicator(Q)
         n_rows, vocab = self.Cb.shape
         per = _dense_corpus_rows_per_chunk(self.Cb, Q.element_size())
-        if per >= n_rows:
+        # Use the run-wide sparse batch size, not this slice's size, so the
+        # dense-swap decision stays consistent across full and tail slices.
+        target_rows = (self.q_cache.batch_size if self.q_cache else None) or n_rows
+        if per >= target_rows:
             # ones, not values: a stored 0.0 is still a structural overlap
             ones = torch.ones(self.Cb.values().numel(), dtype=Q.dtype,
                               device=Q.device)
@@ -3265,6 +3271,8 @@ def run_compute(
                 "over the union of %d distinct filter(s) (batch_size=%s)",
                 vt, len(idxs), len(vt_union_filters[vt]), vt_batch_size[vt],
             )
+    # Keep the sparse dense-swap decision fixed for the run using the resolved batch size.
+    sparse_q_cache.batch_size = vt_batch_size.get("sparse")
     # Only a filter that actually appears in SOME vt's union ever reaches
     # _union_keep (a filter whose vt has has_baseline=True never does) — so
     # only these need the per-file row-level union computed at all (Front B).
