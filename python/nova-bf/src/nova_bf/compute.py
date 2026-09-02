@@ -240,20 +240,31 @@ def _build_query_vocab(indices: np.ndarray) -> np.ndarray:
     return np.unique(indices)
 
 
-# Maximum size of `_vocab_lookup`'s id-indexed LUT. Its size depends on the
+# Maximum size of ONE `_vocab_lookup` id-indexed LUT. Its size depends on the
 # largest id, not vocabulary length, so sparse/hashed id spaces can be huge.
-# Fall back to binary search beyond this budget.
+# Past this a table stops being worth building at all and binary search wins.
 _VOCAB_LUT_MAX_BYTES = 256 << 20
+
+# Total that `run_compute` will spend PREBUILDING per-query filter vocabulary
+# tables (see `gpu_vocab_luts`) before falling back to per-file table building.
+_VOCAB_LUT_PREBUILD_BYTES = 256 << 20
+
+
+def _vocab_lut_nbytes(vocab: np.ndarray) -> int:
+    """Return the bytes needed for a vocab LUT, or 0 if a LUT is unsupported.
+    """
+    if len(vocab) == 0 or not np.issubdtype(vocab.dtype, np.integer):
+        return 0
+    if int(vocab[0]) < 0:  # sorted ascending, so this is the smallest
+        return 0
+    return (int(vocab[-1]) + 2) * 8
 
 
 def _lut_vocab_ok(vocab: np.ndarray) -> bool:
     """The vocabulary half of `_lut_applies` — depends only on `vocab`, so it
     is what `_build_vocab_lut` can decide once for a whole run."""
-    if not np.issubdtype(vocab.dtype, np.integer):
-        return False
-    if int(vocab[0]) < 0:  # sorted ascending, so this is the smallest
-        return False
-    return (int(vocab[-1]) + 2) * 8 <= _VOCAB_LUT_MAX_BYTES
+    n = _vocab_lut_nbytes(vocab)
+    return 0 < n <= _VOCAB_LUT_MAX_BYTES
 
 
 def _lut_ids_ok(ids: np.ndarray) -> bool:
@@ -2211,17 +2222,14 @@ def _is_null_scalar(v) -> bool:
     return v is None or (isinstance(v, float) and v != v)
 
 
-def _encode_against_vocab(vocab: np.ndarray, vals: np.ndarray) -> np.ndarray:
-    """`vals` -> position in `vocab`, or -1 for null or absent-from-vocab —
-    the corpus-side half of Front A's `match_from_query` GPU path (see
-    `_corpus_leaf_array`). Excludes nulls from the `searchsorted` call
-    itself, same reason `filters._match_any_from_query_mask` does: `vocab`'s
-    dtype has no defined ordering against `None`/`nan` mixed into an
-    object array."""
+def _encode_against_vocab(vocab: np.ndarray, vals: np.ndarray, lut=None) -> np.ndarray:
+    """Map `vals` to positions in `vocab`, using -1 for null or missing values.
+    `lut` may provide a prebuilt vocab lookup; otherwise one is built per call. 
+    """
     not_null = _not_null_mask(vals)
     codes = np.full(len(vals), -1, dtype=np.int64)
     if not_null.any():
-        codes[not_null] = _vocab_lookup(vocab, vals[not_null])
+        codes[not_null] = _vocab_lookup(vocab, vals[not_null], lut)
     return codes
 
 
@@ -2383,20 +2391,18 @@ def _build_gpu_leaf_state(
     return bounds, None
 
 
-def _corpus_leaf_array(cond: FilterCondition, table, vocab_for_cond: np.ndarray | None) -> np.ndarray:
-    """CPU-side, once per file (see `run_compute`'s reader thread): this
-    condition's corpus-side array for GPU-native evaluation (Front A) —
-    `(rows,)` int64 vocab codes (-1 for null/absent) for a `match_from_query`
-    leaf (scalar OR MatchAny — both compare/gather against one corpus scalar
-    per row), `(rows,)` float64 raw values for `range_from_query` (a null
-    row becomes NaN, which already compares False against every bound — see
-    `_gpu_cond_mask`), or `(rows,)` boolean — this file's already-evaluated
-    result — for a static `match`/`range` leaf, reusing
-    `filters._condition_mask` UNCHANGED so the leaves Front A doesn't need
-    to move at all can never diverge from the CPU reference path."""
+def _corpus_leaf_array(
+    cond: FilterCondition, table, vocab_for_cond: np.ndarray | None, lut_for_cond=None,
+) -> np.ndarray:
+    """Build this condition's corpus-side array for GPU evaluation. 
+    Query-driven match leaves become int64 vocab codes, query-driven ranges
+    become float64 values, and static leaves reuse the CPU boolean mask. 
+    `lut_for_cond` may provide a prebuilt vocab lookup to avoid rebuilding it
+    for every file.
+    """
     if cond.match_from_query is not None:
         corpus_vals = table[cond.field].to_numpy(zero_copy_only=False)
-        return _encode_against_vocab(vocab_for_cond, corpus_vals)
+        return _encode_against_vocab(vocab_for_cond, corpus_vals, lut_for_cond)
     if cond.range_from_query is not None:
         return table[cond.field].to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
     return _condition_mask(cond, table)
@@ -3183,6 +3189,11 @@ def run_compute(
     filter_is_gpu_eligible: dict[Filter | None, bool] = {f: _gpu_eligible(f) for f in distinct_filters}
     gpu_query_gpu: dict[FilterCondition, object] = {}
     gpu_vocabs: dict[FilterCondition, np.ndarray] = {}
+    # Prebuild vocab lookup tables once instead of once per corpus file. 
+    # The byte cap applies across all conditions to bound resident memory; 
+    # conditions that do not fit fall back to per-file lookup construction.
+    gpu_vocab_luts: dict[FilterCondition, np.ndarray] = {}
+    lut_budget = _VOCAB_LUT_PREBUILD_BYTES
     for f in distinct_filters:
         if not filter_is_gpu_eligible[f]:
             continue
@@ -3195,6 +3206,20 @@ def run_compute(
             gpu_query_gpu[cond] = qgpu
             if vocab is not None:
                 gpu_vocabs[cond] = vocab
+                # Sized BEFORE it is built
+                need = _vocab_lut_nbytes(vocab)
+                if 0 < need <= min(_VOCAB_LUT_MAX_BYTES, lut_budget):
+                    lut = _build_vocab_lut(vocab)
+                    if lut is not None:      # `need` already implies this
+                        gpu_vocab_luts[cond] = lut
+                        lut_budget -= need
+    if gpu_vocab_luts:
+        logger.info(
+            "per-query filter vocab lookup tables: %d prebuilt (%.1f MiB total), "
+            "reused by every corpus file instead of rebuilt per file per reader",
+            len(gpu_vocab_luts),
+            sum(t.nbytes for t in gpu_vocab_luts.values()) / (1 << 20),
+        )
     # How many specs share each distinct filter — used by _process_shared_batch
     # to skip caching a per-query cell_mask when nobody else will reuse it
     # (Front A's memory-shrinking complement).
@@ -3589,7 +3614,10 @@ def run_compute(
                     elif filter_is_gpu_eligible[f]:
                         for cond in f.all_conditions():
                             if cond not in leaf_arrays:
-                                leaf_arrays[cond] = _corpus_leaf_array(cond, table, gpu_vocabs.get(cond))
+                                leaf_arrays[cond] = _corpus_leaf_array(
+                                    cond, table, gpu_vocabs.get(cond),
+                                    gpu_vocab_luts.get(cond),
+                                )
                         if f in filters_needing_row_union:
                             union = _row_union_from_gpu_leaves(f, leaf_arrays, query_filter_vals, n_rows)
                             keeps[f] = union if union is not None else np.ones(n_rows, dtype=bool)
