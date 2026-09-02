@@ -909,6 +909,52 @@ def _reset_sparse_branches() -> None:
 _CSR_BLOCK_BYTES = 64 << 20
 
 
+def _cgroup_cpu_quota() -> int | None:
+    """Return the CPU count allowed by the cgroup quota, or `None` if unlimited.
+
+    This is separate from CPU affinity: quotas limit CPU time, not which CPUs
+    the process can run on. Supports cgroup v2 and v1.
+    """
+    try:  # cgroup v2
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            quota, period = fh.read().split()[:2]
+        if quota != "max":
+            q, per = int(quota), int(period)
+            if q > 0 and per > 0:
+                return max(1, -(-q // per))  # ceil: a 1.5-cpu quota allows 2
+    except Exception:  # noqa: BLE001 — absent, unreadable, or an odd layout
+        pass
+    try:  # cgroup v1
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as fh:
+            q = int(fh.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
+            per = int(fh.read().strip())
+        if q > 0 and per > 0:
+            return max(1, -(-q // per))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _usable_cpu_count() -> int:
+    """Return the CPUs this process can actually use.
+
+    Unlike `os.cpu_count()`, this respects CPU affinity and cgroup quotas,
+    avoiding oversubscribed thread pools in containers.
+
+    Best-effort: failed probes are ignored.
+    """
+    n = os.cpu_count() or 1
+    try:
+        n = min(n, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):  # not Linux, or not permitted
+        pass
+    quota = _cgroup_cpu_quota()
+    if quota:
+        n = min(n, quota)
+    return max(1, n)
+
+
 def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> bool:
     """Per corpus file: may `SparseBatchSlice.score` use the cheap
     `raw == 0` no-overlap gate for this file's slices?  True iff the query
@@ -3346,7 +3392,15 @@ def run_compute(
     cpu_n = (cpu_thread_count if cpu_thread_count is not None
              else cfg.params.cpu_thread_count)
     if not cpu_n or cpu_n <= 0:
-        cpu_n = os.cpu_count() or 1
+        cpu_n = _usable_cpu_count()
+        machine = os.cpu_count() or 1
+        if cpu_n < machine:
+            logger.info(
+                "cpu_thread_count=0 resolved to %d, not the machine's %d — this "
+                "process is limited by CPU affinity and/or a cgroup quota. Set "
+                "params.cpu_thread_count to override.",
+                cpu_n, machine,
+            )
     import pyarrow as pa
     if pa.cpu_count() != cpu_n:
         logger.info(
