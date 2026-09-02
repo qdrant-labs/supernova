@@ -3512,6 +3512,12 @@ def run_compute(
                 # only for the batch-row slice actually needed
                 # (`_process_shared_batch`'s `select`).
                 n_rows = len(table)
+                if n_rows > MAX_ROWS_PER_FILE:
+                    raise ValueError(
+                        f"{f.key} has {n_rows} rows, exceeding MAX_ROWS_PER_FILE="
+                        f"{MAX_ROWS_PER_FILE}; encoded row ids (gidx * MAX_ROWS_PER_FILE "
+                        f"+ row) would collide with the next file's rows"
+                    )
                 keeps: dict[Filter | None, np.ndarray | None] = {}
                 leaf_arrays: dict[FilterCondition, np.ndarray] = {}
 
