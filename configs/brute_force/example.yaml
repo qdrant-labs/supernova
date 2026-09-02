@@ -65,6 +65,13 @@ params:
   # multivector_double_buffer: false
   # merge_batch_size: null
   # merge_prefetch: false
+  # Which of two EXACTLY-tied candidates wins (see
+  # docs/brute-force/overview.md#ties). `ordinal` (default) takes the earlier
+  # corpus row and is free; `id` takes the lower `corpus.id_column`, which
+  # survives re-sharding the corpus, at the cost of one sort of this worker's
+  # id column at startup. Neither makes SCORES reproducible across batch
+  # sizes — pin `dense_batch_size` if you need that.
+  # tiebreak: ordinal
 
 # One or more independent top-K searches computed in a single corpus scan (each
 # corpus file is read/decoded once per vector_type any search below needs, not

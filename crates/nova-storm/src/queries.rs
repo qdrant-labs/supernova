@@ -58,6 +58,19 @@ impl VectorData {
     }
 }
 
+/// Where a query's ground truth stops being unambiguous: the score at the
+/// top-k cutoff, and how many ground-truth entries hold it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GtCutoff {
+    /// The k-th score AS STORED.
+    pub score: f32,
+    pub ties: u32,
+    /// `Some(true)` when the ground truth's own score list ascends — raw
+    /// distances, smaller is better. `Some(false)` when it descends.
+    /// `None` when every score is equal and the list says nothing.
+    pub ascending: Option<bool>,
+}
+
 /// One query vector plus its ground truth, if configured. Bundled into one
 /// struct (rather than two parallel `Vec`s) so the two can never drift out of
 /// index alignment. `ground_truth` is a `HashSet`, not the raw `Vec` the
@@ -72,6 +85,14 @@ pub struct QueryVector {
     /// value is SQL NULL — either way, just "no known-correct answer for this
     /// query," not an error: the query still runs and contributes latency.
     pub ground_truth: Option<HashSet<String>>,
+    /// The ground truth's score AT the top-k cutoff (its k-th best), and how
+    /// many of its entries share that score. `None` when no score column is
+    /// configured. Derived once here rather than carried as a full score list:
+    /// recall only ever needs the boundary, and the per-query lists are large.
+    pub gt_cutoff: Option<GtCutoff>,
+    /// How many ids the (already truncated) ground-truth list held, BEFORE
+    /// `ground_truth` deduplicated it into a set.
+    pub gt_depth: usize,
     /// This query's own resolved value for every queries column referenced by
     /// a `_from_query` condition in `query.filter` (see
     /// [`Filter::query_fields`]) — empty when no per-query filter is
@@ -106,19 +127,40 @@ fn sql_str(raw: &str) -> String {
     raw.replace('\'', "''")
 }
 
+/// `top_k` is the depth recall will be measured at. A ground-truth list
+/// DEEPER than that is truncated to its first `top_k` ids here, at load: the
+/// column is written in descending score order, so the prefix IS the true
+/// top-k. Without the truncation a returned id counted as a hit if it appeared
+/// ANYWHERE in the list, which for a k=1000 ground truth and `top_k=10` asks
+/// "are my 10 in the true top-1000" rather than "are they the true top-10" —
+/// a far weaker measure reported under the same name.
+///
+/// A ground truth SHALLOWER than `top_k` is left alone; it can't answer a
+/// deeper question, and `recall_at_k` already scores those against their own
+/// length and buckets them as `recall_short`.
 pub fn load_query_vectors(
     source: &QuerySource,
     vector_type: VectorType,
     filter: Option<&Filter>,
+    top_k: u64,
 ) -> Result<Vec<QueryVector>, QueryLoadError> {
     let conn = Connection::open_in_memory()?;
     // httpfs lets DuckDB read `s3://` (and `http(s)://`); harmless for local paths.
     conn.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
     configure_s3(&conn)?;
 
-    let filter_columns: Vec<&str> =
-        filter.map(|f| f.query_fields().into_iter().collect()).unwrap_or_default();
+    let filter_columns: Vec<&str> = filter
+        .map(|f| f.query_fields().into_iter().collect())
+        .unwrap_or_default();
     let range_columns = filter.map(|f| f.range_columns()).unwrap_or_default();
+    // Ground-truth truncation depth, plus what it actually did (reported below).
+    let top_k_usize = usize::try_from(top_k).unwrap_or(usize::MAX);
+    let mut gt_truncated: usize = 0;
+    // Ground truths holding the same id twice. Not rejected — the run still
+    // works — but recall can then never reach 1.0 in the full bucket, whose
+    // denominator is `top_k`, so the operator should know why.
+    let mut gt_duplicate_rows: usize = 0;
+    let mut gt_max_depth: usize = 0;
 
     // Config is operator-authored (trusted). Columns are quoted so names with
     // odd characters survive. `cols` is the single source of truth for both the
@@ -126,22 +168,31 @@ pub fn load_query_vectors(
     let mut cols: Vec<&str> = vec![source.column.as_str()];
     cols.extend(source.ground_truth_column.as_deref());
     let has_gt = source.ground_truth_column.is_some();
+    // Only meaningful next to the id column; a score column without ids has
+    // nothing to attach the cutoff to.
+    let has_gt_scores = has_gt && source.ground_truth_score_column.is_some();
+    if has_gt_scores {
+        cols.extend(source.ground_truth_score_column.as_deref());
+    }
     cols.extend(filter_columns.iter().copied());
 
-    let projection = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let projection = cols
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     // Preflight the vector column's TYPE so a dense/sparse config mismatch
     // fails with a pointable message here — without this, the shape-dependent
     // SQL predicate below dies first, as an opaque DuckDB binder error.
-    let column_type: String = conn
-        .query_row(
-            &format!(
-                "SELECT column_type FROM (DESCRIBE SELECT \"{col}\" FROM read_parquet('{uri}'))",
-                col = source.column,
-                uri = sql_str(&source.uri),
-            ),
-            [],
-            |row| row.get(0),
-        )?;
+    let column_type: String = conn.query_row(
+        &format!(
+            "SELECT column_type FROM (DESCRIBE SELECT \"{col}\" FROM read_parquet('{uri}'))",
+            col = source.column,
+            uri = sql_str(&source.uri),
+        ),
+        [],
+        |row| row.get(0),
+    )?;
     // A `STRUCT(...)[]` (LIST of structs) is neither modality — don't let the
     // prefix check misread it as sparse.
     let type_trimmed = column_type.trim();
@@ -199,7 +250,9 @@ pub fn load_query_vectors(
     let n_cols = cols.len();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], move |row| {
-        (0..n_cols).map(|i| row.get::<_, Value>(i)).collect::<duckdb::Result<Vec<_>>>()
+        (0..n_cols)
+            .map(|i| row.get::<_, Value>(i))
+            .collect::<duckdb::Result<Vec<_>>>()
     })?;
 
     let mut out = Vec::new();
@@ -231,9 +284,98 @@ pub fn load_query_vectors(
             }
         };
         let ground_truth = if has_gt { values.next() } else { None };
+        let gt_scores_raw = if has_gt_scores { values.next() } else { None };
+        let mut gt_depth = 0usize;
+        // Pre-truncation length, kept so the id/score pairing check can't be
+        // satisfied merely by a list that was cut down to top_k.
+        let mut gt_full_depth = 0usize;
         let ground_truth = match ground_truth {
             None | Some(Value::Null) => None,
-            Some(v) => Some(string_list(v)?.into_iter().collect::<HashSet<_>>()),
+            Some(v) => {
+                let mut ids = string_list(v)?;
+                let full_depth = ids.len();
+                gt_full_depth = full_depth;
+                if full_depth > top_k_usize {
+                    // Descending score order -> the prefix is the true top-k.
+                    ids.truncate(top_k_usize);
+                    gt_truncated += 1;
+                    gt_max_depth = gt_max_depth.max(full_depth);
+                }
+                // Positional depth, captured BEFORE the set collapses any
+                // duplicate ids.
+                gt_depth = ids.len();
+                let set = ids.into_iter().collect::<HashSet<_>>();
+                // Only a FULL-depth row is capped by a repeat: its denominator
+                // is `top_k` while a hit counts once. A shallow row divides by
+                // its own deduped length and can still reach 1.0, so warning
+                // about it would be wrong.
+                if set.len() < gt_depth && gt_depth >= top_k_usize {
+                    gt_duplicate_rows += 1;
+                }
+                Some(set)
+            }
+        };
+        // The cutoff is the LAST score inside the (already truncated) top-k,
+        // and its tie count is how many of the whole list share it — the tie
+        // group can extend past k, which is exactly the ambiguous case.
+        let gt_cutoff = match (&ground_truth, gt_scores_raw) {
+            (Some(_), Some(v)) if !matches!(v, Value::Null) => {
+                let scores = float_list(v)?;
+                // NaN/inf would make `<`, `>` and `==` all silently false, so
+                // an unsorted list could pass the ranking check, orientation
+                // could invert, and a NaN cutoff would match nothing —
+                // producing `ties: 0` and a query whose diagnostics are
+                // suppressed with no signal. Reject rather than absorb.
+                if let Some(i) = scores.iter().position(|s| !s.is_finite()) {
+                    return Err(QueryLoadError::Other(format!(
+                        "ground_truth_score_column holds a non-finite score ({}) at rank {i} \
+                         — scores must be finite to be ranked or compared",
+                        scores[i]
+                    )));
+                }
+                if let Some(bad) = non_monotonic_at(&scores) {
+                    // `ids.truncate(top_k)` and `scores[depth - 1]` both assume
+                    // the list is ordered best-first. An unsorted ground truth
+                    // silently yields the wrong "true top-k", a cutoff that is
+                    // not the k-th best, and a confidently wrong orientation.
+                    return Err(QueryLoadError::Other(format!(
+                        "ground_truth_score_column is not sorted best-first (rank {bad} breaks \
+                         the ordering) — ground truth must be ranked, since top_k truncation \
+                         and the cutoff both depend on it"
+                    )));
+                }
+                if scores.len() != gt_full_depth {
+                    // The two columns are positionally paired; a short score
+                    // list would silently pull the cutoff to a BETTER position,
+                    // narrowing the tie window and reclassifying in-range
+                    // results as `missing_from_gt`.
+                    return Err(QueryLoadError::Other(format!(
+                        "ground_truth_score_column has {} entries but ground_truth_column \
+                         has {gt_full_depth} for the same row — the two must be positionally \
+                         paired. Compared BEFORE top_k truncation, so a mismatched pair \
+                         cannot hide behind a truncated list.",
+                        scores.len()
+                    )));
+                }
+                let depth = gt_depth;
+                if depth == 0 {
+                    None
+                } else {
+                    // Ties are equality, so they read the same either way;
+                    // the cutoff SCORE is normalized to larger-is-better so it
+                    // can be compared against an engine score normalized the
+                    // same way. See `scores_descending`.
+                    let raw = scores[depth - 1];
+                    // EXACT equality, not `tie_epsilon`.
+                    let ties = scores.iter().filter(|s| **s == raw).count() as u32;
+                    Some(GtCutoff {
+                        score: raw,
+                        ties,
+                        ascending: scores_descending(&scores).map(|desc| !desc),
+                    })
+                }
+            }
+            _ => None,
         };
 
         // Everything remaining, in the same order as `filter_columns`.
@@ -249,17 +391,38 @@ pub fn load_query_vectors(
             let is_range_bound = range_columns.contains(*name);
             filter_values.insert(
                 (*name).to_string(),
-                filter_field_value(value, is_range_bound).map_err(|e| {
-                    QueryLoadError::Other(format!("filter column `{name}`: {e}"))
-                })?,
+                filter_field_value(value, is_range_bound)
+                    .map_err(|e| QueryLoadError::Other(format!("filter column `{name}`: {e}")))?,
             );
         }
 
-        out.push(QueryVector { vector, ground_truth, filter_values });
+        out.push(QueryVector {
+            vector,
+            ground_truth,
+            gt_cutoff,
+            gt_depth,
+            filter_values,
+        });
     }
     if empty_skipped > 0 {
         tracing::warn!(
             "skipped {empty_skipped} query row(s) with an empty vector (nothing to search with)"
+        );
+    }
+    // Say so rather than silently changing what recall means.
+    if gt_duplicate_rows > 0 {
+        tracing::warn!(
+            "{gt_duplicate_rows} full-depth ground-truth list(s) contain a repeated id — \
+             recall for those cannot reach 1.0, since the denominator is top_k while a repeated \
+             hit can only be counted once"
+        );
+    }
+    if gt_truncated > 0 {
+        tracing::info!(
+            "ground truth truncated to top_k={top_k} for {gt_truncated} quer{} \
+             (deepest list held {gt_max_depth} ids) — recall is measured against the \
+             true top-{top_k}, NOT against every id in the list",
+            if gt_truncated == 1 { "y" } else { "ies" },
         );
     }
     Ok(out)
@@ -280,12 +443,16 @@ fn sparse_vector(value: Value) -> Result<(Vec<u32>, Vec<f32>), QueryLoadError> {
         ));
     };
     let field = |name: &str| {
-        fields.iter().find(|(k, _)| k == name).map(|(_, v)| v).ok_or_else(|| {
-            let seen: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
-            QueryLoadError::Other(format!(
-                "sparse struct has no `{name}` field (fields present: {seen:?})"
-            ))
-        })
+        fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+            .ok_or_else(|| {
+                let seen: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+                QueryLoadError::Other(format!(
+                    "sparse struct has no `{name}` field (fields present: {seen:?})"
+                ))
+            })
     };
 
     // `{indices: NULL, values: NULL}` is a common writer spelling of "no
@@ -329,12 +496,14 @@ fn sparse_vector(value: Value) -> Result<(Vec<u32>, Vec<f32>), QueryLoadError> {
             .map(|v| {
                 // floats and ints both make sense as sparse weights (BM25-style
                 // term frequencies are integer-typed); NULL elements do not.
-                float(v).or_else(|| int_value(v).map(|i| i as f32)).ok_or_else(|| {
-                    QueryLoadError::Other(format!(
-                        "sparse struct `values` element `{v:?}` is not a number \
+                float(v)
+                    .or_else(|| int_value(v).map(|i| i as f32))
+                    .ok_or_else(|| {
+                        QueryLoadError::Other(format!(
+                            "sparse struct `values` element `{v:?}` is not a number \
                          (a NULL inside the list?)"
-                    ))
-                })
+                        ))
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?,
         other => {
@@ -394,8 +563,36 @@ fn float_list(value: Value) -> Result<Vec<f32>, QueryLoadError> {
             .map(float)
             .collect::<Option<_>>()
             .ok_or_else(|| QueryLoadError::Other("query column is not a list of floats".into())),
-        _ => Err(QueryLoadError::Other("query column is not a list of floats".into())),
+        _ => Err(QueryLoadError::Other(
+            "query column is not a list of floats".into(),
+        )),
     }
+}
+
+/// The first rank at which a score list stops being monotonic, if any.
+///
+/// A ground truth is a RANKED list; both the `top_k` truncation and the cutoff
+/// index rely on that. Checked rather than assumed because the ordering
+/// convention belongs to whoever produced the file — the same reason
+/// [`scores_descending`] infers direction instead of hard-coding it.
+fn non_monotonic_at(scores: &[f32]) -> Option<usize> {
+    let ascending = match scores_descending(scores) {
+        Some(desc) => !desc,
+        None => return None, // all equal — trivially monotonic
+    };
+    scores
+        .windows(2)
+        .position(|w| if ascending { w[1] < w[0] } else { w[1] > w[0] })
+        .map(|i| i + 1)
+}
+
+/// Which way a ground truth's score list is ordered — `Some(true)` when it
+/// descends (larger is better, e.g. dot/cosine, or a distance stored negated),
+/// `Some(false)` when it ascends (smaller is better, a raw distance), `None`
+/// when every score is equal and there is nothing to tell them apart.
+fn scores_descending(scores: &[f32]) -> Option<bool> {
+    let first = *scores.first()?;
+    scores.iter().find(|s| **s != first).map(|s| *s < first)
 }
 
 /// Coerce a DuckDB float/double value to `f32`.
@@ -480,8 +677,9 @@ fn timestamp_rfc3339(unit: duckdb::types::TimeUnit, raw: i64) -> Result<String, 
 
 /// A DuckDB DATE value (days since epoch) as RFC3339 midnight UTC.
 fn date32_rfc3339(days: i32) -> Result<String, QueryLoadError> {
-    let t = time::OffsetDateTime::from_unix_timestamp(i64::from(days) * 86_400)
-        .map_err(|e| QueryLoadError::Other(format!("date filter column value out of range: {e}")))?;
+    let t = time::OffsetDateTime::from_unix_timestamp(i64::from(days) * 86_400).map_err(|e| {
+        QueryLoadError::Other(format!("date filter column value out of range: {e}"))
+    })?;
     crate::datetime::to_rfc3339(t).map_err(QueryLoadError::Other)
 }
 
@@ -489,7 +687,10 @@ fn date32_rfc3339(days: i32) -> Result<String, QueryLoadError> {
 /// [`FilterFieldValue`] — text, an exact integer, a float/decimal, or a
 /// homogeneous list of one of those. Callers already reject `Value::Null`
 /// before this is called (see the NULL check in [`load_query_vectors`]).
-fn filter_field_value(value: Value, is_range_bound: bool) -> Result<FilterFieldValue, QueryLoadError> {
+fn filter_field_value(
+    value: Value,
+    is_range_bound: bool,
+) -> Result<FilterFieldValue, QueryLoadError> {
     // RANGE-bound columns get datetime handling AT LOAD TIME: text is parsed
     // now (a malformed bound fails the run before any load is offered, not as
     // a full-duration per-dispatch error loop) and stored as canonical
@@ -511,8 +712,8 @@ fn filter_field_value(value: Value, is_range_bound: bool) -> Result<FilterFieldV
                          (RFC3339, `YYYY-MM-DD HH:MM:SS`, or date-only): {e}"
                     ))
                 })?;
-                let normalized = crate::datetime::to_rfc3339(parsed)
-                    .map_err(QueryLoadError::Other)?;
+                let normalized =
+                    crate::datetime::to_rfc3339(parsed).map_err(QueryLoadError::Other)?;
                 return Ok(FilterFieldValue::Text(normalized));
             }
             Value::Timestamp(unit, raw) => {
@@ -567,13 +768,24 @@ fn filter_field_list_value(xs: &[Value]) -> Result<FilterFieldValue, QueryLoadEr
         ));
     }
     if xs.iter().all(is_integer_value) {
-        return xs.iter().map(int_value).collect::<Option<Vec<_>>>().map(FilterFieldValue::IntList).ok_or_else(
-            || QueryLoadError::Other("filter column list has an integer value out of range for i64".into()),
-        );
+        return xs
+            .iter()
+            .map(int_value)
+            .collect::<Option<Vec<_>>>()
+            .map(FilterFieldValue::IntList)
+            .ok_or_else(|| {
+                QueryLoadError::Other(
+                    "filter column list has an integer value out of range for i64".into(),
+                )
+            });
     }
-    xs.iter().map(numeric).collect::<Option<Vec<_>>>().map(FilterFieldValue::NumList).ok_or_else(|| {
-        QueryLoadError::Other("filter column list is neither all-text nor all-numeric".into())
-    })
+    xs.iter()
+        .map(numeric)
+        .collect::<Option<Vec<_>>>()
+        .map(FilterFieldValue::NumList)
+        .ok_or_else(|| {
+            QueryLoadError::Other("filter column list is neither all-text nor all-numeric".into())
+        })
 }
 
 /// Coerce a DuckDB `LIST`/`ARRAY` of ids into a `Vec<String>` — the same
@@ -588,10 +800,34 @@ fn string_list(value: Value) -> Result<Vec<String>, QueryLoadError> {
             .map(id_string)
             .collect::<Option<_>>()
             .ok_or_else(|| {
-                QueryLoadError::Other("ground_truth column is not a list of strings or integers".into())
+                QueryLoadError::Other(
+                    "ground_truth column is not a list of strings or integers".into(),
+                )
             }),
-        _ => Err(QueryLoadError::Other("ground_truth column is not a list of strings or integers".into())),
+        _ => Err(QueryLoadError::Other(
+            "ground_truth column is not a list of strings or integers".into(),
+        )),
     }
+}
+
+/// Two scores are "the same" when they differ by less than `epsilon`
+/// RELATIVE to their magnitude — the `err / (1 + |score|)` form nova-bf's own
+/// Qdrant parity tests use, so a tolerance measured there transfers here.
+///
+/// Scoring is not bit-identical between an exact brute force and a live
+/// engine: the engine may store vectors at a narrower `datatype`, and
+/// accumulates in a different order. Measured worst-case relative gap between
+/// nova-bf's `hit_scores` and live Qdrant (dim 128, exact search):
+///
+/// | datatype | dot     | cosine  |
+/// |----------|---------|---------|
+/// | float32  | 6.5e-07 | 1.5e-07 |
+/// | float16  | 4.2e-04 | 7.3e-05 |
+///
+/// See `QueryConfig::tie_epsilon` for the defaults derived from these.
+pub fn scores_tied(a: f32, b: f32, epsilon: f64) -> bool {
+    let (a, b) = (a as f64, b as f64);
+    (a - b).abs() <= epsilon * (1.0 + b.abs())
 }
 
 /// Stringify a single ground-truth id: text passes through, any integer width
@@ -615,7 +851,21 @@ fn id_string(v: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    /// Loads at the config's DEFAULT `top_k` (10) — the same value a real run
+    /// uses, so these tests exercise the production path rather than a
+    /// truncation-disabled one. The shared ground-truth fixtures are 2 ids
+    /// deep, well under 10, so nothing truncates and every assertion about
+    /// full ground-truth contents still holds. Truncation has its own tests,
+    /// with their own deeper fixture.
+    fn load_at_default_top_k(
+        source: &QuerySource,
+        vector_type: VectorType,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<QueryVector>, QueryLoadError> {
+        load_query_vectors(source, vector_type, filter, 10)
+    }
 
     fn write_parquet(path: &std::path::Path, rows: usize) {
         let conn = Connection::open_in_memory().unwrap();
@@ -643,12 +893,27 @@ mod tests {
         .unwrap();
     }
 
+    /// Ground truth of a chosen DEPTH, in a known order: row `i` gets
+    /// `["gt-{i}-0", "gt-{i}-1", …]`. Order is the point — nova-bf writes
+    /// `hit_ids` best-first, so truncation must keep the PREFIX.
+    fn write_parquet_with_deep_ground_truth(path: &std::path::Path, rows: usize, depth: usize) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [i::FLOAT, (i + 1)::FLOAT, (i + 2)::FLOAT] AS embedding, \
+             list_transform(range({depth}), x -> 'gt-' || i || '-' || x) AS hit_ids \
+             FROM range({rows}) r(i)) TO '{}' (FORMAT PARQUET)",
+            sql_str(&path.display().to_string())
+        ))
+        .unwrap();
+    }
+
     fn source(uri: String, ground_truth_column: Option<&str>) -> QuerySource {
         QuerySource {
             uri,
             column: "embedding".into(),
             limit: 10,
             ground_truth_column: ground_truth_column.map(str::to_string),
+            ground_truth_score_column: None,
         }
     }
 
@@ -659,7 +924,12 @@ mod tests {
         let file = dir.join("queries.parquet");
         write_parquet(&file, 100);
 
-        let vectors = load_query_vectors(&source(file.display().to_string(), None), VectorType::Dense, None).unwrap();
+        let vectors = load_at_default_top_k(
+            &source(file.display().to_string(), None),
+            VectorType::Dense,
+            None,
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -675,8 +945,12 @@ mod tests {
         let file = dir.join("queries.parquet");
         write_parquet_with_ground_truth(&file, 5);
 
-        let vectors =
-            load_query_vectors(&source(file.display().to_string(), Some("hit_ids")), VectorType::Dense, None).unwrap();
+        let vectors = load_at_default_top_k(
+            &source(file.display().to_string(), Some("hit_ids")),
+            VectorType::Dense,
+            None,
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -706,8 +980,12 @@ mod tests {
         ))
         .unwrap();
 
-        let vectors =
-            load_query_vectors(&source(file.display().to_string(), Some("hit_ids")), VectorType::Dense, None).unwrap();
+        let vectors = load_at_default_top_k(
+            &source(file.display().to_string(), Some("hit_ids")),
+            VectorType::Dense,
+            None,
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -731,7 +1009,11 @@ mod tests {
         ))
         .unwrap();
 
-        let result = load_query_vectors(&source(file.display().to_string(), Some("hit_ids")), VectorType::Dense, None);
+        let result = load_at_default_top_k(
+            &source(file.display().to_string(), Some("hit_ids")),
+            VectorType::Dense,
+            None,
+        );
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -759,8 +1041,12 @@ mod tests {
         let filter = parse_filter(
             "must:\n  - field: tenant_id\n    match_from_query: tenant_column\n  - field: budget\n    range_from_query:\n      lt: max_budget\n",
         );
-        let vectors =
-            load_query_vectors(&source(file.display().to_string(), None), VectorType::Dense, Some(&filter)).unwrap();
+        let vectors = load_at_default_top_k(
+            &source(file.display().to_string(), None),
+            VectorType::Dense,
+            Some(&filter),
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -791,8 +1077,11 @@ mod tests {
 
         let filter =
             parse_filter("must:\n  - field: tenant_id\n    match_from_query: tenant_column\n");
-        let result =
-            load_query_vectors(&source(file.display().to_string(), None), VectorType::Dense, Some(&filter));
+        let result = load_at_default_top_k(
+            &source(file.display().to_string(), None),
+            VectorType::Dense,
+            Some(&filter),
+        );
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -819,12 +1108,19 @@ mod tests {
 
         let filter =
             parse_filter("must:\n  - field: tenant_id\n    match_from_query: tenant_column\n");
-        let vectors =
-            load_query_vectors(&source(file.display().to_string(), None), VectorType::Dense, Some(&filter)).unwrap();
+        let vectors = load_at_default_top_k(
+            &source(file.display().to_string(), None),
+            VectorType::Dense,
+            Some(&filter),
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(vectors[0].filter_values.get("tenant_column"), Some(&FilterFieldValue::Int(BIG)));
+        assert_eq!(
+            vectors[0].filter_values.get("tenant_column"),
+            Some(&FilterFieldValue::Int(BIG))
+        );
     }
 
     #[test]
@@ -842,12 +1138,19 @@ mod tests {
 
         let filter =
             parse_filter("must:\n  - field: budget\n    range_from_query:\n      lt: max_budget\n");
-        let vectors =
-            load_query_vectors(&source(file.display().to_string(), None), VectorType::Dense, Some(&filter)).unwrap();
+        let vectors = load_at_default_top_k(
+            &source(file.display().to_string(), None),
+            VectorType::Dense,
+            Some(&filter),
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(vectors[0].filter_values.get("max_budget"), Some(&FilterFieldValue::Num(42.5)));
+        assert_eq!(
+            vectors[0].filter_values.get("max_budget"),
+            Some(&FilterFieldValue::Num(42.5))
+        );
     }
 
     // ---------------------------------------------------------------- sparse
@@ -880,13 +1183,19 @@ mod tests {
                 "SELECT {'indices': [i::BIGINT, (i + 100)::BIGINT], 'values': [0.5::DOUBLE, 0.25::DOUBLE]} AS embedding \
                  FROM range(3) r(i)",
             );
-            let vectors =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap();
+            let vectors = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap();
             assert_eq!(vectors.len(), 3);
             assert_eq!(
                 vectors[1].vector,
-                VectorData::Sparse { indices: vec![1, 101], values: vec![0.5, 0.25] }
+                VectorData::Sparse {
+                    indices: vec![1, 101],
+                    values: vec![0.5, 0.25]
+                }
             );
         });
     }
@@ -902,9 +1211,12 @@ mod tests {
                     ELSE {'indices': [i::BIGINT], 'values': [1.0::DOUBLE]} END AS embedding \
                  FROM range(3) r(i)",
             );
-            let vectors =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap();
+            let vectors = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap();
             // Row 1 (empty) is skipped; rows 0 and 2 survive.
             assert_eq!(vectors.len(), 2);
             assert!(vectors.iter().all(|v| !v.vector.is_empty()));
@@ -916,9 +1228,12 @@ mod tests {
         in_dir("sparse_on_dense", |dir| {
             let file = dir.join("q.parquet");
             write_parquet(&file, 2); // plain list<float> column
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("not a struct"), "{err}");
         });
     }
@@ -931,9 +1246,12 @@ mod tests {
                 &file,
                 "SELECT {'indices': [1::BIGINT], 'values': [1.0::DOUBLE]} AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Dense, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Dense,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("not a list of floats"), "{err}");
         });
     }
@@ -946,9 +1264,12 @@ mod tests {
                 &file,
                 "SELECT {'indices': [-1::BIGINT], 'values': [1.0::DOUBLE]} AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("non-negative"), "{err}");
         });
     }
@@ -961,9 +1282,12 @@ mod tests {
                 &file,
                 "SELECT {'indices': [4294967296::BIGINT], 'values': [1.0::DOUBLE]} AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("u32"), "{err}");
         });
     }
@@ -976,9 +1300,12 @@ mod tests {
                 &file,
                 "SELECT {'indices': [1::BIGINT, 2::BIGINT], 'values': [1.0::DOUBLE]} AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("2 indices but 1 values"), "{err}");
         });
     }
@@ -996,7 +1323,7 @@ mod tests {
                     ELSE {'indices': [i::BIGINT], 'values': [1.0::DOUBLE]} END AS embedding, \
                  ['gt-' || i] AS hit_ids FROM range(3) r(i)",
             );
-            let vectors = load_query_vectors(
+            let vectors = load_at_default_top_k(
                 &source(file.display().to_string(), Some("hit_ids")),
                 VectorType::Sparse,
                 None,
@@ -1019,12 +1346,18 @@ mod tests {
                 &file,
                 "SELECT {'indices': [30000::BIGINT, 4294967295::BIGINT], 'values': [1.0::DOUBLE, 2.0::DOUBLE]} AS embedding",
             );
-            let vectors =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap();
+            let vectors = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 vectors[0].vector,
-                VectorData::Sparse { indices: vec![30_000, u32::MAX], values: vec![1.0, 2.0] }
+                VectorData::Sparse {
+                    indices: vec![30_000, u32::MAX],
+                    values: vec![1.0, 2.0]
+                }
             );
         });
     }
@@ -1039,12 +1372,18 @@ mod tests {
                 &file,
                 "SELECT {'values': [7.0::DOUBLE], 'indices': [3::BIGINT]} AS embedding",
             );
-            let vectors =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap();
+            let vectors = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 vectors[0].vector,
-                VectorData::Sparse { indices: vec![3], values: vec![7.0] }
+                VectorData::Sparse {
+                    indices: vec![3],
+                    values: vec![7.0]
+                }
             );
         });
     }
@@ -1057,9 +1396,12 @@ mod tests {
                 &file,
                 "SELECT {'indices': [5::BIGINT, 5::BIGINT], 'values': [1.0::DOUBLE, 2.0::DOUBLE]} AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("duplicate index 5"), "{err}");
         });
     }
@@ -1077,9 +1419,12 @@ mod tests {
                     ELSE {'indices': [i::BIGINT], 'values': [1.0::DOUBLE]} END AS embedding \
                  FROM range(3) r(i)",
             );
-            let vectors =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap();
+            let vectors = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap();
             assert_eq!(vectors.len(), 2);
         });
     }
@@ -1099,7 +1444,7 @@ mod tests {
             );
             let mut src = source(file.display().to_string(), None);
             src.limit = 3;
-            let vectors = load_query_vectors(&src, VectorType::Sparse, None).unwrap();
+            let vectors = load_at_default_top_k(&src, VectorType::Sparse, None).unwrap();
             assert_eq!(vectors.len(), 3);
         });
     }
@@ -1115,9 +1460,12 @@ mod tests {
                 file.display()
             ))
             .unwrap();
-            let vectors =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Dense, None)
-                    .unwrap();
+            let vectors = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Dense,
+                None,
+            )
+            .unwrap();
             assert_eq!(vectors.len(), 2);
         });
     }
@@ -1131,12 +1479,18 @@ mod tests {
                 &file,
                 "SELECT {'indices': [1::BIGINT, 2::BIGINT], 'values': [3::BIGINT, 4::BIGINT]} AS embedding",
             );
-            let vectors =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap();
+            let vectors = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 vectors[0].vector,
-                VectorData::Sparse { indices: vec![1, 2], values: vec![3.0, 4.0] }
+                VectorData::Sparse {
+                    indices: vec![1, 2],
+                    values: vec![3.0, 4.0]
+                }
             );
         });
     }
@@ -1155,7 +1509,7 @@ mod tests {
                  'tenant-' || i AS tenant FROM range(3) r(i)",
             );
             let filter = parse_filter("must:\n  - field: t\n    match_from_query: tenant\n");
-            let vectors = load_query_vectors(
+            let vectors = load_at_default_top_k(
                 &source(file.display().to_string(), None),
                 VectorType::Sparse,
                 Some(&filter),
@@ -1186,9 +1540,10 @@ mod tests {
                 file.display()
             ))
             .unwrap();
-            let filter =
-                parse_filter("must:\n  - field: date\n    range_from_query:\n      gte: date_gte\n");
-            let vectors = load_query_vectors(
+            let filter = parse_filter(
+                "must:\n  - field: date\n    range_from_query:\n      gte: date_gte\n",
+            );
+            let vectors = load_at_default_top_k(
                 &source(file.display().to_string(), None),
                 VectorType::Dense,
                 Some(&filter),
@@ -1216,7 +1571,7 @@ mod tests {
             .unwrap();
             let mut src = source(file.display().to_string(), None);
             src.limit = 3;
-            let vectors = load_query_vectors(&src, VectorType::Dense, None).unwrap();
+            let vectors = load_at_default_top_k(&src, VectorType::Dense, None).unwrap();
             assert_eq!(vectors.len(), 3);
         });
     }
@@ -1236,7 +1591,7 @@ mod tests {
             );
             let mut src = source(file.display().to_string(), None);
             src.limit = 3;
-            let vectors = load_query_vectors(&src, VectorType::Sparse, None).unwrap();
+            let vectors = load_at_default_top_k(&src, VectorType::Sparse, None).unwrap();
             assert_eq!(vectors.len(), 3);
         });
     }
@@ -1253,10 +1608,16 @@ mod tests {
                 &file,
                 "SELECT {'indices': [1::BIGINT, 2::BIGINT], 'values': NULL::DOUBLE[]} AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
-            assert!(err.to_string().contains("2 indices but a NULL `values`"), "{err}");
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("2 indices but a NULL `values`"),
+                "{err}"
+            );
         });
     }
 
@@ -1279,7 +1640,10 @@ mod tests {
             );
         }
         // pre-1970 negative raw
-        assert_eq!(timestamp_rfc3339(TimeUnit::Second, -1).unwrap(), "1969-12-31T23:59:59Z");
+        assert_eq!(
+            timestamp_rfc3339(TimeUnit::Second, -1).unwrap(),
+            "1969-12-31T23:59:59Z"
+        );
     }
 
     #[test]
@@ -1295,9 +1659,10 @@ mod tests {
                 file.display()
             ))
             .unwrap();
-            let filter =
-                parse_filter("must:\n  - field: date\n    range_from_query:\n      gte: date_gte\n");
-            let vectors = load_query_vectors(
+            let filter = parse_filter(
+                "must:\n  - field: date\n    range_from_query:\n      gte: date_gte\n",
+            );
+            let vectors = load_at_default_top_k(
                 &source(file.display().to_string(), None),
                 VectorType::Dense,
                 Some(&filter),
@@ -1323,9 +1688,10 @@ mod tests {
                 file.display()
             ))
             .unwrap();
-            let filter =
-                parse_filter("must:\n  - field: date\n    range_from_query:\n      gte: date_gte\n");
-            let err = load_query_vectors(
+            let filter = parse_filter(
+                "must:\n  - field: date\n    range_from_query:\n      gte: date_gte\n",
+            );
+            let err = load_at_default_top_k(
                 &source(file.display().to_string(), None),
                 VectorType::Dense,
                 Some(&filter),
@@ -1354,7 +1720,7 @@ mod tests {
                 "must:\n  - field: date\n    range_from_query:\n      gte: date_gte\n\
                  \x20 - field: ls\n    range_from_query:\n      gte: ls_gte\n",
             );
-            let vectors = load_query_vectors(
+            let vectors = load_at_default_top_k(
                 &source(file.display().to_string(), None),
                 VectorType::Dense,
                 Some(&filter),
@@ -1364,7 +1730,10 @@ mod tests {
                 vectors[0].filter_values.get("date_gte"),
                 Some(&FilterFieldValue::Text("2017-09-19T09:23:19Z".into()))
             );
-            assert_eq!(vectors[0].filter_values.get("ls_gte"), Some(&FilterFieldValue::Num(42.5)));
+            assert_eq!(
+                vectors[0].filter_values.get("ls_gte"),
+                Some(&FilterFieldValue::Num(42.5))
+            );
         });
     }
 
@@ -1381,9 +1750,8 @@ mod tests {
                 file.display()
             ))
             .unwrap();
-            let filter =
-                parse_filter("must:\n  - field: date\n    match_from_query: exact_date\n");
-            let err = load_query_vectors(
+            let filter = parse_filter("must:\n  - field: date\n    match_from_query: exact_date\n");
+            let err = load_at_default_top_k(
                 &source(file.display().to_string(), None),
                 VectorType::Dense,
                 Some(&filter),
@@ -1398,9 +1766,12 @@ mod tests {
         in_dir("o'brien", |dir| {
             let file = dir.join("q.parquet");
             write_parquet(&file, 2);
-            let vectors =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Dense, None)
-                    .unwrap();
+            let vectors = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Dense,
+                None,
+            )
+            .unwrap();
             assert_eq!(vectors.len(), 2);
         });
     }
@@ -1416,9 +1787,12 @@ mod tests {
                 &file,
                 "SELECT {'indices': [1::BIGINT], 'vals': [1.0::DOUBLE]} AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("needs `indices`"), "{err}");
         });
     }
@@ -1433,9 +1807,12 @@ mod tests {
                 &file,
                 "SELECT {'idx': [1::BIGINT], 'vals': [1.0::DOUBLE]} AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("needs `indices`"), "{err}");
             assert!(err.to_string().contains("idx"), "{err}");
         });
@@ -1451,10 +1828,306 @@ mod tests {
                 &file,
                 "SELECT [{'indices': [1::BIGINT], 'values': [1.0::DOUBLE]}] AS embedding",
             );
-            let err =
-                load_query_vectors(&source(file.display().to_string(), None), VectorType::Sparse, None)
-                    .unwrap_err();
+            let err = load_at_default_top_k(
+                &source(file.display().to_string(), None),
+                VectorType::Sparse,
+                None,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("not a struct"), "{err}");
         });
+    }
+
+    /// Duplicate ids inside the top-k must not pull the cutoff to a better
+    /// score. `ground_truth` is a HashSet, so duplicates collapse; the cutoff
+    /// indexes the SCORE LIST positionally and has to use the pre-dedup depth.
+    /// Getting this wrong narrows the tie window and reclassifies in-range
+    /// results as `missing_from_gt` — the "stale ground truth" alarm — on
+    /// perfectly clean data.
+    #[test]
+    fn duplicate_ids_do_not_move_the_cutoff_score() {
+        let dir = std::env::temp_dir().join(format!("storm_dupcut_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        // 4 ids of which two repeat -> 3 distinct. Scores decrease, so the
+        // 4th (0.1) is the true cutoff at top_k=4; a dedup-derived depth would
+        // wrongly pick the 3rd.
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT] AS embedding, \
+             ['a', 'b', 'b', 'c'] AS hit_ids, \
+             [0.9::FLOAT, 0.5::FLOAT, 0.5::FLOAT, 0.1::FLOAT] AS hit_scores) TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+
+        let mut src = source(file.display().to_string(), Some("hit_ids"));
+        src.ground_truth_score_column = Some("hit_scores".to_string());
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, 4).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let cutoff = vectors[0].gt_cutoff.expect("cutoff derived");
+        assert!(
+            (cutoff.score - 0.1).abs() < 1e-6,
+            "cutoff must be the 4th score (0.1), not an earlier one — got {}",
+            cutoff.score
+        );
+    }
+
+    #[test]
+    fn non_monotonic_ground_truth_is_detected() {
+        assert_eq!(non_monotonic_at(&[0.9, 0.5, 0.1]), None);
+        assert_eq!(non_monotonic_at(&[0.1, 0.5, 0.9]), None);
+        assert_eq!(non_monotonic_at(&[0.5, 0.5, 0.5]), None);
+        // Written in id order rather than rank order — the case that would
+        // otherwise yield a wrong "true top-k" AND a wrong cutoff.
+        assert_eq!(non_monotonic_at(&[0.9, 0.1, 0.5]), Some(2));
+        assert_eq!(non_monotonic_at(&[0.1, 0.9, 0.5]), Some(2));
+    }
+
+    #[test]
+    fn an_unranked_ground_truth_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("storm_unranked_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT] AS embedding, \
+             ['a', 'b', 'c'] AS hit_ids, [0.9::FLOAT, 0.1::FLOAT, 0.5::FLOAT] AS hit_scores) \
+             TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+        let mut src = source(file.display().to_string(), Some("hit_ids"));
+        src.ground_truth_score_column = Some("hit_scores".to_string());
+        let err = load_query_vectors(&src, VectorType::Dense, None, 3).unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            err.to_string().contains("not sorted best-first"),
+            "got: {err}"
+        );
+    }
+
+    /// The within-ground-truth tie count describes the CORPUS, so it must use
+    /// exact equality — not the cross-system `tie_epsilon`, which at 2e-3
+    /// would sweep in adjacent, genuinely-distinct ranks.
+    #[test]
+    fn the_tie_count_is_exact_not_tolerance_widened() {
+        let dir = std::env::temp_dir().join(format!("storm_tiecnt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        // Two genuinely tied at 0.5, plus a neighbour 1e-4 away — well inside
+        // a 2e-3 relative window, but not a tie.
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT] AS embedding, \
+             ['a', 'b', 'c'] AS hit_ids, \
+             [0.5001::FLOAT, 0.5::FLOAT, 0.5::FLOAT] AS hit_scores) TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+        let mut src = source(file.display().to_string(), Some("hit_ids"));
+        src.ground_truth_score_column = Some("hit_scores".to_string());
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, 3).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            vectors[0].gt_cutoff.unwrap().ties,
+            2,
+            "only the two bit-identical scores count, despite a wide tie_epsilon"
+        );
+    }
+
+    #[test]
+    fn score_orientation_is_inferred_not_assumed() {
+        // Descending -> larger is better (nova-bf's convention, incl. its
+        // negated euclidean). Ascending -> raw distances from some other
+        // producer. All-equal -> no signal.
+        assert_eq!(scores_descending(&[0.9, 0.5, 0.1]), Some(true));
+        assert_eq!(scores_descending(&[-3.2, -3.4, -3.7]), Some(true));
+        assert_eq!(scores_descending(&[0.1, 0.5, 0.9]), Some(false));
+        assert_eq!(scores_descending(&[0.5, 0.5, 0.5]), None);
+        assert_eq!(scores_descending(&[]), None);
+        // Leading ties must not decide it — the first DIFFERING score does.
+        assert_eq!(scores_descending(&[0.5, 0.5, 0.1]), Some(true));
+        assert_eq!(scores_descending(&[0.5, 0.5, 0.9]), Some(false));
+    }
+
+    /// The cutoff is stored RAW with its orientation recorded; normalizing
+    /// needs the engine's orientation too, which only the comparison site
+    /// knows. Recording rather than applying is also what lets a list with no
+    /// ordering signal be resolved later instead of guessed here.
+    #[test]
+    fn an_ascending_ground_truth_records_its_orientation() {
+        let dir = std::env::temp_dir().join(format!("storm_asc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT] AS embedding, \
+             ['a', 'b', 'c'] AS hit_ids, \
+             [0.1::FLOAT, 0.4::FLOAT, 0.9::FLOAT] AS hit_scores) TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+        let mut src = source(file.display().to_string(), Some("hit_ids"));
+        src.ground_truth_score_column = Some("hit_scores".to_string());
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, 3).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let cutoff = vectors[0].gt_cutoff.expect("cutoff derived");
+        assert!(
+            (cutoff.score - 0.9).abs() < 1e-6,
+            "raw k-th score, got {}",
+            cutoff.score
+        );
+        assert_eq!(cutoff.ascending, Some(true), "raw distances -> ascending");
+    }
+
+    /// A score column positionally paired with the id column must not be
+    /// SHORTER than it: silently taking a shallower cutoff would pick a
+    /// strictly better score, narrowing the tie window and reclassifying
+    /// in-range results as `missing_from_gt`.
+    #[test]
+    fn a_short_score_list_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("storm_shortsc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT] AS embedding, \
+             ['a', 'b', 'c'] AS hit_ids, [0.9::FLOAT, 0.5::FLOAT] AS hit_scores) \
+             TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+        let mut src = source(file.display().to_string(), Some("hit_ids"));
+        src.ground_truth_score_column = Some("hit_scores".to_string());
+        let err = load_query_vectors(&src, VectorType::Dense, None, 3).unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            err.to_string().contains("positionally paired"),
+            "must name the real cause, got: {err}"
+        );
+    }
+
+    /// `gt_depth` is the positional length, so a duplicate id inside the top-k
+    /// cannot make a full-depth ground truth look short.
+    #[test]
+    fn gt_depth_is_positional_not_deduplicated() {
+        let dir = std::env::temp_dir().join(format!("storm_gtd_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT] AS embedding, \
+             ['a', 'b', 'b', 'c'] AS hit_ids) TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+        let vectors = load_query_vectors(
+            &source(file.display().to_string(), Some("hit_ids")),
+            VectorType::Dense,
+            None,
+            4,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            vectors[0].ground_truth.as_ref().unwrap().len(),
+            3,
+            "set dedups"
+        );
+        assert_eq!(vectors[0].gt_depth, 4, "depth stays positional");
+    }
+
+    // ---- ground-truth truncation (see `load_query_vectors`) ----------------
+
+    /// A ground truth deeper than `top_k` must collapse to its PREFIX — the
+    /// true top-k — not to an arbitrary k of its ids. `hit_ids` is written
+    /// best-first, so the prefix is what "top-k" means.
+    #[test]
+    fn ground_truth_deeper_than_top_k_keeps_only_the_prefix() {
+        let dir = std::env::temp_dir().join(format!("storm_trunc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        write_parquet_with_deep_ground_truth(&file, 4, 10);
+
+        let vectors = load_query_vectors(
+            &source(file.display().to_string(), Some("hit_ids")),
+            VectorType::Dense,
+            None,
+            3,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        for (i, v) in vectors.iter().enumerate() {
+            let gt = v.ground_truth.as_ref().expect("ground truth present");
+            assert_eq!(
+                gt.len(),
+                3,
+                "row {i}: 10-deep ground truth must truncate to top_k=3"
+            );
+            for rank in 0..3 {
+                assert!(
+                    gt.contains(&format!("gt-{i}-{rank}")),
+                    "row {i}: missing rank {rank}"
+                );
+            }
+            for rank in 3..10 {
+                assert!(
+                    !gt.contains(&format!("gt-{i}-{rank}")),
+                    "row {i}: rank {rank} is below top_k=3 and must not count as a hit"
+                );
+            }
+        }
+    }
+
+    /// Shallower than `top_k` is left alone: it can't answer a deeper
+    /// question, and `recall_at_k` scores those against their own length
+    /// (the `recall_short` bucket).
+    #[test]
+    fn ground_truth_shallower_than_top_k_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("storm_short_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        write_parquet_with_deep_ground_truth(&file, 3, 2);
+
+        let vectors = load_query_vectors(
+            &source(file.display().to_string(), Some("hit_ids")),
+            VectorType::Dense,
+            None,
+            10,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        for v in &vectors {
+            assert_eq!(v.ground_truth.as_ref().unwrap().len(), 2);
+        }
+    }
+
+    /// Exactly `top_k` deep is a no-op, not an off-by-one.
+    #[test]
+    fn ground_truth_equal_to_top_k_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("storm_exact_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        write_parquet_with_deep_ground_truth(&file, 3, 5);
+
+        let vectors = load_query_vectors(
+            &source(file.display().to_string(), Some("hit_ids")),
+            VectorType::Dense,
+            None,
+            5,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        for (i, v) in vectors.iter().enumerate() {
+            let gt = v.ground_truth.as_ref().unwrap();
+            assert_eq!(gt.len(), 5);
+            assert!(gt.contains(&format!("gt-{i}-4")), "the 5th id must survive");
+        }
     }
 }

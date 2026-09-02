@@ -6,18 +6,21 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
+use qdrant_client::qdrant::Filter as QdrantFilter;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::{
     Condition, DatetimeRange, QuantizationSearchParams, Query, QueryBatchPointsBuilder,
     QueryPointsBuilder, Range as QdrantRange, ScoredPoint, SearchParams, Timestamp, VectorInput,
 };
-use qdrant_client::qdrant::Filter as QdrantFilter;
 use serde::Deserialize;
 
-use super::{BatchOutcome, QueryTarget};
+use super::{BatchOutcome, QueryTarget, ScoringProfile};
 use crate::config::{QueryConfig, WithPayload};
 use crate::errors::TargetError;
-use crate::filter::{Filter, FilterCondition, FilterFieldValue, MatchSpec, MatchValue, RangeCondition, RangeFromQuery};
+use crate::filter::{
+    Filter, FilterCondition, FilterFieldValue, MatchSpec, MatchValue, RangeCondition,
+    RangeFromQuery,
+};
 use crate::queries::{QueryVector, VectorData};
 
 /// Qdrant's server-side search-time tuning (`query.search_params` for a
@@ -70,6 +73,8 @@ pub struct QdrantTarget {
     /// a wasted allocation (a `String` clone per returned point) on every
     /// query.
     collect_ids: bool,
+    /// Whether to materialize per-point scores.
+    collect_scores: std::sync::atomic::AtomicBool,
     /// The payload selector built once from `query.with_payload` (bool or an
     /// include-list of fields, e.g. just `text` for a RAG-shaped workload).
     /// The payloads are dropped on arrival — storm measures, it doesn't
@@ -90,7 +95,11 @@ pub struct QdrantTarget {
 
 impl From<&QuantizationSearchParamsConfig> for QuantizationSearchParams {
     fn from(q: &QuantizationSearchParamsConfig) -> Self {
-        QuantizationSearchParams { ignore: q.ignore, rescore: q.rescore, oversampling: q.oversampling }
+        QuantizationSearchParams {
+            ignore: q.ignore,
+            rescore: q.rescore,
+            oversampling: q.oversampling,
+        }
     }
 }
 
@@ -173,7 +182,8 @@ impl QdrantConfig {
                 // caller that hand-builds one (skipping `from_yaml`) would
                 // otherwise reach `to_qdrant_condition`'s per-query lookups
                 // with a shape `Filter::validate` was supposed to rule out.
-                f.validate().map_err(|e| TargetError::Other(e.to_string()))?;
+                f.validate()
+                    .map_err(|e| TargetError::Other(e.to_string()))?;
                 if f.is_per_query() {
                     // A per-query filter defers ITS OWN `_from_query` leaves
                     // to request time (they need real data to translate) —
@@ -198,15 +208,20 @@ impl QdrantConfig {
             top_k: query.top_k,
             search_params: search_params.as_ref().map(SearchParams::from),
             collect_ids: query.source.ground_truth_column.is_some(),
+            collect_scores: std::sync::atomic::AtomicBool::new(
+                query.source.ground_truth_score_column.is_some(),
+            ),
             with_payload: {
                 use qdrant_client::qdrant::with_payload_selector::SelectorOptions;
                 match &query.with_payload {
                     WithPayload::Enable(enabled) => SelectorOptions::Enable(*enabled),
                     // Server-side include selector: only these fields come
                     // back (the RAG shape -- e.g. just `text`).
-                    WithPayload::Fields(fields) => SelectorOptions::Include(
-                        qdrant_client::qdrant::PayloadIncludeSelector { fields: fields.clone() },
-                    ),
+                    WithPayload::Fields(fields) => {
+                        SelectorOptions::Include(qdrant_client::qdrant::PayloadIncludeSelector {
+                            fields: fields.clone(),
+                        })
+                    }
                 }
             },
             static_filter,
@@ -247,7 +262,10 @@ fn to_qdrant_filter(
     query_values: Option<&HashMap<String, FilterFieldValue>>,
 ) -> Result<QdrantFilter, TargetError> {
     let group = |conds: &[FilterCondition]| -> Result<Vec<Condition>, TargetError> {
-        conds.iter().map(|c| to_qdrant_condition(c, query_values)).collect()
+        conds
+            .iter()
+            .map(|c| to_qdrant_condition(c, query_values))
+            .collect()
     };
     Ok(QdrantFilter {
         must: group(&filter.must)?,
@@ -287,7 +305,9 @@ fn resolve_query_value<'a>(
     col: &str,
 ) -> Result<&'a FilterFieldValue, TargetError> {
     query_values.get(col).ok_or_else(|| {
-        TargetError::Other(format!("filter column `{col}` missing from the query's filter_values"))
+        TargetError::Other(format!(
+            "filter column `{col}` missing from the query's filter_values"
+        ))
     })
 }
 
@@ -313,7 +333,9 @@ fn to_qdrant_condition(
     // for a filter with no per-query condition). Return an `Err` rather than
     // panic if that invariant is ever violated (e.g. a hand-built config).
     let query_values = query_values.ok_or_else(|| {
-        TargetError::Other("per-query filter translation requires resolved query_values".to_string())
+        TargetError::Other(
+            "per-query filter translation requires resolved query_values".to_string(),
+        )
     })?;
 
     if let Some(col) = &cond.match_from_query {
@@ -342,7 +364,12 @@ fn to_qdrant_condition(
 }
 
 fn to_qdrant_range(range: &RangeCondition) -> QdrantRange {
-    QdrantRange { gt: range.gt, gte: range.gte, lt: range.lt, lte: range.lte }
+    QdrantRange {
+        gt: range.gt,
+        gte: range.gte,
+        lt: range.lt,
+        lte: range.lte,
+    }
 }
 
 /// A query's nearest-neighbour input in either modality. Dense stays the
@@ -376,14 +403,28 @@ fn to_qdrant_match_condition(field: &str, spec: &MatchSpec) -> Result<Condition,
 /// bool, no float, no mixed-type list.
 fn to_qdrant_match_any(field: &str, values: &[MatchValue]) -> Result<Condition, TargetError> {
     if values.iter().all(|v| matches!(v, MatchValue::Int(_))) {
-        let ints =
-            values.iter().map(|v| if let MatchValue::Int(i) = v { *i } else { unreachable!() }).collect::<Vec<_>>();
+        let ints = values
+            .iter()
+            .map(|v| {
+                if let MatchValue::Int(i) = v {
+                    *i
+                } else {
+                    unreachable!()
+                }
+            })
+            .collect::<Vec<_>>();
         return Ok(Condition::matches(field, ints));
     }
     if values.iter().all(|v| matches!(v, MatchValue::Str(_))) {
         let strs = values
             .iter()
-            .map(|v| if let MatchValue::Str(s) = v { s.clone() } else { unreachable!() })
+            .map(|v| {
+                if let MatchValue::Str(s) = v {
+                    s.clone()
+                } else {
+                    unreachable!()
+                }
+            })
             .collect::<Vec<_>>();
         return Ok(Condition::matches(field, strs));
     }
@@ -407,7 +448,10 @@ fn float_match_error(field: &str, value: f64) -> TargetError {
 /// same constraint [`to_qdrant_match_condition`] enforces for a literal, just
 /// discovered from data instead of config; this path is only reached for a
 /// genuinely float/decimal-typed queries column.
-fn to_qdrant_match_from_value(field: &str, value: &FilterFieldValue) -> Result<Condition, TargetError> {
+fn to_qdrant_match_from_value(
+    field: &str,
+    value: &FilterFieldValue,
+) -> Result<Condition, TargetError> {
     match value {
         FilterFieldValue::Text(s) => Ok(Condition::matches(field, s.clone())),
         FilterFieldValue::Int(i) => Ok(Condition::matches(field, *i)),
@@ -464,7 +508,9 @@ fn to_qdrant_range_from_query(
                 }
                 Ok(Some(Bound::Num(f)))
             }
-            FilterFieldValue::Text(s) => Ok(Some(Bound::Datetime(parse_datetime_bound(field, name, s)?))),
+            FilterFieldValue::Text(s) => {
+                Ok(Some(Bound::Datetime(parse_datetime_bound(field, name, s)?)))
+            }
             _ => Err(TargetError::Other(format!(
                 "filter condition on `{field}`: `range_from_query` column `{name}` must be numeric \
                  or an RFC3339 datetime string"
@@ -472,13 +518,34 @@ fn to_qdrant_range_from_query(
         }
     };
 
-    let (gt, gte, lt, lte) = (bound(&range.gt)?, bound(&range.gte)?, bound(&range.lt)?, bound(&range.lte)?);
-    let any_datetime = [&gt, &gte, &lt, &lte].iter().any(|b| matches!(b, Some(Bound::Datetime(_))));
+    let (gt, gte, lt, lte) = (
+        bound(&range.gt)?,
+        bound(&range.gte)?,
+        bound(&range.lt)?,
+        bound(&range.lte)?,
+    );
+    let any_datetime = [&gt, &gte, &lt, &lte]
+        .iter()
+        .any(|b| matches!(b, Some(Bound::Datetime(_))));
     if !any_datetime {
-        let num = |b: Option<Bound>| b.map(|b| if let Bound::Num(n) = b { n } else { unreachable!() });
+        let num = |b: Option<Bound>| {
+            b.map(|b| {
+                if let Bound::Num(n) = b {
+                    n
+                } else {
+                    unreachable!()
+                }
+            })
+        };
         return Ok(Condition::range(
             field,
-            QdrantRange { gt: num(gt), gte: num(gte), lt: num(lt), lte: num(lte), ..Default::default() },
+            QdrantRange {
+                gt: num(gt),
+                gte: num(gte),
+                lt: num(lt),
+                lte: num(lte),
+                ..Default::default()
+            },
         ));
     }
     let ts = |b: Option<Bound>| -> Result<Option<Timestamp>, TargetError> {
@@ -493,7 +560,13 @@ fn to_qdrant_range_from_query(
     };
     Ok(Condition::datetime_range(
         field,
-        DatetimeRange { gt: ts(gt)?, gte: ts(gte)?, lt: ts(lt)?, lte: ts(lte)?, ..Default::default() },
+        DatetimeRange {
+            gt: ts(gt)?,
+            gte: ts(gte)?,
+            lt: ts(lt)?,
+            lte: ts(lte)?,
+            ..Default::default()
+        },
     ))
 }
 
@@ -547,6 +620,89 @@ fn non_integer_from_query_error(field: &str, value: f64) -> TargetError {
 
 #[async_trait]
 impl QueryTarget for QdrantTarget {
+    fn disable_score_collection(&self) {
+        self.collect_scores
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn scoring_profile(&self) -> ScoringProfile {
+        use qdrant_client::qdrant::vectors_config::Config;
+        use qdrant_client::qdrant::{Datatype, Distance};
+
+        // One RPC for all three answers. Best-effort throughout: anything that
+        // can't be determined stays `None`/`false`, and the caller treats an
+        // unknown distance as "don't compare scores" rather than guessing.
+        let mut out = ScoringProfile::default();
+        let Ok(info) = self
+            .client
+            .collection_info(self.collection_name.clone())
+            .await
+        else {
+            return out;
+        };
+        let Some(config) = info.result.and_then(|r| r.config) else {
+            return out;
+        };
+        // Collection-level for now; a named vector can carry its OWN
+        // quantization config, folded in below once `VectorParams` is in hand.
+        out.quantized = config.quantization_config.is_some();
+        let Some(params) = config
+            .params
+            .and_then(|p| p.vectors_config)
+            .and_then(|v| v.config)
+        else {
+            return out;
+        };
+        let vp = match params {
+            // A bare `Params` block describes the collection's UNNAMED vector.
+            // If this run queries a named one, that block says nothing about
+            // it — and accepting it anyway would hand back another vector's
+            // distance, inverting every score comparison. (A sparse run always
+            // names its vector, and sparse params live in a different config
+            // entirely, so this is also what keeps sparse out.)
+            Config::Params(p) if self.vector_name.is_none() => Some(p),
+            Config::Params(_) => None,
+            // Named vectors: only the one this run searches can answer for it.
+            Config::ParamsMap(m) => self
+                .vector_name
+                .as_deref()
+                .and_then(|n| m.map.get(n).cloned()),
+        };
+        let Some(vp) = vp else { return out };
+        out.quantized = out.quantized || vp.quantization_config.is_some();
+        // ABSENT and UNRECOGNIZED must not collapse together. Absent is the
+        // common case — Qdrant records the field only when a collection is
+        // created with an explicit datatype — and its default storage is
+        // float32, so that takes the tight 5e-6 tolerance. A value this build
+        // cannot parse is the opposite situation and takes the conservative
+        // one; handing it 5e-6 would under-count ties and inflate
+        // `missing_from_gt`.
+        out.datatype = Some(
+            match vp.datatype {
+                None => "float32",
+                Some(raw) => match Datatype::try_from(raw) {
+                    Ok(Datatype::Float32) | Ok(Datatype::Default) => "float32",
+                    Ok(Datatype::Float16) => "float16",
+                    Ok(Datatype::Uint8) => "uint8",
+                    _ => "unknown",
+                },
+            }
+            .to_string(),
+        );
+        out.distance = Distance::try_from(vp.distance).ok().and_then(|d| {
+            match d {
+                Distance::Dot => Some("dot"),
+                Distance::Cosine => Some("cosine"),
+                Distance::Euclid => Some("euclid"),
+                Distance::Manhattan => Some("manhattan"),
+                // An unrecognized distance must NOT read as "larger is better".
+                _ => None,
+            }
+            .map(str::to_string)
+        });
+        out
+    }
+
     async fn query_batch(&self, queries: &[&QueryVector]) -> BatchOutcome {
         // Started before request-building (not just before the RPC) so a
         // per-query filter translation failure below reports a real elapsed
@@ -555,7 +711,14 @@ impl QueryTarget for QdrantTarget {
         // skew this dispatch's contribution to the run's latency percentiles.
         let started = Instant::now();
         if queries.is_empty() {
-            return BatchOutcome { latency: started.elapsed(), ok: true, ids: Vec::new(), error: None, timed_out: false, };
+            return BatchOutcome {
+                latency: started.elapsed(),
+                ok: true,
+                ids: Vec::new(),
+                scores: Vec::new(),
+                error: None,
+                timed_out: false,
+            };
         }
         let query_points: Vec<_> = match queries
             .iter()
@@ -590,7 +753,9 @@ impl QueryTarget for QdrantTarget {
                     latency: started.elapsed(),
                     ok: false,
                     ids: vec![None; queries.len()],
-                    error: Some(e.to_string()), timed_out: false,
+                    scores: vec![None; queries.len()],
+                    error: Some(e.to_string()),
+                    timed_out: false,
                 };
             }
         };
@@ -607,6 +772,7 @@ impl QueryTarget for QdrantTarget {
                 latency: started.elapsed(),
                 ok: false,
                 ids: vec![None; queries.len()],
+                scores: vec![None; queries.len()],
                 error: Some(format!(
                     "query_batch returned {} results for {} submitted queries",
                     resp.result.len(),
@@ -620,36 +786,63 @@ impl QueryTarget for QdrantTarget {
                         latency: started.elapsed(),
                         ok: true,
                         ids: vec![None; resp.result.len()],
-                        error: None, timed_out: false,
+                        scores: vec![None; resp.result.len()],
+                        error: None,
+                        timed_out: false,
                     };
                 }
                 let mut ids = Vec::with_capacity(resp.result.len());
+                // Collected alongside the ids, from the SAME `ScoredPoint`, so
+                // the two stay positionally aligned by construction.
+                let mut scores = Vec::with_capacity(resp.result.len());
                 for batch_result in &resp.result {
                     // A scored point without a usable id is an unexpected
                     // response — fail rather than silently drop it and understate
                     // recall (consistent with the milvus/elastic targets).
                     let mut query_ids = Vec::with_capacity(batch_result.result.len());
+                    let collect_scores = self
+                        .collect_scores
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let mut query_scores = if collect_scores {
+                        Vec::with_capacity(batch_result.result.len())
+                    } else {
+                        Vec::new()
+                    };
                     for point in &batch_result.result {
                         let Some(id) = point_id_string(point) else {
                             return BatchOutcome {
                                 latency: started.elapsed(),
                                 ok: false,
                                 ids: vec![None; queries.len()],
+                                scores: vec![None; queries.len()],
                                 error: Some(
                                     "qdrant returned a scored point without a valid id".to_string(),
-                                ), timed_out: false,
+                                ),
+                                timed_out: false,
                             };
                         };
                         query_ids.push(id);
+                        if collect_scores {
+                            query_scores.push(point.score);
+                        }
                     }
                     ids.push(Some(query_ids));
+                    scores.push(collect_scores.then_some(query_scores));
                 }
-                BatchOutcome { latency: started.elapsed(), ok: true, ids, error: None, timed_out: false, }
+                BatchOutcome {
+                    latency: started.elapsed(),
+                    ok: true,
+                    ids,
+                    scores,
+                    error: None,
+                    timed_out: false,
+                }
             }
             Err(e) => BatchOutcome {
                 latency: started.elapsed(),
                 ok: false,
                 ids: vec![None; queries.len()],
+                scores: vec![None; queries.len()],
                 timed_out: is_client_timeout(&e),
                 error: Some(e.to_string()),
             },
@@ -726,10 +919,17 @@ mod tests {
 
     #[test]
     fn point_id_string_formats_uuid_and_num() {
-        let uuid = PointId { point_id_options: Some(PointIdOptions::Uuid("abc-123".into())) };
-        assert_eq!(point_id_string(&scored(Some(uuid))), Some("abc-123".to_string()));
+        let uuid = PointId {
+            point_id_options: Some(PointIdOptions::Uuid("abc-123".into())),
+        };
+        assert_eq!(
+            point_id_string(&scored(Some(uuid))),
+            Some("abc-123".to_string())
+        );
 
-        let num = PointId { point_id_options: Some(PointIdOptions::Num(42)) };
+        let num = PointId {
+            point_id_options: Some(PointIdOptions::Num(42)),
+        };
         assert_eq!(point_id_string(&scored(Some(num))), Some("42".to_string()));
 
         assert_eq!(point_id_string(&scored(None)), None);
@@ -747,7 +947,9 @@ mod tests {
     #[test]
     fn search_params_absent_by_default() {
         let cfg = cfg(); // no search_params block
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(target.search_params.is_none());
     }
 
@@ -757,7 +959,9 @@ mod tests {
                     query:\n  vector_name: dense\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n\
                     \x20 search_params:\n    hnsw_ef: 128\n    exact: false\n    quantization:\n      ignore: false\n      rescore: true\n      oversampling: 2.5\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         let params = target.search_params.expect("search_params should be Some");
         assert_eq!(params.hnsw_ef, Some(128));
         assert_eq!(params.exact, Some(false));
@@ -771,8 +975,7 @@ mod tests {
         // `let ... else` so this stays exhaustive whether or not the optional
         // `elastic`/`milvus` variants are compiled in.
         #[allow(irrefutable_let_patterns)]
-        let crate::targets::TargetConfig::Qdrant(c) = target
-        else {
+        let crate::targets::TargetConfig::Qdrant(c) = target else {
             panic!("expected a qdrant target config");
         };
         c
@@ -781,13 +984,17 @@ mod tests {
     #[test]
     fn collect_ids_follows_ground_truth_column_config() {
         let cfg = cfg(); // no ground_truth_column
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(!target.collect_ids);
 
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n    ground_truth_column: hit_ids\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(target.collect_ids);
     }
 
@@ -803,8 +1010,16 @@ mod tests {
             Some(qdrant_client::qdrant::condition::ConditionOneOf::Field(_))
         ));
 
-        to_qdrant_condition(&cond("field: price\nrange:\n  gte: 10.0\n  lt: 100.0\n"), None).unwrap();
-        to_qdrant_condition(&cond("field: description\nmatch_text: waterproof hiking\n"), None).unwrap();
+        to_qdrant_condition(
+            &cond("field: price\nrange:\n  gte: 10.0\n  lt: 100.0\n"),
+            None,
+        )
+        .unwrap();
+        to_qdrant_condition(
+            &cond("field: description\nmatch_text: waterproof hiking\n"),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -830,9 +1045,15 @@ mod tests {
     #[test]
     fn translates_per_query_variants_from_resolved_values() {
         let values = HashMap::from([
-            ("tenant_column".to_string(), FilterFieldValue::Text("acme".to_string())),
+            (
+                "tenant_column".to_string(),
+                FilterFieldValue::Text("acme".to_string()),
+            ),
             ("max_budget".to_string(), FilterFieldValue::Num(42.0)),
-            ("phrase_column".to_string(), FilterFieldValue::Text("waterproof hiking".to_string())),
+            (
+                "phrase_column".to_string(),
+                FilterFieldValue::Text("waterproof hiking".to_string()),
+            ),
         ]);
 
         to_qdrant_condition(
@@ -855,8 +1076,11 @@ mod tests {
     #[test]
     fn rejects_non_integer_per_query_match_value() {
         let values = HashMap::from([("budget_column".to_string(), FilterFieldValue::Num(9.5))]);
-        let err = to_qdrant_condition(&cond("field: budget\nmatch_from_query: budget_column\n"), Some(&values))
-            .unwrap_err();
+        let err = to_qdrant_condition(
+            &cond("field: budget\nmatch_from_query: budget_column\n"),
+            Some(&values),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("non-integer"));
     }
 
@@ -877,7 +1101,9 @@ mod tests {
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n  filter:\n    must:\n      - field: category\n        match: shoes\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(target.static_filter.is_some());
         assert!(target.per_query_filter.is_none());
     }
@@ -887,7 +1113,9 @@ mod tests {
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n  filter:\n    must:\n      - field: tenant_id\n        match_from_query: tenant_column\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let target = qdrant_config(cfg.target).into_target(&cfg.query).expect("builds");
+        let target = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .expect("builds");
         assert!(target.static_filter.is_none());
         assert!(target.per_query_filter.is_some());
     }
@@ -908,14 +1136,19 @@ mod tests {
         let yaml = "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
                     query:\n  top_k: 5\n  source:\n    uri: /tmp/q.parquet\n    column: e\n  filter:\n    must:\n      - field: tenant_id\n        match_from_query: tenant_column\n      - field: price\n        match: 9.99\n";
         let cfg = StormConfig::from_yaml(yaml).expect("parses");
-        let err = qdrant_config(cfg.target).into_target(&cfg.query).map(|_| ()).unwrap_err();
+        let err = qdrant_config(cfg.target)
+            .into_target(&cfg.query)
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.to_string().contains("float"));
     }
 
     #[test]
     fn rejects_blank_match_text_from_query_value() {
-        let values =
-            HashMap::from([("phrase_column".to_string(), FilterFieldValue::Text("   ".to_string()))]);
+        let values = HashMap::from([(
+            "phrase_column".to_string(),
+            FilterFieldValue::Text("   ".to_string()),
+        )]);
         let err = to_qdrant_condition(
             &cond("field: description\nmatch_text_from_query: phrase_column\n"),
             Some(&values),
@@ -927,12 +1160,25 @@ mod tests {
     #[test]
     fn translates_exact_integer_and_int_list_from_query_values() {
         let values = HashMap::from([
-            ("tenant_column".to_string(), FilterFieldValue::Int(9_007_199_254_740_993)),
-            ("codes_column".to_string(), FilterFieldValue::IntList(vec![1, 2, 3])),
+            (
+                "tenant_column".to_string(),
+                FilterFieldValue::Int(9_007_199_254_740_993),
+            ),
+            (
+                "codes_column".to_string(),
+                FilterFieldValue::IntList(vec![1, 2, 3]),
+            ),
         ]);
-        to_qdrant_condition(&cond("field: tenant_id\nmatch_from_query: tenant_column\n"), Some(&values))
-            .unwrap();
-        to_qdrant_condition(&cond("field: code\nmatch_from_query: codes_column\n"), Some(&values)).unwrap();
+        to_qdrant_condition(
+            &cond("field: tenant_id\nmatch_from_query: tenant_column\n"),
+            Some(&values),
+        )
+        .unwrap();
+        to_qdrant_condition(
+            &cond("field: code\nmatch_from_query: codes_column\n"),
+            Some(&values),
+        )
+        .unwrap();
     }
 
     // ---------------------------------------------------------------- sparse
@@ -944,8 +1190,10 @@ mod tests {
         let dense = query_input(&VectorData::Dense(vec![0.1, 0.2]));
         assert_eq!(dense, Query::new_nearest(vec![0.1, 0.2]));
 
-        let sparse =
-            query_input(&VectorData::Sparse { indices: vec![7, 42], values: vec![0.5, 0.25] });
+        let sparse = query_input(&VectorData::Sparse {
+            indices: vec![7, 42],
+            values: vec![0.5, 0.25],
+        });
         assert_eq!(
             sparse,
             Query::new_nearest(VectorInput::new_sparse(vec![7u32, 42], vec![0.5f32, 0.25]))
@@ -963,8 +1211,14 @@ mod tests {
 
     fn datetime_values() -> HashMap<String, FilterFieldValue> {
         HashMap::from([
-            ("date_gte".to_string(), FilterFieldValue::Text(T1.0.to_string())),
-            ("date_lt".to_string(), FilterFieldValue::Text(T2.0.to_string())),
+            (
+                "date_gte".to_string(),
+                FilterFieldValue::Text(T1.0.to_string()),
+            ),
+            (
+                "date_lt".to_string(),
+                FilterFieldValue::Text(T2.0.to_string()),
+            ),
             ("ls_gte".to_string(), FilterFieldValue::Num(0.5)),
         ])
     }
@@ -980,8 +1234,14 @@ mod tests {
             "date",
             DatetimeRange {
                 gt: None,
-                gte: Some(Timestamp { seconds: T1.1, nanos: 0 }),
-                lt: Some(Timestamp { seconds: T2.1, nanos: 0 }),
+                gte: Some(Timestamp {
+                    seconds: T1.1,
+                    nanos: 0,
+                }),
+                lt: Some(Timestamp {
+                    seconds: T2.1,
+                    nanos: 0,
+                }),
                 lte: None,
             },
         );
@@ -997,7 +1257,12 @@ mod tests {
         .unwrap();
         let expected = Condition::range(
             "language_score",
-            QdrantRange { gt: None, gte: Some(0.5), lt: None, lte: None },
+            QdrantRange {
+                gt: None,
+                gte: Some(0.5),
+                lt: None,
+                lte: None,
+            },
         );
         assert_eq!(condition, expected);
     }
@@ -1009,7 +1274,10 @@ mod tests {
             Some(&datetime_values()),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("mixes datetime and numeric"), "{err}");
+        assert!(
+            err.to_string().contains("mixes datetime and numeric"),
+            "{err}"
+        );
     }
 
     /// gRPC CANCELLED (what tonic's timeout layer emits as "Timeout expired")
@@ -1017,8 +1285,10 @@ mod tests {
     #[test]
     fn client_timeouts_are_classified_by_grpc_code() {
         use qdrant_client::QdrantError;
-        let timeout_codes =
-            [tonic::Status::cancelled("Timeout expired"), tonic::Status::deadline_exceeded("x")];
+        let timeout_codes = [
+            tonic::Status::cancelled("Timeout expired"),
+            tonic::Status::deadline_exceeded("x"),
+        ];
         for status in timeout_codes {
             assert!(is_client_timeout(&QdrantError::ResponseError { status }));
         }
@@ -1030,7 +1300,9 @@ mod tests {
             "Service internal error: 1 of 1 read operations failed:\n  \
              Timeout error: Operation 'Search' timed out after 999.376572ms",
         );
-        assert!(is_client_timeout(&QdrantError::ResponseError { status: server_timeout }));
+        assert!(is_client_timeout(&QdrantError::ResponseError {
+            status: server_timeout
+        }));
 
         let not_timeouts = [
             tonic::Status::invalid_argument("Wrong input: Not existing vector name"),
@@ -1059,7 +1331,10 @@ mod tests {
         // Must be the datetime PARSER's message, not the generic "must be
         // numeric or..." fallback — a mutation deleting the Text arm entirely
         // was shown to survive a looser "RFC3339" substring.
-        assert!(err.to_string().contains("not a recognized datetime"), "{err}");
+        assert!(
+            err.to_string().contains("not a recognized datetime"),
+            "{err}"
+        );
     }
 
     /// One helper: the condition `field: date / range_from_query: gte: col`
@@ -1067,7 +1342,10 @@ mod tests {
     fn datetime_gte(value: &str) -> Result<Condition, TargetError> {
         let values =
             HashMap::from([("col".to_string(), FilterFieldValue::Text(value.to_string()))]);
-        to_qdrant_condition(&cond("field: date\nrange_from_query:\n  gte: col\n"), Some(&values))
+        to_qdrant_condition(
+            &cond("field: date\nrange_from_query:\n  gte: col\n"),
+            Some(&values),
+        )
     }
 
     fn gte_timestamp(condition: Condition) -> Timestamp {
@@ -1075,7 +1353,10 @@ mod tests {
         let ConditionOneOf::Field(f) = condition.condition_one_of.expect("field condition") else {
             panic!("not a field condition")
         };
-        f.datetime_range.expect("datetime range").gte.expect("gte bound set")
+        f.datetime_range
+            .expect("datetime range")
+            .gte
+            .expect("gte bound set")
     }
 
     #[test]
@@ -1130,10 +1411,22 @@ mod tests {
         let expected = Condition::datetime_range(
             "date",
             DatetimeRange {
-                gt: Some(Timestamp { seconds: T1.1, nanos: 0 }),
-                gte: Some(Timestamp { seconds: T1.1, nanos: 0 }),
-                lt: Some(Timestamp { seconds: T2.1, nanos: 0 }),
-                lte: Some(Timestamp { seconds: T2.1, nanos: 0 }),
+                gt: Some(Timestamp {
+                    seconds: T1.1,
+                    nanos: 0,
+                }),
+                gte: Some(Timestamp {
+                    seconds: T1.1,
+                    nanos: 0,
+                }),
+                lt: Some(Timestamp {
+                    seconds: T2.1,
+                    nanos: 0,
+                }),
+                lte: Some(Timestamp {
+                    seconds: T2.1,
+                    nanos: 0,
+                }),
             },
         );
         assert_eq!(condition, expected);

@@ -66,7 +66,11 @@ pub enum ReportFormat {
 impl ReportConfig {
     /// Build the configured sink. Cheap: no I/O until [`Recorder::begin`].
     pub fn build(&self) -> Box<dyn Recorder> {
-        Box::new(FileRecorder { path: self.path.clone(), format: self.format, out: None })
+        Box::new(FileRecorder {
+            path: self.path.clone(),
+            format: self.format,
+            out: None,
+        })
     }
 }
 
@@ -163,9 +167,10 @@ impl Recorder for FileRecorder {
     }
 
     fn record(&mut self, s: &DispatchSample) -> io::Result<()> {
-        let out = self.out.as_mut().ok_or_else(|| {
-            io::Error::other("record() before begin()")
-        })?;
+        let out = self
+            .out
+            .as_mut()
+            .ok_or_else(|| io::Error::other("record() before begin()"))?;
         // One dispatch's recall samples split into the two buckets — a query is
         // in exactly one, so the two joins together reproduce every sample.
         let join = |short: bool, sep: &str| {
@@ -217,13 +222,39 @@ mod tests {
 
     /// `full` / `short` are the recall values for each bucket; the helper tags
     /// them and concatenates into the one `recalls` vec a real dispatch carries.
-    fn sample(t_s: f64, latency_ms: f64, ok: bool, full: Vec<f64>, short: Vec<f64>) -> DispatchSample {
+    fn sample(
+        t_s: f64,
+        latency_ms: f64,
+        ok: bool,
+        full: Vec<f64>,
+        short: Vec<f64>,
+    ) -> DispatchSample {
         let recalls = full
             .into_iter()
-            .map(|recall| RecallSample { recall, short: false })
-            .chain(short.into_iter().map(|recall| RecallSample { recall, short: true }))
+            .map(|recall| RecallSample {
+                recall,
+                tolerant: recall,
+                short: false,
+                missing_from_gt: 0,
+            })
+            .chain(short.into_iter().map(|recall| RecallSample {
+                recall,
+                tolerant: recall,
+                short: true,
+                missing_from_gt: 0,
+            }))
             .collect();
-        DispatchSample { t_s, latency_ms, ok, timed_out: false, recalls, empty_ground_truth: 0, filter_overreturn: 0 }
+        DispatchSample {
+            t_s,
+            latency_ms,
+            ok,
+            timed_out: false,
+            recalls,
+            empty_ground_truth: 0,
+            short_returns: 0,
+            missing_from_gt: 0,
+            filter_overreturn: 0,
+        }
     }
 
     fn run_recorder(cfg: &ReportConfig, samples: &[DispatchSample]) -> String {
@@ -240,7 +271,10 @@ mod tests {
     fn csv_has_header_and_one_row_per_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ts.csv").to_string_lossy().into_owned();
-        let cfg = ReportConfig { format: ReportFormat::Csv, path };
+        let cfg = ReportConfig {
+            format: ReportFormat::Csv,
+            path,
+        };
 
         let text = run_recorder(
             &cfg,
@@ -261,7 +295,10 @@ mod tests {
     fn jsonl_rows_parse_and_roundtrip_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ts.jsonl").to_string_lossy().into_owned();
-        let cfg = ReportConfig { format: ReportFormat::Jsonl, path };
+        let cfg = ReportConfig {
+            format: ReportFormat::Jsonl,
+            path,
+        };
 
         let text = run_recorder(&cfg, &[sample(1.5, 20.0, true, vec![0.5], vec![0.25])]);
         let row: serde_json::Value = serde_json::from_str(text.trim()).expect("valid json");

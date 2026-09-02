@@ -11,11 +11,12 @@
 #   make sweep    the `nova sweep` parameter-sweep orchestrator (controller-side only)
 #   make docs     serve the docs locally (zensical)
 #   make test     run Rust + Python tests
+#   make parity   nova-bf ground-truth parity vs naive + live Qdrant (see tests/parity)
 #
 # Sub-tools follow the git model: each installs a `nova-<cmd>` on PATH, and the
 # `nova` dispatcher execs it. Install only the ones you need.
 
-.PHONY: all cli embed load storm inspect bf dist sweep docs docs-build test clean
+.PHONY: all cli embed load storm inspect bf dist sweep docs docs-build test parity clean
 
 all: cli embed load storm inspect bf dist sweep
 	@echo
@@ -75,6 +76,15 @@ test:
 	uv run --directory python/nova-embed --extra dev pytest -q || true
 	uv run --directory python/nova-bf --extra dev pytest -q || true
 	uv run --directory python/nova-sweep --extra dev pytest -q || true
+
+# nova-bf three-way parity: nova-bf vs a plain-Python reference vs a live
+# Qdrant, over dense/sparse/multivector, the filter language, sharded
+# compute+merge and the Triton kernels. Starts a throwaway Qdrant if none is
+# reachable, and picks up a GPU on its own.
+# See python/nova-bf/tests/parity/README.md
+parity:
+	uv run --directory python/nova-bf --extra dev --with qdrant-client \
+		bash ../../scripts/parity.sh
 
 clean:
 	cargo clean

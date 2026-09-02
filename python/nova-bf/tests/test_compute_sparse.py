@@ -10,6 +10,8 @@ query-vocab-truncation logic), so these tests catch divergence between the two.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -412,6 +414,57 @@ def test_duplicate_indices_within_a_row_are_summed(ds):
     # correct: query{3:2.0, 1:10.0} . corpus{3:7.0, 1:1.0} = 2.0*7.0 + 10.0*1.0 = 24.0
     # if either side silently overwrote instead of summing, this would come out wrong
     assert t["hit_scores"][0][0] == pytest.approx(24.0, abs=1e-4)
+
+
+def test_ascending_row_with_an_adjacent_duplicate_is_still_summed(ds):
+    """The duplicate case that ASCENDS.
+
+    `test_duplicate_indices_within_a_row_are_summed` writes `[3, 3, 1]`, which
+    is out of order as well as duplicated — so it is caught by anything that
+    notices the disorder, whether or not the duplicate itself is handled.
+    `_coalesce_by_row_col` short-circuits on rows that arrive already sorted
+    and distinct, which makes that distinction load-bearing: a precondition
+    that tested `>=` instead of `>` between columns would wave `[1, 3, 3]`
+    straight through with its duplicate unmerged, and every existing duplicate
+    test would still pass. (Verified: that mutation survives the whole of this
+    file without this test.)
+
+    Cosine is asserted as well as dot, because the row norm is coalesced
+    separately (`_sparse_file_norms`) and from the RAW values, so it detects an
+    unmerged duplicate even if the matmul happened to sum repeated columns on
+    its own.
+    """
+    tmp = ds["tmp"]
+    cdir = tmp / "dup_asc_corpus"
+    cdir.mkdir(exist_ok=True)
+    # ASCENDING indices, token 3 adjacent-duplicated: 2.0 + 5.0 -> 7.0
+    _write_sparse_vectors(
+        cdir / "f0.parquet", [([1, 3, 3], [1.0, 2.0, 5.0])],
+        id=["asc0"], language=["eng"],
+    )
+    qpath = tmp / "dup_asc_queries.parquet"
+    _write_sparse_vectors(qpath, [([1, 3], [10.0, 2.0])], qid=["aq0"])
+
+    out = tmp / "dup_asc_out"
+    out.mkdir(exist_ok=True)
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), sparse_column="sparse_embedding", id_column="id"),
+        queries=QueriesConfig(path=str(qpath), sparse_column="sparse_embedding", id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(io_workers=1),
+        searches=[
+            SearchSpec(name="d", k=1, metric="dot", vector_type="sparse"),
+            SearchSpec(name="c", k=1, metric="cosine", vector_type="sparse"),
+        ],
+    )
+    res = run_compute(cfg)
+    # corpus {1: 1.0, 3: 7.0} . query {1: 10.0, 3: 2.0} = 10.0 + 14.0 = 24.0
+    got_dot = pq.read_table(res["d"]).to_pydict()["hit_scores"][0][0]
+    assert got_dot == pytest.approx(24.0, abs=1e-4)
+    # 24 / (|c| * |q|) = 24 / (sqrt(1 + 49) * sqrt(100 + 4)); an unmerged
+    # duplicate would give |c| = sqrt(1 + 4 + 25) instead
+    got_cos = pq.read_table(res["c"]).to_pydict()["hit_scores"][0][0]
+    assert got_cos == pytest.approx(24.0 / math.sqrt(50 * 104), abs=1e-5)
 
 
 def test_coalesce_by_row_col_merges_duplicates_and_builds_valid_csr():

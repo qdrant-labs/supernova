@@ -387,6 +387,27 @@ def test_run_embedder_end_to_end(tmp_path):
     assert names["dense_a"]["kind"] == "dense"
     assert names["dense_a"]["column"] == "dense_a_embedding"
     assert names["sparse_a"]["modality"] == "text"
+    # What produced the column, not just what it is called: the backend and the
+    # kwargs it was constructed with (dtype above all — an fp16 and an fp32 run
+    # are otherwise indistinguishable in every artifact).
+    assert names["dense_a"]["backend"] == "fake"
+    assert names["dense_a"]["backend_kwargs"] == {}  # this entry declares none
+    assert names["dense_a"]["max_length"] is None
+    assert names["dense_a"]["pooling"] is None
+    # Which build of the code, and which host — neither comes from the config.
+    assert manifest["code"]["python_version"]
+    if "git_commit" in manifest["code"]:  # absent for a wheel install / no git
+        assert len(manifest["code"]["git_commit"]) == 40
+        assert manifest["code"]["git_describe"] and manifest["code"]["git_branch"]
+    assert manifest["job"]["hostname"] and manifest["job"]["pid"] > 0
+    # The chunker's resolved settings, not just its strategy name.
+    assert manifest["chunking"] == {"strategy": "passthrough"}
+    assert manifest["started_at"] < manifest["created_at"]
+    # A single-node run: no slice, and nothing claimed about completeness.
+    assert manifest["sharding"] == {"num_jobs": None, "job_rank": None}
+    assert manifest["rows_expected"] is None
+    assert manifest["complete"] is None
+    assert manifest["source_rows_seen"] == 3  # 2 embedded + 1 skipped as empty
 
 
 def dense_entry(**overrides):
@@ -515,3 +536,170 @@ def test_run_embedder_multimodal_end_to_end(tmp_path):
     assert spec["input_column"] == "text=text,image=image"
     # the instruction is part of the embedding space — the query side needs it
     assert spec["instruction"] == "Represent the user's input."
+
+
+def test_manifest_records_the_rank_slice_and_completeness(tmp_path):
+    """A rank's manifest must say what it was RESPONSIBLE for, not only what it
+    wrote — otherwise a rank that died at 80% looks exactly like one that was
+    given 80% as much work, and finding the gap means diffing object listings."""
+    rows = [{"text": f"row {i}", "id": i} for i in range(4)]
+    engine = build_engine([
+        # unknown keys are backend constructor kwargs — `dtype` decides what the
+        # vectors ARE, and nothing in the output parquet reveals it
+        EmbedderEntry.model_validate(dense_entry(dim=3, dtype="float16")),
+    ])
+    storage = STORAGE.build({"type": "local", "output_dir": str(tmp_path)})
+    sharding = {
+        "num_jobs": 8, "job_rank": 3, "mode": "row_window",
+        "filename_prefix": "rank3_", "offset": 12, "limit": 4, "dataset_total": 32,
+    }
+
+    asyncio.run(
+        run_embedder(
+            source=ListSource(rows),
+            engine=engine,
+            storage=storage,
+            chunk_size=2,
+            num_workers=1,
+            flush_threshold=100,
+            output_dir=str(tmp_path),
+            filename_prefix="rank3_",
+            expected_total_rows=4,
+            sharding=sharding,
+            chunking={"strategy": "recursive", "chunk_overlap": 32},
+        )
+    )
+
+    manifest = json.loads((tmp_path / "rank3__manifest.json").read_text())
+    assert manifest["sharding"] == sharding
+    assert manifest["rows_expected"] == 4
+    assert manifest["total_records"] == 4
+    assert manifest["complete"] is True
+    # Chunk boundaries define the rows, so the chunker's parameters travel with
+    # them — two runs of one strategy with different overlap are different corpora.
+    assert manifest["chunking"] == {"strategy": "recursive", "chunk_overlap": 32}
+    (spec,) = manifest["embedders"]
+    assert spec["backend"] == "fake"
+    assert spec["backend_kwargs"] == {"dim": 3, "dtype": "float16"}
+
+
+def test_manifest_marks_a_short_rank_incomplete(tmp_path):
+    """The point of `rows_expected`: a rank that produced fewer rows than its
+    window says so in its own manifest."""
+    engine = build_engine([EmbedderEntry.model_validate(dense_entry())])
+    storage = STORAGE.build({"type": "local", "output_dir": str(tmp_path)})
+
+    asyncio.run(
+        run_embedder(
+            source=ListSource([{"text": "only one", "id": 0}]),
+            engine=engine,
+            storage=storage,
+            chunk_size=2,
+            num_workers=1,
+            flush_threshold=100,
+            output_dir=str(tmp_path),
+            expected_total_rows=10,
+        )
+    )
+
+    manifest = json.loads((tmp_path / "_manifest.json").read_text())
+    assert manifest["total_records"] == 1
+    assert manifest["rows_expected"] == 10
+    assert manifest["complete"] is False
+
+
+def test_completeness_counts_source_rows_not_written_records(tmp_path):
+    """A splitting chunker writes several records per source row. `complete`
+    must compare the rank's WINDOW (source rows) against rows consumed — using
+    written records would call a rank complete once it had emitted `limit`
+    chunks, i.e. at a fraction of the rows it was actually given."""
+
+    class TripleChunker:
+        def chunk(self, text):
+            return [f"{text}-a", f"{text}-b", f"{text}-c"]
+
+    engine = build_engine([EmbedderEntry.model_validate(dense_entry())])
+    storage = STORAGE.build({"type": "local", "output_dir": str(tmp_path)})
+
+    asyncio.run(
+        run_embedder(
+            source=ListSource([{"text": f"row {i}", "id": i} for i in range(4)]),
+            engine=engine,
+            storage=storage,
+            chunker=TripleChunker(),
+            split_column="text",
+            chunk_size=2,
+            num_workers=1,
+            flush_threshold=100,
+            output_dir=str(tmp_path),
+            expected_total_rows=10,  # this rank was given 10 rows; it saw 4
+        )
+    )
+
+    manifest = json.loads((tmp_path / "_manifest.json").read_text())
+    assert manifest["total_records"] == 12  # 4 rows x 3 chunks
+    assert manifest["source_rows_seen"] == 4
+    assert manifest["rows_expected"] == 10
+    # 12 written records is more than the 10-row window, and it is still short.
+    assert manifest["complete"] is False
+
+
+def test_manifest_redacts_backend_credentials(tmp_path):
+    """`backend_kwargs` is "every unknown key in the entry", and some backends
+    take secrets that way (`openai` accepts `api_key`). The manifest is uploaded
+    next to the embeddings, so a raw key would be published to the bucket."""
+    engine = build_engine([
+        EmbedderEntry.model_validate(
+            dense_entry(api_key="sk-secret-value", hf_token="hf_secret", batch_size=8)
+        )
+    ])
+    storage = STORAGE.build({"type": "local", "output_dir": str(tmp_path)})
+
+    asyncio.run(
+        run_embedder(
+            source=ListSource([{"text": "hello", "id": 0}]),
+            engine=engine,
+            storage=storage,
+            chunk_size=2,
+            num_workers=1,
+            flush_threshold=100,
+            output_dir=str(tmp_path),
+        )
+    )
+
+    raw = (tmp_path / "_manifest.json").read_text()
+    assert "sk-secret-value" not in raw and "hf_secret" not in raw
+    (spec,) = json.loads(raw)["embedders"]
+    # The KEY survives — "this entry was configured with a credential" is real
+    # provenance; only the value is dropped.
+    assert spec["backend_kwargs"] == {
+        "api_key": "[redacted]", "hf_token": "[redacted]", "batch_size": 8,
+    }
+
+
+def test_manifest_survives_unserializable_backend_kwargs(tmp_path):
+    """PyYAML turns an unquoted 2024-01-01 into a date, which reaches
+    `backend_kwargs` verbatim. json.dumps would refuse it — at the very last
+    step of a run whose parquets are already written."""
+    import datetime as _dt
+
+    engine = build_engine([
+        EmbedderEntry.model_validate(dense_entry(cutoff=_dt.date(2024, 1, 1)))
+    ])
+    storage = STORAGE.build({"type": "local", "output_dir": str(tmp_path)})
+
+    asyncio.run(
+        run_embedder(
+            source=ListSource([{"text": "hello", "id": 0}]),
+            engine=engine,
+            storage=storage,
+            chunk_size=2,
+            num_workers=1,
+            flush_threshold=100,
+            output_dir=str(tmp_path),
+        )
+    )
+
+    assert sorted(tmp_path.glob("batch_*.parquet"))  # the real output landed
+    (spec,) = json.loads((tmp_path / "_manifest.json").read_text())["embedders"]
+    assert spec["backend_kwargs"]["cutoff"] == "2024-01-01"

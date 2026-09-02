@@ -1,124 +1,41 @@
-"""The `compute` phase: intra-worker map-reduce to a per-query top-K.
+"""The `compute` phase: score corpus slices and produce an exact per-query top-K.
 
-Each worker:
-  1. loads the query embeddings (Q) onto the GPU,
-  2. iterates its slice of corpus files (a prefetch thread overlaps IO with
-     compute), scoring Q against each file's vectors and folding the file's
-     top-K into a running per-query top-K held on the GPU,
-  3. decodes the running top-K into hit ids and writes one parquet.
+Each worker loads its queries onto the GPU, streams its assigned corpus files, and
+incrementally merges each file's results into a running top-K. I/O is prefetched
+in parallel with GPU computation, and large files can be processed in row batches
+to bound GPU memory. The final top-K is written as one Parquet file per worker.
 
-Running top-K stores `(score, encoded)` where `encoded = global_file_idx *
-MAX_ROWS_PER_FILE + row`. Keeping an int on the GPU (instead of id strings) makes
-the per-file merge a cheap `torch.topk`; ids are recomputed only for the final
-K via `make_point_id`, so the whole corpus's ids never materialize.
+The running state stores `(score, encoded_row)` rather than materializing corpus
+IDs on the GPU. `encoded_row` identifies the source file and row; final IDs are
+resolved only for the winning K entries. If `corpus.id_column` is provided, those
+IDs are read from the corpus instead.
 
-If `corpus.id_column` is set, hit ids come from that pre-existing column instead
-of `make_point_id`. Such an id isn't recomputable from (file, row), so it's read
-alongside the dense column and kept in RAM per file (the worker's slice) to resolve
-the final top-K. Large files can be scored in row-batches (`params.dense_batch_size`/
-`sparse_batch_size`) to bound the per-file score matrix `(n_queries × rows)` on the GPU.
+One invocation may evaluate multiple independent `SearchSpec`s, including dense,
+sparse, multi-vector, filtered, and unfiltered searches. Searches remain
+independent ranked lists, but redundant work is shared: each required vector type
+is decoded and transferred once per batch, and searches using the same vector
+type reuse the same GPU-resident data and score computations.
 
-If a search's `filter` is set (see `nova_bf.filters`), each file's payload columns
-are read alongside the vector column and evaluated into a keep-mask *before*
-scoring, so filtered-out rows never reach the GPU. The mask compacts `arr` but
-never renumbers rows — `orig_rows` tracks each surviving row's true file-row
-number, since both `make_point_id` and the `id_column` lookup are keyed on it.
-Mask evaluation (and, since it happens in the same reader thread right
-afterward, the union-compaction fancy-index copy — see `run_compute`'s
-`reader()`) is timed separately from the read (`filter_secs`, reported
-alongside `read_secs`/`io_wait`/`gpu_secs`) so a slow filter is distinguishable
-from slow IO in the end-of-run timing log.
+For dense search, multiple metrics share one `Q @ C^T` product and derive dot,
+cosine, and Euclidean scores from it. Sparse dot and cosine similarly share their
+underlying sparse product.
 
-`run_compute` runs every `SearchSpec` in `cfg.searches` — one or more
-independent searches (own vector_type/metric/k/filter), e.g. dense-unfiltered
-AND sparse-filtered against the same corpus in one invocation. Each corpus
-file is read and decoded ONCE per vector_type any spec needs, not once per
-spec. This is purely a sharing of REDUNDANT work, never a fusion of scores:
-each search still gets its own independent ranked list, not a blended hybrid
-ranking.
+Filters are applied before or during scoring. Uniform filters compact the corpus
+to surviving rows before GPU transfer. When several filtered searches share a
+vector type, their surviving rows are unioned into one shared batch and each
+search masks that batch back to its own subset. If any search is unfiltered, the
+whole batch is scored once and filtered searches reuse those scores.
 
-Per vector_type, EVERY search sharing that vector_type shares ONE batch grid
-(see `run_compute`'s `has_baseline` and `_process_shared_batch`): the GPU
-transfer/CSR build and each distinct metric's score matrix are computed ONCE
-per batch, and every search merges its own top-K from those same columns,
-masking them down to its own filter's surviving rows first if it has one.
-Masking a raw, per-row-independent score matrix is exact, not an
-approximation, so a filtered search's metric never needs to already be used
-by anyone else — computing one more metric on a batch that's already
-resident on the GPU is cheap, unlike a second transfer.
+Per-query filters cannot be represented by one shared row subset, so they retain
+the necessary candidate columns and mask individual `(query, row)` scores to
+`-inf` before top-K selection. Numeric and categorical per-query filters are
+evaluated GPU-natively when possible; text predicates fall back to the CPU path.
 
-Several metrics on one batch also share the underlying PRODUCT, not just the
-transfer. Every dense metric is derivable from the same Gram `Q @ Cᵀ` plus
-per-vector norms (dot is the Gram; cosine divides by ‖c‖ and ‖q‖; euclidean is
-`−sqrt(‖q‖² + ‖c‖² − 2·Gram)`), so a batch scored by 2+ distinct dense metrics
-runs ONE GEMM and derives the rest — see `DenseBatchSlice`. `SparseBatchSlice`
-does the same for its own `dot`/`cosine` pair via `_masked_raw`. Both cost one
-extra `(n_q, rows)` matrix at peak and both leave the single-metric path
-untouched.
-
-What rows make up that shared grid depends on whether any search of the
-vector_type is unfiltered:
-
-- If ANY search is unfiltered (or has an explicit-but-empty filter — see
-  `_is_unfiltered`), the shared grid is the WHOLE file, uncompacted: an
-  unfiltered search needs every row anyway, so every OTHER (filtered) search
-  of the vector_type rides along for free, masking down to its own rows
-  afterward.
-- Otherwise (every search of the vector_type has an active filter — none
-  unfiltered), the shared grid is the UNION of every DISTINCT active
-  filter's surviving rows (`_union_keep`), compacted/transferred/scored
-  ONCE, with each search then masking down further to its own filter's
-  subset of that union. A per-query filter (see `_is_per_query`) has no
-  SINGLE row-subset to offer here (different queries need different rows
-  from the same batch) — it instead contributes a cheap, safe OVER-
-  approximation ("does at least one query's own leaf admit this row" — Front
-  B, see `_row_union_from_gpu_leaves`), so it still benefits from (and
-  contributes to) compaction; its own FINE per-query masking still applies
-  afterward, via `masked_fill`, same as when it rode the whole-file grid.
-  This never does MORE row-scoring than treating each distinct filter
-  independently would — in the worst case (fully disjoint filters) it's
-  exactly the same total rows, just one transfer/launch instead of several —
-  and strictly less whenever two filters' surviving rows overlap. The
-  tradeoff: unlike treating each filter independently (which bounds each
-  one's own transfer to its own, typically smaller, surviving-row count),
-  the union's peak transfer size is bounded by `params.dense_batch_size`/
-  `sparse_batch_size` alone when left at their None default — several large,
-  mostly-disjoint filters (or one loose per-query over-approximation) can
-  produce a union nearly the size of the whole file. Set that batch size
-  explicitly if you have many such filters (see `ParamsConfig`).
-
-Either way, `_process_shared_batch` does the per-search masking: an
-unfiltered search uses the shared grid as-is; a UNIFORMLY filtered one
-narrows it to its own filter's surviving COLUMNS (a gather), with two
-searches sharing an identical filter memoizing that lookup once (keyed by
-the `Filter` object itself, frozen+hashable) rather than repeating it. A
-PER-QUERY filter (`match_from_query`/`range_from_query`/
-`match_text_from_query` — see `nova_bf.filters`) can't be expressed as a
-column gather, since different queries keep different rows from the SAME
-columns: instead every column stays, and individual `(query, row)` cells get
-invalidated to `-inf` via `masked_fill` before the per-query `torch.topk` —
-needing no changes to the id-encoding scheme, since no column is ever
-dropped. `nova_bf.filters.evaluate()`'s result is `(rows,)` for a uniform
-filter (unchanged cost/shape from before per-query filters existed) or
-`(n_queries, rows)` the instant any condition, in any of `must`/`should`/
-`must_not`, is per-query.
-
-A per-query filter's `(n_queries, rows)` `cell_mask` is built one of two
-ways, decided once per distinct filter (`_gpu_eligible`): if every leaf is a
-static condition, `match_from_query` (scalar or list/MatchAny), or
-`range_from_query`, it's evaluated GPU-natively (`_gpu_evaluate`) straight
-from small per-file corpus arrays (vocab codes or raw numeric values,
-transferred to the GPU ONCE per file, then sliced per batch — see
-`_corpus_leaf_array`/`_build_gpu_leaf_state`) and small per-query GPU state
-built ONCE at setup — no `(n_queries, rows)` array is ever materialized on
-the CPU or shipped over PCIe. A filter with a `match_text`/
-`match_text_from_query` leaf anywhere falls back to `nova_bf.filters.
-evaluate()`'s CPU/numpy path unchanged (torch has no string tensor type) —
-its `(n_queries, rows)` result is the one CPU-fallback mask still held for a
-whole file's batch loop, so it's bit-packed along the query axis
-(`np.packbits`, 8 queries/byte) right after `evaluate()` returns, cutting
-that footprint 8x; each batch slice unpacks only its own row-slice
-(`np.unpackbits`) back to one bool per query, right before use.
+The CPU-fallback mask is the one `(n_queries, file_rows)` array a run
+materializes, held for a whole corpus file's batch loop. Its query axis is that
+FILTER's own row union (`run_compute`'s `filter_rows`), not the queries file's
+height, so it does not grow when unrelated query sets are unioned into one file
+behind a `SearchSpec.rows` selector.
 """
 
 from __future__ import annotations
@@ -131,6 +48,7 @@ import time
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import cached_property
 from queue import Empty, Queue
 from threading import Semaphore, Thread
@@ -139,18 +57,40 @@ import numpy as np
 
 from tqdm import tqdm
 
+from nova_bf import manifest as run_manifest
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import _condition_mask, _match_any_membership, _static_first, evaluate
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
 from nova_bf.ids import make_point_id
 from nova_bf.io import ParquetFile, Store, dense_to_2d, multivector_to_ragged, sparse_to_coo_parts
-from nova_bf.results import build_result_table, partial_dir, result_name, warn_if_short
+from nova_bf.results import (
+    build_result_table,
+    partial_dir,
+    provenance,
+    result_name,
+    vector_dtype,
+    warn_if_short,
+)
+from nova_bf.tiebreak import (
+    MAX_ROWS_PER_WORKER,
+    SENTINEL_KEY,
+    build_ordinals,
+    id_order_scalar,
+    id_order_array,
+    live_rows,
+    pack,
+    pack_topk,
+    sentinel_key,
+    unpack_score,
+)
 
 logger = logging.getLogger(__name__)
 
 PREFETCH_QUEUE_SIZE = 4
-# Per-file id encoding: global_file_idx * MAX_ROWS_PER_FILE + row. Collision-free
-# and reversible as long as no single file has more rows than this.
+# Limit how many top-K entries are decoded/sorted at once to bound peak GPU
+# memory during final result decoding (~384 MiB of temporary storage).
+DECODE_CHUNK_SLOTS = 1 << 24
+# Maximum rows per corpus file; used to keep encoded row IDs collision-free.
 MAX_ROWS_PER_FILE = 100_000_000
 
 # Fraction of FREE CUDA memory a multivector batch's whole token matrix may
@@ -247,8 +187,11 @@ def _to_query_array(values: list) -> np.ndarray:
 
 
 def load_queries(
-    store: Store, qcfg, filter_cols: list[str] = (),
+    store: Store, qcfg, filter_cols: list[str] = (), rows: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[str], dict[str, list], dict[str, np.ndarray]]:
+    """`rows` (sorted file-row indices, see `SearchSpec.rows`) restricts the
+    returned MATRIX to those queries. ids/payload/filter_vals stay FULL length
+    either way, and per-query filter masks are built over the full query axis"""
     cols = [qcfg.dense_column]
     if qcfg.id_column:
         cols.append(qcfg.id_column)
@@ -279,6 +222,8 @@ def load_queries(
         for c in filter_cols:
             filter_vals[c] += conv[c].to_pylist()
     Q = np.concatenate(embs, axis=0) if embs else np.zeros((0, 0), np.float32)
+    if rows is not None:
+        Q = Q[rows]
     return Q, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
 
 
@@ -295,10 +240,83 @@ def _build_query_vocab(indices: np.ndarray) -> np.ndarray:
     return np.unique(indices)
 
 
-def _vocab_lookup(vocab: np.ndarray, ids: np.ndarray) -> np.ndarray:
-    """`ids` -> compact column position in `vocab`, or -1 if not present."""
+# Maximum size of `_vocab_lookup`'s id-indexed LUT. Its size depends on the
+# largest id, not vocabulary length, so sparse/hashed id spaces can be huge.
+# Fall back to binary search beyond this budget.
+_VOCAB_LUT_MAX_BYTES = 256 << 20
+
+
+def _lut_vocab_ok(vocab: np.ndarray) -> bool:
+    """The vocabulary half of `_lut_applies` — depends only on `vocab`, so it
+    is what `_build_vocab_lut` can decide once for a whole run."""
+    if not np.issubdtype(vocab.dtype, np.integer):
+        return False
+    if int(vocab[0]) < 0:  # sorted ascending, so this is the smallest
+        return False
+    return (int(vocab[-1]) + 2) * 8 <= _VOCAB_LUT_MAX_BYTES
+
+
+def _lut_ids_ok(ids: np.ndarray) -> bool:
+    """The ids half of `_lut_applies` — must be re-checked per call, since a
+    prebuilt LUT says nothing about the ids it will be indexed with."""
+    if not np.issubdtype(ids.dtype, np.integer):
+        return False
+    return (np.issubdtype(ids.dtype, np.unsignedinteger)
+            or len(ids) == 0
+            or int(ids.min()) >= 0)
+
+
+def _lut_applies(vocab: np.ndarray, ids: np.ndarray) -> bool:
+    """Whether an id-indexed LUT is valid and within budget.
+
+    Requires integer, non-negative ids and a bounded maximum vocabulary id.
+    """
+    return _lut_vocab_ok(vocab) and _lut_ids_ok(ids)
+
+
+def _build_vocab_lut(vocab: np.ndarray) -> np.ndarray | None:
+    """Build the id-indexed LUT for `vocab`, or return `None` when unsupported.
+
+    The LUT is run-wide and reused by `_vocab_lookup`; rebuilding it per corpus
+    file can otherwise add substantial allocation and initialization overhead.
+    """
+    if len(vocab) == 0 or not _lut_vocab_ok(vocab):
+        return None
+    top = int(vocab[-1])
+    # Final slot maps ids above the vocabulary to -1.
+    lut = np.full(top + 2, -1, dtype=np.int64)
+    lut[vocab] = np.arange(len(vocab), dtype=np.int64)
+    return lut
+
+
+def _vocab_lookup(vocab: np.ndarray, ids: np.ndarray, lut=None) -> np.ndarray:
+    """Map `ids` to positions in sorted `vocab`, or -1 if absent.
+
+    Uses a direct lookup table for suitable non-negative integer ids and
+    `searchsorted` otherwise. The LUT path is much faster for large sparse
+    remaps; the search path also supports strings and other id types.
+
+    `lut` is an optional prebuilt table from `_build_vocab_lut(vocab)`. Passing
+    one skips the per-call build; omitting it keeps the original behaviour.
+    """
     if len(vocab) == 0:
         return np.full(len(ids), -1, dtype=np.int64)
+    if lut is not None and len(lut) != int(vocab[-1]) + 2:
+        # A LUT from a different vocabulary would silently remap every token to
+        # the wrong column, so this is a hard error rather than a fallback.
+        raise ValueError(
+            f"vocab LUT has {len(lut)} slots but this vocabulary needs "
+            f"{int(vocab[-1]) + 2} — it was built for a different vocab"
+        )
+    if _lut_ids_ok(ids) and (lut is not None or _lut_vocab_ok(vocab)):
+        if lut is None:
+            lut = _build_vocab_lut(vocab)
+        cap = len(lut) - 1              # the extra slot, which maps to -1
+        if cap <= np.iinfo(ids.dtype).max:
+            # Keep the clip in `ids`' dtype to avoid a wider temporary.
+            ids = np.minimum(ids, ids.dtype.type(cap))
+        return lut[ids]
+
     pos = np.minimum(np.searchsorted(vocab, ids), len(vocab) - 1)
     return np.where(vocab[pos] == ids, pos, -1).astype(np.int64)
 
@@ -322,8 +340,30 @@ def _coalesce_by_row_col(
 
     `np.lexsort`'s LAST key is primary: `(col_ids, row_ids)` sorts by row
     first, then col within each row — the reverse of the argument order.
+
+    Both properties are usually already TRUE on arrival — a sparse embedder
+    that emits each row's token ids ascending and deduped (which the gte
+    scheme does, and `_vocab_lookup` preserves, being monotone) has nothing
+    here to fix — so the arrival case is tested for directly. It has to be
+    tested for rather than assumed: the sort and the sum are what make a
+    hash-colliding embedder correct, and this is the only place that happens.
+
+    When the fast path is taken the INPUT ARRAYS THEMSELVES are returned, not
+    copies (no caller mutates the result; `_remap_sparse_file` and
+    `_sparse_file_norms` both only read it). That is also bit-identical to
+    what the slow path would have returned, not merely equal: with no
+    duplicates every group receives exactly one value, and float32 -> float64
+    -> float32 round-trips exactly, so `np.add.at`'s float64 accumulator gives
+    back the input value unchanged.
     """
     if len(row_ids) == 0:
+        return row_ids, col_ids, values
+    # Strictly increasing in (row, col) lexicographic order <=> sorted by row
+    # then col AND no (row, col) pair repeated. One test, both invariants.
+    if np.all(
+        (row_ids[1:] > row_ids[:-1])
+        | ((row_ids[1:] == row_ids[:-1]) & (col_ids[1:] > col_ids[:-1]))
+    ):
         return row_ids, col_ids, values
     perm = np.lexsort((col_ids, row_ids))
     row_ids, col_ids, values = row_ids[perm], col_ids[perm], values[perm]
@@ -357,7 +397,7 @@ def _sparse_rows_to_dense(row_offsets: np.ndarray, indices: np.ndarray, values: 
 
 
 def load_queries_sparse(
-    store: Store, qcfg, filter_cols: list[str] = (),
+    store: Store, qcfg, filter_cols: list[str] = (), rows: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, list], dict[str, np.ndarray]]:
     """Sparse analog of `load_queries`: reads the struct<indices,values> column
     from every query file, then densifies once over the query set's own
@@ -401,6 +441,15 @@ def load_queries_sparse(
     n_q = len(counts)
     row_offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
 
+    if rows is not None:
+        # Compact to the subset BEFORE the vocab build and the densify.
+        # Narrowing the vocab (only the subset's own token ids) is exact:
+        # a token no surviving query uses can never contribute to any score.
+        keep = np.zeros(n_q, dtype=bool)
+        keep[rows] = True
+        row_offsets, indices, values, _, _ = _compact_sparse_rows(
+            row_offsets, indices, values, None, keep
+        )
     vocab = _build_query_vocab(indices)
     Q = _sparse_rows_to_dense(row_offsets, indices, values, vocab)
     return Q, vocab, ids, payload, {c: _to_query_array(v) for c, v in filter_vals.items()}
@@ -522,6 +571,7 @@ def _compact_multivector_rows(
 
 def _remap_sparse_file(
     row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray, vocab: np.ndarray,
+    lut=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Remap one whole file's raw CSR parts into the query vocabulary:
     out-of-vocab entries dropped (see `_build_query_vocab`), duplicate
@@ -536,7 +586,7 @@ def _remap_sparse_file(
     the raw pre-truncation values (see its docstring)."""
     n_rows = len(row_offsets) - 1
     row_ids = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(row_offsets))
-    idx = _vocab_lookup(vocab, indices)
+    idx = _vocab_lookup(vocab, indices, lut)
     keep_nnz = idx >= 0
     row_ids, idx, val = row_ids[keep_nnz], idx[keep_nnz], values[keep_nnz]
     row_ids, idx, val = _coalesce_by_row_col(row_ids, idx, val)
@@ -584,28 +634,40 @@ def _sparse_batch_to_csr(
     return Cb.to(device, non_blocking=True)
 
 
-def _sparse_scores(Q, Cb):
-    """`Cb` (RAW, unnormalized sparse CSR, batch × vocab) against dense `Q`
-    (n_q × vocab) via the documented, stable `sparse_csr @ dense -> dense` path
-    (cuSPARSE SpMM) — deliberately not sparse-sparse matmul, which torch has no
-    stable binding for. Returns the raw dot-product score matrix; the caller
-    applies any metric-specific transform (e.g. dividing by each row's L2 norm
-    for cosine) afterward — see `SparseBatchSlice.score`, which shares one
-    `Cb` across every search scoring it regardless of metric, so this
-    function itself must stay metric-agnostic."""
+def _sparse_scores(Q, Cb, q_cache=None):
+    """Raw `(n_q, n_rows)` sparse dot-product scores for one corpus slice.
+
+    Uses `Q_csr @ dense(Cb).T` when the dense corpus slice fits in memory. This
+    is much faster than `Cb @ Q.T`, whose dense query operand is a poorly
+    strided transposed view. Falls back to the contiguous-transpose path when
+    densifying `Cb` would exceed `_SPARSE_SWAP_MAX_DENSE_BYTES`.
+
+    Returns raw scores; metric-specific transforms are applied by the caller.
+    """
     import torch
 
-    return torch.matmul(Cb, Q.T).T
+    n_rows, vocab = Cb.shape
+    cache = q_cache or _SparseQueryCache()
+    if _dense_corpus_rows_per_chunk(Cb, Q.element_size()) >= n_rows:
+        # Produces the `(n_q, n_rows)` layout downstream consumers expect.
+        return torch.matmul(cache.values(Q), _dense_slice_t(Cb, Cb.values()))
+    # Built per slice, not cached. This path is used only when the dense corpus
+    # operand is already too large, so caching `(vocab, n_q)` would keep another
+    # large float32 copy resident. The copy cost is amortized by the matmul.
+    return torch.matmul(Cb, Q.t().contiguous()).T
 
 
-def _scores(Q, C, metric: str, q_norms=None):
+def _scores(Q, C, metric: str, q_norms=None, scale_in_packer: bool = False):
     import torch.nn.functional as F
 
     if metric == "cosine":
-        # C is normalized per file; Q stays RAW (shared with dot searches —
-        # see run_compute's `q_norms_by_vt`), so divide each query's row of
-        # the score matrix by its norm here instead.
-        return (Q @ F.normalize(C, dim=1).T).div_(q_norms[:, None])
+        # Keep queries raw for reuse with dot-product searches; normalize scores instead.
+        raw = Q @ F.normalize(C, dim=1).T
+        if scale_in_packer:
+            # The packer already scaled the scores, so no need to
+            # scale here
+            return raw
+        return raw.div_(q_norms[:, None])
     if metric == "dot":
         return Q @ C.T
     # euclidean: negate distance so larger = nearer (topk picks nearest).
@@ -636,8 +698,8 @@ class DenseCorpusBatch:
     `SparseCorpusBatch` so `run_compute`'s per-file loop never branches on
     vector_type.
 
-    `share_gram` is set by `_process_batch_group` (from `metric_share_count`)
-    once it knows how many DISTINCT metrics will score this batch, and is
+    `share_gram` is set by `_process_batch_group` once it knows how many
+    DISTINCT metrics will score this batch, and is
     handed to every slice `transfer` produces — carried on the batch rather
     than passed as a `transfer` argument so the `transfer(r0, r1, device)`
     surface stays identical across vector_types. See `DenseBatchSlice`."""
@@ -673,8 +735,8 @@ class DenseCorpusBatch:
 class DenseBatchSlice:
     """One on-device slice of a dense corpus batch.
 
-    When two or more DISTINCT metrics score this slice (`share_gram`, set from
-    `metric_share_count` — see `_process_batch_group`), all of them are derived
+    When two or more DISTINCT metrics score this slice (`share_gram` — see
+    `_process_batch_group`), all of them are derived
     from ONE raw Gram matrix `Q @ Cbᵀ` instead of each running its own GEMM:
 
         dot        the Gram itself, returned WITHOUT a copy
@@ -704,9 +766,9 @@ class DenseBatchSlice:
     def n_rows(self) -> int:
         return self.Cb.shape[0]
 
-    def score(self, Q, metric: str, q_norms=None):
+    def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
         if not self.share_gram:
-            return _scores(Q, self.Cb, metric, q_norms)
+            return _scores(Q, self.Cb, metric, q_norms, scale_in_packer=scale_in_packer)
         if self._raw is None:
             self._raw = Q @ self.Cb.T
         raw = self._raw
@@ -721,9 +783,14 @@ class DenseBatchSlice:
                 # clamp matches F.normalize's eps, so a zero corpus row scores
                 # 0 rather than NaN — identical convention to `_scores`.
                 self._c_norms = self.Cb.norm(dim=1).clamp_min(1e-12)
-            # First div allocates (raw must survive for the other metrics);
-            # the second is in place on that fresh copy.
-            return raw.div(self._c_norms[None, :]).div_(q_norms[:, None])
+            # `raw` is shared with dot/euclidean scoring, so normalize out of place first,
+            # then in place on the resulting copy.
+            #
+            # Cosine divides by corpus norms per column and query norms per row. The
+            # column-wise divide affects candidate ordering and must happen before
+            # selection; the row-wise divide can be fused into the packer.
+            out = raw.div(self._c_norms[None, :])
+            return out if scale_in_packer else out.div_(q_norms[:, None])
         # euclidean: negate the distance so larger = nearer (topk picks
         # nearest), matching `_scores`. Accumulated into ONE new tensor
         # (`raw.mul(-2)` then two broadcast adds in place) rather than the
@@ -759,7 +826,7 @@ class SparseCorpusBatch:
 
     def __init__(
         self, row_offsets, indices, values, norms, vocab: np.ndarray, need_row_norms: bool,
-        zero_gate_ok: bool = False, q_indicator=None,
+        zero_gate_ok: bool = False, q_cache=None,
     ):
         self.row_offsets = row_offsets
         self.indices = indices
@@ -768,11 +835,11 @@ class SparseCorpusBatch:
         self.vocab = vocab
         self.need_row_norms = need_row_norms
         # Whether this file's slices may use the cheap `raw == 0` no-overlap
-        # gate (see `_zero_gate_file_ok`), and the run-wide `_QueryIndicator`
+        # gate (see `_zero_gate_file_ok`), and the run-wide `_SparseQueryCache`
         # for the signed fallback — both fixed per file / per run, carried
         # through `.compact()`/`_concat_sparse_batches` like `vocab`.
         self.zero_gate_ok = zero_gate_ok
-        self.q_indicator = q_indicator
+        self.q_cache = q_cache
 
     @property
     def n_rows(self) -> int:
@@ -792,7 +859,7 @@ class SparseCorpusBatch:
         return (
             SparseCorpusBatch(
                 row_offsets, indices, values, norms, self.vocab, self.need_row_norms,
-                self.zero_gate_ok, self.q_indicator,
+                self.zero_gate_ok, self.q_cache,
             ),
             orig_rows,
         )
@@ -805,7 +872,7 @@ class SparseCorpusBatch:
             torch.from_numpy(self.norms[r0:r1]).to(device, non_blocking=True)
             if self.need_row_norms else None
         )
-        return SparseBatchSlice(Cb, row_norms, self.zero_gate_ok, self.q_indicator)
+        return SparseBatchSlice(Cb, row_norms, self.zero_gate_ok, self.q_cache)
 
 
 # The zero-score no-overlap gate (`raw == 0` in `SparseBatchSlice.score`) is
@@ -814,6 +881,16 @@ class SparseCorpusBatch:
 # miss): require min_positive(Q) * min_positive(C_file) above this. Real
 # embedder weights (~1e-4..10) clear it by >20 orders of magnitude.
 _ZERO_GATE_MIN_PRODUCT = 1e-30
+
+# Max size of the dense `(vocab, slice_rows)` corpus operand used by swapped 
+# sparse scoring. Larger slices fall back to the contiguous-transpose path to 
+# avoid excessive temporary memory.
+_SPARSE_SWAP_MAX_DENSE_BYTES = 512 << 20
+
+# Row-block height for `_SparseQueryCache._csr`, as bytes of the transient
+# `(rows, vocab)` bool it materializes per block. 64 MiB keeps the spike far
+# below the dense `Q` it is derived from at any realistic vocabulary.
+_CSR_BLOCK_BYTES = 64 << 20
 
 
 def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> bool:
@@ -840,31 +917,107 @@ def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> 
     return q_min_pos * vmin > _ZERO_GATE_MIN_PRODUCT
 
 
-class _QueryIndicator:
-    """Run-wide, lazily-built sparse-CSR indicator of Q's nonzero pattern
-    (ones), for the SIGNED-data structural no-overlap gate. Built at most
-    once per run, on the first slice whose file fails `_zero_gate_file_ok`
-    (never for all-positive embedders like ReLU'd mGTE); shared by every
-    slice thereafter. ~nnz(Q) entries (~120 MB at 100k × ~100 nnz queries) —
-    replaces the old per-slice re-materialization of a dense `(Q != 0)`
-    float copy (~7.2 GB of writes per slice at fineweb scale)."""
+def _dense_corpus_rows_per_chunk(Cb, element_size: int) -> int:
+    """How many corpus rows may be densified as `(vocab, rows)` at once.
+
+    ONE budget, shared by `_sparse_scores` and `SparseBatchSlice.
+    _structural_no_overlap`, so the two can never disagree — scoring refusing
+    the allocation while the overlap gate makes it anyway was a real hazard on
+    signed data.
+    """
+    vocab = Cb.shape[1]
+    return max(1, _SPARSE_SWAP_MAX_DENSE_BYTES // max(1, vocab * element_size))
+
+
+def _dense_slice_t(Cb, values):
+    """Densify a CSR corpus slice as `(vocab, n_rows)`.
+
+    `values` controls what is scattered at each stored entry: use `Cb.values()`
+    for scoring or ones for structural overlap checks. Direct assignment is safe
+    because `Cb` is coalesced, so each `(row, col)` pair is unique.
+    """
+    import torch
+
+    crow, col = Cb.crow_indices(), Cb.col_indices()
+    row_ids = torch.repeat_interleave(
+        torch.arange(Cb.shape[0], device=col.device), crow.diff()
+    )
+    out = torch.zeros((Cb.shape[1], Cb.shape[0]), dtype=values.dtype, device=values.device)
+    out[col, row_ids] = values
+    return out
+
+
+class _SparseQueryCache:
+    """Lazily cached representations of the run-wide sparse query matrix.
+
+    Assumes every sparse spec shares the same `Q`; `rows` subsets are applied
+    after scoring. If specs can ever receive different query tensors, this cache
+    must be keyed by `Q`.
+
+    Caches:
+      values:    CSR query values for swapped sparse scoring.
+      indicator: CSR query structure with ones for overlap checks.
+
+    Both are SPARSE — they cost nnz, not `n_q * vocab`. Nothing dense-shaped
+    belongs here: a cached `(vocab, n_q)` float32 doubles the biggest resident
+    tensor on the GPU, which is what OOM'd the dot+cosine fineweb run (see the
+    note on `Q_gpu_by_vt` in `run_compute`). The fallback path's contiguous
+    `Q.T` used to live here and was removed for exactly that reason — see
+    `_sparse_scores`.
+    """
 
     def __init__(self):
-        self.csr = None
+        self._values = None
+        self._indicator = None
 
-    def get(self, Q):
-        if self.csr is None:
+    def _csr(self, Q, vals_from_pattern):
+        """Build CSR from `Q`'s nonzero pattern in row blocks.
+
+        Blocking avoids materializing the full `(n_q, vocab)` boolean mask, bounding
+        temporary memory by block height while producing identical CSR output.
+        """
+        import torch
+
+        n_q, vocab = Q.shape
+        rows_per = max(1, _CSR_BLOCK_BYTES // max(1, vocab))
+        crow = torch.zeros(n_q + 1, dtype=torch.int64, device=Q.device)
+        cols, vals = [], []
+        base = 0
+        for r0 in range(0, n_q, rows_per):
+            r1 = min(r0 + rows_per, n_q)
+            blk = Q[r0:r1]
+            nz = blk != 0
+            # Blocks preserve row-major order, so concatenation remains valid CSR order.
+            counts = nz.sum(1)
+            torch.cumsum(counts, 0, out=crow[r0 + 1 : r1 + 1])
+            crow[r0 + 1 : r1 + 1] += base
+            base = int(crow[r1])
+            r, c = nz.nonzero(as_tuple=True)
+            cols.append(c)
+            vals.append(vals_from_pattern(blk, r, c))
+            del nz, counts, r, c, blk
+        return torch.sparse_csr_tensor(
+            crow,
+            torch.cat(cols) if cols else torch.zeros(0, dtype=torch.int64,
+                                                     device=Q.device),
+            torch.cat(vals) if vals else torch.zeros(0, dtype=Q.dtype,
+                                                     device=Q.device),
+            size=(n_q, vocab), check_invariants=False,
+        )
+
+    def values(self, Q):
+        if self._values is None:
+            self._values = self._csr(Q, lambda Q, r, c: Q[r, c])
+        return self._values
+
+    def indicator(self, Q):
+        if self._indicator is None:
             import torch
 
-            nz = Q != 0  # (n_q, vocab) bool — one-time transient
-            crow = torch.zeros(Q.shape[0] + 1, dtype=torch.int64, device=Q.device)
-            torch.cumsum(nz.sum(1), 0, out=crow[1:])
-            cols = nz.nonzero(as_tuple=True)[1]  # row-major order == valid CSR order
-            self.csr = torch.sparse_csr_tensor(
-                crow, cols, torch.ones(cols.numel(), dtype=Q.dtype, device=Q.device),
-                size=tuple(Q.shape), check_invariants=False,
+            self._indicator = self._csr(
+                Q, lambda Q, r, c: torch.ones(c.numel(), dtype=Q.dtype, device=Q.device)
             )
-        return self.csr
+        return self._indicator
 
 
 @dataclass
@@ -892,7 +1045,7 @@ class SparseBatchSlice:
       impossible, so `raw == 0` IS the structural gate — free, no extra
       matmul, underflow fenced by `_ZERO_GATE_MIN_PRODUCT`.
     - Signed data: an indicator spmm — the run-wide query-pattern CSR
-      (`_QueryIndicator`, built once) against this slice's densified
+      (`_SparseQueryCache.indicator`, built once) against this slice's densified
       indicator, counting shared dims exactly as before.
 
     The scoring spmm itself runs ONCE per slice regardless of how many
@@ -909,7 +1062,7 @@ class SparseBatchSlice:
     Cb: object  # torch.Tensor, sparse CSR (n_rows, vocab)
     row_norms: object  # torch.Tensor | None
     zero_gate_ok: bool = False  # may `raw == 0` stand in for the structural gate?
-    q_indicator: object = None  # run-wide _QueryIndicator (signed fallback); lazy local if None
+    q_cache: object = None  # run-wide _SparseQueryCache; lazy local if None
     _masked_raw: object = None  # lazy dot-scale masked (n_q, n_rows) — see docstring
 
     @property
@@ -924,18 +1077,35 @@ class SparseBatchSlice:
         re-materialization of the multi-GB query side."""
         import torch
 
-        crow, col = self.Cb.crow_indices(), self.Cb.col_indices()
-        row_ids = torch.repeat_interleave(
-            torch.arange(self.n_rows, device=col.device), crow.diff()
-        )
-        c_ind_t = torch.zeros((self.Cb.shape[1], self.n_rows), dtype=Q.dtype, device=Q.device)
-        c_ind_t[col, row_ids] = 1.0  # Cb is coalesced: (col, row) pairs are unique
-        q_ind = (self.q_indicator or _QueryIndicator()).get(Q)
-        return torch.matmul(q_ind, c_ind_t) == 0
+        q_ind = (self.q_cache or _SparseQueryCache()).indicator(Q)
+        n_rows, vocab = self.Cb.shape
+        per = _dense_corpus_rows_per_chunk(self.Cb, Q.element_size())
+        if per >= n_rows:
+            # ones, not values: a stored 0.0 is still a structural overlap
+            ones = torch.ones(self.Cb.values().numel(), dtype=Q.dtype,
+                              device=Q.device)
+            return torch.matmul(q_ind, _dense_slice_t(self.Cb, ones)) == 0
 
-    def score(self, Q, metric: str, q_norms=None):
+        # Too wide for one dense indicator. Chunk the CORPUS rows rather than
+        # switching to a query-side dense operand. Chunking keeps
+        # the transient at the budget no matter how wide the slice is.
+        crow, col = self.Cb.crow_indices(), self.Cb.col_indices()
+        parts = []
+        for r0 in range(0, n_rows, per):
+            r1 = min(r0 + per, n_rows)
+            lo, hi = int(crow[r0]), int(crow[r1])
+            sub = torch.sparse_csr_tensor(
+                (crow[r0 : r1 + 1] - crow[r0]).contiguous(),
+                col[lo:hi],
+                torch.ones(hi - lo, dtype=Q.dtype, device=Q.device),
+                size=(r1 - r0, vocab), check_invariants=False,
+            )
+            parts.append(torch.matmul(q_ind, _dense_slice_t(sub, sub.values())) == 0)
+        return torch.cat(parts, dim=1)
+
+    def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
         if self._masked_raw is None:
-            raw = _sparse_scores(Q, self.Cb)
+            raw = _sparse_scores(Q, self.Cb, self.q_cache)
             no_overlap = (raw == 0) if self.zero_gate_ok else self._structural_no_overlap(Q)
             self._masked_raw = raw.masked_fill_(no_overlap, float("-inf"))
         if metric == "dot":
@@ -979,7 +1149,7 @@ def _concat_sparse_batches(batches: list[SparseCorpusBatch]) -> SparseCorpusBatc
         row_offsets, indices, values, norms, batches[0].vocab, batches[0].need_row_norms,
         # A coalesced group may mix files: the cheap gate needs EVERY part
         # to qualify; the indicator holder is run-wide, any part's copy works.
-        all(b.zero_gate_ok for b in batches), batches[0].q_indicator,
+        all(b.zero_gate_ok for b in batches), batches[0].q_cache,
     )
 
 
@@ -1127,7 +1297,8 @@ class MultiVectorBatchSlice:
         self.flat.record_stream(stream)
         self.doc_offsets.record_stream(stream)
 
-    def score(self, Q: "MultiVectorQuery", metric: str, q_norms=None):
+    def score(self, Q: "MultiVectorQuery", metric: str, q_norms=None,
+              scale_in_packer: bool = False):
         # `q_norms` is unused: it's the per-query cosine scalar the dense/sparse
         # slices take, but multivector cosine normalizes each TOKEN (not a
         # per-query rescale), so there's no scalar to apply. The parameter stays
@@ -1284,42 +1455,114 @@ def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "Mul
     return MultiVectorCorpusBatch(doc_offsets, flat)
 
 
-def _merge_topk(top_scores, top_enc, parts: list[tuple], k: int):
-    """Fold pending per-slice candidate columns into a spec's running
-    `(top_scores, top_enc)` top-k state with ONE topk, amortized.
+def _merge_topk(top_key, top_enc, parts: list[tuple], k: int, thr=None):
+    """Merge pending candidates into the running (top_key, top_enc) top-k state.
 
-    `parts` is a list of `(scores, encoded)` pairs accumulated by
-    `_process_batch_group` across one or more slices, in slice (i.e. corpus)
-    order. Each `scores` is `(n_q, cols)` with `cols <= k` (any wider slice
-    was pre-topk'd down to `k` at append time — see `process_slice`); its
-    `encoded` is either the matching `(n_q, cols)` id tensor (a pre-topk'd
-    part) or the raw 1-D `(cols,)` fully-encoded
-    `global_file_idx * MAX_ROWS_PER_FILE + row` column ids, broadcast here.
-    Re-top-k'ing once per ~k accumulated columns instead of once per slice
-    is what makes the token-budget regime cheap: with ~65-doc slices and
-    k=1000, this cuts the number of `(n_q, ~2k)` radix-selects ~15x while
-    keeping peak transient memory the same order as the old per-slice merge
-    (the cat is bounded by k + ~2k columns). Candidate order inside the cat
-    is exactly arrival (corpus) order, so determinism for a fixed config is
-    unchanged; which of several EXACTLY tied candidates survives can differ
-    from the old one-merge-per-slice fold (both are deterministic)."""
+    parts contains (keys, encoded, live) triples accumulated in corpus order.
+    Keys are packed (score, ordinal) int64 values, providing score order and
+    deterministic tie-breaking.
+
+    With thr, live masks prune rows that cannot improve the current state.
+    Dead rows that may still be read are replaced with SENTINEL_KEY; stale masks
+    are safe because the threshold only increases. thr is updated in place.
+
+    Pending parts are folded with the current state using top-k over packed keys,
+    making results independent of slice boundaries and flush timing. With
+    thr=None, pruning is disabled.
+    """
     import torch
 
-    # Each intermediate is del'd as soon as the next line no longer needs it:
-    # at n_q=100k / k=1000 they are 0.4-1.6 GiB EACH, and Python locals would
-    # otherwise keep all of them alive until return.
-    merged_s = torch.cat([top_scores] + [p for p, _ in parts], dim=1)
+    from nova_bf import merge_triton
+
+    live_any = None
+    if thr is None:
+        # Unpruned flushes cannot contain parts with dead/uninitialized rows.
+        # A real raise, not `assert`: `python -O` drops asserts, and what this
+        # guards is silently wrong ground truth rather than a crash.
+        if any(l is not None for _, _, l in parts):
+            raise RuntimeError(
+                "pruned parts reached an unpruned flush — dead rows would be read"
+            )
+    else:
+        # Fold a row if any part marks it live; no mask means all rows are live.
+        live_any = None
+        for p, _, l in parts:
+            if l is None:
+                live_any = torch.ones(p.shape[0], dtype=torch.uint8, device=p.device)
+                break
+        if live_any is None:
+            live_any = parts[0][2]
+            for _, _, l in parts[1:]:
+                live_any = live_any | l
+
+    # Check whether the Triton fold is viable before preparing its inputs.
+    #  This is especially important for large query counts, where the temporary
+    # copies can be substantial.
+    pending_width = sum(int(p.shape[1]) for p, _, _ in parts)
+    if merge_triton.enabled(top_key) and k + pending_width <= merge_triton.MAX_BLOCK:
+        # Multiple parts only occur for narrow slices; combine them before folding
+        # with the full running state.
+        if len(parts) > 1:
+            if thr is not None:
+                # If another part keeps a row live, neutralize dead rows here so
+                # the fold never reads uninitialized keys.
+                for p, _, l in parts:
+                    if l is not None:
+                        p.masked_fill_(
+                            ((live_any != 0) & (l == 0)).unsqueeze(1), SENTINEL_KEY
+                        )
+            pk = torch.cat([p for p, _, _ in parts], dim=1)
+            pe = torch.cat(
+                [e if e.ndim == 2 else e.unsqueeze(0).expand(p.shape[0], -1) for p, e, _ in parts],
+                dim=1,
+            )
+        else:
+            pk, pe = parts[0][0], parts[0][1]
+        # The Triton kernel requires contiguous inputs. Sparse scoring can produce
+        # transposed/non-contiguous tensors, so materialize them here rather than
+        # forcing the more expensive portable merge.
+        if not pk.is_contiguous():
+            pk = pk.contiguous()
+        if not pe.is_contiguous():
+            pe = pe.contiguous()
+        if merge_triton.available(top_key, top_enc, pk, pe, k, live_any, thr):
+            try:
+                return merge_triton.fold(top_key, top_enc, pk, pe, k, live_any, thr)
+            except torch.cuda.OutOfMemoryError:
+                # OOM does not indicate an unsupported kernel configuration, and
+                # the portable path requires even more temporary memory. Preserve
+                # the original error rather than permanently disabling Triton.
+                raise
+            except Exception as exc:
+                merge_triton.disable(exc)
+
+        # Reuse the combined pending inputs if Triton falls back to the portable path.
+        # Portable top-k reads every row, so neutralize rows dead in all parts too.
+        if thr is not None:
+            pk.masked_fill_((live_any == 0).unsqueeze(1), SENTINEL_KEY)
+        parts = [(pk, pe, live_any)]
+    elif thr is not None:
+        # Portable top-k reads every row; neutralize dead rows first.
+        for p, _, l in parts:
+            if l is not None:
+                p.masked_fill_((l == 0).unsqueeze(1), SENTINEL_KEY)
+
+    # Each intermediate is del'd as soon as the next line no longer needs it
+    merged_k = torch.cat([top_key] + [p for p, _, _ in parts], dim=1)
     merged_e = torch.cat(
         [top_enc]
         + [
             e if e.ndim == 2 else e.unsqueeze(0).expand(p.shape[0], -1)
-            for p, e in parts
+            for p, e, _ in parts
         ],
         dim=1,
     )
-    new_top_scores, idx = torch.topk(merged_s, k=k, dim=1)
-    del merged_s
-    return new_top_scores, merged_e.gather(1, idx)
+    new_top_key, idx = torch.topk(merged_k, k=k, dim=1, sorted=False)
+    del merged_k
+    if thr is not None:
+        # Match the kernel path by keeping `thr` equal to the current state min.
+        thr.copy_(new_top_key.min(dim=1).values)
+    return new_top_key, merged_e.gather(1, idx)
 
 
 def _sample_mean_doc_tokens(store: Store, mine: list, column: str) -> float:
@@ -1390,7 +1633,11 @@ def _pack_query_axis(mask: np.ndarray) -> np.ndarray:
     still held on the CPU for a whole file's batch loop, 8x. Rows aren't the
     packed axis, so slicing by `true_rows` (`keeps[f][:, true_rows]`) stays a
     plain column slice — no unpacking needed just to select rows. Inverse:
-    `_unpack_query_axis`."""
+    `_unpack_query_axis` (and `_unpack_query_axis_device`, which is the one
+    the run actually calls).
+
+    `n_queries` here is that FILTER's query-row union, not the queries file's
+    (see `run_compute`'s `filter_rows`)."""
     return np.packbits(mask, axis=0)
 
 
@@ -1402,30 +1649,81 @@ def _unpack_query_axis(packed: np.ndarray, n_queries: int) -> np.ndarray:
     up to 7 extra all-`False` phantom queries, mismatching every real
     per-query tensor it's later combined with. `unpackbits` itself returns
     `uint8` 0/1, not `bool` — cast explicitly, since `~` on a `uint8` tensor
-    flips all 8 bits (`0 -> 255`) rather than negating logically."""
+    flips all 8 bits (`0 -> 255`) rather than negating logically.
+
+    No longer on the run's hot path — `select` expands on the compute device
+    instead (`_unpack_query_axis_device`). This stays as the definition of
+    what that expansion has to produce, and as the reference the equivalence
+    test compares against."""
     return np.unpackbits(packed, axis=0, count=n_queries).astype(bool)
 
 
-def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | None]) -> np.ndarray:
-    """OR-reduce of every DISTINCT active filter's keep-mask in `filters` —
-    the shared row-set for a vector_type where no search is unfiltered (see
-    `run_compute`). Never called with `None` in `filters` (that's the
-    `has_baseline` case, handled by leaving the whole file uncompacted
-    instead), so every `keeps[f]` here is a real `np.ndarray`, not `None`.
-    `filters` is never empty (a vt only reaches this function once
-    `vt_spec_idxs` has established it has at least one spec, each with a
-    real filter).
+_BIT_SHIFTS: dict[object, object] = {}
 
-    A UNIFORM filter's (or a GPU-eligible per-query filter's — Front B, see
-    `_row_union_from_gpu_leaves`) `keeps[f]` is already `(rows,)`, used as
-    -is. A CPU-fallback per-query filter's (`match_text`/
-    `match_text_from_query` leaf present) is bit-packed along the query axis,
-    `(ceil(n_queries / 8), rows)` (see `run_compute`'s reader thread) —
-    reduced to `(rows,)` via `.any(axis=0)` first: still EXACT, not a
-    heuristic, since a packed byte is 0 iff every query bit it holds is 0, so
-    byte-truthiness IS "does any query this byte covers want this row"; OR-ing
-    that across bytes is exactly "does any query want this row", simply read
-    off the packed array rather than approximated."""
+
+def _bit_shifts(device):
+    """The eight single-bit selectors `[0x80 ... 0x01]` as `uint8` on `device`,
+    built once per device — a tiny tensor, but rebuilding it inside
+    `_unpack_query_axis_device` would be a host-to-device copy per batch slice.
+
+    Selectors rather than shift counts (`[7 ... 0]`) so the expansion is one
+    `and` plus one `!= 0` — two device kernels, and bool straight out — where
+    shifting needs a third for the `uint8 -> bool` cast. Same bit order either
+    way: `packbits`'s big-endian bit `7 - (q % 8)` is mask `1 << (7 - q % 8)`.
+    """
+    got = _BIT_SHIFTS.get(device)
+    if got is None:
+        import torch
+
+        got = _BIT_SHIFTS[device] = torch.tensor(
+            [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01],
+            dtype=torch.uint8, device=device,
+        )
+    return got
+
+
+def _unpack_query_axis_device(packed: np.ndarray, n_queries: int, device):
+    """Unpack a query-axis bitmask on `device`.
+
+    Matches `_unpack_query_axis` exactly, including big-endian bit order,
+    truncation, and zero-padding when `n_queries` exceeds the packed height.
+    """
+    import torch
+
+    n_bytes, n_rows = packed.shape
+    n_bits = n_bytes * 8
+
+    # Column slicing can leave `packed` strided; compact before transfer.
+    p = torch.from_numpy(np.ascontiguousarray(packed)).to(device, non_blocking=True)
+    bits = (p.unsqueeze(1) & _bit_shifts(p.device).view(1, 8, 1)) != 0
+    out = bits.reshape(n_bits, n_rows)[:n_queries]
+    if n_queries > n_bits:
+        # Preserve `_unpack_query_axis`'s zero-padding behavior.
+        out = torch.cat([
+            out,
+            torch.zeros(n_queries - n_bits, n_rows, dtype=torch.bool, device=out.device),
+        ])
+    return out
+
+
+# `cache.get` sentinel: an EMPTY per-query mask caches as `None`, which is a
+# real cached value here, not a miss (see `_process_shared_batch`'s `select`).
+_UNCACHED = object()
+
+
+def _union_keep(filters: list[Filter], keeps: dict[Filter | None, np.ndarray | None]) -> np.ndarray:
+    """Return the union of all distinct filtered row masks.
+
+    Uniform and GPU-eligible filters provide `(rows,)` masks directly.
+    CPU per-query filters provide bit-packed `(query_bytes, rows)` masks,
+    which are reduced with `.any(axis=0)` to exactly recover "any query keeps
+    this row."
+
+    This is only used when every spec for the vector type is filtered, so
+    `filters` is non-empty, contains no `None`, and every `keeps[f]` is a real
+    mask. Restricting per-query masks to their owning queries mainly reduces
+    mask allocation; for token-less foreign rows it does not change the union.
+    """
     parts = [m.any(axis=0) if m.ndim == 2 else m for m in (keeps[f] for f in filters)]
     return np.logical_or.reduce(parts)
 
@@ -1457,69 +1755,35 @@ def _ragged_batch_ranges(
 
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
-    spec_top_scores, spec_top_enc,
+    spec_top_key, spec_top_enc, spec_thr,
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None, select,
+    spec_qsel: list, spec_qrows: list, spec_cos_scale: list,
     encoded_row_ids: np.ndarray | None = None,
+    ordinal_base: int = 0,
+    ordinal_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
 ) -> float:
-    """The shared per-vector_type primitive behind `_process_shared_batch`:
-    iterate `batch` in `batch_size`-row slices, transfer each slice once
-    (`batch.transfer`), score it once per
-    DISTINCT metric among `member_idxs` (`score_cache` — every member needing
-    that metric reads the same tensor), and merge each member's own top-k
-    from those shared columns via `_merge_topk`.
+    """Process one vector-type batch, sharing transfer and scoring across members.
 
-    `orig_rows` maps a slice position to its TRUE file-row number (used to
-    index a filter's keep-mask, and — when `encoded_row_ids` is `None` — to
-    build `_merge_topk`'s output-id encoding too): `None` means position IS
-    the true row, either because `batch` is the raw, whole file (some search
-    of this vector_type is unfiltered and needs every row), or because
-    `batch` is several files' rows COALESCED into one (see `run_compute`'s
-    `_flush_coalesce_group`) whose keep-masks were already rebuilt to align
-    with the coalesced batch's own row order — either way, nothing to remap
-    for keep-mask indexing. An array means `batch` is a SINGLE file's own
-    compacted batch (the union of every active filter's surviving rows —
-    see `run_compute`'s `has_baseline` and `_union_keep`) and this maps back
-    to that one file's true rows.
+    The batch is sliced by `batch_size`; each slice is transferred once, scored
+    once per distinct metric, then merged into each member's top-k state.
 
-    `encoded_row_ids`, independently, is `_merge_topk`'s output-id source:
-    `None` means single-file — `gidx * MAX_ROWS_PER_FILE + rows` is computed
-    here (cheaply, directly on device, no CPU round-trip); a caller-supplied
-    array means it's already the fully-encoded id per row (needed for a
-    coalesced batch, where different rows came from different files, so no
-    single scalar `gidx` can encode all of them). This is deliberately a
-    SEPARATE concept from `orig_rows`: a coalesced batch needs identity
-    keep-mask indexing (rebuilt masks already match its own row order) but
-    non-identity, per-source-file id encoding — the two purposes coincide
-    for a single file but diverge once rows from several files share one
-    batch.
+    `orig_rows` maps compacted single-file rows back to true file rows for
+    filtering. `encoded_row_ids` separately provides output IDs when rows cannot
+    be encoded from `gidx` alone, as in coalesced multi-file batches.
 
-    `select(m, rows, true_rows, cache) -> (sel_rows, sel_cols, cell_mask)` is
-    the per-member filtering strategy (see `_process_shared_batch`):
-    `sel_rows is None` skips the merge entirely for this member/slice (e.g.
-    a filter keeping zero rows here); `sel_cols` is either `None` (member is
-    unfiltered or per-query-filtered — use the slice's rows unchanged) or a
-    column-index tensor used to mask the score matrix (and `encoded_rows`,
-    identically) down to that member's own (uniform) filter's surviving
-    columns; `cell_mask` is either `None` (no per-(query,row) masking
-    needed) or a `(n_queries, len(rows))` boolean tensor applied via
-    `masked_fill` — a per-query filter's own rows vary BY QUERY, so unlike a
-    uniform filter it can't be expressed as one shared column selection;
-    every column stays, and individual (query, row) cells get invalidated
-    instead. `true_rows` indexes a filter's keep-mask (sized to match
-    `batch`'s own row order, not necessarily one whole file — see above): a
-    plain `slice(r0, r1)` when `orig_rows is None` (a cheap view, no copy),
-    or `orig_rows`'s corresponding array slice otherwise. `cache` is a fresh
-    dict per r0-slice for `select` to memoize per-filter lookups shared
-    across members — it does not persist across slices, since the mask is
-    slice-relative.
+    `ordinal_base`/`ordinal_row_ids` similarly provide deterministic tie-break
+    ordinals: the scalar form is used when they can be derived from row position,
+    otherwise the caller supplies per-row values.
 
-    Returns elapsed wall-clock seconds spent in this loop (folded into the
-    caller's `gpu_secs`). A caller that pre-compacts `batch` must do so
-    BEFORE calling this function — its own timer starts only once this loop
-    begins, so CPU-side compaction time never counts as GPU time (see the
-    `io_wait`/`gpu_secs` split docs at the top of this module)."""
+    `select(...)` returns optional row/column selection and a per-query cell mask.
+    `spec_qsel` selects queries in the shared score matrix, while `spec_qrows`
+    selects queries in a filter's own mask; these are distinct query spaces.
+
+    Returns wall-clock time spent in the processing loop. Any CPU-side compaction
+    must happen before this call and is therefore excluded from this timing.
+    """
     import torch
 
     n_rows = batch.n_rows
@@ -1540,27 +1804,26 @@ def _process_batch_group(
         ranges = _ragged_batch_ranges(batch.doc_offsets, step, max_doc_tokens)
     else:
         ranges = [(r0, min(r0 + step, n_rows)) for r0 in range(0, n_rows, step)]
-    # How many members read each distinct metric's score matrix — used below
-    # to skip caching one nobody else will reuse (the score-matrix analog of
-    # `filter_share_count`): a single-reader (n_q, rows) matrix — 1.6 GiB at
-    # n_q=100k / rows=4096 — gets collected right after its own merge instead
-    # of sitting in `score_cache` through every later member's matmul+merge.
-    metric_share_count = Counter(specs[m].metric for m in member_idxs)
-    # Dense only: when 2+ DISTINCT metrics score this batch, derive all of them
-    # from ONE raw Gram instead of one GEMM each (see `DenseBatchSlice`). A
-    # single-metric batch keeps the unshared path, so it pays neither the extra
-    # resident matrix nor any change in its float32 output.
-    if isinstance(batch, DenseCorpusBatch):
-        batch.share_gram = len(metric_share_count) > 1
+    # Count consumers of each distinct score matrix so single-use matrices are
+    # not cached. Include `scale_in_packer` because it changes score semantics,
+    # even when the metric is the same.
+    score_share_count = Counter(
+        (specs[m].metric, spec_cos_scale[m] is not None) for m in member_idxs
+    )
 
-    # Amortized running top-k (see _merge_topk): per-slice candidates are
-    # buffered (each part pre-topk'd to <= k columns, so the buffer holds at
-    # most ~2k columns per member) and folded with ONE topk once >= k pending
-    # columns accumulate, instead of one topk per slice. Flushed for every
-    # member before this function returns, so callers still observe a fully
-    # merged running state per batch.
+    # Dense only: if multiple metrics score this batch, derive them from one shared
+    # Gram matrix instead of one GEMM per metric. Count metrics, not score keys.
+    if isinstance(batch, DenseCorpusBatch):
+        batch.share_gram = len({specs[m].metric for m in member_idxs}) > 1
+
+    # Amortize running top-k by buffering pre-topk'd slice candidates and merging
+    # once >= k columns are pending. All members are flushed before returning.
     pending: dict[int, list[tuple]] = {m: [] for m in member_idxs}
     pending_cols: dict[int, int] = {m: 0 for m in member_idxs}
+
+    # Decide pruning once per batch group so pruned parts are never flushed
+    # through an unpruned path. A stale threshold only prunes less, never wrongly.
+    prune = not os.environ.get("NOVA_BF_NO_PRUNE")
 
     def _flush_pending(m: int) -> None:
         if not pending[m]:
@@ -1568,8 +1831,9 @@ def _process_batch_group(
         parts = pending[m]
         pending[m] = []
         pending_cols[m] = 0
-        spec_top_scores[m], spec_top_enc[m] = _merge_topk(
-            spec_top_scores[m], spec_top_enc[m], parts, specs[m].k
+        spec_top_key[m], spec_top_enc[m] = _merge_topk(
+            spec_top_key[m], spec_top_enc[m], parts, specs[m].k,
+            thr=spec_thr[m] if prune else None,
         )
 
     def _flush_all_pending() -> None:
@@ -1593,35 +1857,73 @@ def _process_batch_group(
         else:
             encoded_rows = torch.from_numpy(encoded_row_ids[r0 : r0 + sl.n_rows]).to(device, non_blocking=True)
 
-        score_cache: dict[str, object] = {}
+        # Tie-break ordinals for these rows (see `nova_bf.tiebreak`).
+        if ordinal_row_ids is None:
+            ordinals = ordinal_base + rows
+        else:
+            ordinals = torch.from_numpy(
+                ordinal_row_ids[r0 : r0 + sl.n_rows].astype(np.int64, copy=False)
+            ).to(device, non_blocking=True)
+
+        score_cache: dict[tuple, object] = {}
         cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
         for m in member_idxs:
             s = specs[m]
-            scores = score_cache.get(s.metric)
+            # Dense cosine's query-norm divide happens in the packer, so the
+            # flag is part of the cache key — see `score_share_count`.
+            scale_in_packer = spec_cos_scale[m] is not None
+            score_key = (s.metric, scale_in_packer)
+            scores = score_cache.get(score_key)
             if scores is None:
-                scores = sl.score(spec_Q[m], s.metric, spec_q_norms[m])
-                if metric_share_count[s.metric] > 1:
-                    score_cache[s.metric] = scores
+                scores = sl.score(
+                    spec_Q[m], s.metric, spec_q_norms[m],
+                    scale_in_packer=scale_in_packer,
+                )
+                if score_share_count[score_key] > 1:
+                    score_cache[score_key] = scores
 
             sel_rows, sel_cols, cell_mask = select(m, rows, true_rows, cache)
             if sel_rows is None:
                 continue
             sel_scores = scores if sel_cols is None else scores[:, sel_cols]
             sel_encoded = encoded_rows if sel_cols is None else encoded_rows[sel_cols]
+            sel_ordinals = ordinals if sel_cols is None else ordinals[sel_cols]
+            # Query-row subset (`SearchSpec.rows`). The score matrix spans this
+            # vector_type's whole row union — every spec sharing the type reads
+            # the same one — so a spec that owns only part of it slices here,
+            # BEFORE the top-k.
+            qsel = spec_qsel[m]
+            if qsel is not None:
+                sel_scores = sel_scores[qsel]
             if cell_mask is not None:
+                if qsel is not None:
+                    # `cell_mask` is built over the FULL query axis, so it is
+                    # indexed by FILE row (`spec_qrows`), not by position
+                    # within this spec's slice (`spec_qsel`). Rebinding, never
+                    # mutating: the mask may be cached and shared with another
+                    # spec that has a different subset.
+                    cell_mask = cell_mask[spec_qrows[m]]
                 sel_scores = sel_scores.masked_fill(~cell_mask, float("-inf"))
 
             # Append to the pending buffer (pre-topk wide slices down to k so
             # the buffer, and any slice score matrix it would otherwise pin
             # alive, stays bounded); merge only once >= k columns accumulate.
+            cos_scale = spec_cos_scale[m]
+
             if sel_scores.shape[1] > s.k:
-                part_scores, part_local = torch.topk(sel_scores, k=s.k, dim=1)
+                part_key, part_local, live = pack_topk(
+                    sel_scores, sel_ordinals, s.k, cos_scale,
+                    thr=spec_thr[m] if prune else None)
                 part_enc = sel_encoded[part_local]
                 del part_local
             else:
-                part_scores, part_enc = sel_scores, sel_encoded
-            pending[m].append((part_scores, part_enc))
-            pending_cols[m] += part_scores.shape[1]
+                part_key = pack(sel_scores, sel_ordinals, cos_scale)
+                part_enc = sel_encoded
+                # Narrow slices skip the pre-top-K, so the prune decision the
+                # kernel would have made is applied here by the same rule.
+                live = live_rows(part_key, spec_thr[m]) if prune else None
+            pending[m].append((part_key, part_enc, live))
+            pending_cols[m] += part_key.shape[1]
             if pending_cols[m] >= s.k:
                 _flush_pending(m)
 
@@ -2009,6 +2311,19 @@ def _corpus_leaf_array(cond: FilterCondition, table, vocab_for_cond: np.ndarray 
     return _condition_mask(cond, table)
 
 
+def _narrow_gpu_leaf_state(state, idx):
+    """Restrict shared leaf state to the query rows in `idx`.
+
+    Leaf state is built once per condition at full query-file height, then
+    narrowed per filter so per-slice masks only cover that filter's queries.
+    """
+    if isinstance(state, tuple):            # match_from_query: (kind, tensor)
+        kind, qstate = state
+        return kind, qstate[idx]            # (n_q,) codes or (n_q, n_distinct)
+    # range_from_query: {bound name: (n_q,) tensor}
+    return {name: b[idx] for name, b in state.items()}
+
+
 def _gpu_cond_mask(cond: FilterCondition, leaf_gpu: dict, rows, query_gpu: dict):
     """torch-native per-condition mask for one GPU-eligible leaf — the Front
     A analog of `filters._condition_mask`. `leaf_gpu[cond]` is this
@@ -2081,12 +2396,16 @@ def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str)
 
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
-    spec_top_scores, spec_top_enc,
+    spec_top_key, spec_top_enc, spec_thr,
     keeps: dict[Filter | None, np.ndarray | None], filter_is_per_query: dict[Filter | None, bool],
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
-    query_gpu: dict[FilterCondition, object], filter_share_count: dict[Filter | None, int],
+    query_gpu_by_filter: dict[object, dict], filter_share_count: dict[Filter | None, int],
     batch_size: int | None, gidx: int, device: str, orig_rows: np.ndarray | None,
+    spec_qsel: list, spec_qrows: list, filter_n_q: dict[Filter | None, int],
+    spec_cos_scale: list,
     encoded_row_ids: np.ndarray | None = None,
+    ordinal_base: int = 0,
+    ordinal_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
 ) -> float:
@@ -2103,7 +2422,8 @@ def _process_shared_batch(
     - Per-query filter (either GPU-eligible via Front A, or the CPU fallback
       for a `match_text`/`match_text_from_query` leaf — see `_gpu_eligible`):
       builds this member's `(n_queries, batch_rows)` `cell_mask` — from
-      GPU-resident tensors via `_gpu_evaluate` (`leaf_gpu`/`query_gpu`, no
+      GPU-resident tensors via `_gpu_evaluate` (`leaf_gpu` plus this
+      filter's narrowed `query_gpu_by_filter` entry, no
       CPU-side mask, no per-slice host transfer) or from `keeps[s.filter]`
       (computed once per file in `filters.evaluate()`) — cached per filter
       in `cache` only when `filter_share_count[s.filter] > 1`: a filter used
@@ -2134,23 +2454,35 @@ def _process_shared_batch(
         if _is_unfiltered(s.filter):
             return rows, None, None
         if filter_is_gpu_eligible[s.filter] or filter_is_per_query[s.filter]:
-            cell_mask = cache.get(s.filter)
-            if cell_mask is None:
+            # `None` means "this slice has no row any query wants" — a cached
+            # VALUE, so the miss test needs its own sentinel.
+            cell_mask = cache.get(s.filter, _UNCACHED)
+            if cell_mask is _UNCACHED:
                 if filter_is_gpu_eligible[s.filter]:
-                    cell_mask = _gpu_evaluate(s.filter, leaf_gpu, rows, query_gpu, device)
+                    cell_mask = _gpu_evaluate(
+                        s.filter, leaf_gpu, rows,
+                        # this filter's own query rows, so the mask is
+                        # filter_n_q[s.filter] tall (see
+                        # `_narrow_gpu_leaf_state`)
+                        query_gpu_by_filter[s.filter], device,
+                    )
+                    if not cell_mask.any():
+                        cell_mask = None
                 else:
-                    # `keeps[s.filter]` is bit-packed along the query axis
-                    # (see `run_compute`'s reader thread / `_pack_query_axis`)
-                    # — row-slice the packed bytes first (cheap: rows aren't
-                    # the packed axis), THEN unpack, so only this batch
-                    # slice's bytes ever get expanded back to
-                    # one-bool-per-query, not the whole file's.
+                    # Row-slice the query-axis-packed mask, then unpack on device to keep
+                    # host-to-device transfer packed and avoid materializing host booleans.
                     packed_np = keeps[s.filter][:, true_rows]
-                    cell_np = _unpack_query_axis(packed_np, spec_Q[m].shape[0])
-                    cell_mask = torch.from_numpy(cell_np).to(device, non_blocking=True)
+                    if packed_np.any():
+                        cell_mask = _unpack_query_axis_device(
+                            packed_np, filter_n_q[s.filter], device,
+                        )
+                    else:
+                        # Exact empty-mask fast path; checking packed bytes avoids expansion
+                        # and a per-slice device sync.
+                        cell_mask = None
                 if filter_share_count[s.filter] > 1:
                     cache[s.filter] = cell_mask
-            if not cell_mask.any():
+            if cell_mask is None:
                 return None, None, None
             return rows, None, cell_mask
         local_idx = cache.get(s.filter)
@@ -2163,22 +2495,158 @@ def _process_shared_batch(
         return rows[local_idx], local_idx, None
 
     return _process_batch_group(
-        batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_scores, spec_top_enc,
+        batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_key, spec_top_enc,
+        spec_thr,
         batch_size, gidx, device, orig_rows=orig_rows, select=select,
         encoded_row_ids=encoded_row_ids,
+        ordinal_base=ordinal_base, ordinal_row_ids=ordinal_row_ids,
         multivector_token_budget=multivector_token_budget,
         multivector_double_buffer=multivector_double_buffer,
+        spec_qsel=spec_qsel, spec_qrows=spec_qrows,
+        spec_cos_scale=spec_cos_scale,
     )
 
 
-def _validate_query_filter_cols(qstore: Store, filter_cols: list[str]) -> None:
+def _load_query_columns(
+    store: Store, qcfg, cols: list[str],
+) -> dict[str, np.ndarray]:
+    """Read a few small query columns, nothing else.
+
+    Used for `SearchSpec.rows` selectors, which have to be resolved before the
+    vector loaders run (they decide the query matrix height). Walks the same
+    `store.list_parquets()` order the loaders do, so row i here is row i there.
+    """
+    out: dict[str, list] = {c: [] for c in cols}
+    date_fmts = normalize_date_fields(qcfg.date_fields)
+    for f in store.list_parquets():
+        table = store.read_columns(f.read_path, list(cols))
+        conv = convert_table_date_columns(table, date_fmts)
+        for c in cols:
+            out[c] += conv[c].to_pylist()
+    return {c: _to_query_array(v) for c, v in out.items()}
+
+
+def _resolve_spec_rows(
+    specs: list, query_filter_vals: dict[str, np.ndarray], n_q: int,
+) -> tuple[list, dict[str, np.ndarray | None]]:
+    """Turn each spec's `rows` selector into sorted file-row indices.
+
+    Returns `(spec_rows, vt_rows)`:
+      * `spec_rows[m]` — that spec's own rows, or `None` for "every row".
+      * `vt_rows[vt]`  — the UNION of that vector_type's specs' rows, or `None`
+        if any of them takes every row. This is what the vector matrix gets
+        built over: specs of one vector_type share a single query matrix (and
+        a single score matrix per metric), so the matrix has to cover
+        everything any of them asks for, and each spec indexes its own slice
+        out of it afterwards.
+
+    A selector matching nothing is an error, not an empty result: it means the
+    column or the values are misspelled, and silently writing an empty output
+    would look like a successful run.
+    """
+    spec_rows: list[np.ndarray | None] = []
+    for s in specs:
+        if s.rows is None:
+            spec_rows.append(None)
+            continue
+        vals = query_filter_vals[s.rows.column]
+        # Compare as strings so a selector works against an int/categorical
+        # source column without the config having to mirror its dtype.
+        mask = np.isin(vals.astype(str), np.asarray(s.rows.isin, dtype=str))
+        idx = np.nonzero(mask)[0].astype(np.int64)
+        if idx.size == 0:
+            raise ValueError(
+                f"search {s.name!r}: rows.column={s.rows.column!r} has no row matching "
+                f"isin={s.rows.isin!r} — every query would be excluded"
+            )
+        spec_rows.append(idx)
+
+    return spec_rows, _union_rows_by_key([s.vector_type for s in specs], spec_rows, n_q)
+
+
+def _union_rows_by_key(keys: list, spec_rows: list, n_q: int) -> dict:
+    """`key -> union of the `spec_rows` of every spec carrying that key`, or
+    `None` when any of them takes every row (and likewise when the union turns
+    out to cover the whole file, so the caller can skip indexing entirely).
+
+    Two callers, same shape of question — "how tall does the thing these specs
+    SHARE have to be?":
+
+      * keyed by `vector_type`  -> the shared query/score matrix's height
+        (see `_resolve_spec_rows`)
+      * keyed by `SearchSpec.filter` -> the shared per-query filter mask's
+        height (see `run_compute`'s `filter_rows`)
+
+    `keys` must be hashable; `Filter` is frozen for exactly this reason, and
+    `None` (the unfiltered entry) is a legitimate key.
+    """
+    out: dict = {}
+    for key, rows in zip(keys, spec_rows):
+        if key not in out:
+            out[key] = rows
+        elif out[key] is None or rows is None:
+            out[key] = None
+        else:
+            out[key] = np.union1d(out[key], rows)
+    for key, rows in out.items():
+        if rows is not None and len(rows) == n_q:
+            out[key] = None  # covers everything; skip the indexing entirely
+    return out
+
+
+def _local_positions(
+    rows: np.ndarray | None, vt_rows: np.ndarray | None,
+) -> np.ndarray | None:
+    """Map a spec's file-row indices to positions in its vector_type's matrix.
+
+    `None` means "the identity" — the spec reads every row of that matrix, so
+    the scoring path can skip the gather entirely.
+    """
+    if rows is None:
+        return None
+    if vt_rows is None:
+        return rows  # matrix is full height: file row == matrix row
+    return np.searchsorted(vt_rows, rows).astype(np.int64)
+
+
+def _row_selector(idx: np.ndarray | None, device: str):
+    """One `SearchSpec.rows` index array -> the object the scoring path indexes
+    the query axis with: `None` (all rows — skip the indexing entirely), a
+    `slice` when `idx` is one CONTIGUOUS ascending run (indexing is then a
+    view, no gather-copy), or an on-device int64 index tensor otherwise.
+
+    Module-level, not a closure inside `run_compute`, so the contiguity guard
+    is directly testable: `slice(idx[0], idx[-1] + 1)` is only equivalent to
+    `idx` when `idx` has no gaps, and a run whose subsets are contiguous —
+    which is what you get from a queries file sorted by query set, i.e. most
+    fixtures — cannot tell the two apart.
+    """
+    if idx is None:
+        return None
+    if len(idx) and idx[-1] - idx[0] == len(idx) - 1:
+        return slice(int(idx[0]), int(idx[-1]) + 1)
+    import torch
+
+    return torch.from_numpy(np.ascontiguousarray(idx)).to(device)
+
+
+def _validate_query_filter_cols(
+    qstore: Store, filter_cols: list[str], subset_cols: list[str] = (),
+) -> None:
     """Fail fast with a clear message if a per-query filter condition
-    (`match_from_query`/`range_from_query`/`match_text_from_query`) names a
-    queries column that doesn't exist — rather than letting a typo surface
-    deep inside `load_queries`/`load_queries_sparse` as a generic pyarrow
-    `ArrowInvalid` about a missing `FieldRef`. Peeks at the FIRST queries
-    file's schema only (metadata read, no row data) since every queries
-    file in a run is assumed to share one schema."""
+    (`match_from_query`/`range_from_query`/`match_text_from_query`) or a
+    `SearchSpec.rows` selector (`rows.column`) names a queries column that
+    doesn't exist — rather than letting a typo surface deep inside
+    `load_queries`/`load_queries_sparse` as a generic pyarrow `ArrowInvalid`
+    about a missing `FieldRef`. Peeks at the FIRST queries file's schema only
+    (metadata read, no row data) since every queries file in a run is assumed
+    to share one schema.
+
+    `subset_cols` is the `rows.column` subset of `filter_cols` (they travel
+    together from here on — see `run_compute`), passed separately ONLY so the
+    error names the config key the reader actually has to go fix: pointing a
+    misspelled `rows: {column: …}` at `match_from_query` sends them looking in
+    the wrong place."""
     if not filter_cols:
         return
     files = qstore.list_parquets()
@@ -2189,11 +2657,41 @@ def _validate_query_filter_cols(qstore: Store, filter_cols: list[str]) -> None:
     schema_names = set(pq.ParquetFile(files[0].read_path, filesystem=qstore.fs).schema_arrow.names)
     missing = sorted(c for c in filter_cols if c not in schema_names)
     if missing:
+        subset = set(subset_cols)
+        missing_rows = sorted(c for c in missing if c in subset)
+        missing_filter = sorted(c for c in missing if c not in subset)
+        parts = []
+        if missing_filter:
+            parts.append(
+                f"{missing_filter} referenced by a per-query filter "
+                "(match_from_query/range_from_query/match_text_from_query)"
+            )
+        if missing_rows:
+            parts.append(f"{missing_rows} referenced by a `rows` selector (rows.column)")
         raise ValueError(
-            f"queries file is missing column(s) referenced by a per-query filter "
-            f"(match_from_query/range_from_query/match_text_from_query): {missing} "
+            f"queries file is missing column(s): {' and '.join(parts)} "
             f"— available columns: {sorted(schema_names)}"
         )
+
+
+def _select_device(torch) -> str:
+    """Which torch device this run scores on: CUDA when present, else CPU.
+
+    `NOVA_BF_DEVICE` overrides the choice (`cpu` or `cuda`). It exists for the
+    parity harness (tests/parity), which needs to pin a GPU box to `cpu` to
+    check that both devices produce the same ground truth from the same input.
+    """
+    want = os.environ.get("NOVA_BF_DEVICE", "").strip().lower()
+    if not want:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if want not in ("cpu", "cuda"):
+        raise ValueError(
+            f"NOVA_BF_DEVICE={want!r} is not a device nova-bf scores on "
+            "— use 'cpu' or 'cuda' (or unset it to auto-select)"
+        )
+    if want == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("NOVA_BF_DEVICE='cuda' but torch reports no CUDA device")
+    return want
 
 
 def run_compute(
@@ -2202,6 +2700,7 @@ def run_compute(
     job_rank: int | None = None,
     io_workers: int | None = None,
     io_thread_count: int | None = None,
+    cpu_thread_count: int | None = None,
     max_files: int | None = None,
 ) -> dict[str, str]:
     """Runs every search in `cfg.searches` — independent vector_type/metric/k/
@@ -2220,10 +2719,15 @@ def run_compute(
     except ImportError:
         raise RuntimeError("torch is required for `compute`: install nova-bf[compute]")
 
+    # Whole-invocation timing for the manifest. The scan's own `wall0` (set much
+    # further down) covers only the corpus pass, so it misses query loading and
+    # result decoding.
+    started_at = datetime.now(timezone.utc)
+    run_t0 = time.perf_counter()
     job_rank = _resolve_rank(num_jobs, job_rank)
     specs = cfg.searches
     vts_needed = sorted({s.vector_type for s in specs})  # ["dense"] / ["sparse"] / both
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _select_device(torch)
     if device == "cpu":
         logger.warning("No GPU detected — brute force on CPU will be slow.")
     if "multivector" in vts_needed and cfg.params.multivector_kernel != "torch":
@@ -2273,28 +2777,49 @@ def run_compute(
     # only) what's referenced" guarantee corpus-side filter_cols already makes,
     # extended to the query side (see Filter.query_fields()).
     query_filter_cols = sorted({c for s in specs if s.filter for c in s.filter.query_fields()})
-    _validate_query_filter_cols(qstore, query_filter_cols)
+    # `SearchSpec.rows` columns ride along with the per-query filter columns:
+    # both are read from the queries file into `query_filter_vals`, and both
+    # get the same "referenced columns must exist" validation below.
+    subset_cols = sorted({s.rows.column for s in specs if s.rows is not None})
+    query_filter_cols = sorted(set(query_filter_cols) | set(subset_cols))
+    _validate_query_filter_cols(qstore, query_filter_cols, subset_cols)
+    # Row subsets must be known BEFORE the loaders run, because they decide how
+    # tall each vector_type's query matrix is. The selector columns are a few
+    # small columns, so reading them first is cheap next to the vector columns.
+    spec_rows: list = [None] * len(specs)
+    vt_rows: dict[str, np.ndarray | None] = {}
+    n_q_pre: int | None = None  # None = no selectors, so nothing to cross-check
+    if subset_cols:
+        pre = _load_query_columns(qstore, cfg.queries, subset_cols)
+        n_q_pre = len(next(iter(pre.values())))
+        spec_rows, vt_rows = _resolve_spec_rows(specs, pre, n_q_pre)
     Q_np_by_vt: dict[str, np.ndarray] = {}
     query_vocab = None  # sparse only: sorted distinct query token ids (see _build_query_vocab)
+    query_vocab_lut = None  # built once from `query_vocab` (see _build_vocab_lut)
     mv_q_offsets = None  # multivector only: (n_q+1,) query-token offsets (see load_queries_multivector)
-    # Sparse no-overlap gate state (see _zero_gate_file_ok/_QueryIndicator):
+    # Sparse gate + query-representation state (see _zero_gate_file_ok/_SparseQueryCache):
     # query-side flags fixed run-wide; the indicator holder is shared by every
     # file's batch and builds its CSR lazily, only if a signed file appears.
     sparse_q_nonneg, sparse_q_min_pos = False, float("inf")
-    sparse_q_indicator = _QueryIndicator()
+    sparse_q_cache = _SparseQueryCache()
     query_ids: list[str] | None = None
     payload: dict[str, list] | None = None
     query_filter_vals: dict[str, np.ndarray] | None = None
     for vt in vts_needed:
         if vt == "sparse":
             Q_np, query_vocab, q_ids, q_payload, q_filter_vals = load_queries_sparse(
-                qstore, cfg.queries, query_filter_cols
+                qstore, cfg.queries, query_filter_cols, rows=vt_rows.get(vt)
             )
             if len(query_vocab) == 0 and len(q_ids) > 0:
                 logger.warning(
                     "sparse query vocabulary is empty (every query has zero nonzero entries) — "
                     "every corpus row will score 0; check queries.sparse_column is correct."
                 )
+            # ONE table for the whole run. `_remap_sparse_file` looks up against
+            # this same vocabulary once per corpus file, in the reader threads;
+            # rebuilding it there costs a full-width memset per file and, with
+            # several readers, several of them resident at once.
+            query_vocab_lut = _build_vocab_lut(query_vocab)
             # Query side of the zero-score no-overlap gate (see
             # `_zero_gate_file_ok`): computed on Q as SCORED (post-densify,
             # duplicates summed), once per run.
@@ -2316,7 +2841,9 @@ def run_compute(
                     "every corpus row will score 0; check queries.multivector_column is correct."
                 )
         else:
-            Q_np, q_ids, q_payload, q_filter_vals = load_queries(qstore, cfg.queries, query_filter_cols)
+            Q_np, q_ids, q_payload, q_filter_vals = load_queries(
+                qstore, cfg.queries, query_filter_cols, rows=vt_rows.get(vt)
+            )
         Q_np_by_vt[vt] = Q_np
         if query_ids is None:
             query_ids, payload, query_filter_vals = q_ids, q_payload, q_filter_vals
@@ -2337,11 +2864,29 @@ def run_compute(
                 "agree on row count and order"
             )
     n_q = len(query_ids)
-    for s in specs:
+    if n_q_pre is not None and n_q_pre != n_q:
+        # `spec_rows` indexes `Q`, `query_ids` and `payload` by FILE row, but it
+        # was resolved from a SEPARATE pass over the queries store
+        # (`_load_query_columns`) made before the vector loaders ran. The two
+        # walk the same `store.list_parquets()` order, so they agree — but if
+        # they ever stop agreeing, every subset silently addresses the wrong
+        # queries (or IndexErrors deep inside a loader). Same reason the
+        # cross-vector_type check above compares id IDENTITY, not just length.
+        raise RuntimeError(
+            f"queries store returned {n_q_pre} rows when reading the "
+            f"`rows` selector column(s) but {n_q} rows when loading vectors — "
+            "the query row set changed between the two reads, so a row subset "
+            "cannot be trusted to name the right queries"
+        )
+    for i_spec, s in enumerate(specs):
         dim = Q_np_by_vt[s.vector_type].shape[1]
+        # Per-spec query count, NOT the file's: with `rows` those differ, and
+        # this is the line someone scans to confirm a run covers what they meant.
+        s_n_q = n_q if spec_rows[i_spec] is None else len(spec_rows[i_spec])
         logger.info(
-            "search=%r queries=%d %s=%d metric=%s k=%d device=%s%s",
-            s.name, n_q, "vocab" if s.vector_type == "sparse" else "dim", dim,
+            "search=%r queries=%d%s %s=%d metric=%s k=%d device=%s%s",
+            s.name, s_n_q, "" if s_n_q == n_q else f" of {n_q}",
+            "vocab" if s.vector_type == "sparse" else "dim", dim,
             s.metric, s.k, device,
             f" rank={job_rank}/{num_jobs}" if num_jobs else "",
         )
@@ -2440,8 +2985,9 @@ def run_compute(
         vt: len({s.metric for s in specs if s.vector_type == vt}) for vt in vts_needed
     }
     q_norms_by_vt: dict[str, object] = {}
-    spec_Q, spec_q_norms, spec_top_scores, spec_top_enc = [], [], [], []
-    for s in specs:
+    spec_Q, spec_q_norms, spec_top_key, spec_top_enc = [], [], [], []
+    spec_thr = []
+    for i_spec, s in enumerate(specs):
         # Multivector cosine normalizes each TOKEN inside score() (not a
         # per-query scalar divide like dense/sparse), so it needs no `q_norms`
         # — and Q here is a MultiVectorQuery, not a tensor with .norm().
@@ -2467,8 +3013,55 @@ def run_compute(
         else:
             spec_q_norms.append(None)
         spec_Q.append(Q_gpu_by_vt[s.vector_type])
-        spec_top_scores.append(torch.full((n_q, s.k), float("-inf"), device=device))
-        spec_top_enc.append(torch.zeros((n_q, s.k), dtype=torch.int64, device=device))
+        # Height is this spec's OWN query count, not the file's: with several
+        # specs over a unioned queries file that is the difference between
+        # sum(len(subset)) and n_specs * n_q rows of running top-K state.
+        h = n_q if spec_rows[i_spec] is None else len(spec_rows[i_spec])
+        # The state holds packed keys, so the empty slot is the key for
+        # `(-inf, worst ordinal)` — every real candidate outranks it, and the
+        # decode gate recovers `-inf` from it exactly.
+        spec_top_key.append(sentinel_key((h, s.k), device))
+        spec_top_enc.append(torch.zeros((h, s.k), dtype=torch.int64, device=device))
+        # Per-query prune threshold: the weakest key currently in each top-k state.
+        # Starts at the sentinel so nothing is pruned before the state fills.
+        spec_thr.append(sentinel_key((h,), device))
+
+    # Device-side row selectors for `SearchSpec.rows`, built once per run:
+    #   spec_qsel[m]  — indexes this spec's rows in its vector_type's SCORE
+    #                   matrix (which spans that type's row union)
+    #   spec_qrows[m] — indexes the same rows in a FULL-query-axis per-query
+    #                   filter mask (see `_pack_query_axis`)
+    # A contiguous run becomes a `slice` so the score matrix is sliced as a
+    # view instead of gathered; `None` means "all rows", the historical path,
+    # which skips the indexing entirely. See `_row_selector`.
+    spec_qsel = [
+        _row_selector(_local_positions(spec_rows[m], vt_rows.get(specs[m].vector_type)), device)
+        for m in range(len(specs))
+    ]
+    # Dense cosine's per-query divisor, restricted to each spec's OWN rows so it
+    # lines up with the score matrix after `spec_qsel`.
+    spec_cos_scale = [
+        None if (specs[m].metric != "cosine" or specs[m].vector_type != "dense"
+                 or spec_q_norms[m] is None)
+        else (spec_q_norms[m] if spec_qsel[m] is None
+              else spec_q_norms[m][spec_qsel[m]]).contiguous()
+        for m in range(len(specs))
+    ]
+
+    # spec_qrows is built further down, once `filter_rows` is known: its base is
+    # the per-FILTER mask height, not the file's. See there.
+    if any(r is not None for r in spec_rows):
+        logger.info(
+            "query-row subsets active: %s (file has %d queries; per-spec top-K "
+            "state covers %d rows total instead of %d)",
+            ", ".join(
+                f"{s.name}={len(spec_rows[m])}"
+                for m, s in enumerate(specs) if spec_rows[m] is not None
+            ),
+            n_q,
+            sum(n_q if r is None else len(r) for r in spec_rows),
+            n_q * len(specs),
+        )
 
     # Per vector_type: does any spec have no filter (or an explicit-but-empty
     # one — see `_is_unfiltered`) OR a per-query filter (see `_is_per_query` —
@@ -2512,6 +3105,64 @@ def run_compute(
     # to skip caching a per-query cell_mask when nobody else will reuse it
     # (Front A's memory-shrinking complement).
     filter_share_count: dict[Filter | None, int] = Counter(spec_filter)
+
+    # Narrow CPU per-query filter masks to the query rows that actually use them.
+    # This keeps unrelated query sets in a unified file from increasing mask memory.
+    filter_rows: dict[Filter | None, np.ndarray | None] = _union_rows_by_key(
+        spec_filter, spec_rows, n_q
+    )
+
+    # Uniform and unfiltered paths have no query axis to narrow. Per-query filters
+    # are restricted to their own rows, avoiding oversized (queries x slice) masks
+    # and unnecessary leaf/combine work. See `_narrow_gpu_leaf_state`.
+    for f in list(filter_rows):
+        if f is None or not filter_is_per_query[f]:
+            filter_rows[f] = None
+
+    # Query-axis height of each filter mask.
+    filter_n_q: dict[Filter | None, int] = {
+        f: (n_q if r is None else len(r)) for f, r in filter_rows.items()
+    }
+
+    # Slice per-query filter values to the same rows used by each mask.
+    filter_query_vals: dict[Filter, dict[str, np.ndarray]] = {
+        f: (
+            query_filter_vals if r is None
+            else {c: v[r] for c, v in query_filter_vals.items()}
+        )
+        for f, r in filter_rows.items() if f is not None
+    }
+
+    # Per-FILTER view of the shared per-condition GPU query state, narrowed to
+    # that filter's own query rows.
+    gpu_query_by_filter: dict[object, dict] = {}
+    for f in distinct_filters:
+        if f is None or not filter_is_gpu_eligible[f]:
+            continue
+        r = filter_rows[f]
+        if r is None:
+            gpu_query_by_filter[f] = gpu_query_gpu   # full height: share as-is
+            continue
+        idx = torch.as_tensor(np.asarray(r), dtype=torch.long, device=device)
+        gpu_query_by_filter[f] = {
+            cond: _narrow_gpu_leaf_state(gpu_query_gpu[cond], idx)
+            for cond in f.all_conditions() if cond in gpu_query_gpu
+        }
+
+    # Map each spec's query rows into its filter mask's local row numbering
+    spec_qrows = [
+        _row_selector(_local_positions(spec_rows[m], filter_rows[specs[m].filter]), device)
+        for m in range(len(specs))
+    ]
+    if any(r is not None for r in filter_rows.values()):
+        logger.info(
+            "per-query filter mask height: %s (file has %d queries)",
+            "; ".join(
+                "+".join(s.name for s in specs if s.filter == f) + f"={filter_n_q[f]}"
+                for f, r in filter_rows.items() if r is not None
+            ),
+            n_q,
+        )
 
     vt_spec_idxs: dict[str, list[int]] = {vt: [] for vt in vts_needed}
     for i, s in enumerate(specs):
@@ -2584,6 +3235,66 @@ def run_compute(
     dense_col, sparse_col = cfg.corpus.dense_column, cfg.corpus.sparse_column
     multivector_col = cfg.corpus.multivector_column
     id_col = cfg.corpus.id_column  # None → derive make_point_id(file_key, row) at decode
+
+    # --- tie-break ordinals (see `nova_bf.tiebreak`) --------------------------
+    #
+    # Every corpus row this worker reads gets a dense ordinal in
+    # `[0, rows_this_worker)`, which rides in the low half of the packed
+    # selection key and decides which of two EXACTLY-tied candidates wins.
+    #
+    #   ordinal  the row's position in CORPUS order — `rows_before` below is
+    #            just a running counter, so this costs nothing.
+    #   id       the row's position in SORTED-ID order, from one sort of this
+    #            worker's whole id column here at startup.
+    #
+    # The `id` sort spans the worker's entire file list rather than each file,
+    # because ordinals have to interleave across files to stay comparable when
+    # the running top-K folds a later file against an earlier one.
+    tiebreak = cfg.params.tiebreak
+    rows_before = 0                      # ordinal of this worker's next row
+    id_ordinals: dict[int, np.ndarray] | None = None
+    # Whether `tiebreak='id'` orders NUMERICALLY. Read from the corpus SCHEMA,
+    # not from any row, so every worker resolves the same rule — including one
+    # that drew no files at all (`--num-jobs` above the file count).
+    id_is_int = tie_unsigned = False
+    if tiebreak == "id" and all_files:
+        import pyarrow as _pa
+
+        _t = cstore.read_schema(all_files[0].read_path).field(id_col).type
+        id_is_int = _pa.types.is_integer(_t)
+        tie_unsigned = _pa.types.is_unsigned_integer(_t)
+        if not (
+            id_is_int or _pa.types.is_string(_t) or _pa.types.is_large_string(_t)
+        ):
+            # Binary is deliberately NOT accepted. The ordinals would order it
+            # by raw bytes, but `hit_ids` render it through Python's bytes
+            # repr — whose order differs (`str(b'\\x41z') < str(b'\\x0az')`,
+            # because 'A' < '\\') — and `merge` orders those reprs. The two
+            # sides would disagree and the winner would move with --num-jobs.
+            raise ValueError(
+                f"params.tiebreak='id' needs an integer or string "
+                f"corpus.id_column; {id_col!r} is {_t}. Use params.tiebreak='ordinal'."
+            )
+    if tiebreak == "id" and mine:
+        t_ord = time.perf_counter()
+        pool_n = max(1, min(io_workers or 8, 32))
+        with ThreadPoolExecutor(max_workers=pool_n) as pool:
+            # `map` preserves input order, which is what makes the ordinals
+            # line up with `mine` — and `mine` is ascending `gidx`, so the
+            # secondary "earliest corpus position wins" rule among duplicate
+            # ids means what it says.
+            id_arrays = list(pool.map(
+                lambda f: cstore.read_columns(f.read_path, [id_col])[id_col],
+                [f for _, f in mine],
+            ))
+        id_ordinals = dict(zip([g for g, _ in mine], build_ordinals(id_arrays)))
+        n_ids = sum(len(a) for a in id_arrays)
+        del id_arrays
+        logger.info(
+            "params.tiebreak='id': ranked %s ids from this worker's %d file(s) "
+            "in %.1fs; ties go to the lowest %r, then to the earliest corpus row.",
+            f"{n_ids:,}", len(mine), time.perf_counter() - t_ord, id_col,
+        )
     # Union of every spec's filter fields — read_cols below stays exactly (and only)
     # the columns some spec actually references, same guarantee the single-search
     # path always made.
@@ -2610,6 +3321,18 @@ def run_compute(
         import pyarrow as pa
         pa.set_io_thread_count(itc)
         logger.info("pyarrow IO thread pool set to %d (true S3 fetch concurrency)", itc)
+    # The OTHER pyarrow pool: parquet DECODE parallelism
+    cpu_n = (cpu_thread_count if cpu_thread_count is not None
+             else cfg.params.cpu_thread_count)
+    if not cpu_n or cpu_n <= 0:
+        cpu_n = os.cpu_count() or 1
+    import pyarrow as pa
+    if pa.cpu_count() != cpu_n:
+        logger.info(
+            "pyarrow CPU thread pool %d -> %d (parquet decode parallelism)",
+            pa.cpu_count(), cpu_n,
+        )
+    pa.set_cpu_count(cpu_n)
     work: Queue = Queue()
     for item in mine:
         work.put(item)
@@ -2671,7 +3394,7 @@ def run_compute(
                     sp_norms = _sparse_file_norms(sp_offsets, sp_idx, sp_val) if need_sparse_norms else None
                     sp_gate = _zero_gate_file_ok(sp_val, sparse_q_nonneg, sparse_q_min_pos)
                     sp_offsets, sp_idx, sp_val = _remap_sparse_file(
-                        sp_offsets, sp_idx, sp_val, query_vocab
+                        sp_offsets, sp_idx, sp_val, query_vocab, query_vocab_lut
                     )
                     arrs["sparse"] = (sp_offsets, sp_idx, sp_val, sp_norms, sp_gate)
                 # carry the id column (combined to one contiguous array) to decode;
@@ -2732,13 +3455,16 @@ def run_compute(
                 cpu_fallback_filters = [
                     f for f in distinct_filters if f is not None and not filter_is_gpu_eligible[f]
                 ]
+
+                # `filter_query_vals[f]` is already narrowed to this filter's query rows,
+                # so `evaluate` builds a mask with `filter_n_q[f]` rows.
                 if len(cpu_fallback_filters) > 1:
                     with ThreadPoolExecutor(max_workers=len(cpu_fallback_filters)) as pool:
                         masks = list(pool.map(
-                            lambda f: evaluate(f, table, query_filter_vals), cpu_fallback_filters
+                            lambda f: evaluate(f, table, filter_query_vals[f]), cpu_fallback_filters
                         ))
                 else:
-                    masks = [evaluate(f, table, query_filter_vals) for f in cpu_fallback_filters]
+                    masks = [evaluate(f, table, filter_query_vals[f]) for f in cpu_fallback_filters]
                 for f, mask in zip(cpu_fallback_filters, masks):
                     keeps[f] = _pack_query_axis(mask) if mask.ndim == 2 else mask
 
@@ -2796,7 +3522,7 @@ def run_compute(
                     sp_offsets, sp_idx, sp_val, sp_norms, sp_gate = arrs["sparse"]
                     b = SparseCorpusBatch(
                         sp_offsets, sp_idx, sp_val, sp_norms, query_vocab, need_sparse_norms,
-                        sp_gate, sparse_q_indicator,
+                        sp_gate, sparse_q_cache,
                     )
                     raw_stats["sparse"] = (b.n_rows, b.nbytes)
                     if has_baseline["sparse"]:
@@ -2809,7 +3535,12 @@ def run_compute(
                 # here together) — see the `filter_secs` logging below, whose
                 # meaning widens accordingly.
                 t2 = time.perf_counter()
-                fq.put((gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, t1 - t0, t2 - t1))
+                # `n_rows` is the file's own row count, carried explicitly:
+                # the tie-break ordinal counter advances by it, and deriving it
+                # from `raw_stats` instead would tie that counter to whichever
+                # vector types this run happens to configure.
+                fq.put((gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays,
+                        n_rows, t1 - t0, t2 - t1))
             except Exception as exc:
                 # Permit deliberately NOT released: the consumer re-raises on
                 # fetching this, killing the run — holding it just stops the
@@ -2867,7 +3598,12 @@ def run_compute(
 
     def _flush_coalesce_group(vt: str) -> float:
         buf = coalesce_buf[vt]
+        # A file contributing no rows — an empty shard, or every row dropped by
+        # the union filter — must be dropped BEFORE concatenating.
+        buf = [e for e in buf if e[1].n_rows]
         if not buf:
+            coalesce_buf[vt] = []
+            coalesce_rows[vt] = 0
             return 0.0
         concat = {
             "dense": _concat_dense_batches,
@@ -2876,8 +3612,16 @@ def run_compute(
         }[vt]
         combined_batch = concat([entry[1] for entry in buf])
         encoded_ids = np.concatenate([
-            file_gidx * MAX_ROWS_PER_FILE + orig_rows for file_gidx, _, orig_rows, _ in buf
+            file_gidx * MAX_ROWS_PER_FILE + orig_rows
+            for file_gidx, _, orig_rows, _, _, _ in buf
         ])
+        # Tie-break ordinals for the SAME rows in the SAME concatenated order.
+        # A coalesced group mixes files, so no scalar base covers it even under
+        # `tiebreak='ordinal'` — each file's own base is applied here.
+        ordinal_ids = np.concatenate([
+            (f_ord[orig_rows] if f_ord is not None else f_base + orig_rows)
+            for _, _, orig_rows, _, f_base, f_ord in buf
+        ]).astype(np.int64, copy=False)
         # Rebuild each of this vt's (uniform-only, by `coalesce_eligible_
         # vts`' own precondition) filters' keep-mask, restricted to
         # survivor rows and concatenated in the SAME order as
@@ -2886,15 +3630,19 @@ def run_compute(
         # lookups with this GROUP's own row order, not any one file's
         # original per-file numbering.
         combined_keeps = {
-            f: np.concatenate([file_keeps[f][orig_rows] for _, _, orig_rows, file_keeps in buf])
+            f: np.concatenate([
+                file_keeps[f][orig_rows] for _, _, orig_rows, file_keeps, _, _ in buf
+            ])
             for f in vt_union_filters[vt]
         }
         elapsed = _process_shared_batch(
             combined_batch, vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
-            spec_top_scores, spec_top_enc,
-            combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_gpu,
+            spec_top_key, spec_top_enc, spec_thr,
+            combined_keeps, filter_is_per_query, filter_is_gpu_eligible, {}, gpu_query_by_filter,
             filter_share_count, vt_batch_size[vt], 0, device, orig_rows=None,
-            encoded_row_ids=encoded_ids,
+            encoded_row_ids=encoded_ids, ordinal_row_ids=ordinal_ids,
+            spec_qsel=spec_qsel, spec_qrows=spec_qrows, filter_n_q=filter_n_q,
+            spec_cos_scale=spec_cos_scale,
             multivector_token_budget=(
                 cfg.params.multivector_token_budget if vt == "multivector" else None
             ),
@@ -2909,7 +3657,7 @@ def run_compute(
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for want_gidx, _f in mine:
             w0 = time.perf_counter()
-            gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, rsec, fsec = _next_in_order(
+            gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays, file_rows, rsec, fsec = _next_in_order(
                 want_gidx, pending, _fetch_or_raise
             )
             window.release()  # file consumed — a reader may start another
@@ -2960,6 +3708,25 @@ def run_compute(
             # retention for that file, so the missing entry costs nothing.
             if id_col and any(mask is None or mask.any() for mask in keeps.values()):
                 corpus_ids[gidx] = ids
+            # This file's tie-break ordinals. The counter advances by the file's
+            # PRE-compaction row count, so a row's ordinal is a property of the
+            # corpus alone — advancing by survivors instead would make it depend
+            # on which filters happened to run, and the specs sharing this file
+            # do not share a filter.
+            ordinal_base = rows_before
+            rows_before += file_rows
+            if rows_before > MAX_ROWS_PER_WORKER:
+                raise RuntimeError(
+                    f"this worker's corpus slice exceeds {MAX_ROWS_PER_WORKER:,} "
+                    "rows, which overflows the 32-bit tie-break field and would "
+                    "make ties non-deterministic again. Split the work further "
+                    "with a larger `--num-jobs`."
+                )
+            # Popped, not read: the worker's ordinals are ~4 bytes/row and each
+            # file is visited exactly once, so releasing them as they are
+            # consumed keeps only the unread tail resident.
+            file_ordinals = None if id_ordinals is None else id_ordinals.pop(gidx)
+
             for vt in vts_needed:
                 raw_rows, raw_bytes = raw_stats[vt]
                 rows_seen += raw_rows
@@ -2970,6 +3737,7 @@ def run_compute(
                     coalesce_buf[vt].append((
                         gidx, batches[vt], batch_orig_rows[vt],
                         {f: keeps[f] for f in vt_union_filters[vt]},
+                        ordinal_base, file_ordinals,
                     ))
                     coalesce_rows[vt] += batches[vt].n_rows
                     if coalesce_rows[vt] >= vt_batch_size[vt]:
@@ -2977,9 +3745,19 @@ def run_compute(
                 else:
                     gpu_secs += _process_shared_batch(
                         batches[vt], vt_spec_idxs[vt], specs, spec_Q, spec_q_norms,
-                        spec_top_scores, spec_top_enc,
-                        keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_gpu,
+                        spec_top_key, spec_top_enc, spec_thr,
+                        keeps, filter_is_per_query, filter_is_gpu_eligible, leaf_gpu, gpu_query_by_filter,
                         filter_share_count, vt_batch_size[vt], gidx, device, orig_rows=batch_orig_rows[vt],
+                        ordinal_base=ordinal_base,
+                        ordinal_row_ids=(
+                            None if file_ordinals is None
+                            else (
+                                file_ordinals if batch_orig_rows[vt] is None
+                                else file_ordinals[batch_orig_rows[vt]]
+                            )
+                        ),
+                        spec_qsel=spec_qsel, spec_qrows=spec_qrows,
+                        filter_n_q=filter_n_q, spec_cos_scale=spec_cos_scale,
                         multivector_token_budget=(
                             cfg.params.multivector_token_budget
                             if vt == "multivector"
@@ -3030,10 +3808,10 @@ def run_compute(
     read_wall = read_secs / max(1, io_workers)
     filter_wall = filter_secs / max(1, io_workers)
     logger.info(
-        "bf-bench io_workers=%d files=%d rows=%d gb=%.3f wall_s=%.1f "
+        "bf-bench io_workers=%d cpu_threads=%d files=%d rows=%d gb=%.3f wall_s=%.1f "
         "wall_mbps=%.1f stream_mbps=%.1f io_wait_s=%.1f gpu_s=%.1f filter_s=%.1f "
         "read_wall_s=%.1f filter_wall_s=%.1f",
-        io_workers, len(mine), rows_seen, gb, wall,
+        io_workers, cpu_n, len(mine), rows_seen, gb, wall,
         wall_mbps, stream_mbps, io_wait, gpu_secs, filter_secs,
         read_wall, filter_wall,
     )
@@ -3065,30 +3843,230 @@ def run_compute(
     #    nothing corpus-wide — or, when an id column is configured, read it back
     #    from the in-RAM per-file arrays. Shared by every spec: depends only on
     #    id_col/corpus_ids/all_files, none of which is per-spec.
+    
+    # ID decoding is on the n_q*k hot path. Flatten per-file IDs once so encoded
+    # (gidx, row) pairs resolve as one vectorized `take` instead of scalar lookups.
+    # Built lazily and only when an ID column is configured.
+    flat_ids: list = [None]  # boxed so the closure can memoize into it
+
+    def _flat_ids():
+        if flat_ids[0] is None:
+            import pyarrow as pa
+
+            gidxs = sorted(corpus_ids)
+            arrays = [
+                corpus_ids[g].combine_chunks()
+                if isinstance(corpus_ids[g], pa.ChunkedArray) else corpus_ids[g]
+                for g in gidxs
+            ]
+            lens = np.fromiter((len(a) for a in arrays), dtype=np.int64,
+                               count=len(arrays))
+            # `base` is indexed by gidx, so it must span the largest gidx seen,
+            # not just len(arrays) — a filtered run can leave gaps.
+            base = np.zeros((max(gidxs) + 1) if gidxs else 1, dtype=np.int64)
+            base[np.asarray(gidxs, dtype=np.int64)] = np.concatenate(
+                ([0], np.cumsum(lens)[:-1])
+            ) if len(lens) else np.zeros(0, dtype=np.int64)
+
+            # Prevent 32-bit offset overflow
+            if arrays and pa.types.is_string(arrays[0].type):
+                arrays = [a.cast(pa.large_string()) for a in arrays]
+            elif arrays and pa.types.is_binary(arrays[0].type):
+                arrays = [a.cast(pa.large_binary()) for a in arrays]
+            values = pa.concat_arrays(arrays) if arrays else pa.array([])
+            if pa.types.is_string(values.type):
+                values = values.cast(pa.large_string())
+            elif pa.types.is_binary(values.type):
+                values = values.cast(pa.large_binary())
+            flat_ids[0] = (values, base)
+        return flat_ids[0]
+
     if id_col is not None:
         def resolve_id(e: int) -> str:
             gidx = e // MAX_ROWS_PER_FILE
             row = e % MAX_ROWS_PER_FILE
             return str(corpus_ids[gidx][row].as_py())
+
+        def resolve_id_value(e: int):
+            """The id's RAW value, before stringification — what `merge` needs
+            to order a numeric id column, since `"10"` precedes `"9"`."""
+            return corpus_ids[e // MAX_ROWS_PER_FILE][e % MAX_ROWS_PER_FILE].as_py()
     else:
         def resolve_id(e: int) -> str:
             return make_point_id(
                 all_files[e // MAX_ROWS_PER_FILE].key, e % MAX_ROWS_PER_FILE
             )
 
+    # Storage dtypes of the vectors that were actually scored, read from the
+    # file footers (schema only, no column data). Best-effort: this is
+    # provenance, so a store that cannot answer costs the metadata key, never
+    # the run.
+    def _dtypes_for(spec) -> dict[str, str]:
+        column = (
+            cfg.corpus.sparse_column
+            if spec.vector_type == "sparse"
+            else cfg.corpus.multivector_column
+            if spec.vector_type == "multivector"
+            else cfg.corpus.dense_column
+        )
+        qcolumn = (
+            cfg.queries.sparse_column
+            if spec.vector_type == "sparse"
+            else cfg.queries.multivector_column
+            if spec.vector_type == "multivector"
+            else cfg.queries.dense_column
+        )
+        out: dict[str, str] = {}
+        try:
+            if all_files:
+                out["corpus_dtype"] = vector_dtype(
+                    cstore.read_schema(all_files[0].read_path), column or ""
+                )
+        except Exception as exc:  # noqa: BLE001 - provenance must never fail a run
+            logger.debug("could not read corpus dtype for provenance: %s", exc)
+        try:
+            qfiles = qstore.list_parquets()
+            if qfiles:
+                out["queries_dtype"] = vector_dtype(
+                    qstore.read_schema(qfiles[0].read_path), qcolumn or ""
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not read queries dtype for provenance: %s", exc)
+        return out
+
     out = Store(cfg.output.path)
     results: dict[str, str] = {}
-    for i, s in enumerate(specs):
-        enc = spec_top_enc[i].cpu().numpy()
-        sc = spec_top_scores[i].cpu().numpy()
-        valid = sc > float("-inf")
-        hit_ids, hit_scores = [], []
-        for q in range(n_q):
-            qe, qs = enc[q][valid[q]], sc[q][valid[q]]
-            hit_ids.append([resolve_id(int(e)) for e in qe])
-            hit_scores.append(qs.tolist())
+    # Per-search rows for the run manifest, filled as each output is written.
+    manifest_searches: list[dict] = []
+    # The corpus as an ordered file list, hashed once: it identifies which run
+    # these partials belong to (see results.run_identity) AND goes in the
+    # manifest. Computed over `all_files` — post include/exclude, PRE stride —
+    # so every rank of one run derives the identical value without coordinating.
+    corpus_fp = run_manifest.corpus_fingerprint(all_files)
+    # A sharded run's partials must carry whatever `merge` needs to apply the
+    # SAME rule across workers that each worker applied within itself. The
+    # worker's ordinal cannot travel — it is a private relabelling, meaningless
+    # against another worker's — so:
+    #
+    #   ordinal          the row's GLOBAL corpus position, which `enc` already
+    #                    is (`gidx * MAX_ROWS_PER_FILE + row`, and `gidx`
+    #                    indexes the same path-sorted list in every worker).
+    #   id, string col   nothing: `merge` compares `hit_ids` directly.
+    #   id, numeric col  the id's numeric order image, because `hit_ids` reach
+    #                    `merge` already stringified.
+    #
+    # A string id column needs nothing at all, and a single-node run needs
+    # nothing either, since there is no reduce.
+    if tiebreak == "ordinal":
+        # `enc` IS the ordinate — no per-hit work, just write the column.
+        resolve_tie = None
+        needs_ordinate = True
+    elif id_is_int:
+        def resolve_tie(e: int) -> int:
+            return id_order_scalar(resolve_id_value(e), tie_unsigned)
+        needs_ordinate = True
+    else:
+        resolve_tie = None
+        needs_ordinate = False
+    want_tie_column = needs_ordinate and num_jobs is not None
 
-        table = build_result_table(query_ids, payload, hit_ids, hit_scores)
+    for i, s in enumerate(specs):
+       # Sort the final top-K by packed key so ties follow deterministic tie-break
+        # order. Process query rows in chunks to bound peak GPU memory during sorting.
+        h_i = spec_top_key[i].shape[0]
+        chunk = max(1, min(h_i, DECODE_CHUNK_SLOTS // max(1, s.k)))
+        enc_parts, sc_parts = [], []
+        for r0 in range(0, h_i, chunk):
+            kb, order = torch.sort(
+                spec_top_key[i][r0 : r0 + chunk], dim=1, descending=True
+            )
+            enc_parts.append(spec_top_enc[i][r0 : r0 + chunk].gather(1, order).cpu().numpy())
+            del order
+            # Recover scores from the packed keys.
+            sc_parts.append(unpack_score(kb).cpu().numpy())
+            del kb
+        enc = enc_parts[0] if len(enc_parts) == 1 else np.concatenate(enc_parts)
+        sc = sc_parts[0] if len(sc_parts) == 1 else np.concatenate(sc_parts)
+        del enc_parts, sc_parts
+        # Release this search's GPU state before decoding results on the CPU.
+        spec_top_key[i] = spec_top_enc[i] = None
+        valid = sc > float("-inf")
+        # A spec with a `rows` subset wrote state for its OWN queries only, so
+        # its output covers those rows — ids and payload are sliced to match.
+        # `query_ids`/`payload` stay full-length upstream (both loaders return
+        # every row) precisely so this slice is the only place that has to know.
+        rows_i = spec_rows[i]
+        out_n = sc.shape[0]
+        import pyarrow as pa
+
+        counts = valid.sum(axis=1).astype(np.int64)
+        offsets = pa.array(
+            np.concatenate(([0], np.cumsum(counts))).astype(np.int32), type=pa.int32()
+        )
+        flat_enc = enc[valid]                       # row-major == list order
+        hit_scores = pa.ListArray.from_arrays(
+            offsets, pa.array(sc[valid], type=pa.float32())
+        )
+
+        raw_taken = None  # the id values for these hits, resolved ONCE
+        if id_col is not None:
+            values, base = _flat_ids()
+            flat_idx = (base[flat_enc // MAX_ROWS_PER_FILE]
+                        + (flat_enc % MAX_ROWS_PER_FILE))
+            raw_taken = values.take(pa.array(flat_idx))
+            hit_ids = pa.ListArray.from_arrays(
+                # `large_string`, NOT `string`: see `_flat_ids`. Casting down
+                # here would wrap the offsets again.
+                offsets, raw_taken.cast(pa.large_string()).fill_null("None")
+            )
+        else:
+            # make_point_id is an md5 per hit and cannot be vectorized into
+            # Arrow
+            keys = [f.key for f in all_files]
+            hit_ids = pa.ListArray.from_arrays(offsets, pa.array(
+                [make_point_id(keys[int(e) // MAX_ROWS_PER_FILE],
+                               int(e) % MAX_ROWS_PER_FILE) for e in flat_enc],
+                type=pa.large_string(),   # 1e8 x 36-byte UUIDs = 3.6 GB > 2 GiB
+            ))
+
+        hit_tie = None
+        if want_tie_column:
+            if resolve_tie is None:
+                # ordinal mode: the encoded value already IS the global corpus
+                # position, so no resolution at all.
+                tie_vals = pa.array(flat_enc.astype(np.int64), type=pa.int64())
+            else:
+                # `id` mode over a numeric column. Reuses `raw_taken` rather
+                # than resolving every element a second time
+                tie_vals = id_order_array(raw_taken, tie_unsigned)
+            hit_tie = pa.ListArray.from_arrays(offsets, tie_vals)
+
+        if rows_i is None:
+            out_ids, out_payload = query_ids, payload
+        else:
+            out_ids = [query_ids[r] for r in rows_i]
+            out_payload = {c: [v[r] for r in rows_i] for c, v in payload.items()}
+        # Stamped on the PARTIALS too, not just the final file: a partial is a
+        # parquet someone can pick up on its own, and a merge that mixed
+        # partials from two different runs is exactly the mistake this makes
+        # visible.
+        dtypes = _dtypes_for(s)
+        table = build_result_table(
+            out_ids, out_payload, hit_ids, hit_scores,
+            provenance(
+                cfg, s, dtypes,
+                corpus_sha=corpus_fp["sha256"],
+                num_jobs=num_jobs,
+                job_rank=job_rank,
+                # A `--max-files` run read only part of its own slice, so its
+                # output is not ground truth. Fingerprinting it separately is
+                # what stops a benchmarking partial from ever merging with a
+                # real one.
+                partial_slice=max_files is not None,
+            ),
+            hit_tie=hit_tie,
+        )
+        short_i = int((counts < s.k).sum())
         if num_jobs is not None:
             width = max(3, len(str(num_jobs - 1)))
             name = f"{partial_dir(cfg, s)}/rank{job_rank:0{width}d}.parquet"
@@ -3099,8 +4077,98 @@ def run_compute(
             # the true final count, so that's the only place worth warning.
         else:
             name = result_name(cfg, s)
-            warn_if_short(sum(1 for h in hit_ids if len(h) < s.k), len(hit_ids), s.k, s.name, logger)
+            warn_if_short(short_i, out_n, s.k, s.name, logger)
         path = out.write(name, table)
-        logger.info("search=%r wrote %s (%d queries)", s.name, path, n_q)
+        logger.info("search=%r wrote %s (%d queries)", s.name, path, out_n)
         results[s.name] = path
+        entry = run_manifest.search_entry(s)
+        entry.update({
+            "queries": out_n,
+            "output_file": name,
+            "output_path": path,
+            "hit_tie_column": want_tie_column,
+            # Storage dtypes of the vectors actually scored.
+            "corpus_dtype": dtypes.get("corpus_dtype"),
+            "queries_dtype": dtypes.get("queries_dtype"),
+        })
+        if num_jobs is None:
+            # Only a whole-corpus run can say anything true about short top-Ks.
+            # On a partial, "fewer than k hits" is the normal state of a stride
+            # slice, so reporting it would read as a defect that isn't one.
+            entry["queries_short_of_k"] = short_i
+        manifest_searches.append(entry)
+
+    # The run manifest — written LAST, so it only ever describes outputs that
+    # actually landed, and best-effort, so it cannot fail a run that produced
+    # them (see manifest.py).
+    # See `counts.queries_searched`: any unsubsetted search covers every query,
+    # otherwise it is the union of the subsets (searches may overlap, so this is
+    # a set union, not a sum).
+    queries_searched = (
+        n_q if any(r is None for r in spec_rows)
+        else len(set().union(*(set(r.tolist()) for r in spec_rows)))
+    )
+    doc = run_manifest.base_manifest(cfg, "compute", device=device)
+    doc["compute"].update(run_manifest.gpu_peak(device))
+    # Which corpus, as an ordered file list — the ids depend on that order.
+    # Fingerprinted over `all_files` (post include/exclude, PRE stride), so
+    # every rank of one run reports the identical hash and a mismatch means
+    # the ranks disagreed about the corpus, not about their slice of it.
+    doc["source"]["corpus"]["fingerprint"] = corpus_fp
+    # `params` records what RAN, so the CLI overrides and the sizes resolved at
+    # runtime replace the configured values (which are `null` whenever a knob
+    # was left to be derived — see `_resolve_vt_batch_size` and the
+    # multivector token-budget derivation).
+    doc["params"].update({
+        "io_workers": io_workers,
+        "io_thread_count": itc,
+        "batch_size_by_vector_type": vt_batch_size,
+        "multivector_batch_size": mv_batch_size,
+        "multivector_query_block": mv_query_block,
+    })
+    doc.update({
+        "started_at": started_at.isoformat(),
+        "sharding": {
+            "num_jobs": num_jobs,
+            "job_rank": job_rank,
+            "corpus_files_total": len(all_files),
+            "corpus_files_this_worker": len(mine),
+            "max_files": max_files,
+            # A `--max-files` run read only part of its own slice, so its output
+            # is NOT valid ground truth. That has to survive into the artifact
+            # record — it is exactly the file someone later mistakes for real.
+            "partial_slice": max_files is not None,
+        },
+        "searches": manifest_searches,
+        "counts": {
+            # The queries FILE's row count. With `rows` subsets a search covers
+            # fewer than this (each search's own count is in `searches[]`), so
+            # the name says which number this is rather than letting a reader
+            # take it for "queries searched".
+            "queries_in_file": n_q,
+            # The union across searches of the rows any search actually scored.
+            # A search with no `rows` covers the whole file, so one of those
+            # makes the union the whole file regardless of what the others subset.
+            "queries_searched": queries_searched,
+            "corpus_rows_scanned": rows_seen,
+            "corpus_bytes_decoded": bytes_seen,
+        },
+        # `elapsed_seconds` is the whole invocation; `scan_seconds` and the four
+        # splits below cover the corpus pass only (see the bf-bench log line).
+        # read/filter seconds are SUMMED across io_workers reader threads, so
+        # divide by io_workers to compare either with wall time.
+        "timing": {
+            "elapsed_seconds": round(time.perf_counter() - run_t0, 2),
+            "scan_seconds": round(wall, 2),
+            "io_wait_seconds": round(io_wait, 2),
+            "gpu_seconds": round(gpu_secs, 2),
+            "read_seconds_summed": round(read_secs, 2),
+            "filter_seconds_summed": round(filter_secs, 2),
+            "rows_per_second": round(rows_seen / wall, 1) if wall > 0 else 0,
+            "wall_mbps": round(wall_mbps, 1),
+            "stream_mbps": round(stream_mbps, 1),
+        },
+        "output_files": [e["output_file"] for e in manifest_searches],
+    })
+    run_manifest.write(out, run_manifest.manifest_name(cfg, "compute", job_rank, num_jobs), doc)
     return results

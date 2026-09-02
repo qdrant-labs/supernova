@@ -39,6 +39,7 @@ output:
 params:
   io_workers: 16             # concurrent corpus-file reader threads
   io_thread_count: 0         # pyarrow IO-pool size (0 = pyarrow's default ~8)
+  cpu_thread_count: 0        # pyarrow CPU-pool size = decode + compute kernels (0 = all cores)
   # dense_batch_size: 4096   # bound GPU memory on huge files; omit = whole file at once
   # sparse_batch_size: 4096  # same, for vector_type: sparse searches
   # merge_batch_size: null   # merge tuning, see Performance & tuning
@@ -96,6 +97,123 @@ searches:
 `name` is optional — it's spliced into the output filename (`bf_<queries-stem>_<name>_k<K>.parquet`), so if you set it, it must be unique. Omit it and one is derived from `vector_type`/`metric` (e.g. `dense_cosine`), with `_filtered` appended when `filter` is set and any collision (with another default, or with an explicit name elsewhere in `searches`) disambiguated by an incrementing suffix (`_2`, `_3`, …) — so the single-search case above needs no `name:` line at all.
 
 **Mixing `vector_type: dense` and `vector_type: sparse` in one run doubles the per-file host-RAM budget**: each in-flight file's reader decodes both columns at once, so `io_workers × file_size` (see [Performance & tuning](#performance--tuning)) becomes `io_workers × (dense_bytes + sparse_bytes)`. Lower `io_workers` accordingly on memory-constrained boxes when mixing vector_types.
+
+### Giving each search its own query rows
+
+By default every search scores every row of the queries file. 
+However, `rows:` lets a search declare which rows are its own instead. The generic format is as follows: `rows: {column: <parquet_column_with_query_set_values>, isin: [<specific_query_set>]}`. For example, if you have a parquet with a `query_set` column, where the `query_set` values could either be `filtered_text` or `structured`, you would use the following yaml format:  
+
+```yaml
+queries:
+  path: s3://…/ms_marco_10000_combined.parquet
+
+searches:
+  - name: filtered_text
+    rows: {column: query_set, isin: [filtered_text]}
+    filter:
+      must:
+        - field: text
+          match_text_from_query: keyword_phrase
+
+  - name: structured
+    rows: {column: query_set, isin: [structured]}
+    filter:
+      must:
+        - field: language_score
+          range_from_query: {gte: ls_gte}
+```
+
+Omit `rows` and the search covers every query, as before. The selector column is read from the queries file directly, so it does not need to appear in `queries.payload_fields` (list it there anyway if you want it carried into the output). Values compare as strings. A selector that matches no row is an error, not an empty result.
+
+- **Not supported with `vector_type: multivector`** — that path carries ragged
+  per-query token offsets that a row subset would have to rebuild. Configuring
+  both is rejected at config load rather than silently ignored.
+- Order the unified query file rows based on the query_set value (i.e., keep the same values contiguous) to improve computational efficiency with row selection.
+#### What `rows` saves
+
+Specs sharing a `vector_type` still build queries and scores over the **union** of their `rows`, so those allocations only shrink if the union itself is smaller. When the subsets together cover the full query file, the main savings are per-spec top-K state and merge work.
+
+For example, with `k=1000` and 10,000 queries, splitting queries between two specs cuts top-K state from 240 MB to 120 MB and roughly halves merge work.
+
+`rows` also simplifies per-query filters and output: each spec only needs filter values and results for its own queries.
+
+Per-query **filter masks** are the exception, and they shrink by a different
+rule — see below.
+
+#### Per-query filter masks shrink with the FILTER's rows, not the vector_type's
+
+A per-query filter whose leaves are all `match_from_query` / `range_from_query`
+/ static is evaluated GPU-natively, per corpus batch, and never materializes a
+CPU-side mask at all. One with a `match_text` / `match_text_from_query` leaf
+cannot be (torch has no string tensor type), so it falls back to
+`filters.evaluate`'s numpy path and materializes a real
+`(n_queries, file_rows)` boolean mask — bit-packed 8 queries/byte, but built
+once per corpus file and held for that file's whole batch loop, once per
+in-flight reader. It is the only allocation in a run that scales as
+`n_queries × file_rows`, which makes its query axis worth being precise about.
+
+That axis is the **union of the `rows` of the specs that use that filter** —
+not the queries file's height, and not the vector_type's row union either.
+Three consequences:
+
+- Unioning an unrelated query set into the file does not enlarge it. A
+  5,000-query text search costs the same whether it sits in its own 10,000-row
+  queries file or in a 110,000-row union file. (Measured: 65.6 MiB → 3.0 MiB of
+  packed mask for 5,000 owned queries out of 110,000 over a 5,000-row corpus
+  file — a 22× drop, exactly the row ratio.)
+- Two specs **sharing one filter** pool their rows, since they share one
+  `keeps` entry. Give them distinct filter values and each narrows on its own.
+- A spec with no `rows` pins that filter back to full file height, because it
+  really does look at every query.
+
+The one thing this does not narrow is a GPU-eligible filter, deliberately: its
+per-query state is shared across filters by `FilterCondition`, and its mask is
+per-batch (`n_queries × dense_batch_size`) rather than per-file, so it is
+roughly three orders of magnitude smaller to begin with.
+
+#### Sentinels are optional, but a GPU-eligible filter still wants one
+
+`rows` means a foreign row's per-query filter value is never read for that
+search, so the match-nothing sentinels the two-halves pattern needed
+(`zzznomatchzzz`, a token-less phrase) are not required for correctness.
+
+They still buy something for a **GPU-eligible** per-query filter. Such a filter
+contributes a row-union over-approximation to the shared corpus batch grid
+("does at least one query's own leaf admit this row" —
+`_row_union_from_gpu_leaves`), and that reduction runs over the full query
+axis. For `match_from_query` / `range_from_query` a **null** value reads as *no
+restriction*, so leaving foreign rows null makes the union admit every corpus
+row and quietly costs that search its corpus pruning — invisible in a run that
+also contains an unfiltered search (which scans everything anyway), then
+surprising when the filtered search is rerun alone. An explicit match-nothing
+value (`dump_set: [zzznomatchzzz]`) keeps the union tight and costs nothing.
+
+A **text** filter never had this problem, before or after the narrowing above,
+and it is worth being precise about why rather than crediting `rows` for it: a
+null or empty phrase is *token-less*, and a token-less phrase in a `must`
+matches nothing while a null slot in a `should` contributes nothing. Either
+way such a query's mask row is all-`False` and adds nothing to the OR. So for
+a text filter whose foreign rows carry sentinels or nulls — i.e. every
+configuration in this repo — narrowing the mask changes the corpus-row union
+by exactly zero. Its payoff is the allocation, not the union. Foreign rows
+holding *real* values in the filter's own columns are the only case where the
+union genuinely tightens.
+
+#### `rows` is not bit-exact against a full-file run
+
+When a subset *does* shorten the query matrix — i.e. the union of the run's
+`rows` is a strict subset of the file, so some rows no search owns — scores can
+differ from the same search run over the whole file by ~1 float32 ULP
+(observed ~5e-7 relative). Nothing is wrong: the matmul's query dimension
+changed, so BLAS picks a different kernel and accumulates in a different order.
+Hit **ids** are unaffected except where two documents' scores sit within that
+margin, in which case they can swap.
+
+Practically: two searches whose subsets cover every row (the layout above) stay
+bit-exact, but rerunning just *one* of them from the same queries file will not
+reproduce the combined run's scores to the last bit. Treat scores from a
+narrowed run as ~1e-6-comparable, not identical — the same caveat
+`params.allow_tf32` carries, at a much smaller magnitude.
 
 ### Sparse vectors
 
@@ -209,6 +327,45 @@ Do not confuse this with a negative `dot` or `cosine` score, which is **not** a 
 
 **Sanity check:** if a query also appears in the corpus, its top hit should be itself — with score ≈ 1.0 for cosine, or ≈ 0.0 for euclidean. Expect the euclidean self-hit to be a small negative number rather than exactly `-0.0`: it is computed as `‖q‖² + ‖c‖² − 2q·c`, whose cancellation resolves a true zero to roughly `sqrt(float32 eps) · ‖q‖` (~1e-2 at `‖q‖≈35`). That is inherent to the expansion — `torch.cdist` uses the same one at any real corpus size — and it bounds how finely euclidean *distances* can be trusted between near-duplicates, though not the ranking of ordinary neighbours.
 
+### One run's partials, and all of them
+
+A search's partial directory is addressed by `(queries stem, search name, k)` alone, so **any two runs agreeing on those three write into the same directory**, and rank files overwrite only the ranks the newer run has. A 32-way run landing on a 64-rank run's leftovers leaves 32 fresh partials beside 32 stale ones. Nothing about the rows says so — same schema, same query rows, same hit-id shape — and the merge is clean: the corpus gets double-counted where the two strides overlap and missed where neither covered, producing a top-K that looks entirely normal and is wrong.
+
+Every partial therefore carries a **run fingerprint** in its parquet metadata, and `merge` refuses to reduce a directory whose partials disagree on it. The fingerprint is content-derived rather than a per-invocation id: every rank computes the same value from the same inputs without coordinating, and re-running one failed rank later reproduces it exactly, so the documented recovery path still works. It covers the config (`nova_bf.config_fingerprint` — spec, metric, `k`, filter, `rows`, input paths and columns, `allow_tf32`), the corpus file list *in index order*, `num_jobs`, the tie-break rule, and whether `--max-files` truncated the slice — so a benchmarking partial can never merge with a real one.
+
+Sharded partials also stamp `nova_bf.num_jobs` and `nova_bf.job_rank`, and merge checks the ranks present are exactly `0..num_jobs-1`. This is what catches a **missing** rank: the older "every search has the same partial count" check cannot, because a rank that dies before writing anything leaves every search short by exactly one. A missing rank's slice is simply absent from the merged top-K, silently lowering every recall number computed against it.
+
+Merge also recomputes the config fingerprint from the config *it* was handed and compares — the generalization of the existing `tiebreak` guard to every other field that changes results. Only result-affecting fields are in it: `io_workers`, batch sizes and `output.path` are not, so two runs differing only in those still merge.
+
+Partials written before fingerprinting log a loud warning rather than failing — refusing them would strand hours of legitimate GPU work over a check that would have passed. A directory where only *some* partials carry the stamp is an error, since that mixture is itself the failure.
+
+### Run manifest
+
+Each phase also writes one JSON manifest next to its outputs. The parquet's schema metadata (`nova_bf.*` keys: corpus/queries path, metric, `k`, `allow_tf32`, the stored vector dtypes, the tie-break rule) says what the ground truth **is**; the manifest says what the **run** was — how many ranks, which files this worker took, how long each phase took, what hardware it ran on, and the full filter each search used. It is the same shape `nova embed` writes (`source` / `destination` / `created_at` / `compute` / settings / counts / timing / `output_files`), so both toolsets' artifacts read the same way.
+
+```
+{output.path}/_bf_manifest_<queries-stem>_compute.json            # single-GPU compute
+{output.path}/_bf_manifest_<queries-stem>_compute/rank<NNN>.json  # one per rank when sharded
+{output.path}/_bf_manifest_<queries-stem>_merge.json              # merge
+```
+
+| Block | |
+|-------|--|
+| `source` / `destination` | corpus + queries paths, `include`/`exclude`, and the id/vector/payload columns actually read |
+| `source.corpus.fingerprint` (compute) | file count and a sha256 over the corpus file list **in the order the run indexed it** — with no `corpus.id_column` the hit ids are `make_point_id(file_key, row)`, so that order is part of the id scheme: add or rename one file and every later file's ids shift. Comparing this hash proves two runs saw the same corpus, and catches `include`/`exclude` drift between ranks. Merge has no corpus listing of its own, so it carries no fingerprint |
+| `compute` | instance type, region, AZ, GPU + count and total memory, torch/CUDA version, the device scoring really ran on, and this run's peak GPU allocated/reserved bytes |
+| `code` | supernova workspace version, `git describe` / commit / branch / dirty flag, and the python, numpy and pyarrow versions — the scoring and tie-break kernels *are* the ground truth, so the revision that produced it is part of the record |
+| `job` | SkyPilot task/cluster/job ids when present, plus hostname and pid — what ties a suspicious rank's manifest back to its log |
+| `params` | every run-level knob **as resolved** — CLI overrides like `--io-workers`, the per-vector-type batch sizes in `batch_size_by_vector_type`, and the multivector tile sizes derived from `multivector_token_budget` all replace the configured (often `null`) values, so it records what ran, not what the YAML said |
+| `searches` | per search: `vector_type`, `metric`, `k`, the **full filter** and `rows` selector, query count, output file, and the corpus/queries storage dtypes |
+| `sharding` (compute) | `num_jobs`, `job_rank`, corpus files total vs. this worker's, and `partial_slice: true` when `--max-files` made the output invalid as ground truth |
+| `counts` / `timing` | `queries_in_file` and `queries_searched` (they differ when a search uses `rows`), corpus rows scanned, bytes decoded; elapsed vs. scan seconds and the `io_wait` / `gpu` / `read` / `filter` split behind the `bf-bench` log line |
+| `output_files` | the files this phase wrote — the only record of which are a given rank's once names collide across ranks |
+
+The filter is dumped in full because for a filtered GT the filter *is* the search: recall numbers from two runs are comparable only if the predicates were identical, and a YAML edit between runs is otherwise invisible in the artifacts. A merge manifest also records `partials` per search — how many ranks' candidates were actually folded in, which the final parquet cannot tell you and which a dead rank silently changes.
+
+Writing a manifest is best-effort: it is a record *of* outputs that already landed, so a failure to write one logs a warning and never fails the run.
+
 ## Hit IDs & recall evaluation
 
 `hit_ids` are how you join ground truth back to a loaded collection, so they must match the point ids the store holds. Two modes:
@@ -218,6 +375,32 @@ Do not confuse this with a negative `dot` or `cosine` score, which is **not** a 
 
 Whichever you pick, the corpus loaded into the vector store must use the **same** id scheme, or the id sets won't line up and recall reads ~0.
 
+## Ties
+
+Two documents can score **exactly** equal, and more often than you'd guess: duplicate documents embed to bit-identical vectors, sparse and filtered searches collide constantly, and at production `k` over thousands of candidates float32 stops separating scores deep in the tail. Something has to decide which one makes the cut, and left alone `torch.topk` (and numpy's `argpartition`/`argsort`, all unstable) decided by whatever the selector happened to visit first — so the answer moved with `dense_batch_size` and `--num-jobs`.
+
+`params.tiebreak` fixes the rule:
+
+| Value | Rule | Cost |
+|---|---|---|
+| `ordinal` *(default)* | Earlier in the corpus wins. | Free. No id column needed. |
+| `id` | Lower `corpus.id_column` wins; among equal ids, earlier in the corpus. | One sort of this worker's id column at startup. Requires `corpus.id_column`. |
+
+`id` is closer to a property of the data than of how it happens to be laid out on disk, so it survives re-sharding the corpus into different files; `ordinal` does not. Neither costs anything at scoring time.
+
+Ordering follows the column's **type**: a numeric id column compares numerically (9 before 10), a string column bytewise. There is no length or entropy limit — what is keyed is the id's *position* in sorted order, not its bytes, so 128-bit UUIDs, long shared prefixes like `<urn:uuid:…>`, zero-padded ids and the full `uint64` range all separate exactly. A null id is rejected under `id` (it has no ordering position, and every null row would report the same `"None"` hit id).
+
+### What this guarantees, and what it does not
+
+Given two candidates whose scores are equal **bit for bit**, which one survives and in what order they appear is invariant to `--num-jobs`, every batch size, `io_workers`, thread counts, device, and file arrival order.
+
+It does **not** make the scores themselves reproducible. A matmul's reduction order is part of its answer, so re-tiling can move a score by one ULP and change whether two documents tie *at all* — measured on a real corpus, `dense_batch_size: 64` and `512` disagreed in the last bit of a score, and `dot` is not immune. `--num-jobs` preserves batch shapes and so is safe; batch size is not. **Pin `dense_batch_size` (and leave `allow_tf32` off) if you need a bit-reproducible artifact across runs.**
+
+Two further limits worth knowing:
+
+- **4.29B rows per worker.** The rule rides in a 32-bit field, so one worker may hold at most that many rows — not a limit on the corpus, and not on how many distinct ids exist. Exceeding it is a hard error pointing at `--num-jobs`; at 10B rows over 64 workers there is 27× headroom.
+- **This makes the artifact reproducible, not the engines identical.** Qdrant's `ScoredPoint` compares score only and has no tie-break of its own, so nova-bf and Qdrant may still keep different points at a tie boundary. That is what nova-storm's tie-tolerant recall absorbs.
+
 ## Performance & tuning
 
 The work splits into three layers: **reading** corpus parquet from S3, **decoding** it (parquet → Arrow → numpy, on CPU), and **scoring** on the GPU. For typical query counts the GPU is light; the read + decode path dominates, so tune those first.
@@ -225,6 +408,7 @@ The work splits into three layers: **reading** corpus parquet from S3, **decodin
 | Knob | Default | Guidance |
 |------|---------|----------|
 | `params.io_thread_count` | `0` (≈8) | **The real S3 fetch concurrency.** pyarrow funnels every read through one global IO pool, so this — not `io_workers` — is what raises throughput once decode keeps up. Try `64`–`128` on a fat NIC. |
+| `params.cpu_thread_count` | `0` (all cores) | **pyarrow's CPU pool** — the compute half of the pair above (named to match pyarrow's own `set_cpu_count`/`set_io_thread_count`): `io_thread_count` fetches bytes, this one works on them. Parquet decode dominates, but Arrow compute kernels run here too, so it also moves filter evaluation. Left to the environment it defaults to `OMP_NUM_THREADS`, which GPU images commonly pin to `1`; a decode pool of 1 throttles every reader thread at once and looks exactly like an IO bottleneck (idle CPU, `read_wall_s` flat however you tune the two knobs above). Measured on a g5.8xlarge whose image set `OMP_NUM_THREADS=1`: one 5 GB file parsed in 32.0s at `1` vs 2.8s at `32`, and a real run's `read_wall_s` fell 242s → 166s. nova-bf now sets it explicitly and reports it on the `bf-bench` line. |
 | `params.io_workers` | `16` | Concurrent corpus-file reader threads (each holds ~one file in RAM, so `io_workers × file_size` must fit host memory — **double that if any run mixes `vector_type: dense` and `vector_type: sparse` searches**, since each in-flight file then decodes both columns at once). Useful, but caps at `io_thread_count` — raising it alone won't lift throughput. |
 | instance vCPUs | — | Parquet decode is CPU-bound and scales ~linearly with cores. The brute-force matmul is light, so **pick the instance for vCPUs, not the GPU** (e.g. a single-GPU, high-core `g5.16xlarge`). |
 | `params.dense_batch_size` / `sparse_batch_size` | `None` | The per-file score matrix is `queries × rows`. Big files (or very large query sets) can OOM the GPU; set this to score in row-batches. Omit for the whole-file (fastest) path. One value per vector_type, run-wide — every search of a vector_type ends up sharing one GPU pass over the corpus (see [One search, or several in one pass](#one-search-or-several-in-one-pass)). When some search of that vector_type is unfiltered (the shared-pass case), your configured value is always kept as-is — it's a memory bound, so it's never silently raised, even if some search's `k` exceeds it (that search just takes a few extra merge rounds). Otherwise, each filter group's own batch size floors at the largest `k` among that group's own members. |

@@ -117,6 +117,23 @@ class QueriesConfig(BaseModel):
     # epoch µs so each query's bound compares against the (also-µs) corpus date.
     date_fields: list[str] | dict[str, str] = []
 
+    @model_validator(mode="after")
+    def _payload_fields_are_not_reserved(self) -> "QueriesConfig":
+        """A carried column cannot be named like an output column.
+        """
+        # Imported here, not at module scope: `results` imports this module.
+        from nova_bf.results import RESERVED
+
+        clash = [c for c in self.payload_fields if c in RESERVED]
+        if clash:
+            raise ValueError(
+                f"queries.payload_fields may not use the reserved output column "
+                f"name(s) {clash}; nova-bf writes {list(RESERVED)} itself, so "
+                "these would be silently overwritten. Rename the column(s) in the "
+                "queries file, or drop them from payload_fields."
+            )
+        return self
+
 
 class OutputConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -148,6 +165,10 @@ class ParamsConfig(BaseModel):
     # pool-bound; if it stays flat you're network-bound. Applied via
     # pa.set_io_thread_count() once at startup.
     io_thread_count: int = 0
+    # PyArrow CPU threads used for Parquet decoding/decompression, separate from
+    # the I/O thread pool. 0 uses os.cpu_count() rather than PyArrow's default,
+    # which may inherit OMP_NUM_THREADS and unintentionally serialize decoding.
+    cpu_thread_count: int = 0
     # Opt-in: read each large corpus/queries parquet as MANY concurrent byte
     # ranges before parsing (the `aws s3 cp` strategy). Files written with a
     # large flush threshold hold ~ONE row group, so a single-column read
@@ -166,7 +187,11 @@ class ParamsConfig(BaseModel):
     # given vector_type ends up sharing one GPU pass over the corpus anyway
     # (see compute.py), so a per-search value would just be resolved down to
     # this same shared number regardless — this makes that explicit instead
-    # of implicit. A value below some search's own `k` is never raised —
+    # of implicit. `SearchSpec.rows` does NOT change that: the shared score
+    # matrix spans the vector_type's whole query-row union and each search
+    # slices its own rows out of it AFTER scoring, so what this bounds is
+    # still one matrix per vector_type, not one per search.
+    # A value below some search's own `k` is never raised —
     # only warned about (that search just needs extra merge rounds to fill
     # its own top-K, at no extra memory cost to anyone).
     #
@@ -251,6 +276,11 @@ class ParamsConfig(BaseModel):
     # effect when the partials are already local. Default off (a laptop
     # controller may lack the disk).
     merge_prefetch: bool = False
+
+    # Which of two EXACTLY-tied candidates wins.
+    # Neither makes SCORES reproducible across batch sizes — re-tiling a matmul
+    # changes its reduction order, which can change whether a tie exists at all.
+    tiebreak: Literal["ordinal", "id"] = "ordinal"
 
 
 # A single scalar payload value, as it would appear in a corpus column.
@@ -472,6 +502,41 @@ class Filter(BaseModel):
         return bool(self.query_fields())
 
 
+class RowSelector(BaseModel):
+    """Which QUERY rows a search owns — `SearchSpec.rows`.
+
+    Without one, a spec covers every row in the queries file, so a run that
+    unions several query sets into one file has to neutralize each spec's
+    foreign rows with a match-nothing sentinel value.
+
+    A selector names the rows directly instead, and the sentinels become
+    unnecessary:
+
+        rows: {column: query_set, isin: [filtered_text]}
+
+    `column` is read from the queries file alongside the per-query filter
+    columns, so it does NOT need to be listed in `queries.payload_fields`
+    (though it usually is, to carry through to the output). Values are compared
+    as strings, so `isin: ["1"]` matches an integer 1 in the source column.
+
+    NOT bit-exact against a full-file run when the run's selectors leave some
+    rows unowned. Specs of one vector_type share one query matrix built over
+    the UNION of their `rows`; if that union is a strict subset of the file the
+    matrix is shorter, the scoring matmul's query dimension changes with it,
+    and BLAS accumulates in a different order — scores move by ~1 float32 ULP
+    (~5e-7 relative), enough to swap two documents scored within that margin.
+    Subsets that between them cover every row (the two-halves case `rows` was
+    added for) keep the matrix full height and stay bit-exact. See
+    docs/brute-force/overview.md; same class of caveat as
+    `ParamsConfig.allow_tf32`, several orders of magnitude smaller.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    column: str = Field(min_length=1)
+    isin: list[str] = Field(min_length=1)
+
+
 class SearchSpec(BaseModel):
     """One independent top-K search to compute in a `nova-bf compute` run —
     its own vector_type, metric, k, and (optional) filter, scored and top-K'd
@@ -497,6 +562,10 @@ class SearchSpec(BaseModel):
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
     vector_type: Literal["dense", "sparse", "multivector"] = "dense"
     filter: Filter | None = None
+    # Which QUERY rows this search owns (see RowSelector). None = every row,
+    # the historical behavior. `filter` is the CORPUS-side predicate; this is
+    # the query-side one, and the two are independent.
+    rows: RowSelector | None = None
 
     @model_validator(mode="after")
     def _no_euclidean_for_non_dense(self) -> "SearchSpec":
@@ -509,6 +578,21 @@ class SearchSpec(BaseModel):
             raise ValueError(
                 f"metric='euclidean' is not supported with vector_type="
                 f"'{self.vector_type}' — use 'dot' or 'cosine'"
+                + (f" (search {self.name!r})" if self.name else "")
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _rows_not_multivector(self) -> "SearchSpec":
+        # The multivector path carries its own ragged (total_tokens, D) matrix
+        # plus a length-n_q+1 token-offset array (`MultiVectorQuery`); taking a
+        # query-row subset means rebuilding those offsets, which the dense and
+        # sparse paths don't need. Rejected explicitly rather than silently
+        # ignored — a subset that didn't apply would produce a correct-looking
+        # result over the WRONG query set.
+        if self.rows is not None and self.vector_type == "multivector":
+            raise ValueError(
+                "`rows` is not supported with vector_type='multivector'"
                 + (f" (search {self.name!r})" if self.name else "")
             )
         return self
@@ -570,6 +654,19 @@ class BruteForceConfig(BaseModel):
         names = [s.name for s in self.searches]
         if len(set(names)) != len(names):
             raise ValueError(f"`searches` names must be unique, got {names}")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tiebreak(self) -> "BruteForceConfig":
+        """`tiebreak: id` orders ties by the point id, so there has to be one.
+        """
+        if self.params.tiebreak == "id" and not self.corpus.id_column:
+            raise ValueError(
+                "params.tiebreak='id' orders ties by the point id, so it needs "
+                "`corpus.id_column`. Without one the ids are derived from a hash "
+                "of (file, row), whose order says nothing the default "
+                "params.tiebreak='ordinal' does not already say — use that."
+            )
         return self
 
     @model_validator(mode="after")

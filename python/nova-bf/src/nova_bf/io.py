@@ -90,6 +90,15 @@ class Store:
         out.sort(key=lambda f: f.read_path)
         return out
 
+    def read_schema(self, read_path: str) -> pa.Schema:
+        """The file's schema, footer only — no column data.
+
+        Used to record what dtype the vectors were STORED as (see
+        `results.provenance`), which the loaders can't report because they
+        upcast to float32 on the way in.
+        """
+        return pq.read_schema(read_path, filesystem=self.fs)
+
     def read_columns(self, read_path: str, columns: list[str] | None) -> pa.Table:
         if self.ranged_get:
             size = self.fs.get_file_info(read_path).size
@@ -131,11 +140,26 @@ class Store:
         """
         Write a table to root/filename (creating local parent dirs).
         """
+        path = self._prepare_write(filename)
+        with self.fs.open_output_stream(path) as sink:
+            pq.write_table(table, sink, compression="snappy")
+        return path
+
+    def write_bytes(self, filename: str, data: bytes) -> str:
+        """Write raw bytes to root/filename — the run manifest (see manifest.py).
+
+        Same path/parent-dir handling as `write`, so a manifest lands beside the
+        parquets it describes whether the root is local or s3://.
+        """
+        path = self._prepare_write(filename)
+        with self.fs.open_output_stream(path) as sink:
+            sink.write(data)
+        return path
+
+    def _prepare_write(self, filename: str) -> str:
         path = f"{self.root.rstrip('/')}/{filename}"
         if not self.is_s3:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        with self.fs.open_output_stream(path) as sink:
-            pq.write_table(table, sink, compression="snappy")
         return path
 
 

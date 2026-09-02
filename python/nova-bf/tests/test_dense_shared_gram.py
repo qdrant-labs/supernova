@@ -342,6 +342,128 @@ def test_share_gram_gate(ds, metrics, expect_shared, monkeypatch):
     assert all(s is expect_shared for s in seen), seen
 
 
+def test_score_cache_dedupes_per_metric_and_scale(ds, monkeypatch):
+    """`score_cache` is keyed on `(metric, scale_in_packer)`, because that flag
+    decides whether the matrix has ALREADY been divided by the per-query norm —
+    it changes what the cached tensor means, not just how it was built.
+
+    Two things this pins. First, the key change must not have DISABLED the
+    cache: four specs over two metrics must still score exactly twice per
+    slice, not four times. Second, every member sharing a metric must agree on
+    the flag — that agreement is what makes a shared matrix safe, and it is the
+    assumption that would silently break if `spec_cos_scale` ever gained a
+    per-spec condition (a fused spec would cache an un-normalised matrix and an
+    unfused reader would never divide, scaling its scores by ‖q‖ and leaving
+    ranking — hence recall — untouched).
+    """
+    from nova_bf.compute import DenseBatchSlice
+
+    # Slices are transient, and CPython recycles id() aggressively (1000
+    # short-lived objects can share ~17 addresses), so calls are tagged with a
+    # monotonic epoch bumped per transfer rather than grouped by identity.
+    epoch = {"n": 0}
+    calls: list[tuple] = []
+    real_transfer = DenseCorpusBatch.transfer
+    real_score = DenseBatchSlice.score
+
+    def transfer_spy(self, r0, r1, device):
+        epoch["n"] += 1
+        return real_transfer(self, r0, r1, device)
+
+    def spy(self, Q, metric, q_norms=None, scale_in_packer=False):
+        calls.append((epoch["n"], metric, scale_in_packer))
+        return real_score(self, Q, metric, q_norms, scale_in_packer=scale_in_packer)
+
+    monkeypatch.setattr(DenseCorpusBatch, "transfer", transfer_spy)
+    monkeypatch.setattr(DenseBatchSlice, "score", spy)
+    specs = [
+        SearchSpec(name="c1", vector_type="dense", metric="cosine", k=5),
+        SearchSpec(name="c2", vector_type="dense", metric="cosine", k=5),
+        SearchSpec(name="d1", vector_type="dense", metric="dot", k=5),
+        SearchSpec(name="d2", vector_type="dense", metric="dot", k=5),
+    ]
+    _run(ds, specs, "score_cache_dedupe")
+    assert calls, "no slice was scored"
+
+    per_slice: dict[int, list[tuple]] = {}
+    for ep, metric, flag in calls:
+        per_slice.setdefault(ep, []).append((metric, flag))
+    for sid, keys in per_slice.items():
+        assert len(keys) == len(set(keys)), \
+            f"a slice scored the same key twice — cache disabled? {keys}"
+        assert set(keys) == {("cosine", True), ("dot", False)}, keys
+
+    by_metric: dict[str, set] = {}
+    for _, metric, flag in calls:
+        by_metric.setdefault(metric, set()).add(flag)
+    assert all(len(v) == 1 for v in by_metric.values()), \
+        f"members sharing a metric disagreed on scale_in_packer: {by_metric}"
+
+
+def test_a_per_spec_scale_decision_keeps_both_specs_correct(ds, monkeypatch):
+    """Simulate the future condition the pair-keyed `score_cache` exists for.
+
+    Today `spec_cos_scale[m] is not None` reduces to "dense cosine", so every
+    member sharing a metric necessarily agrees and NO test can tell a
+    metric-keyed cache from a pair-keyed one. This forces the disagreement the
+    review anticipated — two cosine specs, one fusing the query-norm divide
+    into the packer and one not — and pins both consequences:
+
+      * results stay identical. Under a metric-keyed cache the second spec
+        reads a matrix built under the FIRST spec's flag and never applies its
+        own divide, so every score comes back scaled by ‖q‖. Ranking within a
+        query is untouched (a positive per-row scalar), so hit_ids would still
+        match and only hit_scores would be wrong.
+      * `share_gram` stays False. There is still exactly ONE distinct metric;
+        counting score-cache keys instead would switch a single-metric batch
+        onto the shared-Gram path.
+    """
+    import nova_bf.compute as compute_mod
+
+    specs = [
+        SearchSpec(name="fused", vector_type="dense", metric="cosine", k=5),
+        SearchSpec(name="unfused", vector_type="dense", metric="cosine", k=5),
+    ]
+    baseline = {n: pq.read_table(p_).to_pydict()
+                for n, p_ in _run(ds, specs, "perspec_base").items()}
+
+    seen_share: list[bool] = []
+    real_group = compute_mod._process_batch_group
+    real_transfer = DenseCorpusBatch.transfer
+
+    def transfer_spy(self, r0, r1, device):
+        seen_share.append(self.share_gram)
+        return real_transfer(self, r0, r1, device)
+
+    def group_spy(*args, **kwargs):
+        import inspect
+        bound = inspect.signature(real_group).bind(*args, **kwargs)
+        member_idxs = bound.arguments["member_idxs"]
+        group_specs = bound.arguments["specs"]
+        scale = bound.arguments["spec_cos_scale"]
+        cos = [m for m in member_idxs if group_specs[m].metric == "cosine"]
+        if len(cos) > 1:
+            # The second cosine member opts OUT of the packer fusion.
+            scale[cos[1]] = None
+        return real_group(*args, **kwargs)
+
+    monkeypatch.setattr(DenseCorpusBatch, "transfer", transfer_spy)
+    monkeypatch.setattr(compute_mod, "_process_batch_group", group_spy)
+    got = {n: pq.read_table(p_).to_pydict()
+           for n, p_ in _run(ds, specs, "perspec_split").items()}
+
+    assert seen_share, "no dense slice was transferred"
+    assert all(v is False for v in seen_share), \
+        f"one distinct metric must not enable share_gram, got {seen_share}"
+
+    for name in ("fused", "unfused"):
+        assert got[name]["hit_ids"] == baseline[name]["hit_ids"], f"{name} ids"
+        assert got[name]["hit_scores"] == baseline[name]["hit_scores"], \
+            f"{name}: scores changed when the two specs disagreed on the fusion"
+    assert got["fused"]["hit_scores"] == got["unfused"]["hit_scores"], \
+        "the fused and unfused specs disagree on cosine scores"
+
+
 @pytest.mark.parametrize(
     "metrics,euclid_gets_norms",
     [
@@ -362,9 +484,12 @@ def test_euclidean_only_run_builds_no_query_norms(ds, metrics, euclid_gets_norms
     seen: list[tuple[str, bool]] = []
     real = DenseBatchSlice.score
 
-    def spy(self, Q, metric, q_norms=None):
+    def spy(self, Q, metric, q_norms=None, **kw):
+        # **kw forwards `scale_in_packer` (see `topk_triton._cutfill`, which
+        # fuses cosine's per-query divide into the packer);
+        # this spy is about whether q_norms was BUILT, not about scoring.
         seen.append((metric, q_norms is not None))
-        return real(self, Q, metric, q_norms)
+        return real(self, Q, metric, q_norms, **kw)
 
     monkeypatch.setattr(DenseBatchSlice, "score", spy)
     specs = [
