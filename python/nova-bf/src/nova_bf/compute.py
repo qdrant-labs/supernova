@@ -3686,6 +3686,11 @@ def run_compute(
                 # vector types this run happens to configure.
                 fq.put((gidx, batches, batch_orig_rows, raw_stats, ids, keeps, leaf_arrays,
                         n_rows, t1 - t0, t2 - t1))
+                # Drop producer references after queueing the file so 
+                # finished data can be freed # while this reader blocks 
+                # or starts the next read. The queue keeps its own refs.
+                arrs = batches = batch_orig_rows = raw_stats = None
+                keeps = leaf_arrays = ids = b = union = None
             except Exception as exc:
                 # Permit deliberately NOT released: the consumer re-raises on
                 # fetching this, killing the run — holding it just stops the
