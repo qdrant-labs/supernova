@@ -217,13 +217,15 @@ def available(state_key, state_enc, part_key, part_enc, k, live=None, thr=None) 
             "tie-break fold: the Triton kernel does not apply to this run "
             "(%s; state %s, part %s, k=%s) — using the portable path, which "
             "computes the identical answer more slowly. Logged once.",
-            _why_declined(state_key, state_enc, part_key, part_enc, k),
+            _why_declined(state_key, state_enc, part_key, part_enc, k,
+                          live, thr),
             _shape_of(state_key), _shape_of(part_key), k,
         )
     return ok
 
 
-def _why_declined(state_key, state_enc, part_key, part_enc, k) -> str:
+def _why_declined(state_key, state_enc, part_key, part_enc, k,
+                  live=None, thr=None) -> str:
     """A short reason for the log. The shapes alone are not enough to act on:
     a transposed tensor and an oversized block both look perfectly ordinary
     printed, and those are the two most likely causes.
@@ -242,6 +244,29 @@ def _why_declined(state_key, state_enc, part_key, part_enc, k) -> str:
             return "NOVA_BF_NO_FOLD_KERNEL is set"
         if getattr(torch.version, "hip", None) is not None:
             return "ROCm build, which these kernels are untuned for"
+        # Pruning inputs, checked in the same order as `_available` so the
+        # reason matches the branch that actually declined. Without these the
+        # function falls through to the catch-all below and blames shapes.
+        if (live is None) != (thr is None):
+            missing = "thr" if live is not None else "live"
+            return (f"pruning inputs must arrive as a pair; {missing} is None "
+                    "while the other is not")
+        if live is not None:
+            n_q = state_key.shape[0] if state_key.ndim == 2 else -1
+            for name, t, dt in (("live", live, torch.uint8),
+                                ("thr", thr, torch.int64)):
+                if t.ndim != 1:
+                    return f"{name} is {t.ndim}-D, not 1-D"
+                if t.numel() != n_q:
+                    return (f"{name} has {t.numel()} entries, not one per query "
+                            f"row (n_q = {n_q})")
+                if t.dtype is not dt:
+                    return f"{name} is {t.dtype}, not {dt}"
+                if not t.is_contiguous():
+                    return f"{name} is not contiguous (strides {t.stride()})"
+                if t.device != state_key.device:
+                    return (f"{name} is on {t.device}, not state_key's "
+                            f"{state_key.device}")
         ts = {"state_key": state_key, "state_enc": state_enc,
               "part_key": part_key, "part_enc": part_enc}
         for name, t in ts.items():
