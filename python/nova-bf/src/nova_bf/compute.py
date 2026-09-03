@@ -285,11 +285,56 @@ def _lut_applies(vocab: np.ndarray, ids: np.ndarray) -> bool:
     return _lut_vocab_ok(vocab) and _lut_ids_ok(ids)
 
 
-def _build_vocab_lut(vocab: np.ndarray) -> np.ndarray | None:
+class _VocabLut:
+    """An id-indexed LUT bound to the vocabulary it was built from.
+
+    Storing the vocabulary allows exact compatibility checks; table size alone
+    cannot detect different vocabularies with the same maximum token ID.
+    """
+
+    __slots__ = ("table", "vocab")
+
+    def __init__(self, table: np.ndarray, vocab: np.ndarray):
+        self.table = table
+        self.vocab = vocab
+
+    @property
+    def nbytes(self) -> int:
+        """The table's footprint — what the LUT budget is accounted in."""
+        return self.table.nbytes
+
+
+def _lut_table_for(lut: "_VocabLut", vocab: np.ndarray) -> np.ndarray:
+    """`lut`'s table, after proving it was built for `vocab`.
+
+    Identity first: one `_VocabLut` is built per vocabulary per run and both are
+    carried in the same dict, so the common path is a pointer comparison. A
+    different object falls back to a full content compare — exact, and reached
+    only if a caller rebuilt an equal vocabulary, which production does not do.
+    """
+    if lut.vocab is vocab:
+        return lut.table
+    # `np.array_equal` compares shape before contents, so it needs no length
+    # pre-check of its own.
+    if np.array_equal(lut.vocab, vocab):
+        return lut.table
+    raise ValueError(
+        f"vocab LUT was built for a different vocabulary: "
+        f"{len(lut.vocab)} entries ending at "
+        f"{lut.vocab[-1] if len(lut.vocab) else '-'} versus {len(vocab)} "
+        f"ending at {vocab[-1] if len(vocab) else '-'}. Using it would remap "
+        f"every token to the wrong column."
+    )
+
+
+def _build_vocab_lut(vocab: np.ndarray) -> "_VocabLut | None":
     """Build the id-indexed LUT for `vocab`, or return `None` when unsupported.
 
     The LUT is run-wide and reused by `_vocab_lookup`; rebuilding it per corpus
     file can otherwise add substantial allocation and initialization overhead.
+
+    Returns a `_VocabLut`, not a bare array: see that class for why the table
+    and its vocabulary must not be separable.
     """
     if len(vocab) == 0 or not _lut_vocab_ok(vocab):
         return None
@@ -297,7 +342,7 @@ def _build_vocab_lut(vocab: np.ndarray) -> np.ndarray | None:
     # Final slot maps ids above the vocabulary to -1.
     lut = np.full(top + 2, -1, dtype=np.int64)
     lut[vocab] = np.arange(len(vocab), dtype=np.int64)
-    return lut
+    return _VocabLut(lut, vocab)
 
 
 def _vocab_lookup(vocab: np.ndarray, ids: np.ndarray, lut=None) -> np.ndarray:
@@ -307,26 +352,24 @@ def _vocab_lookup(vocab: np.ndarray, ids: np.ndarray, lut=None) -> np.ndarray:
     `searchsorted` otherwise. The LUT path is much faster for large sparse
     remaps; the search path also supports strings and other id types.
 
-    `lut` is an optional prebuilt table from `_build_vocab_lut(vocab)`. Passing
-    one skips the per-call build; omitting it keeps the original behaviour.
+    `lut` is an optional prebuilt `_VocabLut` from `_build_vocab_lut(vocab)`.
+    Passing one skips the per-call build; omitting it keeps the original
+    behaviour. A LUT built for a different vocabulary RAISES — see
+    `_lut_table_for`.
     """
     if len(vocab) == 0:
         return np.full(len(ids), -1, dtype=np.int64)
-    if lut is not None and len(lut) != int(vocab[-1]) + 2:
-        # A LUT from a different vocabulary would silently remap every token to
-        # the wrong column, so this is a hard error rather than a fallback.
-        raise ValueError(
-            f"vocab LUT has {len(lut)} slots but this vocabulary needs "
-            f"{int(vocab[-1]) + 2} — it was built for a different vocab"
-        )
-    if _lut_ids_ok(ids) and (lut is not None or _lut_vocab_ok(vocab)):
-        if lut is None:
-            lut = _build_vocab_lut(vocab)
-        cap = len(lut) - 1              # the extra slot, which maps to -1
+    # A LUT from a different vocabulary would silently remap every token to the
+    # wrong column, so a mismatch is a hard error rather than a fallback.
+    table = None if lut is None else _lut_table_for(lut, vocab)
+    if _lut_ids_ok(ids) and (table is not None or _lut_vocab_ok(vocab)):
+        if table is None:
+            table = _build_vocab_lut(vocab).table
+        cap = len(table) - 1            # the extra slot, which maps to -1
         if cap <= np.iinfo(ids.dtype).max:
             # Keep the clip in `ids`' dtype to avoid a wider temporary.
             ids = np.minimum(ids, ids.dtype.type(cap))
-        return lut[ids]
+        return table[ids]
 
     pos = np.minimum(np.searchsorted(vocab, ids), len(vocab) - 1)
     return np.where(vocab[pos] == ids, pos, -1).astype(np.int64)
@@ -3217,7 +3260,7 @@ def run_compute(
     # Prebuild vocab lookup tables once instead of once per corpus file. 
     # The byte cap applies across all conditions to bound resident memory; 
     # conditions that do not fit fall back to per-file lookup construction.
-    gpu_vocab_luts: dict[FilterCondition, np.ndarray] = {}
+    gpu_vocab_luts: dict[FilterCondition, _VocabLut] = {}
     lut_budget = _VOCAB_LUT_PREBUILD_BYTES
     for f in distinct_filters:
         if not filter_is_gpu_eligible[f]:

@@ -92,7 +92,7 @@ def test_negative_ids_still_take_the_search_path_even_with_a_lut():
     """
     v = _vocab([1, 2, 3])          # lut = [-1, 0, 1, 2, -1], 5 slots
     lut = C._build_vocab_lut(v)
-    assert lut.tolist() == [-1, 0, 1, 2, -1], lut.tolist()
+    assert lut.table.tolist() == [-1, 0, 1, 2, -1], lut.table.tolist()
 
     for bad in (-1, -2, -3, -4, -5):
         ids = np.array([bad], dtype=np.int64)
@@ -114,6 +114,51 @@ def test_a_mismatched_lut_is_rejected_loudly():
     v1, v2 = _vocab([1, 2, 3]), _vocab([1, 2, 300])
     with pytest.raises(ValueError, match="different vocab"):
         C._vocab_lookup(v1, np.array([2], dtype=np.int64), C._build_vocab_lut(v2))
+
+
+def test_a_mismatched_lut_with_the_SAME_MAX_ID_is_rejected():
+    """The case the old guard could not see, and the reason it was replaced.
+
+    The check used to be `len(lut) != int(vocab[-1]) + 2`, and `len(lut)` IS
+    `int(vocab[-1]) + 2` by construction — so it tested the largest id and
+    nothing else. These two vocabularies have the same length AND the same
+    maximum, so both build a 12-slot table and the old check passed them as
+    interchangeable. Every token would then be remapped to the wrong column:
+    wrong ground truth, no exception, nothing in the manifest.
+
+    `test_a_mismatched_lut_is_rejected_loudly` above does NOT cover this — its
+    two vocabularies differ in maximum, which the size test already caught.
+    """
+    a, b = _vocab([0, 5, 10]), _vocab([3, 7, 10])
+    lut_a = C._build_vocab_lut(a)
+    assert len(lut_a.table) == int(b[-1]) + 2, (
+        "these vocabularies must produce IDENTICALLY SIZED tables, or this "
+        "test is not exercising the hole")
+
+    with pytest.raises(ValueError, match="different vocab"):
+        C._vocab_lookup(b, np.array([7], dtype=np.int64), lut_a)
+
+
+def test_an_EQUAL_vocabulary_in_a_different_array_is_accepted():
+    """Identity is the fast path, not the rule. A caller that rebuilt an equal
+    vocabulary must still be served rather than refused — otherwise the guard
+    trades silent corruption for a spurious hard failure."""
+    v = _vocab([0, 5, 10])
+    rebuilt = _vocab([0, 5, 10])
+    assert rebuilt is not v
+
+    lut = C._build_vocab_lut(v)
+    got = C._vocab_lookup(rebuilt, np.array([5, 10, 7], dtype=np.int64), lut)
+    assert got.tolist() == [1, 2, -1], got.tolist()
+
+
+def test_the_lut_keeps_the_vocabulary_OBJECT_it_was_built_from():
+    """What makes the check O(1) in production: the LUT holds the very array it
+    was built from, so every real call site compares pointers instead of
+    contents. Storing a copy would still be CORRECT but would silently move
+    every lookup onto the O(n) compare."""
+    v = _vocab([0, 5, 10])
+    assert C._build_vocab_lut(v).vocab is v
 
 
 def test_remap_sparse_file_is_identical_with_and_without_a_lut():
