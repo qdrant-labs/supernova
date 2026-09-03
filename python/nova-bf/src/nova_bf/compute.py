@@ -3529,6 +3529,15 @@ def run_compute(
                 # carry the id column (combined to one contiguous array) to decode;
                 # None when id_column isn't configured. Same row order as `arrs`.
                 ids = table[id_col].combine_chunks() if id_col else None
+                # Vector/ID data is already retained by `arrs`/`ids`, so `table` only
+                # needs to keep filter columns alive from here on. `select` is metadata-only
+                # and drops references to otherwise-dead Arrow buffers, reducing peak RSS.
+                #
+                # Note: fp32 dense arrays may be zero-copy views into Arrow memory, so
+                # `arrs` must not be mutated in place. Capture the row count before narrowing.
+                n_rows_file = len(table)
+                if filter_cols:
+                    table = table.select(filter_cols)
                 t1 = time.perf_counter()
                 # One mask per DISTINCT filter (`None` for the unfiltered entry),
                 # evaluated against the same table — timed separately from the read
@@ -3565,7 +3574,7 @@ def run_compute(
                 # so byte-truthiness IS query-truthiness) or unpacks lazily,
                 # only for the batch-row slice actually needed
                 # (`_process_shared_batch`'s `select`).
-                n_rows = len(table)
+                n_rows = n_rows_file
                 if n_rows > MAX_ROWS_PER_FILE:
                     raise ValueError(
                         f"{f.key} has {n_rows} rows, exceeding MAX_ROWS_PER_FILE="
