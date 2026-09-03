@@ -287,7 +287,16 @@ def _topk_merge(
     # single-node run emits, and dropping it here would make a sharded result
     # differ from an unsharded one on the same corpus.
     valid = top_s > -np.inf
-    counts = valid.sum(axis=1).astype(np.int32)
+    # `ListArray` offsets are int32 and silently wrap on overflow, corrupting the
+    # merged output. Guard the total hit count for each merge batch.
+    counts = valid.sum(axis=1).astype(np.int64)
+    total_hits = int(counts.sum())
+    if total_hits > np.iinfo(np.int32).max:
+        raise ValueError(
+            f"{total_hits:,} hits in one merge batch overflows the int32 "
+            f"ListArray offsets (limit {np.iinfo(np.int32).max:,})."
+        )
+    counts = counts.astype(np.int32)
     offsets = np.empty(b + 1, dtype=np.int32)
     offsets[0] = 0
     np.cumsum(counts, out=offsets[1:])

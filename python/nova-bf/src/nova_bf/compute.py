@@ -4159,6 +4159,17 @@ def run_compute(
         import pyarrow as pa
 
         counts = valid.sum(axis=1).astype(np.int64)
+        # `ListArray` offsets are int32; casting silently wraps on overflow and would
+        # corrupt the output. Guard `n_q * k` rather than switching to `LargeListArray`,
+        # which would change the published GT schema.
+        total_hits = int(counts.sum())
+        if total_hits > np.iinfo(np.int32).max:
+            raise ValueError(
+                f"search {s.name!r}: {total_hits:,} hits overflows the int32 "
+                f"ListArray offsets (limit {np.iinfo(np.int32).max:,}). Reduce k "
+                f"or the query count, or switch this producer and merge.py's to "
+                f"pa.LargeListArray — which changes the output schema."
+            )
         offsets = pa.array(
             np.concatenate(([0], np.cumsum(counts))).astype(np.int32), type=pa.int32()
         )
