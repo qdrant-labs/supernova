@@ -178,6 +178,31 @@ def _warps_for(block: int) -> int:
 # register pressure and reduces performance on production shapes. Instead,
 # reject shapes whose offsets cannot be represented safely in int32 and let
 # them use the portable path, which has no such limitation.
+# How many times the kernel ACTUALLY launched, for the manifest.
+_LAUNCHES = 0
+
+
+def usage() -> dict:
+    """`permitted` / `launches` / `unavailable` for the run manifest.
+
+    `permitted and launches == 0` means it never ran; a nonzero `launches`
+    together with an `unavailable` reason means it ran and then STOPPED, which
+    is the case the old env-var-only report hid completely.
+    """
+    import os
+
+    return {
+        "permitted": not os.environ.get("NOVA_BF_NO_TOPK_KERNEL"),
+        "launches": _LAUNCHES,
+        "unavailable": _UNAVAILABLE,
+    }
+
+
+def reset_usage() -> None:
+    global _LAUNCHES
+    _LAUNCHES = 0
+
+
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -328,6 +353,8 @@ def topk(scores, ordinal, k, scale=None, thr=None):
     live = None if thr is None else torch.empty(n_q, dtype=torch.uint8, device=scores.device)
     # Triton launches on the CURRENT device; pin it to the tensors' own so a
     # process whose current device differs (multi-GPU) cannot launch elsewhere.
+    global _LAUNCHES
+    _LAUNCHES += 1
     with torch.cuda.device(scores.device):
         _cutfill[(n_q,)](
             # `scores` doubles as the NRM placeholder when unscaled,

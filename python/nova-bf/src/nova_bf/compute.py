@@ -903,6 +903,18 @@ _ZERO_GATE_MIN_PRODUCT = 1e-30
 _SPARSE_SWAP_MAX_DENSE_BYTES = 512 << 20
 
 
+# How many times a prune THRESHOLD was actually applied, for the manifest.
+# `NOVA_BF_NO_PRUNE` records what was permitted; this records what happened.
+# Unlike the two Triton kernels, prune cannot decline at runtime -- but it can
+# be permitted and never applied (no search reaches the pre-top-K path), and the
+# switch alone could not tell those apart.
+_PRUNE_APPLIED = {"count": 0}
+
+
+def _reset_prune_applied() -> None:
+    _PRUNE_APPLIED["count"] = 0
+
+
 # Which sparse code paths a run actually took for the manifest
 _SPARSE_BRANCHES = {
     "scored_swapped": 0,      # dense corpus operand fit the budget
@@ -2013,6 +2025,8 @@ def _process_batch_group(
             cos_scale = spec_cos_scale[m]
 
             if sel_scores.shape[1] > s.k:
+                if prune:
+                    _PRUNE_APPLIED["count"] += 1
                 part_key, part_local, live = pack_topk(
                     sel_scores, sel_ordinals, s.k, cos_scale,
                     thr=spec_thr[m] if prune else None)
@@ -2023,6 +2037,8 @@ def _process_batch_group(
                 part_enc = sel_encoded
                 # Narrow slices skip the pre-top-K, so the prune decision the
                 # kernel would have made is applied here by the same rule.
+                if prune:
+                    _PRUNE_APPLIED["count"] += 1
                 live = live_rows(part_key, spec_thr[m]) if prune else None
             pending[m].append((part_key, part_enc, live))
             pending_cols[m] += part_key.shape[1]
@@ -2823,7 +2839,16 @@ def run_compute(
     run_t0 = time.perf_counter()
     # Process-global, so a second `run_compute` in one process (every test, and
     # the single-node path) would otherwise report the first run's branches too.
+    # Same for the kernel launch counters, which live in the kernel modules.
     _reset_sparse_branches()
+    _reset_prune_applied()
+    # Local imports: both modules are imported function-locally throughout this
+    # file (triton is optional), and `topk_triton` is otherwise reached only via
+    # `tiebreak`.
+    from nova_bf import merge_triton as _mt
+    from nova_bf import topk_triton as _tt
+    _mt.reset_usage()
+    _tt.reset_usage()
     job_rank = _resolve_rank(num_jobs, job_rank)
     specs = cfg.searches
     vts_needed = sorted({s.vector_type for s in specs})  # ["dense"] / ["sparse"] / both
@@ -4300,7 +4325,8 @@ def run_compute(
         "batch_size_by_vector_type": vt_batch_size,
         "multivector_batch_size": mv_batch_size,
         "multivector_query_block": mv_query_block,
-        "kernels": run_manifest.kernel_switches(),
+        # What actually RAN, not what the kill switches permitted.
+        "kernels": run_manifest.kernel_usage(_PRUNE_APPLIED["count"]),
     })
     doc.update({
         "started_at": started_at.isoformat(),

@@ -146,6 +146,26 @@ def _warps_for(block: int) -> int:
 # register pressure and reduces performance on production shapes. Instead,
 # reject shapes whose offsets cannot be represented safely in int32 and let
 # them use the portable path, which has no such limitation.
+# See `topk_triton.usage` — the switch says PERMITTED, this says RAN.
+_LAUNCHES = 0
+
+
+def usage() -> dict:
+    """`permitted` / `launches` / `unavailable` for the run manifest."""
+    import os
+
+    return {
+        "permitted": not os.environ.get("NOVA_BF_NO_FOLD_KERNEL"),
+        "launches": _LAUNCHES,
+        "unavailable": _UNAVAILABLE,
+    }
+
+
+def reset_usage() -> None:
+    global _LAUNCHES
+    _LAUNCHES = 0
+
+
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -387,6 +407,8 @@ def fold(state_key, state_enc, part_key, part_enc, k, live=None, thr=None):
     pe = part_enc if part_enc.ndim == 2 else part_enc.unsqueeze(0)
     pe_s = pe.stride(0) if part_enc.ndim == 2 else 0
     block = _triton.next_power_of_2(k + w)
+    global _LAUNCHES
+    _LAUNCHES += 1
     with torch.cuda.device(state_key.device):
         _fold[(n_q,)](
             state_key, state_enc, part_key, pe, out_k, out_e,

@@ -309,21 +309,198 @@ def test_code_versions_omits_git_when_the_repo_is_not_ours(monkeypatch, tmp_path
 # --- 18 + today's additions: the manifest records what RAN ----------------
 
 
-def test_kernel_switches_report_resolved_booleans(monkeypatch):
+def _clear_switches(monkeypatch):
     for var in ("NOVA_BF_NO_PRUNE", "NOVA_BF_NO_FOLD_KERNEL",
                 "NOVA_BF_NO_TOPK_KERNEL"):
         monkeypatch.delenv(var, raising=False)
-    assert run_manifest.kernel_switches() == {
+
+
+def test_kernel_usage_reports_the_resolved_switches(monkeypatch):
+    _clear_switches(monkeypatch)
+    got = run_manifest.kernel_usage(0)
+    assert {k: v["permitted"] for k, v in got.items()} == {
         "prune": True, "fold_kernel": True, "topk_kernel": True}
 
     monkeypatch.setenv("NOVA_BF_NO_PRUNE", "1")
     monkeypatch.setenv("NOVA_BF_NO_FOLD_KERNEL", "1")
-    assert run_manifest.kernel_switches() == {
+    got = run_manifest.kernel_usage(0)
+    assert {k: v["permitted"] for k, v in got.items()} == {
         "prune": False, "fold_kernel": False, "topk_kernel": True}
 
     # `""` is unset-shaped and must not read as "disabled"
     monkeypatch.setenv("NOVA_BF_NO_PRUNE", "")
-    assert run_manifest.kernel_switches()["prune"] is True
+    assert run_manifest.kernel_usage(0)["prune"]["permitted"] is True
+
+
+def test_kernel_usage_reports_what_RAN_not_what_was_permitted(monkeypatch):
+    """The finding this replaced: `kernel_switches()` returned the three
+    `NOVA_BF_NO_*` vars and called them "ACTIVE", so a kernel that was
+    permitted but never executed — no triton, a shape its gate refuses, or a
+    `disable()` after a launch failure — was recorded as active for the whole
+    run. The manifest exists to say what produced a ground truth, so that was
+    the one thing it must not get wrong."""
+    from nova_bf import merge_triton, topk_triton
+
+    _clear_switches(monkeypatch)
+
+    # Permitted, but nothing ever launched.
+    monkeypatch.setattr(topk_triton, "_LAUNCHES", 0)
+    monkeypatch.setattr(merge_triton, "_LAUNCHES", 0)
+    got = run_manifest.kernel_usage(0)
+    for name in ("prune", "fold_kernel", "topk_kernel"):
+        assert got[name]["permitted"] is True
+        assert got[name]["launches"] == 0, \
+            f"{name} reports launches it never made"
+
+    # Now they ran. `permitted` alone could not tell these two states apart.
+    monkeypatch.setattr(topk_triton, "_LAUNCHES", 41)
+    monkeypatch.setattr(merge_triton, "_LAUNCHES", 7)
+    got = run_manifest.kernel_usage(1234)
+    assert got["topk_kernel"]["launches"] == 41
+    assert got["fold_kernel"]["launches"] == 7
+    assert got["prune"]["launches"] == 1234
+
+
+def test_kernel_usage_shows_a_kernel_that_ran_then_STOPPED(monkeypatch):
+    """The combination the old report could not express at all: a kernel that
+    worked for most of a run and then `disable()`d itself after a launch
+    failure, leaving the rest of a multi-hour run ~4x slower on the portable
+    path. `launches > 0` with a reason set is the signature."""
+    from nova_bf import topk_triton
+
+    _clear_switches(monkeypatch)
+    monkeypatch.setattr(topk_triton, "_LAUNCHES", 900)
+    monkeypatch.setattr(topk_triton, "_UNAVAILABLE",
+                        "RuntimeError: CUDA error: out of memory")
+
+    got = run_manifest.kernel_usage(0)["topk_kernel"]
+    assert got["permitted"] is True
+    assert got["launches"] == 900
+    assert got["unavailable"] == "RuntimeError: CUDA error: out of memory", \
+        "a mid-run disable must be visible in the manifest"
+
+
+class _StubKernel:
+    """Stands in for a Triton JIT kernel: `_kernel[(grid,)](args...)`."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __getitem__(self, grid):
+        def launch(*a, **kw):
+            self.calls += 1
+        return launch
+
+
+def _no_cuda_device(monkeypatch):
+    """`torch.cuda.device(cpu_tensor.device)` raises `ValueError: Expected a
+    cuda device`, so the launch site cannot be reached on CPU without this."""
+    import contextlib
+
+    import torch
+    monkeypatch.setattr(torch.cuda, "device",
+                        lambda dev: contextlib.nullcontext())
+
+
+def test_topk_kernel_launch_site_increments_the_counter(monkeypatch):
+    """The counter must sit at the LAUNCH, not somewhere merely reachable.
+
+    A CPU box never launches either Triton kernel, so removing the increment
+    is invisible to every other test here — it was a surviving mutant. This
+    stubs the kernel object and the CUDA device guard so the launch site itself
+    executes, then asserts the count moved.
+    """
+    import torch
+
+    from nova_bf import topk_triton
+
+    stub = _StubKernel()
+    monkeypatch.setattr(topk_triton, "_cutfill", stub)
+    monkeypatch.setattr(topk_triton, "_LAUNCHES", 0)
+    _no_cuda_device(monkeypatch)
+
+    scores = torch.zeros((3, 8), dtype=torch.float32)
+    ordinal = torch.arange(8, dtype=torch.int64)
+    topk_triton.topk(scores, ordinal, k=4)
+
+    assert stub.calls == 1, "the kernel was not launched; the test proves nothing"
+    assert topk_triton._LAUNCHES == 1, \
+        "the kernel launched but the manifest counter did not move"
+
+
+def test_fold_kernel_launch_site_increments_the_counter(monkeypatch):
+    """Same as above for `merge_triton.fold`, the other surviving mutant."""
+    import torch
+
+    from nova_bf import merge_triton
+
+    stub = _StubKernel()
+    monkeypatch.setattr(merge_triton, "_fold", stub)
+    monkeypatch.setattr(merge_triton, "_LAUNCHES", 0)
+    _no_cuda_device(monkeypatch)
+
+    n_q, k, w = 3, 4, 2
+    state_key = torch.zeros((n_q, k), dtype=torch.int64)
+    state_enc = torch.zeros((n_q, k), dtype=torch.int64)
+    part_key = torch.zeros((n_q, w), dtype=torch.int64)
+    part_enc = torch.zeros(w, dtype=torch.int64)
+    merge_triton.fold(state_key, state_enc, part_key, part_enc, k)
+
+    assert stub.calls == 1, "the kernel was not launched; the test proves nothing"
+    assert merge_triton._LAUNCHES == 1, \
+        "the kernel launched but the manifest counter did not move"
+
+
+def test_kernel_launch_counters_reset_between_runs(monkeypatch):
+    """Process-global counters. Two `run_compute` calls in one process (every
+    test, and the single-node path) would otherwise attribute the first run's
+    launches to the second."""
+    from nova_bf import merge_triton, topk_triton
+    from nova_bf.compute import _PRUNE_APPLIED, _reset_prune_applied
+
+    monkeypatch.setattr(topk_triton, "_LAUNCHES", 5)
+    monkeypatch.setattr(merge_triton, "_LAUNCHES", 5)
+    _PRUNE_APPLIED["count"] = 5
+
+    topk_triton.reset_usage()
+    merge_triton.reset_usage()
+    _reset_prune_applied()
+
+    assert topk_triton._LAUNCHES == 0
+    assert merge_triton._LAUNCHES == 0
+    assert _PRUNE_APPLIED["count"] == 0
+
+
+def test_two_runs_in_one_process_do_not_ACCUMULATE_launches(tmp_path):
+    """The reset must be WIRED INTO `run_compute`, not merely callable.
+
+    The test above calls `reset_usage()` directly, so deleting the call from
+    `run_compute` satisfied it — a surviving mutant. This runs the same config
+    twice in one process and asserts the second manifest reports the same count
+    as the first rather than the sum, which is the only thing that pins the
+    call site.
+    """
+    pytest.importorskip("torch")
+    import json
+
+    from nova_bf.compute import run_compute
+    from test_prune_search_paths import _sparse_cfg, _sparse_corpus
+
+    cdir, qpath = _sparse_corpus(tmp_path, n_files=2, per_file=50, seed=9)
+
+    def _prune_count(out):
+        run_compute(_sparse_cfg(cdir, qpath, out, k=4))
+        doc = json.loads(next(out.rglob("*manifest*.json")).read_text())
+        return doc["params"]["kernels"]["prune"]["launches"]
+
+    first = _prune_count(tmp_path / "m1")
+    second = _prune_count(tmp_path / "m2")
+
+    assert first > 0, "nothing pruned, so this cannot detect accumulation"
+    assert second == first, (
+        f"the second run reported {second} where the first reported {first}: "
+        "the counters were not reset, so a rank's manifest includes the "
+        "previous run's launches")
 
 
 # --- peak host RSS, and which sparse paths actually ran -------------------
@@ -399,6 +576,36 @@ def test_sparse_branches_reach_the_manifest(tmp_path):
     doc = json.loads(manifests[0].read_text())
     assert "sparse_branches" in doc["params"], doc["params"].keys()
     assert doc["compute"].get("peak_host_rss_bytes", 0) > 0
+
+
+def test_kernel_usage_counters_actually_MOVE_in_a_real_run(tmp_path):
+    """The counters must be wired into the hot path, not merely readable.
+
+    Every other test here patches `_LAUNCHES` / passes a count, so an increment
+    that was never reached would satisfy all of them. This one runs a real
+    `run_compute` and reads the number out of the manifest it wrote. The Triton
+    kernels do not launch on CPU, so `prune` is the one whose count is asserted
+    nonzero here; the GPU counters are covered by the parity suite on CUDA.
+    """
+    pytest.importorskip("torch")
+    import json
+
+    from nova_bf.compute import run_compute
+    from test_prune_search_paths import _sparse_cfg, _sparse_corpus
+
+    out = tmp_path / "m"
+    cdir, qpath = _sparse_corpus(tmp_path, n_files=2, per_file=50, seed=9)
+    run_compute(_sparse_cfg(cdir, qpath, out, k=4))
+
+    doc = json.loads(next(out.rglob("*manifest*.json")).read_text())
+    kernels = doc["params"]["kernels"]
+    assert set(kernels) == {"prune", "fold_kernel", "topk_kernel"}, kernels
+    for name, entry in kernels.items():
+        assert set(entry) == {"permitted", "launches", "unavailable"}, (name, entry)
+    assert kernels["prune"]["permitted"] is True
+    assert kernels["prune"]["launches"] > 0, (
+        "the prune counter never incremented, so the manifest is reporting the "
+        f"switch again rather than what ran: {kernels['prune']}")
 
 
 # --- 15: never invent a run fingerprint ------------------------------------

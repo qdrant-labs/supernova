@@ -155,13 +155,27 @@ def _workspace_version(start: str) -> str | None:
     return None
 
 
-def kernel_switches() -> dict:
-    """Which GPU fast paths were ACTIVE, from the operator kill switches.
+def kernel_usage(prune_launches: int) -> dict:
+    """Which GPU fast paths actually RAN, not which ones were permitted.
+
+    Each entry carries:
+
+      permitted    the kill switch, i.e. what was allowed
+      launches     how many times it actually ran
+      unavailable  why it cannot run, or None
     """
+    from nova_bf import merge_triton, topk_triton
+
     return {
-        "prune": not os.environ.get("NOVA_BF_NO_PRUNE"),
-        "fold_kernel": not os.environ.get("NOVA_BF_NO_FOLD_KERNEL"),
-        "topk_kernel": not os.environ.get("NOVA_BF_NO_TOPK_KERNEL"),
+        "prune": {
+            "permitted": not os.environ.get("NOVA_BF_NO_PRUNE"),
+            # Prune has no kernel and cannot decline at runtime; this counts the
+            # slices where a threshold was actually applied.
+            "launches": prune_launches,
+            "unavailable": None,
+        },
+        "fold_kernel": merge_triton.usage(),
+        "topk_kernel": topk_triton.usage(),
     }
 
 
