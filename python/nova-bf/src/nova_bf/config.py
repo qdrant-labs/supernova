@@ -210,6 +210,10 @@ class ParamsConfig(BaseModel):
     # silent all-empty run downstream.
     dense_batch_size: int | None = Field(default=None, gt=0)
     sparse_batch_size: int | None = Field(default=None, gt=0)
+    # Sparse scoring only. When the dense corpus operand exceeds the swap-memory
+    # budget, chunk rows and stay on the faster, more reproducible dense GEMM path.
+    # Set False to use the legacy sparse-CSR transpose fallback.
+    sparse_chunk: bool = True
     # The multivector (MaxSim) implementations (torch and triton_reduce) have
     # TWO memory axes: their intermediate is `(block_query_tokens ×
     # corpus_doc_tokens)`, so both corpus rows and queries are tiled to bound

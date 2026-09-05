@@ -52,6 +52,12 @@ params:
   # io_ranged_get: false
   # dense_batch_size: 4096
   # sparse_batch_size: 4096
+  # Sparse only: when a corpus slice's dense operand is too big to densify
+  # whole, chunk the corpus rows and stay on the (faster, more reproducible)
+  # dense GEMM branch instead of falling back to a sparse-CSR transpose matmul.
+  # Default true; set false only to reproduce an older ground-truth run's
+  # exact scores. See docs/brute-force/sparse-chunked-scoring-2026-09-02.md.
+  # sparse_chunk: true
   # MaxSim implementation: torch (established/reference), triton_reduce
   # (cuBLAS matmul + fused Triton ragged reduction, requires CUDA), or auto
   # (triton_reduce when compatible, torch otherwise).

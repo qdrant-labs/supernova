@@ -112,6 +112,14 @@ def test_params_io_ranged_get():
     assert ParamsConfig(io_ranged_get=True).io_ranged_get is True
 
 
+def test_params_sparse_chunk_defaults_true():
+    """Default True is what makes chunked sparse scoring the production
+    path (see compute.py's `_sparse_scores`) rather than opt-in — see
+    docs/brute-force/sparse-chunked-scoring-2026-09-02.md."""
+    assert ParamsConfig().sparse_chunk is True
+    assert ParamsConfig(sparse_chunk=False).sparse_chunk is False
+
+
 def test_params_run_level_fields_still_work():
     cfg = BruteForceConfig(**_base(
         params=ParamsConfig(io_workers=32, io_thread_count=64, merge_prefetch=True),

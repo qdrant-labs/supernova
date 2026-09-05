@@ -578,6 +578,38 @@ def test_sparse_branches_reach_the_manifest(tmp_path):
     assert doc["compute"].get("peak_host_rss_bytes", 0) > 0
 
 
+def test_sparse_chunk_config_and_branch_reach_the_manifest(tmp_path, monkeypatch):
+    """`params.sparse_chunk` reaches the manifest for free — `params` is a full
+    `cfg.params.model_dump()` (see manifest.base_manifest) — but that's easy
+    to break silently (a field renamed, or manifest assembly switching to an
+    explicit allow-list) without any test noticing, since nothing else reads
+    it back. Pins both halves together: the CONFIGURED value, and the
+    `scored_chunked` branch bucket (see `_sparse_scores`) actually firing when
+    it's forced to."""
+    pytest.importorskip("torch")
+    import json
+
+    from nova_bf import compute as C
+    from nova_bf.compute import run_compute
+    from test_prune_search_paths import _sparse_cfg, _sparse_corpus
+
+    out = tmp_path / "m"
+    cdir, qpath = _sparse_corpus(tmp_path, n_files=2, per_file=50, seed=9)
+    cfg = _sparse_cfg(cdir, qpath, out, k=4, batch=17)
+    cfg.params.sparse_chunk = True
+    # Fixture-scale budget: force the "does not fit whole" branch so
+    # scored_chunked actually increments rather than staying at zero.
+    monkeypatch.setattr(C, "_SPARSE_SWAP_MAX_DENSE_BYTES", 64)
+    run_compute(cfg)
+
+    manifests = list(out.rglob("*manifest*.json"))
+    assert manifests, "no manifest was written"
+    doc = json.loads(manifests[0].read_text())
+    assert doc["params"]["sparse_chunk"] is True
+    assert doc["params"]["sparse_branches"]["scored_chunked"] > 0
+    assert doc["params"]["sparse_branches"]["scored_swapped"] == 0
+
+
 def test_kernel_usage_counters_actually_MOVE_in_a_real_run(tmp_path):
     """The counters must be wired into the hot path, not merely readable.
 

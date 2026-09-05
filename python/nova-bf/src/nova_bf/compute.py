@@ -691,27 +691,38 @@ def _sparse_batch_to_csr(
 def _sparse_scores(Q, Cb, q_cache=None):
     """Raw `(n_q, n_rows)` sparse dot-product scores for one corpus slice.
 
-    Uses `Q_csr @ dense(Cb).T` when the dense corpus slice fits in memory. This
-    is much faster than `Cb @ Q.T`, whose dense query operand is a poorly
-    strided transposed view. Falls back to the contiguous-transpose path when
-    densifying `Cb` would exceed `_SPARSE_SWAP_MAX_DENSE_BYTES`.
-
-    Returns raw scores; metric-specific transforms are applied by the caller.
+    Uses `Q_csr @ dense(Cb).T` when possible; large corpus slices are chunked to
+    bound dense memory. `sparse_chunk: false` uses the contiguous-transpose fallback.
+    Metric transforms are applied by the caller.
     """
     import torch
 
-    n_rows, vocab = Cb.shape
     cache = q_cache or _SparseQueryCache()
     # Decided once per run, not per slice — see `_SparseQueryCache.batch_size`.
-    target_rows = cache.batch_size or n_rows
-    fits = _dense_corpus_rows_per_chunk(Cb, Q.element_size()) >= target_rows
-    _SPARSE_BRANCHES["scored_swapped" if fits else "scored_fallback"] += 1
+    fits, per = _sparse_dense_op_fits(Cb, Q.element_size(), cache)
     if fits:
+        _SPARSE_BRANCHES["scored_swapped"] += 1
         # Produces the `(n_q, n_rows)` layout downstream consumers expect.
         return torch.matmul(cache.values(Q), _dense_slice_t(Cb, Cb.values()))
-    # Built per slice, not cached. This path is used only when the dense corpus
-    # operand is already too large, so caching `(vocab, n_q)` would keep another
-    # large float32 copy resident. The copy cost is amortized by the matmul.
+
+    # Default: chunk corpus rows and stay on the dense GEMM path. Besides bounding
+    # memory, this avoids CUDA CSR transpose SpMM, whose atomic reductions introduce
+    # run-to-run score jitter. `sparse_chunk: false` restores the old fallback.
+    if cache.sparse_chunk:
+        _SPARSE_BRANCHES["scored_chunked"] += 1
+
+        # Always use the chunk iterator; tail slices may fit in one chunk but should
+        # still take the same scoring path as the rest of the file.
+        q_csr = cache.values(Q)
+        parts = [torch.matmul(q_csr, _dense_slice_t(sub, sub.values()))
+                 for sub in _iter_csr_row_chunks(Cb, per, Cb.values())]
+
+        # Avoid an unnecessary copy when only one chunk was produced.
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+
+    # `sparse_chunk: false` fallback. Build the contiguous query transpose per
+    # slice rather than caching another large float32 copy.
+    _SPARSE_BRANCHES["scored_fallback"] += 1
     return torch.matmul(Cb, Q.t().contiguous()).T
 
 
@@ -940,10 +951,13 @@ class SparseCorpusBatch:
 # embedder weights (~1e-4..10) clear it by >20 orders of magnitude.
 _ZERO_GATE_MIN_PRODUCT = 1e-30
 
-# Max size of the dense `(vocab, slice_rows)` corpus operand used by swapped 
-# sparse scoring. Larger slices fall back to the contiguous-transpose path to 
-# avoid excessive temporary memory.
-_SPARSE_SWAP_MAX_DENSE_BYTES = 512 << 20
+
+# Max dense `(vocab, slice_rows)` corpus operand for swapped sparse scoring.
+# Override with `NOVA_BF_SPARSE_SWAP_MAX` to force/avoid the fallback path.
+# Read once so the branch cannot change mid-run
+_SPARSE_SWAP_MAX_DENSE_BYTES = int(
+    os.environ.get("NOVA_BF_SPARSE_SWAP_MAX", 512 << 20)
+)
 
 
 # How many times a prune THRESHOLD was actually applied, for the manifest.
@@ -961,7 +975,8 @@ def _reset_prune_applied() -> None:
 # Which sparse code paths a run actually took for the manifest
 _SPARSE_BRANCHES = {
     "scored_swapped": 0,      # dense corpus operand fit the budget
-    "scored_fallback": 0,     # cuSPARSE transpose path
+    "scored_chunked": 0,      # too big to fit whole; chunked dense (sparse_chunk: true, default)
+    "scored_fallback": 0,     # too big to fit whole; CSR transpose path (sparse_chunk: false)
     "gate_zero": 0,           # cheap `raw == 0` no-overlap gate
     "gate_structural": 0,     # signed/stored-zero data: indicator spmm
 }
@@ -1059,22 +1074,112 @@ def _dense_corpus_rows_per_chunk(Cb, element_size: int) -> int:
     return max(1, _SPARSE_SWAP_MAX_DENSE_BYTES // max(1, vocab * element_size))
 
 
-def _dense_slice_t(Cb, values):
-    """Densify a CSR corpus slice as `(vocab, n_rows)`.
+def _sparse_dense_op_fits(Cb, element_size: int, cache) -> tuple[bool, int]:
+    """Whether the run's dense corpus operand fits the swap-memory budget.
 
-    `values` controls what is scattered at each stored entry: use `Cb.values()`
-    for scoring or ones for structural overlap checks. Direct assignment is safe
-    because `Cb` is coalesced, so each `(row, col)` pair is unique.
+    Uses the configured batch size so all slices, including tails, make the
+    same branch decision. Returns both the fit result and rows-per-chunk.
+    """
+    per = _dense_corpus_rows_per_chunk(Cb, element_size)
+    target_rows = (cache.batch_size if cache else None) or Cb.shape[0]
+    return per >= target_rows, per
+
+
+def _dense_slice_t(Cb, values, row_ids=None):
+    """Densify a coalesced CSR slice as `(vocab, n_rows)`.
+
+    `values` controls the scattered entries. Callers that reuse the same sparsity
+    pattern may pass precomputed `row_ids` to avoid repeating row expansion.
     """
     import torch
 
-    crow, col = Cb.crow_indices(), Cb.col_indices()
-    row_ids = torch.repeat_interleave(
-        torch.arange(Cb.shape[0], device=col.device), crow.diff()
-    )
+    col = Cb.col_indices()
+    if row_ids is None:
+        row_ids = torch.repeat_interleave(
+            torch.arange(Cb.shape[0], device=col.device), Cb.crow_indices().diff()
+        )
     out = torch.zeros((Cb.shape[1], Cb.shape[0]), dtype=values.dtype, device=values.device)
     out[col, row_ids] = values
     return out
+
+
+def _iter_csr_row_chunk_bounds(Cb, per: int):
+    """Yield CSR structure for each `per`-row chunk.
+
+    Structure is separated from values so callers can reuse the same chunk
+    boundaries for multiple value arrays. Carries `hi` forward to avoid an
+    extra GPU->host sync per chunk. A zero-row input still yields one chunk.
+    """
+    n_rows = Cb.shape[0]
+    crow, col = Cb.crow_indices(), Cb.col_indices()
+    if n_rows == 0:
+        yield crow[:1], col[:0], 0, 0, 0
+        return
+    lo = 0
+    for r0 in range(0, n_rows, per):
+        r1 = min(r0 + per, n_rows)
+        hi = int(crow[r1])
+        yield (crow[r0 : r1 + 1] - crow[r0]).contiguous(), col[lo:hi], lo, hi, r1 - r0
+        lo = hi
+
+
+def _csr_chunk_tensor(crow_chunk, col_chunk, values, lo, hi, rows, vocab):
+    """Build one CSR chunk from precomputed row bounds.
+
+    Centralizes chunk construction so callers can reuse the same structure with
+    different value arrays.
+    """
+    import torch
+
+    return torch.sparse_csr_tensor(
+        crow_chunk, col_chunk, values[lo:hi],
+        size=(rows, vocab), check_invariants=False,
+    )
+
+
+def _iter_csr_row_chunks(Cb, per: int, values):
+    """Yield `per`-row CSR sub-tensors of `Cb`, covering it end to end, with
+    `values` scattered into each.
+
+    `values` supplies each chunk's stored entries — pass `Cb.values()` for
+    real scores (`_sparse_scores`) or a ones tensor for a structural overlap
+    indicator (`SparseBatchSlice._structural_no_overlap`), the two places
+    that chunk a corpus slice's rows and need only ONE values array per
+    chunk. Shared so the CSR row-range slicing itself — get right once —
+    cannot drift between them; see `_iter_csr_row_chunk_bounds` for the
+    structure-only form this wraps, used instead when a chunk boundary needs
+    to produce more than one values array at once."""
+    vocab = Cb.shape[1]
+    for crow_chunk, col_chunk, lo, hi, rows in _iter_csr_row_chunk_bounds(Cb, per):
+        yield _csr_chunk_tensor(crow_chunk, col_chunk, values, lo, hi, rows, vocab)
+
+
+def _chunked_sparse_score_and_gate(Q, Cb, cache, per: int):
+    """Yield `per`-row CSR chunks using the supplied stored values.
+
+    Wraps `_iter_csr_row_chunk_bounds` for callers that need one values array
+    per chunk.
+    """
+    import torch
+
+    vocab = Cb.shape[1]
+    q_csr, q_ind = cache.values(Q), cache.indicator(Q)
+    vals = Cb.values()
+    ones = torch.ones(vals.numel(), dtype=Q.dtype, device=Q.device)
+    score_parts, gate_parts = [], []
+    for crow_chunk, col_chunk, lo, hi, rows in _iter_csr_row_chunk_bounds(Cb, per):
+        vals_sub = _csr_chunk_tensor(crow_chunk, col_chunk, vals, lo, hi, rows, vocab)
+        ind_sub = _csr_chunk_tensor(crow_chunk, col_chunk, ones, lo, hi, rows, vocab)
+        row_ids = torch.repeat_interleave(
+            torch.arange(rows, device=col_chunk.device), crow_chunk.diff()
+        )
+        score_parts.append(
+            torch.matmul(q_csr, _dense_slice_t(vals_sub, vals_sub.values(), row_ids)))
+        gate_parts.append(
+            torch.matmul(q_ind, _dense_slice_t(ind_sub, ind_sub.values(), row_ids)) == 0)
+    raw = score_parts[0] if len(score_parts) == 1 else torch.cat(score_parts, dim=1)
+    no_overlap = gate_parts[0] if len(gate_parts) == 1 else torch.cat(gate_parts, dim=1)
+    return raw, no_overlap
 
 
 class _SparseQueryCache:
@@ -1096,10 +1201,12 @@ class _SparseQueryCache:
     `_sparse_scores`.
     """
 
-    def __init__(self, batch_size: int | None = None):
+    def __init__(self, batch_size: int | None = None, sparse_chunk: bool = True):
         self._values = None
         self._indicator = None
         self.batch_size = batch_size
+        # Default to the production chunked sparse path; callers can explicitly opt out.
+        self.sparse_chunk = sparse_chunk
 
     def _csr(self, Q, vals_from_pattern):
         """Build CSR from `Q`'s nonzero pattern in row blocks.
@@ -1201,53 +1308,49 @@ class SparseBatchSlice:
         return self.Cb.shape[0]
 
     def _structural_no_overlap(self, Q):
-        """Signed-data gate: (query-pattern CSR) @ (densified slice
-        indicator, built transposed so no (n_q, …) transpose copy is ever
-        made) == 0. Same FLOPs as the historical per-slice indicator spmm,
-        but the dense operand is the ~300 MB corpus side, not a per-slice
-        re-materialization of the multi-GB query side."""
+        """Return where query and corpus sparse patterns have no shared entries.
+
+        Densifies the corpus-side indicator; oversized slices are row-chunked to
+        stay within the same memory budget used by `_sparse_scores`.
+        """
         import torch
 
         q_ind = (self.q_cache or _SparseQueryCache()).indicator(Q)
-        n_rows, vocab = self.Cb.shape
-        per = _dense_corpus_rows_per_chunk(self.Cb, Q.element_size())
-        # Use the run-wide sparse batch size, not this slice's size, so the
-        # dense-swap decision stays consistent across full and tail slices.
-        target_rows = (self.q_cache.batch_size if self.q_cache else None) or n_rows
-        if per >= target_rows:
-            # ones, not values: a stored 0.0 is still a structural overlap
-            ones = torch.ones(self.Cb.values().numel(), dtype=Q.dtype,
-                              device=Q.device)
+
+        # Use the run-wide sparse batch size
+        fits, per = _sparse_dense_op_fits(self.Cb, Q.element_size(), self.q_cache)
+        ones = torch.ones(self.Cb.values().numel(), dtype=Q.dtype, device=Q.device)
+        if fits:
             return torch.matmul(q_ind, _dense_slice_t(self.Cb, ones)) == 0
 
-        # Too wide for one dense indicator. Chunk the CORPUS rows rather than
-        # switching to a query-side dense operand. Chunking keeps
-        # the transient at the budget no matter how wide the slice is.
-        crow, col = self.Cb.crow_indices(), self.Cb.col_indices()
-        parts = []
-        for r0 in range(0, n_rows, per):
-            r1 = min(r0 + per, n_rows)
-            lo, hi = int(crow[r0]), int(crow[r1])
-            sub = torch.sparse_csr_tensor(
-                (crow[r0 : r1 + 1] - crow[r0]).contiguous(),
-                col[lo:hi],
-                torch.ones(hi - lo, dtype=Q.dtype, device=Q.device),
-                size=(r1 - r0, vocab), check_invariants=False,
-            )
-            parts.append(torch.matmul(q_ind, _dense_slice_t(sub, sub.values())) == 0)
+        # Chunk corpus rows to bound the dense indicator size.
+        parts = [torch.matmul(q_ind, _dense_slice_t(sub, sub.values())) == 0
+                 for sub in _iter_csr_row_chunks(self.Cb, per, ones)]
         return torch.cat(parts, dim=1)
 
     def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
         if self._masked_raw is None:
-            raw = _sparse_scores(Q, self.Cb, self.q_cache)
             _SPARSE_BRANCHES["gate_zero" if self.zero_gate_ok
                              else "gate_structural"] += 1
-            no_overlap = (raw == 0) if self.zero_gate_ok else self._structural_no_overlap(Q)
+
+            # Resolve one cache for the whole score call so query CSR work is shared.
+            cache = self.q_cache = self.q_cache or _SparseQueryCache()
+
+            # Match the same dense/chunked dispatch used by the scoring helpers.
+            fits, per = _sparse_dense_op_fits(self.Cb, Q.element_size(), cache)
+            if not self.zero_gate_ok and not fits and cache.sparse_chunk:
+                # Signed sparse data needs scores and structural overlap over the
+                # same chunks, so compute them together to avoid duplicate work.
+                raw, no_overlap = _chunked_sparse_score_and_gate(Q, self.Cb, cache, per)
+                _SPARSE_BRANCHES["scored_chunked"] += 1
+            else:
+                raw = _sparse_scores(Q, self.Cb, cache)
+                no_overlap = (raw == 0) if self.zero_gate_ok else self._structural_no_overlap(Q)
             self._masked_raw = raw.masked_fill_(no_overlap, float("-inf"))
         if metric == "dot":
             return self._masked_raw
-        # cosine: a NEW tensor (dot may still read `_masked_raw`), then the
-        # second division in place on that fresh copy.
+
+        # Cosine uses a new tensor so the cached dot scores remain unchanged.
         return self._masked_raw.div(self.row_norms.clamp_min(1e-12)[None, :]).div_(q_norms[:, None])
 
 
@@ -3387,6 +3490,7 @@ def run_compute(
             )
     # Keep the sparse dense-swap decision fixed for the run using the resolved batch size.
     sparse_q_cache.batch_size = vt_batch_size.get("sparse")
+    sparse_q_cache.sparse_chunk = cfg.params.sparse_chunk
     # Only a filter that actually appears in SOME vt's union ever reaches
     # _union_keep (a filter whose vt has has_baseline=True never does) — so
     # only these need the per-file row-level union computed at all (Front B).
