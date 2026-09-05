@@ -136,13 +136,16 @@ class Store:
                     fut.result()
         return pa.py_buffer(data)
 
-    def write(self, filename: str, table: pa.Table) -> str:
-        """
-        Write a table to root/filename (creating local parent dirs).
+    def write(self, filename: str, table: pa.Table, row_group_size: int | None = None) -> str:
+        """Write a table to `root/filename`.
+
+        Smaller row groups bound memory for downstream streaming reads, since
+        Parquet materializes data at row-group granularity.
         """
         path = self._prepare_write(filename)
         with self.fs.open_output_stream(path) as sink:
-            pq.write_table(table, sink, compression="snappy")
+            pq.write_table(table, sink, compression="snappy",
+                           row_group_size=row_group_size)
         return path
 
     def write_bytes(self, filename: str, data: bytes) -> str:
