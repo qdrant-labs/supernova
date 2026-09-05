@@ -3,6 +3,8 @@ name = "nova-cli"
 version = "3"
 description = "Git-style dispatcher for the nova/supernova toolset: `nova <cmd>` runs `nova-<cmd>`."
 requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 # Intentionally zero dependencies: the dispatcher must install instantly
 # anywhere. Heavy commands (e.g. nova-embed with pytorch) are separate packages
 # under python/.

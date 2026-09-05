@@ -3,6 +3,8 @@ name = "nova-sweep"
 version = "0.0.1"
 description = "Parameter sweep orchestrator for the supernova toolset — drives nova-load/nova-storm across a matrix of index/search configs."
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 # Controller-side only, no heavy compute of its own: orchestrates nova-load /
 # nova-storm subprocesses. qdrant-client is needed only for the pre-flight
 # collection-exists check — nova-load's own CLI has no bare

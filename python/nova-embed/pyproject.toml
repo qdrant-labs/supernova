@@ -3,6 +3,8 @@ name = "nova-embed"
 version = "0.0.12"
 description = "Embedding generation for the supernova toolset — stream datasets, embed at scale, write parquet."
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 # Base deps are light enough to import the config layer and the CLI scaffolding.
 # The heavy ML stack (torch, sentence-transformers, …) is in the `embed` extra,
 # installed only on embedding workers.

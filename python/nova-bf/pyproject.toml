@@ -3,6 +3,8 @@ name = "nova-bf"
 version = "0.0.1"
 description = "Brute-force exact nearest-neighbor ground truth for the supernova toolset."
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 # Base deps cover config + the merge phase + IO. `compute` (GPU topk) needs torch,
 # which lives in the `compute` extra so the controller-side `merge` stays light.
 dependencies = [

@@ -3,6 +3,8 @@ name = "nova-dist"
 version = "0.0.12"
 description = "Distributed orchestration for the supernova toolset — fan embed/load/storm across a SkyPilot fleet."
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 # This package IS the SkyPilot orchestrator, so the SDK is a core dep (not an
 # extra). Installed only on the controller (your laptop / a dispatch box) —
 # never on workers, which just run the tool binaries.
