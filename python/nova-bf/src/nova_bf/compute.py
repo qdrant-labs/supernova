@@ -972,11 +972,6 @@ def _reset_prune_applied() -> None:
     _PRUNE_APPLIED["count"] = 0
 
 
-# Row-group size for per-rank partials. Smaller groups bound reducer memory
-# when many partials are streamed concurrently.
-PARTIAL_ROW_GROUP_ROWS = 4096
-
-
 # Which sparse code paths a run actually took for the manifest
 _SPARSE_BRANCHES = {
     "scored_swapped": 0,      # dense corpus operand fit the budget
@@ -4425,10 +4420,7 @@ def run_compute(
         else:
             name = result_name(cfg, s)
             warn_if_short(short_i, out_n, s.k, s.name, logger)
-        # Sharded runs write a PARTIAL that `merge` must later stream. Cap the
-        # row group so a reducer can hold several partials at once.
-        path = (out.write(name, table, row_group_size=PARTIAL_ROW_GROUP_ROWS)
-                if num_jobs is not None else out.write(name, table))
+        path = out.write(name, table)
         logger.info("search=%r wrote %s (%d queries)", s.name, path, out_n)
         results[s.name] = path
         entry = run_manifest.search_entry(s)
