@@ -280,48 +280,42 @@ def test_id_order_scalar_agrees_with_the_ordinals_it_stands_in_for():
 
 
 # --------------------------------------------------------------------------
-# the compiled fast path
+# the packed key
 # --------------------------------------------------------------------------
 
 
-def test_the_compiled_pack_agrees_with_the_eager_one():
-    """`pack` runs a `torch.compile`d kernel and falls back to the eager body if
-    compilation is unavailable. The two must be bit-identical: which of them ran
-    is a performance detail, and a divergence would make the ARTIFACT depend on
-    whether inductor happened to work on that host."""
+def test_pack_is_the_three_elementwise_ops_it_claims_to_be():
+    """`pack` used to run a `torch.compile`d body with an eager fallback, and
+    a test pinned the two bit-identical. The compile is gone (R4: the Triton
+    pre-top-K emits packed keys itself, so `pack` is a cold path and the
+    inductor compile cost ~15 s of per-rank startup). Pin the keys directly
+    against the transform they are defined by, so removing the compile cannot
+    have moved a bit."""
     rng = np.random.default_rng(3)
     bits = rng.integers(-(2**31), 2**31, 50_000, dtype=np.int64).astype(np.int32)
     s = torch.from_numpy(bits).view(torch.float32)
     s = torch.where(torch.isnan(s), torch.zeros_like(s), s)  # NaN has no order
     o = torch.from_numpy(rng.integers(0, U32, len(s)).astype(np.int64))
-    assert bool((tb.pack(s.clone(), o) == tb._pack_eager(s.clone(), o)).all())
+    want = tb.score_order_key(s.clone()).to(torch.int64) * (1 << 32) + (U32 - o)
+    assert bool((tb.pack(s.clone(), o) == want).all())
 
 
-def test_a_failing_compile_degrades_to_eager_instead_of_raising(monkeypatch):
-    """The fallback is what keeps this a performance path only."""
-    monkeypatch.setattr(tb, "_compiled_pack", None)
-    monkeypatch.setattr(tb, "_compiled_proven", False)
+def test_pack_does_not_compile_anything(monkeypatch):
+    """No inductor on the import or the call path: the compile it used to do
+    triggered ~15 s of a ~30 s per-rank startup, once per process."""
+    assert not hasattr(tb, "_compiled_pack")
+    assert not hasattr(tb, "_pack_eager")
+    called = []
+    orig = torch.compile
+    # `monkeypatch`, not bare assignment: an assertion between the assignment
+    # and a `finally` would otherwise leave a patched `torch.compile` behind for
+    # the rest of the session. pytest unwinds this even if the test dies.
     monkeypatch.setattr(
-        torch, "compile", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no inductor"))
-    )
-    s = torch.tensor([[1.0, -0.0, 3.0]], dtype=torch.float32)
-    o = torch.arange(3, dtype=torch.int64)
-    assert tb.pack(s.clone(), o).tolist() == tb._pack_eager(s.clone(), o).tolist()
-    assert tb._compiled_pack is False, "a failed compile must not be retried"
-
-
-def test_a_failure_AFTER_the_compile_is_proven_propagates(monkeypatch):
-    """Only the first call is guarded. Guarding every call would let one
-    anomalous input, or a transient CUDA OOM, silently pin the rest of a
-    multi-hour run to the slow path with the real error swallowed."""
-    def boom(*a, **k):
-        raise RuntimeError("CUDA out of memory")
-
-    monkeypatch.setattr(tb, "_compiled_pack", boom)
-    monkeypatch.setattr(tb, "_compiled_proven", True)
-    with pytest.raises(RuntimeError, match="out of memory"):
-        tb.pack(torch.tensor([[1.0]], dtype=torch.float32), torch.zeros(1, dtype=torch.int64))
-    assert tb._compiled_pack is boom, "a proven path must not be torn down by one error"
+        torch, "compile", lambda *a, **k: called.append(1) or orig(*a, **k))
+    tb.pack(torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+            torch.arange(2, dtype=torch.int64))
+    tb.sentinel_key((2, 3), "cpu")
+    assert called == []
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
@@ -334,16 +328,6 @@ def test_non_float32_scores_are_refused_rather_than_reshaped(dtype):
     s = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=dtype)
     with pytest.raises(TypeError, match="needs float32 scores"):
         tb.pack(s, torch.arange(4, dtype=torch.int64))
-
-
-def test_a_refused_dtype_does_not_disable_the_compiled_path():
-    """A bad input must not be blamed on inductor: the dtype gate runs BEFORE
-    the compile fallback, so a rejected call leaves the fast path intact."""
-    tb.pack(torch.tensor([[1.0]], dtype=torch.float32), torch.zeros(1, dtype=torch.int64))
-    was = tb._compiled_pack
-    with pytest.raises(TypeError):
-        tb.pack(torch.tensor([[1.0]], dtype=torch.float64), torch.zeros(1, dtype=torch.int64))
-    assert tb._compiled_pack is was
 
 
 def test_the_negative_zero_fold_is_exact_over_the_bit_space():
@@ -558,3 +542,118 @@ def test_two_real_candidates_can_never_share_a_packed_key():
     sent = int(pack(torch.tensor([float("-inf")]), torch.tensor([top]))[0])
     assert sent not in set(mixed.tolist()), "a real candidate collided with the sentinel"
     assert sent < int(mixed.min()), "the sentinel must lose to every real candidate"
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_encoded_ids_survive_above_the_32_bit_boundary(device):
+    """Encoded row ids are `gidx * MAX_ROWS_PER_FILE + row` with
+    `MAX_ROWS_PER_FILE = 100_000_000`, so they cross `2**31` at file index 21
+    and reach ~3.2e10 on a production rank of 317 files. Every fixture in this
+    suite builds at most 10 files (max id 9e8), so the whole id path was
+    exercised only in the low 31 bits — 15x below where production runs.
+
+    A truncation to 31 bits anywhere in that path (the kernel's ENC store, the
+    portable gather, the int64 widening) would hand back ids pointing at the
+    WRONG corpus rows, with plausible scores and no error. Nothing downstream
+    can detect it, so it has to be pinned here.
+    """
+    from nova_bf.compute import MAX_ROWS_PER_FILE
+
+    n_cols, k = 64, 8
+    # ids from real production file indices, straddling and far above 2**31
+    gidx = torch.tensor([0, 20, 21, 22, 100, 316], dtype=torch.int64)
+    ids = (gidx.repeat_interleave(n_cols // len(gidx) + 1)[:n_cols]
+           * MAX_ROWS_PER_FILE + torch.arange(n_cols, dtype=torch.int64))
+    assert (ids > 2**31).any(), "fixture must actually exceed 31 bits"
+    assert (ids > 2**32).any(), "...and 32 bits"
+
+    ids = ids.to(device)
+    ordinal = torch.arange(n_cols, dtype=torch.int64, device=device)
+    scores = torch.randn(16, n_cols, generator=torch.Generator().manual_seed(4)
+                         ).float().to(device)
+
+    keys, got, live = tb.pack_topk(scores, ordinal, k, encoded=ids)
+
+    # every returned id must be one of the ids we supplied, bit-exact
+    supplied = set(ids.tolist())
+    returned = set(got.flatten().tolist())
+    assert returned <= supplied, (
+        f"ids not in the input: {sorted(returned - supplied)[:4]} — a wide id "
+        f"was mangled (truncation would land these below 2**31)")
+    assert max(returned) > 2**32, "no wide id survived into the result at all"
+
+    # and each id must still be paired with ITS OWN column's score, checked
+    # PER ROW (one map across all rows would just be the last row's scores)
+    for r in range(scores.shape[0]):
+        want = {int(ids[c]): float(scores[r, c]) for c in range(n_cols)}
+        for slot in range(k):
+            i = int(got[r, slot])
+            assert i in want, f"row {r} slot {slot}: id {i} is not a supplied id"
+            assert want[i] == pytest.approx(
+                float(tb.unpack_score(keys[r, slot])), abs=1e-6), (
+                f"row {r} slot {slot}: id {i} carries another column's score")
+
+
+def test_the_enc_contract_is_enforced_condition_by_condition():
+    """The `enc` half of the gate, exercised WITHOUT a GPU.
+
+    As part of `available()` these conditions were unreachable on a CPU box:
+    the "not CUDA" check declines first, so every `assert not available(...)`
+    above passes for that reason alone and none of the `enc` rules is actually
+    tested. Deleting the whole block survived the full GPU suite.
+
+    Each rule is a silent-wrong-answer guard. The kernel indexes `enc` by
+    COLUMN and loads 8 bytes per lane, so a short, strided, non-int64 or
+    foreign-device `enc` yields ids for the WRONG corpus rows, with plausible
+    scores and no error. Declining costs ~4x on that slice; accepting costs the
+    ground truth.
+    """
+    import nova_bf.topk_triton as tk
+
+    n_cols = 8
+    dev = torch.device("cpu")
+    good = torch.arange(n_cols, dtype=torch.int64)
+    assert tk._enc_ok(good, n_cols, dev), "a well-formed enc must be accepted"
+
+    cases = {
+        "2-D (per-cell) enc": good.unsqueeze(0).expand(2, n_cols),
+        "too short": torch.arange(n_cols - 1, dtype=torch.int64),
+        "too long": torch.arange(n_cols + 1, dtype=torch.int64),
+        "int32, not int64": torch.arange(n_cols, dtype=torch.int32),
+        "float, not int64": torch.arange(n_cols, dtype=torch.float32),
+        "non-contiguous": torch.arange(n_cols * 2, dtype=torch.int64)[::2],
+    }
+    for why, bad in cases.items():
+        assert not tk._enc_ok(bad, n_cols, dev), f"must decline: {why}"
+
+    # a foreign device is the one rule needing two devices to express
+    if torch.cuda.is_available():
+        assert not tk._enc_ok(good, n_cols, torch.device("cuda")), (
+            "an enc on another device than the scores must decline")
+        assert not tk._enc_ok(good.cuda(), n_cols, dev), "...and the reverse"
+
+    # and every declined case must SAY why, rather than blaming the shape/k
+    s = torch.randn(4, n_cols)
+    o = torch.arange(n_cols, dtype=torch.int64)
+    for why, bad in cases.items():
+        reason = tk._why_declined(s, o, 4, None, None, bad)
+        assert reason, f"no reason reported for: {why}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gate's CUDA half")
+def test_available_actually_declines_a_bad_enc_on_cuda():
+    """The predicate above is wired into `available()`, not merely present."""
+    import nova_bf.topk_triton as tk
+
+    n_cols = 8
+    s = torch.randn(4, n_cols, device="cuda")
+    o = torch.arange(n_cols, dtype=torch.int64, device="cuda")
+    good = torch.arange(n_cols, dtype=torch.int64, device="cuda")
+    assert tk.available(s, o, 4, None, None, good), "the good case must be served"
+    for bad in (good.to(torch.int32),
+                torch.arange(n_cols - 1, dtype=torch.int64, device="cuda"),
+                torch.arange(n_cols * 2, dtype=torch.int64, device="cuda")[::2],
+                good.cpu()):
+        assert not tk.available(s, o, 4, None, None, bad), (
+            f"available() served a malformed enc: dtype={bad.dtype} "
+            f"numel={bad.numel()} contig={bad.is_contiguous()} dev={bad.device}")

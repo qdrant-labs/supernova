@@ -12,6 +12,8 @@ instead of passing vacuously.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -190,31 +192,34 @@ def test_live_rows_handles_a_zero_width_part():
 # ---------------------------------------------------------------------------
 
 
-def test_kernel_sentinel_matches_tiebreak():
-    """`topk_triton` resolves `SENTINEL_KEY` lazily to dodge an import cycle,
-    so nothing structural keeps the two in step. Pin them."""
-    from nova_bf import topk_triton
-
-    assert topk_triton._sentinel_key() == SENTINEL_KEY
 
 
-def test_kernel_sentinel_argument_has_no_default():
-    """`SENTINEL` must stay REQUIRED at the kernel's launch site.
+def test_kernel_takes_no_sentinel_argument_any_more():
+    """The sentinel FILL is gone, and this pins that it stays gone.
 
-    This runs without CUDA on purpose. `test_dead_rows_carry_the_sentinel_not_
-    garbage` below is the real proof, but it is GPU-gated, so on a CPU box —
-    which is where this suite usually runs — nothing else here would notice a
-    default reappearing.
+    `_cutfill` used to write k sentinel keys and k zero indices into every
+    pruned row so that a consumer which read one would lose rather than
+    corrupt. At the production shape that was 1.2 GB of stores per slice for
+    output nobody reads — and once the run reaches steady state ~97% of rows
+    are dead, so it was most of the kernel's write traffic. See G1 in
+    `docs/brute-force/perf-design-2026-09-05.md`.
 
-    Why a default is worse than none: a `tl.constexpr` default is silently
-    applied to any launch that omits the keyword, and the value that would look
-    natural, 0, is the single worst choice. `0` is `pack(+0.0, TIE_WORST)` — a
-    score of POSITIVE ZERO. It outranks the -inf sentinel, it outranks every
-    negative score (all euclidean scores are negative, and dot routinely is),
-    and `0.0 > -inf` so the decode gate keeps it. A dead row would come back
-    holding k hits at score 0.0 pointing at one repeated id: wrong ground truth
-    that looks entirely normal, which is the exact failure the sentinel fill was
-    added to prevent. With no default, the same mistake is a TypeError.
+    What replaced it is not a weaker guarantee, it is a different one: NOBODY
+    READS A DEAD ROW. `merge_triton._fold` returns before touching it and
+    `compute._merge_topk`'s portable fallback folds live rows only, and
+    `tests/test_dead_row_poison.py` proves both by filling those rows with
+    values engineered to WIN any selection they leak into. A test beats a fill:
+    the fill made a leak survivable, the test makes a leak fail.
+
+    Keeping `SENTINEL` as a parameter would be actively harmful now — it would
+    read as though the fill were still happening. Its absence also means a
+    stale launch site still passing `SENTINEL=` dies with a TypeError instead
+    of being silently ignored.
+
+    This runs without CUDA on purpose. `test_dead_rows_are_not_written_at_all`
+    below is the real proof, but it is GPU-gated, so on a CPU box — which is
+    where this suite usually runs — nothing else here would notice the fill
+    coming back.
     """
     import inspect
 
@@ -225,23 +230,25 @@ def test_kernel_sentinel_argument_has_no_default():
 
     # `@triton.jit` wraps the function; the original is on `.fn`.
     fn = getattr(topk_triton._cutfill, "fn", topk_triton._cutfill)
-    param = inspect.signature(fn).parameters["SENTINEL"]
-    assert param.default is inspect.Parameter.empty, (
-        f"topk_triton._cutfill's SENTINEL has default {param.default!r}; it must "
-        "stay required so a launch that forgets it fails loudly instead of "
-        "filling dead rows with a key that beats real candidates"
+    params = inspect.signature(fn).parameters
+    assert "SENTINEL" not in params, (
+        "topk_triton._cutfill still takes SENTINEL; dead rows are no longer "
+        "filled, so the argument would be a lie"
+    )
+    # ...and the pointer that replaced the work it used to do is there.
+    assert "ENC" in params and "HAS_ENC" in params, (
+        "the kernel should emit encoded ids directly (G2)"
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="exercises the kernel")
-def test_dead_rows_carry_the_sentinel_not_garbage():
-    """The kernel used to `return` without writing `OUTK`, leaving whatever was
-    in GPU memory — values that decode to a plausible score and a plausible id,
-    so a consumer that read one produced wrong ground truth that looked normal.
-    Dead rows now hold `SENTINEL_KEY`, which loses to every real candidate.
+def test_dead_rows_are_not_written_at_all():
+    """A pruned row must come back EXACTLY as the buffer was handed over.
 
-    Allocating the output pre-poisoned is what makes this test mean something:
-    if the kernel skipped the store, the poison would survive and be visible.
+    Poison mode fills the output before the launch, so anything the kernel
+    wrote is visible as a difference. Live rows must overwrite their own k
+    slots completely (the kernel asserts it selects exactly k); dead rows must
+    still be pure poison afterwards.
     """
     from nova_bf import topk_triton
 
@@ -250,23 +257,32 @@ def test_dead_rows_carry_the_sentinel_not_garbage():
     g = torch.Generator(device="cpu").manual_seed(11)
     scores = torch.randn(n_q, n_cols, generator=g).float().to(dev)
     ordinal = torch.arange(n_cols, dtype=torch.int64, device=dev)
+    enc = (torch.arange(n_cols, dtype=torch.int64, device=dev) + 10_000)
 
     # Threshold above every score for half the rows -> those rows are dead.
     thr = pack(torch.full((n_q, 1), 1e9), torch.zeros(1, dtype=torch.int64))
     thr = thr.squeeze(1).contiguous().to(dev)
     thr[: n_q // 2] = SENTINEL_KEY          # keep the first half alive
 
-    keys, idx, live = topk_triton.topk(scores, ordinal, k, thr=thr)
+    os.environ["NOVA_BF_POISON_DEAD_ROWS"] = "1"
+    try:
+        keys, vals, live = topk_triton.topk(scores, ordinal, k, thr=thr, enc=enc)
+    finally:
+        del os.environ["NOVA_BF_POISON_DEAD_ROWS"]
 
     dead = (live == 0).nonzero(as_tuple=True)[0]
     assert dead.numel() > 0, "no row was pruned; the test proves nothing"
-    assert torch.equal(
-        keys[dead], torch.full_like(keys[dead], SENTINEL_KEY)
-    ), "a dead row's keys are not the sentinel"
-    assert torch.equal(
-        idx[dead], torch.zeros_like(idx[dead])
-    ), "a dead row's indices must stay gather-safe"
+    assert (keys[dead] == topk_triton.POISON_KEY).all(), (
+        "the kernel wrote into a dead row's keys"
+    )
+    assert (vals[dead] == topk_triton.POISON_ID).all(), (
+        "the kernel wrote into a dead row's ids"
+    )
 
     alive = (live != 0).nonzero(as_tuple=True)[0]
     assert alive.numel() > 0
-    assert (keys[alive] != SENTINEL_KEY).all(), "a live row lost its real keys"
+    assert (keys[alive] != topk_triton.POISON_KEY).all(), (
+        "a live row kept poison — the kernel did not fill all k slots"
+    )
+    # G2: a live row's values are the ENCODED IDS, not column indices.
+    assert (vals[alive] >= 10_000).all() and (vals[alive] < 10_000 + n_cols).all()

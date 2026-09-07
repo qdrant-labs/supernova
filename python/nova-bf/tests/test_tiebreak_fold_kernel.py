@@ -39,8 +39,11 @@ def _same(a, b):
 
 
 def _check(sk, se, pk, pe, k, label):
+    # `fold` is IN PLACE (`OK=SK`, `OE=SE`), so the oracle must run on the
+    # state as it was BEFORE the fold. Reading `sk`/`se` afterwards would
+    # compare the kernel against its own output.
+    ek, ee = _portable(sk.clone(), se.clone(), pk, pe, k)
     gk, ge = mt.fold(sk, se, pk, pe, k)
-    ek, ee = _portable(sk, se, pk, pe, k)
     assert _same(gk, ek), f"{label}: wrong surviving keys"
     # Ids must travel with their own key AND stay in their own query's row, so
     # compare (key, id) pairs ROW BY ROW. Flattening the grid first would pass
@@ -205,7 +208,10 @@ def test_a_chain_of_folds_equals_one_big_selection(n_parts):
     k, n_q, w = 200, 32, 150
     sk, se = _rand_state(n_q, k, seed=5, sentinels=60)
     parts = [_rand_part(n_q, w, seed=100 + i, offset=10_000 * (i + 1)) for i in range(n_parts)]
-    ck, ce = sk, se
+    # `fold` is IN PLACE, so the chain must start from a COPY — otherwise the
+    # one-shot oracle below would be handed the chain's own output as its
+    # starting state.
+    ck, ce = sk.clone(), se.clone()
     for pk, pe in parts:
         ck, ce = mt.fold(ck, ce, pk, pe, k)
     ek, ee = _one_shot(sk, se, parts, k)
@@ -220,7 +226,10 @@ def test_grouping_of_parts_does_not_change_the_answer():
     parts = [_rand_part(n_q, w, seed=200 + i, offset=10_000 * (i + 1)) for i in range(3)]
 
     def run(groups):
-        ck, ce = sk, se
+        # A fresh copy per grouping: `fold` rewrites the state it is given, so
+        # without this the second run would start where the first stopped and
+        # the comparison would be meaningless.
+        ck, ce = sk.clone(), se.clone()
         for grp in groups:
             pk = torch.cat([parts[i][0] for i in grp], dim=1)
             pe = torch.cat([parts[i][1].unsqueeze(0).expand(n_q, -1) for i in grp], dim=1)
@@ -267,10 +276,12 @@ def test_state_and_part_sharing_identical_keys():
     sk, se = _rand_state(n_q, k, seed=17)
     pk = sk.clone()                                  # byte-identical keys
     pe = torch.full((n_q, w), -1, dtype=torch.int64, device=DEV)
-    gk, ge = mt.fold(sk, se, pk, pe, k)
-    ek, _ = _portable(sk, se, pk, pe, k)
-    assert _same(gk, ek)
+    # Snapshot before the in-place fold — both for the oracle and for the id
+    # set, which is a property of the state that WENT IN.
+    ek, _ = _portable(sk.clone(), se.clone(), pk, pe, k)
     allowed = set(se.flatten().tolist()) | {-1}
+    gk, ge = mt.fold(sk, se, pk, pe, k)
+    assert _same(gk, ek)
     assert set(ge.flatten().tolist()) <= allowed
 
 

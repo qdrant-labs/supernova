@@ -47,13 +47,10 @@ try:
     _triton, _tl = _load()
 
     @_triton.jit
-    def _cutfill(S, NRM, RANK, ORD, OUTK, OUTI, THR, LIVE, stride_s, n_cols, k,
+    def _cutfill(S, NRM, RANK, ORD, ENC, OUTK, OUTI, THR, LIVE, stride_s, n_cols, k,
                  BLOCK: _tl.constexpr, RBITS: _tl.constexpr,
                  HAS_NRM: _tl.constexpr, HAS_THR: _tl.constexpr,
-                 # Required: every real candidate must outrank this sentinel.
-                 # A default like 0 is unsafe: it can survive decoding and beat valid negative
-                 # scores, producing plausible fake hits. Missing it should fail at launch.
-                 SENTINEL: _tl.constexpr):
+                 HAS_ENC: _tl.constexpr):
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
         m = offs < n_cols
@@ -94,13 +91,8 @@ try:
             alive = _tl.sum((m & (u >= thr_u)).to(_tl.int32)) > 0
             _tl.store(LIVE + row, alive.to(_tl.uint8))
             if alive == 0:
-                # Dead rows skip selection, so initialize outputs explicitly: sentinel
-                # keys lose to all real candidates, and zero indices remain gather-safe.
-                _tl.store(OUTK + row * k + offs,
-                          _tl.full([BLOCK], SENTINEL, _tl.int64), mask=offs < k)
-                # Indices must stay gather-safe even though they mean nothing.
-                _tl.store(OUTI + row * k + offs, _tl.zeros([BLOCK], _tl.int32),
-                          mask=offs < k)
+                # Dead rows write nothing; their outputs are undefined. Downstream folds
+                # gate on `live` and never read them; dead-row poisoning tests enforce this.
                 return
 
         prefix = _tl.zeros([], dtype=_tl.uint32)
@@ -145,7 +137,13 @@ try:
         key32 = (u ^ 0x80000000).to(_tl.int32, bitcast=True)
         packed = key32.to(_tl.int64) * 4294967296 + (0xFFFFFFFF - ordv)
         _tl.store(OUTK + row * k + pos, packed, mask=keep & (pos < k))
-        _tl.store(OUTI + row * k + pos, offs.to(_tl.int32), mask=keep & (pos < k))
+        if HAS_ENC:
+            # Emit encoded row IDs directly, avoiding the caller's index widening
+            # and post-top-K gather.
+            _tl.store(OUTI + row * k + pos, _tl.load(ENC + offs, mask=m, other=0),
+                      mask=keep & (pos < k))
+        else:
+            _tl.store(OUTI + row * k + pos, offs.to(_tl.int32), mask=keep & (pos < k))
 
 
 except Exception as exc:  # no triton, or a version whose API moved
@@ -154,12 +152,12 @@ except Exception as exc:  # no triton, or a version whose API moved
     _UNAVAILABLE = f"{type(exc).__name__}: {exc}"
 
 
-# Widest slice the kernel will take. Each program holds the whole row in
-# registers, so past some width the register file spills and the win evaporates.
-# MEASURED on an A10G with `num_warps=8`: 4096 -> n_regs=104, 8192 -> n_regs=209,
-# zero spills at both. (At 8192 with num_warps=4 it spills 8 bytes, which is why
-# the launch below pins 8.) Anything wider is unmeasured and takes the portable
-# path.
+# Maximum measured kernel width. Each program holds a full row in registers, so
+# wider blocks risk spilling and fall back to the portable path.
+#
+# A10G / Triton 3.8.0, num_warps=8: BLOCK=8192 has no spills but is near the
+# register limit (254 regs without encoded IDs). Re-measure before increasing
+# this limit or materially increasing kernel state.
 MAX_BLOCK = 8192
 
 
@@ -245,23 +243,85 @@ def _shape_of(t) -> str:
 _DECLINE_LOGGED = False
 
 
-def available(scores, ordinal, k, scale=None, thr=None) -> bool:
+def available(scores, ordinal, k, scale=None, thr=None, enc=None) -> bool:
     """Is the kernel usable for THIS call? Anything false falls back.
     """
-    ok = _available(scores, ordinal, k, scale, thr)
+    ok = _available(scores, ordinal, k, scale, thr, enc)
     global _DECLINE_LOGGED
     if not ok and not _DECLINE_LOGGED:
         _DECLINE_LOGGED = True
         logger.info(
             "tie-break top-K: the Triton kernel does not apply to this run "
-            "(scores %s, k=%s) — using the portable path, which computes the "
+            "(scores %s, k=%s%s) — using the portable path, which computes the "
             "identical answer roughly 4x slower. Logged once.",
-            _shape_of(scores), k,
+            _shape_of(scores), k, _why_declined(scores, ordinal, k, scale, thr, enc),
         )
     return ok
 
 
-def _available(scores, ordinal, k, scale=None, thr=None) -> bool:
+def _enc_ok(enc, n_cols: int, device) -> bool:
+    """Whether `enc` satisfies the kernel's direct-indexing assumptions.
+
+    The kernel treats `enc` as a contiguous int64 vector with one value per
+    column on the same device. Kept separate so these guards are CPU-testable.
+    """
+    import torch
+
+    return bool(
+        enc.ndim == 1
+        and enc.numel() == n_cols
+        and enc.dtype is torch.int64
+        and enc.is_contiguous()
+        and enc.device == device
+    )
+
+
+def _why_declined(scores, ordinal, k, scale, thr, enc) -> str:
+    """Return the first reason the Triton top-K path is unavailable. 
+    
+    Checks should stay in the same order as `_available` so the 
+    logged reason matches the condition that actually declined the kernel. 
+    """
+    import os
+
+    import torch
+
+    if _cutfill is None:
+        return f"; the kernel did not load ({_UNAVAILABLE})"
+    if os.environ.get("NOVA_BF_NO_TOPK_KERNEL"):
+        return "; NOVA_BF_NO_TOPK_KERNEL is set"
+    if getattr(torch.version, "hip", None) is not None:
+        return "; ROCm/HIP build"
+    if scores.ndim != 2 or ordinal.ndim != 1:
+        return f"; scores.ndim={scores.ndim}, ordinal.ndim={ordinal.ndim}, want 2 and 1"
+    if not scores.is_cuda:
+        return f"; scores are on {scores.device}, not CUDA"
+    if scores.dtype is not torch.float32:
+        return f"; scores are {scores.dtype}, not float32"
+    if not scores.is_contiguous():
+        return "; scores are not contiguous"
+    n_cols = scores.shape[1]
+    if enc is not None and not _enc_ok(enc, n_cols, scores.device):
+        for cond, why in (
+            (enc.ndim == 1, f"enc.ndim={enc.ndim}, want 1"),
+            (enc.numel() == n_cols, f"enc has {enc.numel()} ids for {n_cols} columns"),
+            (enc.dtype is torch.int64, f"enc is {enc.dtype}, not int64"),
+            (enc.is_contiguous(), "enc is not contiguous"),
+            (enc.device == scores.device,
+             f"enc is on {enc.device}, scores on {scores.device}"),
+        ):
+            if not cond:
+                return f"; {why}"
+    if ordinal.numel() != n_cols:
+        return f"; {ordinal.numel()} ordinals for {n_cols} columns"
+    if not 0 < k <= n_cols:
+        return f"; k={k} outside (0, n_cols={n_cols}]"
+    if n_cols > MAX_BLOCK:
+        return f"; n_cols={n_cols} exceeds MAX_BLOCK={MAX_BLOCK}"
+    return ""
+
+
+def _available(scores, ordinal, k, scale=None, thr=None, enc=None) -> bool:
     """`available`'s body — see there.
 
     This is the contract boundary: everything the kernel ASSUMES is checked
@@ -311,56 +371,99 @@ def _available(scores, ordinal, k, scale=None, thr=None) -> bool:
         return False
     if not _offsets_fit_int32(n_q, scores.stride(0), k):
         return False
+    # `enc` is indexed directly by score-column offset, so require one contiguous
+    # int64 value per column on the same device.
+    if enc is not None and not _enc_ok(enc, n_cols, scores.device):
+        return False
     return ordinal.numel() == n_cols and 0 < k <= n_cols <= MAX_BLOCK
 
 
-def _sentinel_key() -> int:
-    """`tiebreak.SENTINEL_KEY`, fetched lazily.
 
-    `tiebreak` imports this module, so a module-level import here would be a
-    cycle. Pinned equal by `test_kernel_sentinel_matches_tiebreak`.
+
+# Test-only values for dead rows. `POISON_KEY` is the largest int64 key, so any
+# accidental read wins selection and fails loudly; `POISON_ID` is recognizable.
+POISON_KEY = 0x7FFFFFFFFFFFFFFF
+POISON_ID = -0x5EEDDEAD
+
+
+def _poisoning() -> bool:
+    """Whether to fill undefined dead-row outputs with deterministic poison.
+
+    Used to verify that downstream paths gate on `live` and never consume them.
     """
-    from nova_bf.tiebreak import SENTINEL_KEY
+    import os
 
-    return SENTINEL_KEY
+    return bool(os.environ.get("NOVA_BF_POISON_DEAD_ROWS"))
 
 
-def topk(scores, ordinal, k, scale=None, thr=None):
-    """Select top-K from `(n_q, n_cols)` float32 scores.
+def rank_of(ordinal):
+    """Return each column's 0-based rank in ascending ordinal order.
 
-    Returns `(packed_keys, column_indices, live)`, with the first two shaped
-    `(n_q, k)`. Higher scores win; exact ties use the smallest ordinal.
-    Results are unordered within each row and match `tiebreak.pack(...)`.
+    The rank depends only on `ordinal`, so callers may compute it once and reuse
+    it across members sharing the same columns.
+    """
+    import torch
 
-    `scale` is an optional per-query divisor applied before selection.
-    `thr` enables per-row pruning; a dead row's keys are filled with
-    `tiebreak.SENTINEL_KEY` (so reading one is wasteful, never wrong) and its
-    indices are zero — gather-safe but meaningless. With `thr=None`, `live` is
-    `None`.
+    n_cols = ordinal.numel()
+    perm = torch.argsort(ordinal)
+    rank = torch.empty(n_cols, dtype=torch.int32, device=ordinal.device)
+    rank.scatter_(0, perm,
+                  torch.arange(n_cols, dtype=torch.int32, device=ordinal.device))
+    return rank
+
+
+def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None):
+    """Select top-K packed `(score, ordinal)` keys per query row.
+
+    Returns `(keys, values, live)`. `values` contains `enc[column]` when
+    provided, otherwise column indices. `scale` applies a per-query divisor and
+    `thr` enables pruning.
+
+    Dead rows have undefined outputs when pruning; callers must gate on `live`.
+    `rank` may provide a precomputed `rank_of(ordinal)` for reuse.
+
+    `rank` is `rank_of(ordinal)`; pass it to share one computation across the
+    members of a slice, which all see the same ordinal vector.
 
     Requires unique ordinals in `[0, 0xFFFFFFFF]`.
     """
     import torch
 
     n_q, n_cols = scores.shape
-    perm = torch.argsort(ordinal)
-    rank = torch.empty(n_cols, dtype=torch.int32, device=scores.device)
-    rank.scatter_(0, perm, torch.arange(n_cols, dtype=torch.int32, device=scores.device))
+    if rank is None:
+        rank = rank_of(ordinal)
+    elif not (rank.dtype is torch.int32 and rank.numel() == n_cols
+              and rank.is_contiguous() and rank.device == scores.device):
+        # Reject structurally invalid ranks rather than silently recomputing.
+        raise ValueError(
+            f"rank must be int32, contiguous, {n_cols} long, on "
+            f"{scores.device}; got dtype={rank.dtype} "
+            f"shape={tuple(rank.shape)} device={rank.device}"
+        )
 
     _block = _triton.next_power_of_2(n_cols)
     outk = torch.empty((n_q, k), dtype=torch.int64, device=scores.device)
-    outi = torch.empty((n_q, k), dtype=torch.int32, device=scores.device)
+    outi = torch.empty((n_q, k),
+                       dtype=torch.int64 if enc is not None else torch.int32,
+                       device=scores.device)
     live = None if thr is None else torch.empty(n_q, dtype=torch.uint8, device=scores.device)
-    # Triton launches on the CURRENT device; pin it to the tensors' own so a
-    # process whose current device differs (multi-GPU) cannot launch elsewhere.
+    if thr is not None and _poisoning():
+        # Poison undefined dead-row outputs so accidental reads fail loudly.
+        outk.fill_(POISON_KEY)
+        outi.fill_(POISON_ID if enc is not None else 0x7FFFFFFF)
+
+    # Launch on the tensors' CUDA device, not the process's current device.
     global _LAUNCHES
     _LAUNCHES += 1
     with torch.cuda.device(scores.device):
         _cutfill[(n_q,)](
-            # `scores` doubles as the NRM placeholder when unscaled,
-            # and as the THR/LIVE placeholders when unpruned.
+            # `scores` doubles as the NRM placeholder when unscaled, as the
+            # THR/LIVE placeholders when unpruned, and as ENC when the caller
+            # wants column indices back.
             scores, scale if scale is not None else scores,
-            rank, ordinal.contiguous(), outk, outi,
+            rank, ordinal.contiguous(),
+            enc if enc is not None else scores,
+            outk, outi,
             thr if thr is not None else scores,
             live if live is not None else scores,
             scores.stride(0), n_cols, k,
@@ -368,7 +471,7 @@ def topk(scores, ordinal, k, scale=None, thr=None):
             RBITS=max(1, int(n_cols).bit_length()),   # w lands in [1, n_cols]
             HAS_NRM=scale is not None,
             HAS_THR=thr is not None,
-            SENTINEL=_sentinel_key(),
+            HAS_ENC=enc is not None,
             num_warps=_warps_for(_block),  # 4 spills at BLOCK=8192; 8 does not.
         )
-    return outk, outi.to(torch.int64), live
+    return outk, outi if enc is not None else outi.to(torch.int64), live

@@ -101,41 +101,15 @@ def unpack_score(packed):
     return _order_key_to_bits(key).view(torch.float32)
 
 
-def _pack_eager(scores, ordinal):
-    """`pack`'s body, as plain tensor ops — see `pack` for what it computes."""
-    key = score_order_key(scores)
-    # In-place from here: `score_order_key` already returned a fresh tensor, and
-    # the multiply/add would otherwise allocate two more full-size int64 copies
-    # of what is often the largest tensor in the run.
-    key *= _TWO32
-    key += (U32 - ordinal)
-    return key
-
-
-# `torch.compile(_pack_eager)`, built on first use. `None` = not tried yet,
-# `False` = unavailable or it raised on first use, so don't try again.
-_compiled_pack = None
-# Set once the compiled callable has actually returned. Until then a failure is
-# "inductor doesn't work here" and degrades; after it, a failure is a real error
-# and propagates.
-_compiled_proven = False
-
-
 def pack(scores, ordinal, scale=None):
-    """Pack scores and ordinals into sortable int64 keys.
+    """Pack float32 scores and ordinals into sortable int64 keys.
 
-    Higher scores sort first; exact ties use lower ordinals. `scale`, if given,
-    is a per-query-row divisor applied before packing so the key encodes the
-    final score. `ordinal` broadcasts against `scores`.
-
-    Scores occupy the high 32 bits and inverted ordinals the low 32 bits.
-    Elementwise operations are compiled into one kernel when available.
+    Higher scores sort first; exact ties use lower ordinals. Scores occupy the
+    high 32 bits and inverted ordinals the low 32 bits.
     """
     import torch
 
     # The ordering transform reinterprets each float32 score as an int32.
-    # Other dtypes can change the tensor shape and produce invalid packed keys,
-    # so require float32 explicitly.
     if scores.dtype != torch.float32:
         raise TypeError(
             f"tie-break key needs float32 scores, got {scores.dtype}; the order "
@@ -144,41 +118,14 @@ def pack(scores, ordinal, scale=None):
             "float32 before scoring, so this means something upstream did not."
         )
 
-    
     if scale is not None:
-        # scale before the score is generated, so the result matches
-        # `topk_triton._cutfill`'s fused `s / n` bit-for-bit.
+        # Apply the final per-query scaling before encoding score order.
         scores = scores / scale[:, None]
 
-    global _compiled_pack, _compiled_proven
-
-    if _compiled_pack is None:
-        try:
-            _compiled_pack = torch.compile(_pack_eager, dynamic=True)
-        except Exception as exc:  # no torch.compile on this build/backend
-            logger.info("tie-break key: torch.compile unavailable (%s); using eager ops", exc)
-            _compiled_pack = False
-
-    if _compiled_pack is False:
-        return _pack_eager(scores, ordinal)
-
-    if _compiled_proven:
-        # Past the one call that proves inductor works here, errors are real.
-        return _compiled_pack(scores, ordinal)
-
-    try:
-        key = _compiled_pack(scores, ordinal)
-    except Exception as exc:
-        # Compilation can fail lazily, on first call rather than at wrap time.
-        logger.warning(
-            "tie-break key: torch.compile failed (%s); using eager ops for the "
-            "rest of this run — results are unaffected, this is a ~3x slower "
-            "path for building the packed key",
-            exc,
-        )
-        _compiled_pack = False
-        return _pack_eager(scores, ordinal)
-    _compiled_proven = True
+    key = score_order_key(scores)
+    # Build the packed key in place; `score_order_key` already returned a copy.
+    key *= _TWO32
+    key += (U32 - ordinal)
     return key
 
 
@@ -194,6 +141,12 @@ def sentinel_key(shape, device):
 # Packed key for `(-inf, worst ordinal)`, kept as a Python int for module-level
 # fills/comparisons without importing torch. Pinned to `sentinel_key` by test.
 SENTINEL_KEY = -2139095041 << 32
+
+# Fill value for a candidate that must lose every selection.
+# It must be strictly below `SENTINEL_KEY`: using the sentinel itself can tie
+# with under-filled state slots and let an arbitrary dead-cell id survive top-k.
+# int64 min decodes to NaN, which the final `sc > -inf` validity check rejects.
+NEUTRAL_KEY = -(1 << 63)
 
 
 def live_rows(keys, thr):
@@ -234,46 +187,48 @@ def live_rows(keys, thr):
     return ((keys.amax(dim=1) >> 32) >= (thr >> 32)).to(torch.uint8)
 
 
-# Materializing the packed key doubles a score matrix's footprint (int64 next
-# to float32). Where the key is only an intermediate — the wide pre-top-K in
-# `compute.process_slice` — rows are processed in chunks so that transient
-# stays bounded regardless of query count. 2**28 slots = 2 GiB of int64.
+# Packed keys are int64, so the key alone is 2x the float32 score matrix. 
+# Wide pre-top-K paths chunk rows to bound this transient.
+# `PACK_TARGET_SLOTS` allows up to 2 GiB of packed-key output; eager packing 
+# peaks at ~2x that (~4 GiB measured) due to its intermediate allocation.
 PACK_TARGET_SLOTS = 1 << 28
 
 
-def pack_topk(scores, ordinal, k, scale=None, thr=None):
-    """Run top-K over `pack(scores, ordinal, scale)`, returning `(keys, idx, live)`.
-
-    Query rows are chunked to bound temporary packed-key memory; this is exact
-    because top-K is independent per row.
-
-    CUDA float32 inputs may use `topk_triton`; otherwise the portable packed-key
-    path is used. Both produce the same winners.
-
-    If `thr` is given, `live` marks rows that can still affect the running top-K.
-    Reading a dead row is wasteful, never wrong, on either path: the portable
-    path leaves its `keys` fully valid (it selects before deciding), and the
-    Triton kernel skips the selection but fills the row with `SENTINEL_KEY`,
-    which loses to every real candidate. A dead row's `idx` stays in range
-    (gather-safe) but means nothing on the kernel path. With `thr=None`, `live`
-    is `None` and all outputs are valid.
+def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
+              rank=None):
+    """Top-K over packed `(score, ordinal)` keys. 
+    
+    `encoded` replaces winning column indices with their payload values.
+    `rank` may supply a precomputed ordinal rank for the Triton path. 
+    
+    Rows are chunked on the portable path to bound packed-key memory. With `thr`, 
+    `live` marks rows that may improve the running state; outputs for dead rows 
+    are undefined on the Triton path and must not be consumed. 
     """
     import torch
 
     from nova_bf import topk_triton
 
-    if topk_triton.available(scores, ordinal, k, scale, thr):
+    if topk_triton.available(scores, ordinal, k, scale, thr, encoded):
         # Use the optimized Triton path when available; fall back permanently if
         # compilation or launch fails.
         try:
-            return topk_triton.topk(scores, ordinal, k, scale, thr)
+            return topk_triton.topk(scores, ordinal, k, scale, thr, encoded,
+                                    rank=rank)
         except Exception as exc:
             if _is_oom(exc):
-                # OOM does not indicate an unsupported kernel configuration,
-                # and the portable path requires even more temporary memory.
+                # OOM does not indicate an unsupported kernel configuration.
                 # Preserve the original error rather than permanently
                 # disabling Triton.
                 raise
+            from nova_bf import merge_triton
+
+            if not merge_triton.is_pre_enqueue(exc):
+                # NOT a compile/launch failure, so `disable` is the wrong
+                # response
+                raise
+            # Pre-enqueue failures leave outputs untouched; disable Triton and 
+            # recompute through the portable path.
             topk_triton.disable(exc)
 
     n_rows, n_cols = scores.shape
@@ -293,6 +248,8 @@ def pack_topk(scores, ordinal, k, scale=None, thr=None):
         keys, idx = torch.cat(key_parts, dim=0), torch.cat(idx_parts, dim=0)
     # The slice max lives in its top-k, so deciding from `keys` is the same
     # decision the kernel makes from the full row.
+    if encoded is not None:
+        idx = encoded[idx]
     return keys, idx, None if thr is None else live_rows(keys, thr)
 
 

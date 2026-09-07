@@ -1,24 +1,15 @@
-"""Triton fold for the running top-K state (`compute._merge_topk`).
+"""Triton fold for `compute._merge_topk`.
 
-Fuses concatenation, top-K selection, and gathering into one kernel: each query
-row selects directly from the existing state and pending part and writes the
-surviving `(key, id)` pairs without materializing an intermediate concatenation.
+Fuses state/part concatenation, top-K selection, and id gathering into one
+in-place kernel over packed `(score, tiebreak)` keys.
 
-Packed keys are ordered lexicographically by their high and low 32-bit halves.
-Selection therefore uses a 32-bit descent on the score half and, only when the
-cut falls within a score tie, a second descent on the tie-break half.
+With pruning enabled, dead rows are never read or written; their part buffers
+may contain garbage. Live rows update the running state and `thr` in place.
 
-Padding lanes are excluded explicitly. Duplicate sentinel keys require an exact
-cumulative fill at the cutoff so a real candidate cannot be displaced by an
-under-filled state's sentinels.
-
-With live/thr, rows that cannot improve the current top-k skip selection
-entirely, leaving the state unchanged without reading the part's dead row
-(which the top-K kernel fills with `SENTINEL_KEY`, so a stray read would lose
-rather than corrupt — but skipping is still the point)
-part keys. Live rows also update thr with the new row minimum, providing the
-threshold for the next slice at no extra reduction cost.
+Padding is excluded explicitly, and tied score cutoffs are resolved by the
+packed tiebreak so results remain deterministic.
 """
+
 
 
 from __future__ import annotations
@@ -42,14 +33,8 @@ try:
 
         if HAS_LIVE:
             if _tl.load(LIVE + row) == 0:
-                # Dead rows cannot improve the state; copy it through without reading
-                # the part's dead row (sentinel-filled, not garbage, but
-                # still nothing worth reading). `thr` is unchanged.
-                mk = offs < k
-                _tl.store(OK + row * ok_s + offs,
-                          _tl.load(SK + row * sk_s + offs, mask=mk, other=0), mask=mk)
-                _tl.store(OE + row * oe_s + offs,
-                          _tl.load(SE + row * se_s + offs, mask=mk, other=0), mask=mk)
+                # Dead rows leave state and threshold unchanged and must not read the
+                # part buffer, whose contents are undefined.
                 return
 
         n = k + w
@@ -84,19 +69,8 @@ try:
             for i in _tl.static_range(32):
                 c2 = p2 | _tl.full([], 1 << (31 - i), _tl.uint32)
                 p2 = _tl.where(_tl.sum((tied & (lo >= c2)).to(_tl.int32)) >= need, c2, p2)
-            # `lo >= p2` alone can select MORE than `need`, because low halves
-            # are not distinct here: every sentinel is `pack(-inf, TIE_WORST)`,
-            # whose low half is 0. When the cut lands among sentinels the
-            # descent bottoms out at p2 == 0 and `lo >= 0` takes all of them.
-            # The `pos < k` store mask would then truncate in LANE order — and
-            # the state occupies the low lanes, so what gets truncated is always
-            # the PART. A real new candidate would be silently displaced by
-            # sentinels it outranks.
-            #
-            # So fill the last places explicitly: everything strictly above the
-            # cut, then the earliest lanes AT the cut, exactly as the pre-top-K
-            # kernel fills its tied slots. (That kernel needs no such step —
-            # its ranks are a permutation, hence distinct.)
+            # Low halves can tie, so select exactly `need` lanes at
+            # the cutoff instead of letting lane-order truncation choose arbitrarily.
             strictly = tied & (lo > p2)
             at_cut = tied & (lo == p2)
             room = need - _tl.sum(strictly.to(_tl.int32))
@@ -159,6 +133,26 @@ def usage() -> dict:
         "launches": _LAUNCHES,
         "unavailable": _UNAVAILABLE,
     }
+
+
+# Triton errors that occur before kernel enqueue. Match MRO class names rather
+# than importing Triton types so this module works across Triton versions and
+# when Triton is unavailable.
+_PRE_ENQUEUE_ERRORS = frozenset({
+    "CompilationError",
+    "CompileTimeAssertionFailure",
+    "OutOfResources",
+})
+
+
+def is_pre_enqueue(exc: BaseException) -> bool:
+    """Whether `exc` is classified as a pre-enqueue Triton failure.
+
+    These failures can safely fall back to the portable fold because the
+    in-place state has not been written. Matching by MRO name avoids depending
+    on Triton's version-specific exception modules.
+    """
+    return any(c.__name__ in _PRE_ENQUEUE_ERRORS for c in type(exc).__mro__)
 
 
 def reset_usage() -> None:
@@ -374,36 +368,28 @@ def _available(state_key, state_enc, part_key, part_enc, k, live=None, thr=None)
     return 0 < w and k + w <= MAX_BLOCK
 
 
-def fold(state_key, state_enc, part_key, part_enc, k, live=None, thr=None):
-    """Select the top-k of `state ++ part` on the packed key.
+def fold(state_key, state_enc, part_key, part_enc, k, live=None, thr=None,
+         _out=None):
+    """Fold `part` into the packed-key top-k state.
 
-    PRECONDITION: `available(...)` must have returned True for these exact
-    arguments. This function validates NOTHING — not dtype, not layout, not
-    device, not `k + w <= MAX_BLOCK`, not the int32 offset bound. It is the hot
-    path (once per flush, per search, for the length of a rank) and every one of
-    those checks lives in the gate instead. Calling it directly bypasses guards
-    whose failure mode is silently wrong ground truth rather than an exception —
-    a transposed `part_key` reads across query rows and still returns k
-    plausible hits per row.
+    Preconditions are enforced by `available(...)`; this hot path performs no
+    validation.
 
-    `live`/`thr` (both or neither) turn on per-query pruning: a row with
-    `live[row] == 0` keeps its state unchanged and ITS PART ROW IS NEVER READ
-    (it holds `SENTINEL_KEY` on the kernel path — see `topk_triton.topk`);
-    a live row folds
-    normally and writes its new row-min key into `thr[row]` IN PLACE, keeping
-    `thr` the exact state min for the caller's next prune decision.
+    With `live`/`thr`, dead rows are untouched and their part rows are never
+    read. Live rows update both the state and `thr` in place.
 
-    Returns `(new_key, new_enc)`, each `(n_q, k)`. Unordered within a row — the
-    caller either folds again or sorts once at decode.
+    Production folds in place and returns the updated state tensors. Results are
+    unordered within each row; callers sort only when decoding.
     """
     import torch
 
     n_q = state_key.shape[0]
     w = part_key.shape[1]
-    out_k = torch.empty((n_q, k), dtype=torch.int64, device=state_key.device)
-    out_e = torch.empty((n_q, k), dtype=torch.int64, device=state_key.device)
-    # A 1-D part id vector is shared by every query row; stride 0 broadcasts it
-    # in place instead of materializing n_q copies the way `expand`+`cat` does.
+
+    # Test-only seam for comparing aliased and unaliased execution.
+    out_k, out_e = (state_key, state_enc) if _out is None else _out
+
+    # A 1-D part-id vector is shared across query rows via stride-0 broadcast.
     pe = part_enc if part_enc.ndim == 2 else part_enc.unsqueeze(0)
     pe_s = pe.stride(0) if part_enc.ndim == 2 else 0
     block = _triton.next_power_of_2(k + w)

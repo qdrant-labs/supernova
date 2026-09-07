@@ -3,9 +3,11 @@
 Two things a CPU run never exercises, both of which hide exactly the bug
 class per-query pruning can introduce:
 
-  1. `topk_triton._cutfill` leaves a DEAD row's output keys UNINITIALIZED.
-     The portable `pack_topk` leaves them fully valid, so a CPU test reads
-     correct values precisely where the GPU would read garbage.
+  1. `topk_triton._cutfill` leaves a DEAD row's output keys AND IDS
+     UNINITIALIZED. The portable `pack_topk` leaves them fully valid, so a CPU
+     test reads correct values precisely where the GPU would read garbage.
+     (Both halves matter now: since G2 the kernel emits the encoded row id
+     itself, so a dead row's id column is garbage too, not a harmless zero.)
   2. `merge_triton.enabled()` is `sample.is_cuda`, so on CPU the entire
      Triton branch of `_merge_topk` is dead code — the single-part
      no-neutralize case, the multi-part `(live_any != 0) & (l == 0)`
@@ -42,10 +44,20 @@ from nova_bf.tiebreak import pack_topk as _real_pack_topk
 # from correct pruning.
 POISON_KEY = 2**62
 
+# And its id. `_cutfill` no longer writes the id column of a dead row either,
+# so it holds whatever the fresh buffer did. Encoded row ids are
+# `gidx * MAX_ROWS_PER_FILE + row`, hence non-negative and bounded by the
+# corpus; this is neither, so if one reaches the decode it either indexes past
+# the file list or emerges as an id nobody can explain — both loud. Zero, the
+# old fill, would decode to a real corpus row.
+POISON_ID = 2**61 + 12345
 
-def poisoning_pack_topk(scores, ordinal, k, scale=None, thr=None):
+
+def poisoning_pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
+                        rank=None):
     """`pack_topk`, with `_cutfill`'s uninitialized-dead-row contract."""
-    keys, idx, live = _real_pack_topk(scores, ordinal, k, scale, thr=thr)
+    keys, vals, live = _real_pack_topk(scores, ordinal, k, scale, thr=thr,
+                                       encoded=encoded, rank=rank)
     if live is not None:
         dead = live == 0
         if dead.any():
@@ -53,20 +65,22 @@ def poisoning_pack_topk(scores, ordinal, k, scale=None, thr=None):
             _state["dead_rows_via_pack_topk"] += int(dead.sum())
             keys = keys.clone()
             keys[dead] = POISON_KEY
-            # The kernel leaves dead rows' indices in range but meaningless.
-            idx = idx.clone()
-            idx[dead] = 0
-    return keys, idx, live
+            # BOTH halves: the kernel writes neither for a dead row.
+            vals = vals.clone()
+            vals[dead] = POISON_ID
+    return keys, vals, live
 
 
 _state = {"folds": 0, "dead_rows_seen": 0, "available_false": 0,
           "dead_rows_via_pack_topk": 0, "dead_rows_via_live_rows": 0}
 
 
-def counting_pack_topk(scores, ordinal, k, scale=None, thr=None):
+def counting_pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
+                       rank=None):
     """Count without poisoning — for `native`, where the real kernel has
     already left dead rows uninitialized on its own."""
-    keys, idx, live = _real_pack_topk(scores, ordinal, k, scale, thr=thr)
+    keys, idx, live = _real_pack_topk(scores, ordinal, k, scale, thr=thr,
+                                      encoded=encoded, rank=rank)
     if live is not None:
         dead = int((live == 0).sum())
         _state["dead_rows_seen"] += dead
@@ -120,7 +134,13 @@ def _emul_available(state_key, state_enc, part_key, part_enc, k,
 
 def _emul_fold(state_key, state_enc, part_key, part_enc, k, live=None, thr=None):
     """CPU emulation of `_fold`, including the dead-row skip and the in-place
-    `thr` update the kernel performs as a by-product."""
+    `thr` update the kernel performs as a by-product.
+
+    IN PLACE, like the kernel: a dead row is not written, not merely written
+    back unchanged. The difference is the whole point of the emulation — if a
+    caller kept a reference to the pre-fold state expecting it to survive, an
+    out-of-place emulation would hide that.
+    """
     _state["folds"] += 1
     n_q = state_key.shape[0]
     pe = (part_enc if part_enc.ndim == 2
@@ -129,21 +149,21 @@ def _emul_fold(state_key, state_enc, part_key, part_enc, k, live=None, thr=None)
         merged_k = torch.cat([state_key, part_key], dim=1)
         merged_e = torch.cat([state_enc, pe], dim=1)
         nk, idx = torch.topk(merged_k, k=k, dim=1, sorted=False)
-        return nk, merged_e.gather(1, idx)
+        state_key.copy_(nk)
+        state_enc.copy_(merged_e.gather(1, idx))
+        return state_key, state_enc
 
-    out_k, out_e = torch.empty_like(state_key), torch.empty_like(state_enc)
     alive = live.bool()
-    # Dead rows: state copied through, `thr` untouched, part NEVER read.
-    out_k[~alive] = state_key[~alive]
-    out_e[~alive] = state_enc[~alive]
+    # Dead rows: NOT TOUCHED AT ALL — not read, not written, `thr` unchanged.
     if alive.any():
         merged_k = torch.cat([state_key[alive], part_key[alive]], dim=1)
         merged_e = torch.cat([state_enc[alive], pe[alive]], dim=1)
         nk, idx = torch.topk(merged_k, k=k, dim=1, sorted=False)
-        out_k[alive] = nk
-        out_e[alive] = merged_e.gather(1, idx)
+        new_e = merged_e.gather(1, idx)
+        state_key[alive] = nk
+        state_enc[alive] = new_e
         thr[alive] = nk.min(dim=1).values
-    return out_k, out_e
+    return state_key, state_enc
 
 
 def install(monkeypatch, mode="fold"):

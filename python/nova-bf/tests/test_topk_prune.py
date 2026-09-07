@@ -109,15 +109,17 @@ def test_pack_topk_live_matches_the_portable_rule():
         keys, idx, live = pack_topk(sc.contiguous(), od, k, thr=thr)
         want = live_rows(pack(sc, od), thr)
         assert torch.equal(live.cpu(), want.cpu()), f"live diverged on {dev}"
-        # live rows must carry the exact selection; dead rows' keys are
-        # unspecified but their idx must stay gatherable
+        # Live rows must carry the exact selection. A dead row's keys AND idx
+        # are both unspecified now — the Triton kernel writes neither, so its
+        # idx is no longer gather-safe either (it used to be zero-filled).
+        # Only the live rows' idx can be range-checked.
         full = pack(sc, od)
         want_keys = torch.topk(full, k=k, dim=1, sorted=False).values
         lv = live.bool()
         assert torch.equal(
             keys[lv].sort(dim=1).values, want_keys[lv].sort(dim=1).values
         ), f"a live row's keys diverged on {dev}"
-        assert int(idx.min()) >= 0 and int(idx.max()) < 33
+        assert int(idx[lv].min()) >= 0 and int(idx[lv].max()) < 33
 
 
 # ---------------------------------------------------------------------------

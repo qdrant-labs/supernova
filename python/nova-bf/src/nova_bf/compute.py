@@ -59,6 +59,7 @@ from tqdm import tqdm
 
 from nova_bf import manifest as run_manifest
 from nova_bf import profiling
+from nova_bf import topk_triton
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import _condition_mask, _match_any_membership, _static_first, evaluate
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
@@ -74,7 +75,8 @@ from nova_bf.results import (
 )
 from nova_bf.tiebreak import (
     MAX_ROWS_PER_WORKER,
-    SENTINEL_KEY,
+    NEUTRAL_KEY,
+    _is_oom,
     build_ordinals,
     id_order_scalar,
     id_order_array,
@@ -1753,20 +1755,48 @@ def _concat_multivector_batches(batches: list["MultiVectorCorpusBatch"]) -> "Mul
     return MultiVectorCorpusBatch(doc_offsets, flat)
 
 
+def _subset_for(cache: dict, ordinals, sel_cols):
+    """Return `ordinals[sel_cols]`, cached by the selected-column tensor.
+
+    Keying on `sel_cols` lets filtered members reuse the same ordinal subset;
+    identity is rechecked to guard against Python object-id reuse.
+    """
+    got = cache.get(id(sel_cols))
+    if got is not None and got[0] is sel_cols:
+        return got[1]
+    sub = ordinals[sel_cols]
+    cache[id(sel_cols)] = (sel_cols, sub)
+    return sub
+
+
+def _rank_for(cache: dict, ordinals):
+    """Return `rank_of(ordinals)`, cached by tensor identity.
+
+    The cache retains the tensor and rechecks identity so Python `id()` reuse
+    cannot return a rank computed for a different ordinal vector.
+    """
+    got = cache.get(id(ordinals))
+    if got is not None and got[0] is ordinals:
+        return got[1]
+    rank = topk_triton.rank_of(ordinals)
+    cache[id(ordinals)] = (ordinals, rank)
+    return rank
+
+
 def _merge_topk(top_key, top_enc, parts: list[tuple], k: int, thr=None):
-    """Merge pending candidates into the running (top_key, top_enc) top-k state.
+    """Merge candidate parts into the running packed-key top-k state.
 
     parts contains (keys, encoded, live) triples accumulated in corpus order.
     Keys are packed (score, ordinal) int64 values, providing score order and
     deterministic tie-breaking.
 
-    With thr, live masks prune rows that cannot improve the current state.
-    Dead rows that may still be read are replaced with SENTINEL_KEY; stale masks
-    are safe because the threshold only increases. thr is updated in place.
+    With `thr`, rows that cannot improve the state are pruned and never read.
+    Dead cells in partially-live rows are neutralized below both real keys and
+    state sentinels. `thr` is updated in place.
 
-    Pending parts are folded with the current state using top-k over packed keys,
-    making results independent of slice boundaries and flush timing. With
-    thr=None, pruning is disabled.
+    Results are independent of part boundaries and flush timing. Callers must
+    use the returned state tensors, since some paths update in place and others
+    return new tensors.
     """
     import torch
 
@@ -1807,7 +1837,7 @@ def _merge_topk(top_key, top_enc, parts: list[tuple], k: int, thr=None):
                 for p, _, l in parts:
                     if l is not None:
                         p.masked_fill_(
-                            ((live_any != 0) & (l == 0)).unsqueeze(1), SENTINEL_KEY
+                            ((live_any != 0) & (l == 0)).unsqueeze(1), NEUTRAL_KEY
                         )
             pk = torch.cat([p for p, _, _ in parts], dim=1)
             pe = torch.cat(
@@ -1826,41 +1856,65 @@ def _merge_topk(top_key, top_enc, parts: list[tuple], k: int, thr=None):
         if merge_triton.available(top_key, top_enc, pk, pe, k, live_any, thr):
             try:
                 return merge_triton.fold(top_key, top_enc, pk, pe, k, live_any, thr)
-            except torch.cuda.OutOfMemoryError:
-                # OOM does not indicate an unsupported kernel configuration, and
-                # the portable path requires even more temporary memory. Preserve
-                # the original error rather than permanently disabling Triton.
-                raise
             except Exception as exc:
+                # Retry only failures known to occur before Triton enqueues work; otherwise
+                # the state may already be mutated and re-folding would duplicate candidates.
+                if _is_oom(exc):
+                    raise
+                if not merge_triton.is_pre_enqueue(exc):
+                    raise
                 merge_triton.disable(exc)
 
-        # Reuse the combined pending inputs if Triton falls back to the portable path.
-        # Portable top-k reads every row, so neutralize rows dead in all parts too.
-        if thr is not None:
-            pk.masked_fill_((live_any == 0).unsqueeze(1), SENTINEL_KEY)
+        # Reuse the combined inputs on portable fallback.
         parts = [(pk, pe, live_any)]
     elif thr is not None:
-        # Portable top-k reads every row; neutralize dead rows first.
+        # Neutralize cells dead in one part but live overall; fully dead rows are 
+        # excluded from the fold below.
         for p, _, l in parts:
             if l is not None:
-                p.masked_fill_((l == 0).unsqueeze(1), SENTINEL_KEY)
+                p.masked_fill_(
+                    ((live_any != 0) & (l == 0)).unsqueeze(1), NEUTRAL_KEY
+                )
 
-    # Each intermediate is del'd as soon as the next line no longer needs it
-    merged_k = torch.cat([top_key] + [p for p, _, _ in parts], dim=1)
-    merged_e = torch.cat(
-        [top_enc]
-        + [
+    if thr is None:
+        # No pruning: fold every row directly.
+        rows = None
+        state_k, state_e = top_key, top_enc
+        part_ks = [p for p, _, _ in parts]
+        part_es = [
             e if e.ndim == 2 else e.unsqueeze(0).expand(p.shape[0], -1)
             for p, e, _ in parts
-        ],
-        dim=1,
-    )
-    new_top_key, idx = torch.topk(merged_k, k=k, dim=1, sorted=False)
+        ]
+    else:
+        # Gather only live rows so dead rows are never read.
+        rows = live_any.nonzero(as_tuple=True)[0]
+        if rows.numel() == 0:
+            return top_key, top_enc
+        state_k = top_key.index_select(0, rows)
+        state_e = top_enc.index_select(0, rows)
+        part_ks = [p.index_select(0, rows) for p, _, _ in parts]
+        part_es = [
+            e.index_select(0, rows) if e.ndim == 2
+            else e.unsqueeze(0).expand(rows.numel(), -1)
+            for _, e, _ in parts
+        ]
+
+    # Fold state and pending candidates, releasing intermediates promptly.
+    merged_k = torch.cat([state_k] + part_ks, dim=1)
+    merged_e = torch.cat([state_e] + part_es, dim=1)
+    new_key, idx = torch.topk(merged_k, k=k, dim=1, sorted=False)
     del merged_k
-    if thr is not None:
-        # Match the kernel path by keeping `thr` equal to the current state min.
-        thr.copy_(new_top_key.min(dim=1).values)
-    return new_top_key, merged_e.gather(1, idx)
+    new_enc = merged_e.gather(1, idx)
+    del merged_e
+
+    if rows is None:
+        return new_key, new_enc
+
+    # Update only live rows; dead state and thresholds remain unchanged.
+    top_key.index_copy_(0, rows, new_key)
+    top_enc.index_copy_(0, rows, new_enc)
+    thr.index_copy_(0, rows, new_key.min(dim=1).values)
+    return top_key, top_enc
 
 
 def _sample_mean_doc_tokens(store: Store, mine: list, column: str) -> float:
@@ -2165,6 +2219,8 @@ def _process_batch_group(
 
         score_cache: dict[tuple, object] = {}
         cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
+        rank_cache: dict[int, tuple] = {}
+        subset_cache: dict[int, tuple] = {}
         for m in member_idxs:
             s = specs[m]
             # Dense cosine's query-norm divide happens in the packer, so the
@@ -2185,7 +2241,8 @@ def _process_batch_group(
                 continue
             sel_scores = scores if sel_cols is None else scores[:, sel_cols]
             sel_encoded = encoded_rows if sel_cols is None else encoded_rows[sel_cols]
-            sel_ordinals = ordinals if sel_cols is None else ordinals[sel_cols]
+            sel_ordinals = (ordinals if sel_cols is None
+                            else _subset_for(subset_cache, ordinals, sel_cols))
             # Query-row subset (`SearchSpec.rows`). The score matrix spans this
             # vector_type's whole row union — every spec sharing the type reads
             # the same one — so a spec that owns only part of it slices here,
@@ -2211,11 +2268,31 @@ def _process_batch_group(
             if sel_scores.shape[1] > s.k:
                 if prune:
                     _PRUNE_APPLIED["count"] += 1
-                part_key, part_local, live = pack_topk(
+                # The kernel's tie-break descent ranks the ordinals, which
+                # depends on the COLUMNS only — so every member of a slice was
+                # computing the same argsort + scatter (four launches) over
+                # again. Built once per distinct ordinal vector instead.
+                #
+                # Computed HERE, not beside `sel_ordinals`, because this is the
+                # only branch that consumes it: the narrow-slice `pack` below
+                # never takes a rank, and on a filtered run that is the common
+                # case. Hoisting it above the branch cost `rank_of` on every
+                # member whether or not anything read the result (measured
+                # 97 us CPU / 121 us CUDA at n=8192, and 11,866 unused calls
+                # across one CPU suite run).
+                sel_rank = _rank_for(rank_cache, sel_ordinals)
+                # `encoded=` makes the selection return the encoded ROW IDS
+                # directly. On the Triton path the kernel loads them for kept
+                # lanes, so the int32->int64 widening and the
+                # `sel_encoded[part_local]` gather that used to follow every
+                # slice are gone (G2); on the portable path `pack_topk` does
+                # the same gather internally. `sel_encoded` is dense int64 on
+                # device either way — the whole slice's `encoded_rows`, or the
+                # column-selected subset for a uniform filter.
+                part_key, part_enc, live = pack_topk(
                     sel_scores, sel_ordinals, s.k, cos_scale,
-                    thr=spec_thr[m] if prune else None)
-                part_enc = sel_encoded[part_local]
-                del part_local
+                    thr=spec_thr[m] if prune else None,
+                    encoded=sel_encoded, rank=sel_rank)
                 if live is not None:
                     _live_stats_add(m, live, live.shape[0])
             else:
