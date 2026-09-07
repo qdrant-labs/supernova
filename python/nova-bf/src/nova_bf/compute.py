@@ -730,11 +730,11 @@ def _sparse_scores(Q, Cb, q_cache=None):
 
 
 def _scores(Q, C, metric: str, q_norms=None, scale_in_packer: bool = False):
-    import torch.nn.functional as F
-
     if metric == "cosine":
-        # Keep queries raw for reuse with dot-product searches; normalize scores instead.
-        raw = Q @ F.normalize(C, dim=1).T
+        # Compute dot products first, then apply corpus normalization. This avoids
+        # per-component rounding from pre-normalizing C and preserves exact ties
+        # more reliably, while matching DenseBatchSlice's shared-Gram path.
+        raw = (Q @ C.T).div_(C.norm(dim=1).clamp_min(1e-12)[None, :])
         if scale_in_packer:
             # The packer already scaled the scores, so no need to
             # scale here
