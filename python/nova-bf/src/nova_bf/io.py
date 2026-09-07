@@ -54,14 +54,17 @@ def _fs_and_path(uri: str) -> tuple[pafs.FileSystem, str]:
 
 
 class Store:
-    """A parquet root (local dir or s3:// prefix) you can list / read / write."""
+    """A Parquet root backed by local storage or S3."""
 
-    def __init__(self, uri: str, ranged_get: bool = False):
+    def __init__(self, uri: str, ranged_get: bool = False,
+                 ranged_get_concurrency: int | None = None):
         self.uri = uri
         self.is_s3 = _is_s3(uri)
-        # Opt-in parallel ranged reads for large files
-        # (see the module comment above _RANGED_GET_BYTES).
+        # Optional parallel ranged reads for large files
         self.ranged_get = ranged_get
+        # Per-file concurrency; callers reading multiple files should divide
+        # this to bound total concurrent GETs.
+        self.ranged_get_concurrency = ranged_get_concurrency or _RANGED_GET_CONCURRENCY
         self.fs, self.root = _fs_and_path(uri)
 
     def _loader_key(self, read_path: str) -> str:
@@ -128,7 +131,7 @@ class Store:
                 hi = min(lo + _RANGED_GET_BYTES, size)
                 view[lo:hi] = f.read_at(hi - lo, lo)
 
-            with ThreadPoolExecutor(max_workers=_RANGED_GET_CONCURRENCY) as pool:
+            with ThreadPoolExecutor(max_workers=self.ranged_get_concurrency) as pool:
                 for fut in [
                     pool.submit(fetch, lo)
                     for lo in range(0, size, _RANGED_GET_BYTES)
@@ -136,16 +139,13 @@ class Store:
                     fut.result()
         return pa.py_buffer(data)
 
-    def write(self, filename: str, table: pa.Table, row_group_size: int | None = None) -> str:
-        """Write a table to `root/filename`.
-
-        Smaller row groups bound memory for downstream streaming reads, since
-        Parquet materializes data at row-group granularity.
+    def write(self, filename: str, table: pa.Table) -> str:
+        """
+        Write a table to root/filename (creating local parent dirs).
         """
         path = self._prepare_write(filename)
         with self.fs.open_output_stream(path) as sink:
-            pq.write_table(table, sink, compression="snappy",
-                           row_group_size=row_group_size)
+            pq.write_table(table, sink, compression="snappy")
         return path
 
     def write_bytes(self, filename: str, data: bytes) -> str:

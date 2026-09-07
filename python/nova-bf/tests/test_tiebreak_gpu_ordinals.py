@@ -783,3 +783,30 @@ def test_host_memory_guard_is_permissive_when_it_cannot_measure(monkeypatch):
     monkeypatch.setattr(builtins, "open", boom)
     assert _host_can_pack(3_000_000_000, 8) is True, \
         "an unreadable /proc must proceed, not decline"
+
+
+@pytest.mark.parametrize("width", [8, 5, 47, 16, 9])
+def test_packed_lanes_are_big_endian_bytes_zero_padded_on_the_right(width):
+    """The exact layout, not just the order it induces.
+
+    A lane is the id's bytes read big-endian, and a width that is not a
+    multiple of 8 pads the LAST lane on the RIGHT with zeros -- pad on the left
+    and every short id would sort as though it began with NULs. `_pack_lanes`
+    reinterprets the arrow buffer instead of assembling this arithmetically, so
+    the layout it assumes is worth stating outright.
+    """
+    rng = np.random.default_rng(width)
+    vals = ["".join(chr(c) for c in rng.integers(33, 127, size=width))
+            for _ in range(64)]
+    arr = pa.array(vals, pa.string())
+    assert _fixed_width([arr]) == width
+    lanes = _pack_lanes([arr], width, len(vals), 4)
+    nl = (width + 7) // 8
+    assert lanes.shape == (len(vals), nl) and lanes.dtype == np.uint64
+
+    want = np.zeros((len(vals), nl), dtype=np.uint64)
+    for i, v in enumerate(vals):
+        b = v.encode() + b"\x00" * (nl * 8 - width)
+        for j in range(nl):
+            want[i, j] = int.from_bytes(b[j * 8:(j + 1) * 8], "big")
+    assert np.array_equal(lanes, want)

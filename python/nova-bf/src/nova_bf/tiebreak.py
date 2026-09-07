@@ -39,6 +39,7 @@ exists. Pin the batch size when bit-reproducible output is required.
 from __future__ import annotations
 
 import logging
+import sys
 
 import numpy as np
 import pyarrow as pa
@@ -360,24 +361,24 @@ def _pack_lanes(chunks: list, W: int, total: int, workers: int) -> np.ndarray:
         starts.append(off)
         off += len(c)
 
+    # Each uint64 lane represents 8 ID bytes in big-endian order. Copy the bytes
+    # directly into the lane buffer; the zero-initialized tail provides the 
+    # required right padding.
+    raw = lanes.view(np.uint8).reshape(total, nlanes * 8)
+
     def fill(i_c):
         i, c = i_c
         if len(c) == 0:
             return
-        rows = _byte_rows(c, W)
         o = starts[i]
-        dst = lanes[o : o + len(c)]
-        for j in range(nlanes):
-            acc = np.zeros(len(c), dtype=np.uint64)
-            for k in range(8):
-                b = j * 8 + k
-                acc <<= np.uint64(8)
-                if b < W:
-                    acc |= rows[:, b].astype(np.uint64)
-            dst[:, j] = acc
+        raw[o : o + len(c), :W] = _byte_rows(c, W)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         list(pool.map(fill, enumerate(chunks)))
+    if sys.byteorder == "little":
+        # Convert the copied bytes to big-endian numeric lane order in place.
+        # An allocating conversion would duplicate this potentially large array.
+        lanes.byteswap(inplace=True)
     return lanes
 
 

@@ -266,18 +266,10 @@ class ParamsConfig(BaseModel):
     # memory for larger batches and fewer parquet row groups. Merge warns when 
     # your value is above its own target.
     merge_batch_size: int | None = None
-    # `merge`: when the partials live on S3, first bulk-download them to local disk
-    # (ranged reads, io_workers-many concurrent) and merge from there, instead of
-    # streaming each batch over S3 in lockstep. Trades local disk (~sum of partial
-    # sizes) for a one-shot parallel download at full NIC speed + latency-free reads
-    # during the reduce — worth it on a beefy box with fast NVMe. With `searches`
-    # listing several searches, every search's downloads share ONE pool of
-    # io_workers threads (see merge.py's `_prefetch_all`) rather than each search
-    # getting its own — a search with fewer/smaller partials frees its share of
-    # the pool for a slower search instead of sitting on dedicated capacity. No
-    # effect when the partials are already local. Default off (a laptop
-    # controller may lack the disk).
-    merge_prefetch: bool = False
+    # Merge partials by range-fetching each file into memory before Parquet parsing.
+    # Helps remote single-row-group partials, but adds one raw file's bytes per
+    # in-flight partial and is usually slower for local storage.
+    merge_ranged_reads: bool = False
 
     # Which of two EXACTLY-tied candidates wins.
     # Neither makes SCORES reproducible across batch sizes — re-tiling a matmul

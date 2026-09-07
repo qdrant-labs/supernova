@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 
-from nova_bf.merge import _ambiguous_rows, _string_ranks, _topk_merge
+from nova_bf.merge import _ambiguous_rows, _id_tie_grid, _topk_merge
 
 NEG = -np.inf
 
@@ -45,7 +45,7 @@ def _run(per_partial, k, use_tie):
         score_lists.append(_lists([[s for _, s, _ in row] for row in p], pa.float32()))
         id_lists.append(_lists([[i for i, _, _ in row] for row in p], pa.string()))
         tie_lists.append(_lists([[t for _, _, t in row] for row in p], pa.int64()))
-    ids_arr, scores_arr = _topk_merge(
+    ids_arr, scores_arr, _ = _topk_merge(
         score_lists, id_lists, tie_lists if use_tie else None, k
     )
     return [
@@ -123,51 +123,85 @@ def test_a_short_row_is_never_membership_ambiguous():
     assert not bool(_ambiguous_rows(scores, top)[0])
 
 
-def test_string_ranks_are_order_preserving_and_dense():
-    ids = np.array([["zebra", "apple", "mango", "apple"]], dtype=object)
-    r = _string_ranks(ids)
-    assert r.tolist() == [[2, 0, 1, 0]]
-    flat = ids[0].tolist()
-    assert [flat[i] for i in np.argsort(r[0])] == sorted(flat)
+def _rank_row(vals):
+    """The ranks `_topk_merge` would compute for ONE ambiguous row of `vals`."""
+    flat = pa.array(vals, pa.large_string())
+    row_idx = np.zeros(len(vals), dtype=np.int64)
+    col = np.arange(len(vals))
+    return _id_tie_grid([(row_idx, col, flat)], np.array([0]), 1, len(vals))[0]
 
 
-def test_string_ranks_compare_the_whole_id_not_a_prefix():
+def test_id_ranks_are_order_preserving():
+    """The one property the tie-break rests on: ordering by rank IS ordering by
+    id. Ranks are a total order (equal ids take their position, they do not
+    share a number) — two partials cannot both hold the same corpus row, so
+    within a row equal ids never arise, and where they somehow did the lower
+    column still wins either way."""
+    vals = ["zebra", "apple", "mango", "apple"]
+    r = _rank_row(vals)
+    assert [vals[i] for i in np.argsort(r)] == sorted(vals)
+    assert len(set(r.tolist())) == len(vals), "ranks must be a total order"
+
+
+def test_id_ranks_compare_the_whole_id_not_a_prefix():
     """The reduce's exactness for string ids rests on this: two ids agreeing in
-    a long head must still separate."""
+    a long head must still separate. The lane path packs ceil(W/8) uint64s and
+    covers every byte, so this holds on GPU too."""
     head = "<urn:uuid:" + "0" * 40
-    ids = np.array([[head + "b", head + "a"]], dtype=object)
-    assert _string_ranks(ids).tolist() == [[1, 0]]
-
-
-def test_string_ranks_order_the_same_whichever_width_they_take():
-    """Ranking narrows to `astype("S")` (1 byte/char) and falls back to
-    `astype("U")` (4) only for non-ASCII, so the two must agree wherever both
-    apply — bytewise order over UTF-8 IS code-point order, and it is the order
-    `compute` ranked on. A divergence would move the winner with `--num-jobs`.
-    """
-    ascii_ids = np.array([["zebra", "Apple", "apple", "1", "~", "", "A"]], dtype=object)
-    wide = np.unique(ascii_ids.astype("U"), return_inverse=True)[1].reshape(ascii_ids.shape)
-    assert _string_ranks(ascii_ids).tolist() == wide.tolist()
+    assert _rank_row([head + "b", head + "a"]).tolist() == [1, 0]
 
 
 def test_non_ascii_ids_still_rank_correctly():
-    """The narrow path raises on these; the fallback must still produce ranks
-    that sort in code-point order."""
-    ids = np.array([["zeta", "café", "cafe", "Ωmega", "apple"]], dtype=object)
-    r = _string_ranks(ids)[0]
-    flat = ids[0].tolist()
-    assert [flat[i] for i in np.argsort(r)] == sorted(flat)
+    """Ranking must hold for ids the fixed-width lane path declines."""
+    vals = ["zeta", "café", "cafe", "\u03a9mega", "apple"]
+    r = _rank_row(vals)
+    assert [vals[i] for i in np.argsort(r)] == sorted(vals)
 
 
 def test_ranking_agrees_with_the_order_compute_sorted_on():
-    """`compute` ranks ids with pyarrow (bytewise over UTF-8); `merge` ranks the
-    same ids here. The two sides must not disagree, or a tie would be broken one
-    way inside a worker and the other way across workers."""
+    """`compute` ranks ids with `build_ordinals`; `merge` now calls the SAME
+    function, so a tie cannot be broken one way inside a worker and the other
+    way across workers. Pinned against pyarrow directly so the guarantee is
+    checked, not just the call."""
     vals = ["zebra", "Apple", "apple", "café", "cafe", "10", "9", "", "~x"]
-    ids = np.array([vals], dtype=object)
-    mine = np.argsort(_string_ranks(ids)[0], kind="stable")
+    mine = np.argsort(_rank_row(vals), kind="stable")
     theirs = np.asarray(pc.sort_indices(pa.array(vals), sort_keys=[("", "ascending")]))
     assert mine.tolist() == theirs.tolist()
+
+
+def test_ids_from_different_partials_rank_against_each_other():
+    """The reason every partial is ranked in ONE `build_ordinals` call. Ranking
+    each alone would number both partials from zero, and a cross-partial tie
+    would then be decided by whichever column happened to be lower."""
+    a = pa.array(["m", "z"], pa.large_string())
+    b_ = pa.array(["a", "q"], pa.large_string())
+    grid = _id_tie_grid(
+        [(np.zeros(2, dtype=np.int64), np.array([0, 1]), a),
+         (np.zeros(2, dtype=np.int64), np.array([2, 3]), b_)],
+        np.array([0]), 1, 4)[0]
+    # a, m, q, z  ->  the second partial's "a" must outrank the first's "m"
+    assert [["m", "z", "a", "q"][i] for i in np.argsort(grid)] == ["a", "m", "q", "z"]
+
+
+def test_unranked_slots_sort_past_every_real_hit():
+    """Only ambiguous rows are ranked and only real candidates are scattered, so
+    every other slot keeps int64 max — which must never outrank a real id."""
+    grid = _id_tie_grid(
+        [(np.zeros(1, dtype=np.int64), np.array([1]),
+          pa.array(["z"], pa.large_string()))],
+        np.array([0]), 1, 3)[0]
+    assert grid[1] < grid[0] and grid[1] < grid[2]
+    assert grid[0] == grid[2] == np.iinfo(np.int64).max
+
+
+def test_rows_that_are_not_ambiguous_are_never_ranked():
+    """Ranking is the expensive half; it must touch only the rows that need it."""
+    flat = pa.array(["b", "a", "d", "c"], pa.large_string())
+    scatter = [(np.array([0, 0, 1, 1]), np.array([0, 1, 0, 1]), flat)]
+    grid = _id_tie_grid(scatter, np.array([1]), 2, 2)
+    assert grid.shape == (1, 2)
+    # only row 1's ids ("d", "c") were ranked, and against each other
+    assert grid[0, 0] > grid[0, 1]
 
 
 def test_a_partial_longer_than_k_is_refused():

@@ -268,17 +268,23 @@ def _cfg_for_merge(tmp):
 
 
 def test_explicit_merge_batch_size_is_obeyed_and_warned_about(caplog):
-    """`_topk_merge` allocates `(rows, n_partials * k)` grids, so the knob is
-    quadratic in the fan-in and a value tuned for fewer shards can ask for far
-    more memory than its author meant. That is worth SAYING; it is not worth
-    overriding. The operator knows their machine, and the auto ceiling is only
-    a heuristic — so an explicit value is obeyed, with a warning."""
+    """An explicit `merge_batch_size` is obeyed, with a warning when it exceeds
+    the auto target. The operator knows their machine; the ceiling is only a
+    heuristic.
+
+    The grid is `(rows, 2 * k)`, NOT `(rows, n_partials * k)`: the reduce folds
+    partial-by-partial, so `_topk_merge` always sees the running state plus one
+    partial however wide the fan-in. Sizing off `n_partials` was right for the
+    old lockstep loop and made the auto ceiling collapse as shards grew — at
+    256 partials it fell to SEVEN rows, i.e. ~143k parquet row groups for a
+    1M-query merge. That collapse is what this test used to document; it is now
+    what it guards against."""
     import logging
 
     from nova_bf.merge import _TARGET_CANDIDATE_SLOTS, _resolve_batch_rows
 
     n_partials, k, n_rows = 64, 1000, 1_000_000
-    ceiling = _TARGET_CANDIDATE_SLOTS // (n_partials * k)
+    ceiling = _TARGET_CANDIDATE_SLOTS // (2 * k)
 
     with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
         got = _resolve_batch_rows(50_000, n_rows, n_partials, k)
@@ -291,10 +297,13 @@ def test_explicit_merge_batch_size_is_obeyed_and_warned_about(caplog):
         assert _resolve_batch_rows(10, n_rows, n_partials, k) == 10
     assert caplog.text == "", "a value inside the target has nothing to warn about"
 
-    # The shape the clamp made unusable: the auto ceiling collapses to single
-    # digits, and `merge` writes one parquet row group per batch — so ~143k row
-    # groups for a 1M-query merge unless the operator can override it. They can.
-    assert _resolve_batch_rows(None, n_rows, 256, 10_000) == 7
+    # The shape that used to be unusable. Fanning in 256 partials no longer
+    # narrows the batch at all: only `k` does, because only `k` widens the grid.
+    assert _resolve_batch_rows(None, n_rows, 256, 10_000) == \
+        _TARGET_CANDIDATE_SLOTS // (2 * 10_000)
+    # ...and it is independent of the partial count, which is the actual fix.
+    assert (_resolve_batch_rows(None, n_rows, 4, 10_000)
+            == _resolve_batch_rows(None, n_rows, 256, 10_000))
     with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
         assert _resolve_batch_rows(20_000, n_rows, 256, 10_000) == 20_000
 
@@ -309,5 +318,7 @@ def test_explicit_merge_batch_size_is_obeyed_and_warned_about(caplog):
     assert _resolve_batch_rows(None, n_rows, n_partials, k) == ceiling
     # a tiny corpus still bounds by n_rows
     assert _resolve_batch_rows(None, 5, n_partials, k) == 5
-    # never zero
-    assert _resolve_batch_rows(None, 1_000_000, 100_000, 100_000) == 1
+    # never zero. It takes a genuinely absurd `k` to floor the ceiling now —
+    # a 100k fan-in no longer does it, because the fan-in is not in the sizing.
+    assert _resolve_batch_rows(None, 1_000_000, 100_000, 100_000) == 100
+    assert _resolve_batch_rows(None, 1_000_000, 4, _TARGET_CANDIDATE_SLOTS) == 1

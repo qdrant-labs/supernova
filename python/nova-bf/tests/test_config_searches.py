@@ -122,7 +122,7 @@ def test_params_sparse_chunk_defaults_true():
 
 def test_params_run_level_fields_still_work():
     cfg = BruteForceConfig(**_base(
-        params=ParamsConfig(io_workers=32, io_thread_count=64, merge_prefetch=True),
+        params=ParamsConfig(io_workers=32, io_thread_count=64, merge_ranged_reads=True),
         searches=[SearchSpec(name="a")],
     ))
     assert cfg.params.io_workers == 32
