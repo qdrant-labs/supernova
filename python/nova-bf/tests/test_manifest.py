@@ -456,7 +456,7 @@ def test_kernel_launch_counters_reset_between_runs(monkeypatch):
     test, and the single-node path) would otherwise attribute the first run's
     launches to the second."""
     from nova_bf import merge_triton, topk_triton
-    from nova_bf.compute import _PRUNE_APPLIED, _reset_prune_applied
+    from nova_bf.compute import _PRUNE_APPLIED, _reset_prune_instrumentation
 
     monkeypatch.setattr(topk_triton, "_LAUNCHES", 5)
     monkeypatch.setattr(merge_triton, "_LAUNCHES", 5)
@@ -464,7 +464,7 @@ def test_kernel_launch_counters_reset_between_runs(monkeypatch):
 
     topk_triton.reset_usage()
     merge_triton.reset_usage()
-    _reset_prune_applied()
+    _reset_prune_instrumentation()
 
     assert topk_triton._LAUNCHES == 0
     assert merge_triton._LAUNCHES == 0
@@ -488,19 +488,28 @@ def test_two_runs_in_one_process_do_not_ACCUMULATE_launches(tmp_path):
 
     cdir, qpath = _sparse_corpus(tmp_path, n_files=2, per_file=50, seed=9)
 
-    def _prune_count(out):
+    def _prune(out):
         run_compute(_sparse_cfg(cdir, qpath, out, k=4))
         doc = json.loads(next(out.rglob("*manifest*.json")).read_text())
-        return doc["params"]["kernels"]["prune"]["launches"]
+        return doc["params"]["kernels"]["prune"]
 
-    first = _prune_count(tmp_path / "m1")
-    second = _prune_count(tmp_path / "m2")
+    first = _prune(tmp_path / "m1")
+    second = _prune(tmp_path / "m2")
 
-    assert first > 0, "nothing pruned, so this cannot detect accumulation"
-    assert second == first, (
-        f"the second run reported {second} where the first reported {first}: "
-        "the counters were not reset, so a rank's manifest includes the "
-        "previous run's launches")
+    assert first["launches"] > 0, "nothing pruned, so this cannot detect accumulation"
+    assert second["launches"] == first["launches"], (
+        f"the second run reported {second['launches']} where the first reported "
+        f"{first['launches']}: the counters were not reset, so a rank's "
+        "manifest includes the previous run's launches")
+    # The liveness counters live in a SEPARATE accumulator (`_LIVE_STATS`) that
+    # is cleared by the same reset, so they need the same guard: deleting that
+    # one line left `launches` correct while `query_slice_rows` doubled.
+    for field in ("query_slice_rows", "live_query_slice_rows"):
+        assert first[field] > 0, (field, first)
+        assert second[field] == first[field], (
+            f"{field}: second run reported {second[field]} where the first "
+            f"reported {first[field]} — `_LIVE_STATS` survived into it")
+    assert second["by_search"] == first["by_search"], (first, second)
 
 
 # --- peak host RSS, and which sparse paths actually ran -------------------
@@ -632,12 +641,52 @@ def test_kernel_usage_counters_actually_MOVE_in_a_real_run(tmp_path):
     doc = json.loads(next(out.rglob("*manifest*.json")).read_text())
     kernels = doc["params"]["kernels"]
     assert set(kernels) == {"prune", "fold_kernel", "topk_kernel"}, kernels
+    base = {"permitted", "launches", "unavailable"}
     for name, entry in kernels.items():
-        assert set(entry) == {"permitted", "launches", "unavailable"}, (name, entry)
+        assert base <= set(entry), (name, entry)
+    # `prune` carries the liveness measurement as well — see
+    # `manifest.kernel_usage`. `launches` says a threshold was APPLIED; these
+    # say what it was worth, which is the number the "make dead rows free"
+    # work is justified by.
+    assert set(kernels["prune"]) == base | {
+        "live_query_slice_rows", "query_slice_rows", "live_fraction",
+        "by_search"}, kernels["prune"]
+    for name in ("fold_kernel", "topk_kernel"):
+        assert set(kernels[name]) == base, (name, kernels[name])
     assert kernels["prune"]["permitted"] is True
     assert kernels["prune"]["launches"] > 0, (
         "the prune counter never incremented, so the manifest is reporting the "
         f"switch again rather than what ran: {kernels['prune']}")
+    # The liveness counters have to be wired into the hot path too, for the
+    # same reason `launches` does: a number that is merely readable proves
+    # nothing about the run that produced it.
+    assert kernels["prune"]["query_slice_rows"] > 0, kernels["prune"]
+    assert 0.0 <= kernels["prune"]["live_fraction"] <= 1.0, kernels["prune"]
+    assert kernels["prune"]["by_search"], "no per-search liveness breakdown"
+    pr = kernels["prune"]
+    assert sum(v["query_slice_rows"] for v in pr["by_search"].values()) \
+        == pr["query_slice_rows"]
+    # `query_slice_rows > 0` alone left four ways to fake this, all of which
+    # passed: hard-coding live to 0 (which reads as "pruning removed ALL the
+    # work" — a spectacular claim), halving live_fraction, setting live equal
+    # to rows, and truncating by_search. Bound and cross-check it instead.
+    assert pr["live_query_slice_rows"] > 0, (
+        "no row was ever live, which would mean the prune threshold rejected "
+        f"every query against every slice: {pr}")
+    assert pr["live_query_slice_rows"] <= pr["query_slice_rows"], pr
+    assert sum(v["live_query_slice_rows"] for v in pr["by_search"].values()) \
+        == pr["live_query_slice_rows"], pr
+    assert pr["live_fraction"] == round(
+        pr["live_query_slice_rows"] / pr["query_slice_rows"], 6), pr
+    for name, v in pr["by_search"].items():
+        assert 0 < v["live_query_slice_rows"] <= v["query_slice_rows"], (name, v)
+        assert v["live_fraction"] == round(
+            v["live_query_slice_rows"] / v["query_slice_rows"], 6), (name, v)
+        assert v["slices"] > 0, (name, v)
+    # `launches` and `slices` both increment once per member per slice, so they
+    # are the same count by construction. Cheap, and it is what catches
+    # `_LIVE_STATS` surviving into a second run in one process.
+    assert pr["launches"] == sum(v["slices"] for v in pr["by_search"].values()), pr
 
 
 # --- 15: never invent a run fingerprint ------------------------------------

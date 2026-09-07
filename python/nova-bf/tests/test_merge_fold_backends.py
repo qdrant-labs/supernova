@@ -97,7 +97,7 @@ def test_manifest_records_the_fold_that_actually_ran(tmp_path, monkeypatch, mode
     from nova_bf import manifest as run_manifest
     from nova_bf import merge as merge_mod
     from nova_bf.results import partial_dir
-    from tests.test_merge_regressions import _cfg, _write_partials
+    from test_merge_regressions import _cfg, _write_partials
 
     monkeypatch.setenv("NOVA_BF_MERGE_FOLD", mode)
     cfg = _cfg(str(tmp_path / "out"))

@@ -58,6 +58,7 @@ import numpy as np
 from tqdm import tqdm
 
 from nova_bf import manifest as run_manifest
+from nova_bf import profiling
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import _condition_mask, _match_any_membership, _static_first, evaluate
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
@@ -968,8 +969,45 @@ _SPARSE_SWAP_MAX_DENSE_BYTES = int(
 _PRUNE_APPLIED = {"count": 0}
 
 
-def _reset_prune_applied() -> None:
+def _reset_prune_instrumentation() -> None:
     _PRUNE_APPLIED["count"] = 0
+    _LIVE_STATS.clear()
+
+
+# Track how many query/slice rows survive pruning, overall and per search.
+# `live` stays on-device and is read back once per file; `rows` is host-known.
+_LIVE_STATS: dict[int, dict] = {}
+
+
+def _live_stats_add(m: int, live, n_rows: int) -> None:
+    """Fold one member's per-slice liveness into its running counters."""
+    st = _LIVE_STATS.get(m)
+    if st is None:
+        st = _LIVE_STATS[m] = {"live": None, "rows": 0, "slices": 0}
+    import torch
+
+    st["rows"] += n_rows
+    st["slices"] += 1
+    # `live` is uint8; sum into int64 explicitly — a uint8 accumulator would
+    # wrap after 255 live rows and silently under-report.
+    got = live.sum(dtype=torch.int64)
+    st["live"] = got if st["live"] is None else st["live"] + got
+
+
+def live_fractions() -> dict[int, dict]:
+    """Read the accumulated counters back to the host, once per file.
+
+    Returns `{member: {"live": int, "rows": int, "slices": int}}`. The device
+    read is the only synchronization this instrumentation costs.
+    """
+    out = {}
+    for m, st in _LIVE_STATS.items():
+        out[m] = {
+            "live": int(st["live"].item()) if st["live"] is not None else 0,
+            "rows": st["rows"],
+            "slices": st["slices"],
+        }
+    return out
 
 
 # Which sparse code paths a run actually took for the manifest
@@ -2178,6 +2216,8 @@ def _process_batch_group(
                     thr=spec_thr[m] if prune else None)
                 part_enc = sel_encoded[part_local]
                 del part_local
+                if live is not None:
+                    _live_stats_add(m, live, live.shape[0])
             else:
                 part_key = pack(sel_scores, sel_ordinals, cos_scale)
                 part_enc = sel_encoded
@@ -2186,6 +2226,8 @@ def _process_batch_group(
                 if prune:
                     _PRUNE_APPLIED["count"] += 1
                 live = live_rows(part_key, spec_thr[m]) if prune else None
+                if live is not None:
+                    _live_stats_add(m, live, live.shape[0])
             pending[m].append((part_key, part_enc, live))
             pending_cols[m] += part_key.shape[1]
             if pending_cols[m] >= s.k:
@@ -2223,22 +2265,32 @@ def _process_batch_group(
         free_mem += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
         need = int(batch.flat_tokens.nbytes) + int(batch.doc_offsets.nbytes)
         if need <= _MV_RESIDENT_FREE_FRACTION * free_mem:
-            flat_gpu = torch.from_numpy(batch.flat_tokens).to(device)
-            off_gpu = torch.from_numpy(
-                np.ascontiguousarray(batch.doc_offsets, dtype=np.int64)
-            ).to(device)
+            # Distinct marker names per path: each measures a different span, so
+            # one shared name would compare unlike things. These two also fire
+            # only when this path is taken, which turns on free device memory at
+            # this instant -- so which markers a trace contains is a property of
+            # the run, not of the config.
+            with profiling.slice_mark("bf_resident_upload"):
+                flat_gpu = torch.from_numpy(batch.flat_tokens).to(device)
+                off_gpu = torch.from_numpy(
+                    np.ascontiguousarray(batch.doc_offsets, dtype=np.int64)
+                ).to(device)
             for r0, r1 in ranges:
-                tk0, tk1 = int(batch.doc_offsets[r0]), int(batch.doc_offsets[r1])
-                sl = MultiVectorBatchSlice(
-                    flat_gpu[tk0:tk1], off_gpu[r0 : r1 + 1] - off_gpu[r0]
-                )
-                process_slice(r0, r1, sl)
+                with profiling.slice_mark("bf_resident_slice"):
+                    tk0, tk1 = int(batch.doc_offsets[r0]), int(batch.doc_offsets[r1])
+                    sl = MultiVectorBatchSlice(
+                        flat_gpu[tk0:tk1], off_gpu[r0 : r1 + 1] - off_gpu[r0]
+                    )
+                    process_slice(r0, r1, sl)
             _flush_all_pending()
             return time.perf_counter() - t0
 
     if not use_double_buffer:
         for r0, r1 in ranges:
-            process_slice(r0, r1, batch.transfer(r0, r1, device))
+            with profiling.slice_mark("bf_slice"):
+                with profiling.slice_mark("bf_transfer"):
+                    sl = batch.transfer(r0, r1, device)
+                process_slice(r0, r1, sl)
         _flush_all_pending()
         return time.perf_counter() - t0
 
@@ -2302,18 +2354,26 @@ def _process_batch_group(
     # second-newest compute event is free when transfers are the bottleneck
     # (the event has already fired) and throttles exactly when compute is.
     inflight_compute: deque = deque()
-    sl, ready = prefetch(0, *ranges[0])
+    # `bf_prefetch`, not `bf_transfer`: a pinned copy plus a non_blocking
+    # enqueue. The H2D wait itself lands in `bf_ring_slice` at `wait_event`, so
+    # renaming these to match the other paths would read the ring's transfers as
+    # near-free and bill their real cost to compute.
+    with profiling.slice_mark("bf_prefetch"):
+        sl, ready = prefetch(0, *ranges[0])
     for index, (r0, r1) in enumerate(ranges):
-        compute_stream.wait_event(ready)
-        sl.record_stream(compute_stream)
-        process_slice(r0, r1, sl)
+        with profiling.slice_mark("bf_ring_slice"):
+            compute_stream.wait_event(ready)
+            sl.record_stream(compute_stream)
+            process_slice(r0, r1, sl)
         done = torch.cuda.Event()
         done.record(compute_stream)
         inflight_compute.append(done)
         if len(inflight_compute) > 1:
-            inflight_compute.popleft().synchronize()
+            with profiling.slice_mark("bf_backpressure"):
+                inflight_compute.popleft().synchronize()
         if index + 1 < len(ranges):
-            sl, ready = prefetch(index + 1, *ranges[index + 1])
+            with profiling.slice_mark("bf_prefetch"):
+                sl, ready = prefetch(index + 1, *ranges[index + 1])
     _flush_all_pending()
     return time.perf_counter() - t0
 
@@ -2987,7 +3047,7 @@ def run_compute(
     # the single-node path) would otherwise report the first run's branches too.
     # Same for the kernel launch counters, which live in the kernel modules.
     _reset_sparse_branches()
-    _reset_prune_applied()
+    _reset_prune_instrumentation()
     # Local imports: both modules are imported function-locally throughout this
     # file (triton is optional), and `topk_triton` is otherwise reached only via
     # `tiebreak`.
@@ -3600,6 +3660,30 @@ def run_compute(
         + ([id_col] if id_col else [])
         + filter_cols
     ))
+    # Optional read-phase profiling, grouped by column shape/type so timings remain 
+    # meaningful across corpora with different column names.
+    read_timing = profiling.read_timing_on()
+    read_col_groups = {
+        "dense": [dense_col] if "dense" in vts_needed else [],
+        "sparse": [sparse_col] if "sparse" in vts_needed else [],
+        "multivector": [multivector_col] if "multivector" in vts_needed else [],
+        "text": [c for c in filter_cols if c in ("text", "url")],
+        "other": [c for c in read_cols
+                  if c not in (dense_col, sparse_col, multivector_col)
+                  and c not in ("text", "url")],
+    } if read_timing else None
+    # HERE, not in `profiling.configure()`: that runs after the reader threads
+    # start, so resetting there discards timings files have already reported
+    # (measured: 82% of the split silently lost, and no test catches it).
+    profiling.reset_read_split()
+    if read_timing:
+        logger.info(
+            "NOVA_BF_READ_TIMING is set: the read phase is split into fetch / "
+            "parquet decode / per-column-group decode / our own decode steps. "
+            "This COSTS time — the file is pulled into a buffer before being "
+            "parsed, and each column group is decoded again — so read_secs "
+            "from this run is not comparable to a normal one."
+        )
     need_sparse_norms = any(s.vector_type == "sparse" and s.metric == "cosine" for s in specs)
     # Corpus id strings carried through to decode, kept in RAM per file (only when
     # id_column is set). gidx → pyarrow string array aligned with that file's rows.
@@ -3673,44 +3757,104 @@ def run_compute(
             # consumer re-raise it in the main thread with a clear message.
             try:
                 t0 = time.perf_counter()
-                table = cstore.read_columns(f.read_path, read_cols)
-                # Declared datetime corpus columns -> int64 epoch µs before any
-                # filter (static `range` or GPU-native `range_from_query`) reads
-                # them, so every range path stays numeric and unchanged.
+                # Optional per-file read timing; None on the normal path.
+                rt: dict | None = None
+                if read_timing:
+                    table, rt = profiling.fetch_and_decode(
+                        cstore, f.read_path, read_cols, read_col_groups)
+                else:
+                    table = cstore.read_columns(f.read_path, read_cols)
+                
+                # Normalize declared datetime columns before any filter reads them.
+                ts = time.perf_counter()
                 table = convert_table_date_columns(table, corpus_date_fmts)
+                if rt is not None:
+                    rt["dates"] = time.perf_counter() - ts
                 # Decode each vector_type at most ONCE per file, regardless of how many
                 # specs need it — wrapped in the batch abstraction (`DenseCorpusBatch`/
                 # `SparseCorpusBatch`) below, where every spec of that vector_type shares
                 # it (see `run_compute`'s `has_baseline`).
                 arrs: dict[str, object] = {}
+                ts = time.perf_counter()
                 if "dense" in vts_needed:
                     arrs["dense"] = dense_to_2d(table[dense_col])
+                if rt is not None:
+                    # Recorded only when the stage RAN
+                    if "dense" in vts_needed:
+                        rt["dense_cast"] = time.perf_counter() - ts
+                    ts = time.perf_counter()
                 if "multivector" in vts_needed:
                     arrs["multivector"] = multivector_to_ragged(table[multivector_col])
+                    if rt is not None:
+                        rt["multivector_cast"] = time.perf_counter() - ts
+                if rt is not None:
+                    ts = time.perf_counter()
                 if "sparse" in vts_needed:
+                    # Time sparse decode, norms/gate, and vocab remap separately.
                     sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[sparse_col])
-                    # Norms and the zero-score gate BEFORE remap: both are
-                    # defined over the raw, untruncated file values (see
-                    # _sparse_file_norms / _zero_gate_file_ok docstrings).
+                    if rt is not None:
+                        rt["sparse_decode"] = time.perf_counter() - ts
+                        ts = time.perf_counter()
+                    # Norms/gate use the original, unremapped sparse values.
                     sp_norms = _sparse_file_norms(sp_offsets, sp_idx, sp_val) if need_sparse_norms else None
+                    if rt is not None:
+                        rt["sparse_norms"] = time.perf_counter() - ts
+                        ts = time.perf_counter()
                     sp_gate = _zero_gate_file_ok(sp_val, sparse_q_nonneg, sparse_q_min_pos)
+                    if rt is not None:
+                        rt["sparse_gate"] = time.perf_counter() - ts
+                        ts = time.perf_counter()
                     sp_offsets, sp_idx, sp_val = _remap_sparse_file(
                         sp_offsets, sp_idx, sp_val, query_vocab, query_vocab_lut
                     )
                     arrs["sparse"] = (sp_offsets, sp_idx, sp_val, sp_norms, sp_gate)
-                # carry the id column (combined to one contiguous array) to decode;
-                # None when id_column isn't configured. Same row order as `arrs`.
+                    if rt is not None:
+                        rt["sparse_remap"] = time.perf_counter() - ts
+                if rt is not None:
+                    ts = time.perf_counter()
+
+                # Keep IDs contiguous and aligned with `arrs`.
                 ids = table[id_col].combine_chunks() if id_col else None
-                # Vector/ID data is already retained by `arrs`/`ids`, so `table` only
-                # needs to keep filter columns alive from here on. `select` is metadata-only
-                # and drops references to otherwise-dead Arrow buffers, reducing peak RSS.
-                #
-                # Note: fp32 dense arrays may be zero-copy views into Arrow memory, so
-                # `arrs` must not be mutated in place. Capture the row count before narrowing.
+                if rt is not None:
+                    rt["ids"] = time.perf_counter() - ts
+
+                # Keep only filter columns; vector/ID data is already retained elsewhere.
+                # fp32 dense data may still be a zero-copy Arrow view, so do not mutate it.
                 n_rows_file = len(table)
+                ts = time.perf_counter()
                 if filter_cols:
                     table = table.select(filter_cols)
+                if rt is not None:
+                    rt["select"] = time.perf_counter() - ts
                 t1 = time.perf_counter()
+                if rt is not None:
+                    rt["rows"] = n_rows_file
+                    rt["total"] = t1 - t0
+                    profiling.read_split_add({k: v for k, v in rt.items()
+                                     if k not in ("rows",)})
+                    mb = rt["bytes"] / 1e6
+
+                    # Build stage logging from the shared field list so instrumentation stays
+                    # in sync when stages are added or split.
+                    stages = " ".join(
+                        f"{k}={rt[k]:.3f}s" for k in profiling.READ_SPLIT_FIELDS
+                        if k in rt
+                    )
+                    logger.info(
+                        "read-split file=%s rows=%d MB=%.0f total=%.3fs "
+                        "(includes the per-column-group RE-READS below, which "
+                        "is why the stages do not sum to it) | fetch %s | %s | "
+                        "group re-reads: %s",
+                        f.key.rsplit("/", 1)[-1], n_rows_file, mb, rt["total"],
+                        ("ranged" if rt.get("fetch_mode")
+                         else "single-stream") + f" {mb / max(rt['fetch'], 1e-9):.0f} MB/s",
+                        stages,
+                        " ".join(
+                            f"{k[len('decode_parquet_'):]}={v:.3f}s"
+                            for k, v in sorted(rt.items())
+                            if k.startswith("decode_parquet_")
+                        ) or "none",
+                    )
                 # One mask per DISTINCT filter (`None` for the unfiltered entry),
                 # evaluated against the same table — timed separately from the read
                 # above (CPU-vectorized work, not IO wait). Keyed by the `Filter`
@@ -3893,6 +4037,7 @@ def run_compute(
     # every spec's filter/scoring work on a file), not per spec.
     any_filter = any(s.filter is not None for s in specs)
     io_wait = gpu_secs = read_secs = filter_secs = 0.0
+    live_seen_prev: dict[int, tuple[int, int]] = {}
     rows_seen = 0
     bytes_seen = 0  # decoded float32 bytes consumed (~= wire bytes for snappy-float32)
     wall0 = time.perf_counter()
@@ -3985,6 +4130,15 @@ def run_compute(
         coalesce_rows[vt] = 0
         return elapsed
 
+    prof_window = profiling.configure()
+    if prof_window is not None:
+        logger.info(
+            "%s=%d:%d — the scan runs normally and torch.profiler records only "
+            "those files, so the trace is the STEADY state rather than the "
+            "live-heavy first files.",
+            profiling.PROFILE_FILES, *prof_window,
+        )
+    prev_t, prev_gpu, prev_io = wall0, gpu_secs, io_wait
     with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
         for want_gidx, _f in mine:
             w0 = time.perf_counter()
@@ -3996,6 +4150,7 @@ def run_compute(
             read_secs += rsec
             filter_secs += fsec
             bar.update(1)
+            profiling.start(bar.n)
 
             # `batches[vt]` is already wrapped AND, when `has_baseline[vt]` is
             # False, already compacted to the union of every active filter's
@@ -4101,16 +4256,57 @@ def run_compute(
                         ),
                     )
 
+            # Per-file live fractions from cumulative device counters.
+            stats = live_fractions()
+            parts_log: list[str] = []
+            if stats:
+                live_seen = {**live_seen_prev}
+                for m, st in sorted(stats.items()):
+                    prev_l, prev_r = live_seen_prev.get(m, (0, 0))
+                    d_live, d_rows = st["live"] - prev_l, st["rows"] - prev_r
+                    live_seen[m] = (st["live"], st["rows"])
+                    if d_rows:
+                        parts_log.append(
+                            f"{specs[m].name}={d_live / d_rows:.4f}"
+                        )
+                live_seen_prev = live_seen
+
+            # Log per-file deltas so startup and steady-state behavior can be separated.
+            # `dgpu` is CPU enqueue time, not CUDA device execution time.
+            now = time.perf_counter()
+            logger.info(
+                "per-file file=%d n=%d/%d t=%.2f dwall=%.2f dgpu=%.2f "
+                "dio_wait=%.2f read=%.2f filter=%.2f rows=%d%s",
+                gidx, bar.n, len(mine), now - wall0, now - prev_t,
+                gpu_secs - prev_gpu, io_wait - prev_io, rsec, fsec, file_rows,
+                (" " + " ".join(parts_log)) if parts_log else "",
+            )
+            prev_t, prev_gpu, prev_io = now, gpu_secs, io_wait
+            profiling.stop(bar.n)
+
             if bar.n % 200 == 0:
                 postfix = f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s"
                 if any_filter:
                     postfix += f" filter={filter_secs:.0f}s"
                 bar.set_postfix_str(postfix, refresh=False)
 
-    # Flush any remainder still buffered for coalescing — a coalesce-eligible
-    # vt's LAST group may not have reached vt_batch_size[vt] on its own.
+    # Flush any coalesced tail that never reached its target batch size.
+    # This happens after file-scoped profiling, so tail GPU work is not traced.
+    tail_gpu = 0.0
     for vt in coalesce_eligible_vts:
-        gpu_secs += _flush_coalesce_group(vt)
+        tail_gpu += _flush_coalesce_group(vt)
+    gpu_secs += tail_gpu
+    if prof_window is not None and tail_gpu > 0.0:
+        logger.warning(
+            "%.2fs of GPU work ran in the trailing coalesce flush, which is "
+            "AFTER the per-file loop and therefore outside the %s=%d:%d window "
+            "— that work is absent from the trace. Coalesced vector types (%s) "
+            "buffer until `*_batch_size` rows; if a type never reaches it, all "
+            "of its work lands here. Lower the batch size for that type, or "
+            "profile a run with enough files to fill a group.",
+            tail_gpu, profiling.PROFILE_FILES, *prof_window,
+            ", ".join(sorted(coalesce_eligible_vts)) or "none",
+        )
 
     wall = time.perf_counter() - wall0
     gb = bytes_seen / 1e9
@@ -4146,6 +4342,43 @@ def run_compute(
         wall_mbps, stream_mbps, io_wait, gpu_secs, filter_secs,
         read_wall, filter_wall,
     )
+    split = profiling.read_split_totals()
+    read_counters = profiling.read_counter_totals()
+    if split:
+        # Summed over reader threads, like `read_secs` itself — divide by
+        # `io_workers` for the wall-comparable figure.
+        logger.info(
+            # %.3f: six stages each carry a fraction of what one used to, and
+            # %.1f printed every one of them as 0.0.
+            "bf-bench read_split_s (summed over %d readers; total includes the "
+            "instrumentation's own group re-reads, so the stages do not sum to "
+            "it) " + " ".join(
+                f"{k}=%.3f" for k in profiling.READ_SPLIT_FIELDS
+            ) + " total=%.3f file_fetch_mbps=%.0f",
+            io_workers,
+            *[split.get(k, 0.0) for k in profiling.READ_SPLIT_FIELDS],
+            split.get("total", 0.0),
+            read_counters.get("read_bytes", 0.0) / 1e6
+            / max(split.get("fetch", 0.0), 1e-9),
+        )
+        logger.info(
+            "bf-bench read_split counters: read_bytes=%.0fMB ranged_files=%.0f "
+            "of %d (this path fetches WHOLE files, so read_bytes is not what an "
+            "untimed run transfers — and `file_fetch_mbps` above is over those "
+            "whole-file bytes, where `wall_mbps`/`stream_mbps` are over decoded "
+            "VECTOR bytes; the three share no denominator)",
+            read_counters.get("read_bytes", 0.0) / 1e6,
+            read_counters.get("ranged_files", 0.0), len(mine),
+        )
+        by_group = {k[len("decode_parquet_"):]: v for k, v in split.items()
+                    if k.startswith("decode_parquet_")}
+        if by_group:
+            logger.info(
+                "bf-bench read_split parquet decode by column group "
+                "(re-read per group, so these OVERLAP and do not sum to "
+                "decode_parquet): %s",
+                " ".join(f"{k}={v:.1f}s" for k, v in sorted(by_group.items())),
+            )
     # Diagnose WHY the consumer starved (io_wait high), distinguishing the two
     # reader-side costs — raising io_workers only helps when reads, not filtering,
     # are the reader bottleneck. Comparing io_wait against gpu_secs alone (as this
@@ -4473,7 +4706,11 @@ def run_compute(
         "multivector_batch_size": mv_batch_size,
         "multivector_query_block": mv_query_block,
         # What actually RAN, not what the kill switches permitted.
-        "kernels": run_manifest.kernel_usage(_PRUNE_APPLIED["count"]),
+        "kernels": run_manifest.kernel_usage(
+            _PRUNE_APPLIED["count"],
+            # Keyed by SEARCH NAME, not member index
+            {specs[m].name: st for m, st in live_fractions().items()},
+        ),
     })
     doc.update({
         "started_at": started_at.isoformat(),
@@ -4516,6 +4753,15 @@ def run_compute(
             "rows_per_second": round(rows_seen / wall, 1) if wall > 0 else 0,
             "wall_mbps": round(wall_mbps, 1),
             "stream_mbps": round(stream_mbps, 1),
+            # Read timing inflates read-derived metrics, so record it explicitly in the
+            # manifest. Use the flag rather than split contents so empty ranks agree.
+            "read_timing": read_timing,
+            **({"read_split": {k: round(v, 3) for k, v in split.items()}}
+               if split else {}),
+            # Keep non-time read counters separate from `read_split`.
+            **({"read_bytes": int(read_counters.get("read_bytes", 0)),
+                "ranged_files": int(read_counters.get("ranged_files", 0))}
+               if read_counters else {}),
         },
         "output_files": [e["output_file"] for e in manifest_searches],
     })

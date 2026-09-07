@@ -61,9 +61,15 @@ REVERSE_PATCHES = [
     # 2. release the hand-off locals after `fq.put`
     ("                arrs = batches = batch_orig_rows = raw_stats = None\n"
      "                keeps = leaf_arrays = ids = b = union = None\n", ""),
-    # 3. narrow the table to the filter columns before `evaluate`
-    ("                n_rows_file = len(table)\n"
-     "                if filter_cols:\n"
+    # 3. narrow the table to the filter columns before `evaluate`.
+    #    Only the narrowing is stripped. `n_rows_file = len(table)` STAYS: read
+    #    timing references it twice more, and removing it left those pointing at
+    #    an undefined name -- the stripped package then died with a NameError
+    #    whenever NOVA_BF_READ_TIMING happened to be set. It cannot be replaced
+    #    by `len(table)` either, since patch 1 sets `table` to None by then.
+    #    Keeping it is harmless: patch 4 restores `n_rows = len(table)`, so the
+    #    un-optimised path is reproduced either way.
+    ("                if filter_cols:\n"
      "                    table = table.select(filter_cols)\n", ""),
     ("                n_rows = n_rows_file\n",
      "                n_rows = len(table)\n"),
@@ -210,6 +216,9 @@ MODES = {"full": 9, "nofilter": 3}
 def _run(root, out, mode, pkg_root=None):
     env = dict(os.environ)
     env.pop("NOVA_BF_NO_PRUNE", None)
+    # This test's verdict must not depend on unrelated instrumentation being
+    # exported in the caller's shell.
+    env.pop("NOVA_BF_READ_TIMING", None)
     if pkg_root is not None:
         env["PYTHONPATH"] = str(pkg_root)
     r = subprocess.run([sys.executable, "-c", _DRIVER, str(root), str(out), mode],

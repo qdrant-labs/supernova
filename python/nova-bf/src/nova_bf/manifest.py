@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 # Bump when a field's MEANING changes (not when one is added) — consumers that
 # parse manifests across runs need to tell a rename from a new key.
+# The liveness fields under `kernel_usage.prune` are OPTIONAL within v1: they
+# were added (and renamed once) during development, and no released manifest
+# carries the earlier names, so their arrival is an addition, not a rename.
 MANIFEST_VERSION = 1
 
 
@@ -155,25 +158,47 @@ def _workspace_version(start: str) -> str | None:
     return None
 
 
-def kernel_usage(prune_launches: int) -> dict:
-    """Which GPU fast paths actually RAN, not which ones were permitted.
+def kernel_usage(prune_launches: int, live_stats: dict | None = None) -> dict:
+    """Report GPU fast paths that actually ran.
 
-    Each entry carries:
-
-      permitted    the kill switch, i.e. what was allowed
-      launches     how many times it actually ran
-      unavailable  why it cannot run, or None
+    Each entry records whether the path was permitted, how many times it ran,
+    and why it was unavailable. Prune effectiveness is included only when
+    measured.
     """
     from nova_bf import merge_triton, topk_triton
 
+    prune = {
+        "permitted": not os.environ.get("NOVA_BF_NO_PRUNE"),
+        # Prune has no kernel and cannot decline at runtime; this counts the
+        # slices where a threshold was actually applied.
+        "launches": prune_launches,
+        "unavailable": None,
+    }
+    if live_stats:
+        # These are (query, slice) decisions, not corpus rows.
+        total_live = sum(v["live"] for v in live_stats.values())
+        total_rows = sum(v["rows"] for v in live_stats.values())
+        prune["live_query_slice_rows"] = total_live
+        prune["query_slice_rows"] = total_rows
+
+        # Compare live_fraction only across runs with the same batch sizing.
+        prune["live_fraction"] = (
+            round(total_live / total_rows, 6) if total_rows else None
+        )
+        prune["by_search"] = {
+            name: {
+                "live_query_slice_rows": v["live"],
+                "query_slice_rows": v["rows"],
+                "slices": v["slices"],
+                "live_fraction": (
+                    round(v["live"] / v["rows"], 6) if v["rows"] else None
+                ),
+            }
+            for name, v in live_stats.items()
+        }
+
     return {
-        "prune": {
-            "permitted": not os.environ.get("NOVA_BF_NO_PRUNE"),
-            # Prune has no kernel and cannot decline at runtime; this counts the
-            # slices where a threshold was actually applied.
-            "launches": prune_launches,
-            "unavailable": None,
-        },
+        "prune": prune,
         "fold_kernel": merge_triton.usage(),
         "topk_kernel": topk_triton.usage(),
     }
