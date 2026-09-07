@@ -163,8 +163,18 @@ def test_a_declined_block_falls_back_and_matches_the_torch_reference(monkeypatch
         with caplog.at_level(logging.WARNING, logger="nova_bf.compute"):
             declined = sl.score(_query("triton_reduce"), metric)
         assert "int32 pointer arithmetic" in caplog.text, "the decline must be logged"
-        assert torch.equal(declined, reference), (
-            f"{metric}: the fallback must reproduce the torch reference exactly"
+        # Tolerance, NOT `torch.equal`, even though both sides run the same
+        # torch path: that path ends in `dest.index_add_(0, row_q, M)`
+        # (`compute._segment_max_over_cols`'s caller), and `index_add_`
+        # accumulates through CUDA atomics, so the summation order varies run
+        # to run. Two back-to-back identical calls already disagree by ~1 ulp
+        # (measured 9.54e-07 on an A10G, on the rows of the queries with the
+        # most tokens — more terms, more order to vary). `torch.equal` here
+        # could only ever pass by luck. Same tolerance as the kernel comparison
+        # below, deliberately.
+        assert torch.allclose(declined, reference, rtol=1e-5, atol=1e-6), (
+            f"{metric}: the fallback must reproduce the torch reference "
+            f"(max |diff| {float((declined - reference).abs().nan_to_num().max()):.3e})"
         )
         caplog.clear()
 
