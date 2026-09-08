@@ -167,11 +167,24 @@ class Store:
 
 
 def dense_to_2d(col: pa.ChunkedArray) -> np.ndarray:
-    """A list/fixed-size-list-of-float column → a contiguous (n, dim) float32 array.
+    """A list/fixed-size-list-of-float column → a contiguous (n, dim) array in
+    the STORED float dtype.
 
     Avoids per-row Python conversion: flattens the Arrow values buffer once and
     reshapes. Assumes a uniform vector dimension and no null rows (always true
     for embedding output).
+
+    It used to upcast to float32 here, unconditionally. On a fineweb corpus
+    file — 1.09 M rows x 768 dims stored as `halffloat` — that allocated
+    3.35 GB and spent ~2.2 s per file per reader thread widening bytes that
+    the GPU is about to receive anyway, and then sent 3.35 GB over PCIe
+    instead of 1.67 GB. The cast now happens on the DEVICE, inside
+    `compute.DenseCorpusBatch.transfer`, which is the only other place in the
+    system that is allowed to know the stored dtype: everything downstream of
+    `transfer` sees float32, exactly as before, and `transfer` asserts it.
+    The scores cannot move — widening float16 to float32 is exact, so the
+    float32 matrix the GPU ends up with is bit-identical to the one the host
+    used to build.
     """
     col = col.combine_chunks()
     n = len(col)
@@ -183,7 +196,12 @@ def dense_to_2d(col: pa.ChunkedArray) -> np.ndarray:
     else:  # variable-length list, uniform width in practice
         flat = col.values.to_numpy(zero_copy_only=False)
         dim = len(flat) // n
-    return np.ascontiguousarray(flat.reshape(n, dim), dtype=np.float32)
+    if flat.dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+        # float64, or an integer-typed list: widen once, here. Only float16
+        # and float32 are worth carrying at their stored width, and only
+        # those two widen to float32 exactly.
+        flat = flat.astype(np.float32, copy=False)
+    return np.ascontiguousarray(flat.reshape(n, dim))
 
 
 def multivector_to_ragged(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray]:
@@ -264,14 +282,32 @@ def sparse_to_coo_parts(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray, n
     Python conversion. Returns `(row_offsets, indices, values)` — `row_offsets`
     is length n+1 (CSR `crow_indices`), `indices`/`values` are the flat,
     concatenated-across-rows nonzero entries (CSR `col_indices`/`values`).
+
+    `indices` keeps the STORED integer width — never widened, never copied.
+    `values` is float32: `copy=False` passes a float32-stored column straight
+    through, and a float64-stored one is NARROWED here (scoring is float32
+    throughout, so carrying float64 further would only cost bandwidth).
+
+    It used to widen `indices` to int64 and re-`astype` `values`
+    unconditionally, which on a fineweb corpus file (~220 M nonzeros)
+    allocated 1.76 GB for the widening and copied 0.88 GB of float32 onto
+    itself, in the reader thread, once per file. The int64 width was never
+    needed: `_vocab_lookup` indexes its table with whatever integer dtype it
+    is handed, and torch's CSR builder is fed the REMAPPED column ids
+    (`compute._remap_sparse_file`), not these.
+
+    Consequently callers must not assume a dtype. Everything downstream is
+    dtype-agnostic on purpose: `_build_query_vocab` (`np.unique`),
+    `_vocab_lookup` (LUT gather or `searchsorted`), `_zero_gate_file_ok`
+    (comparisons), `_sparse_file_norms` (accumulates in float64 explicitly).
     """
     col = col.combine_chunks()
     n = len(col)
     if n == 0:
-        return np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+        return np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.uint32), np.zeros(0, dtype=np.float32)
     idx_list = col.field("indices")
     val_list = col.field("values")
     row_offsets = idx_list.offsets.to_numpy(zero_copy_only=False).astype(np.int64)
-    indices = idx_list.values.to_numpy(zero_copy_only=False).astype(np.int64)
-    values = val_list.values.to_numpy(zero_copy_only=False).astype(np.float32)
+    indices = idx_list.values.to_numpy(zero_copy_only=False)
+    values = val_list.values.to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
     return row_offsets, indices, values

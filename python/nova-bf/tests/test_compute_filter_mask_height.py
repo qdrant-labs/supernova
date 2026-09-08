@@ -149,6 +149,30 @@ def _force_full_height(monkeypatch):
     )
 
 
+def _spy_masks(monkeypatch, seen, height_only=False):
+    """Record every per-query filter mask `evaluate()` hands back.
+
+    Replaces the old `compute._pack_query_axis` spy: masks are built already
+    packed now, inside `filters.evaluate`'s fused combine, so the pack step
+    these tests used to intercept no longer exists. `PackedRowMask.shape`
+    still reports the LOGICAL `(n_queries, rows)`, which is what every caller
+    asserts on — the byte width never appears.
+
+    Only 2-D results are recorded, exactly as before: a uniform filter returns
+    a plain `(rows,)` array and has no query axis to measure.
+    """
+    real = compute_mod.evaluate
+
+    def spy(*a, **kw):
+        mask = real(*a, **kw)
+        if getattr(mask, "ndim", 1) == 2:
+            seen.append(mask.shape[0] if height_only else mask.shape)
+        return mask
+
+    monkeypatch.setattr(compute_mod, "evaluate", spy)
+    return seen
+
+
 def _spy_union_widths(monkeypatch):
     """Record how many corpus rows each file's `_union_keep` admitted, so a
     test can PROVE the batch composition it claims to vary actually varied.
@@ -156,8 +180,8 @@ def _spy_union_widths(monkeypatch):
     widths: list[int] = []
     real = compute_mod._union_keep
 
-    def spy(fs, keeps):
-        u = real(fs, keeps)
+    def spy(fs, keeps, n_rows):
+        u = real(fs, keeps, n_rows)
         widths.append(int(u.sum()))
         return u
 
@@ -167,16 +191,14 @@ def _spy_union_widths(monkeypatch):
 
 @pytest.fixture
 def mask_spy(monkeypatch):
-    """Record the shape of every mask that reaches `_pack_query_axis` — i.e.
-    every CPU-fallback per-query mask the run actually materializes."""
+    """Record the LOGICAL shape of every per-query mask the run materializes.
+
+    `evaluate()` returns these row-bit-packed now (`filters.PackedRowMask`), so
+    there is no `_pack_query_axis` step left to intercept — and `.shape` is
+    still the `(n_queries, rows)` the mask stands for, not the byte width, so
+    every assertion below reads the same as before."""
     seen: list[tuple[int, int]] = []
-    real = compute_mod._pack_query_axis
-
-    def spy(mask):
-        seen.append(mask.shape)
-        return real(mask)
-
-    monkeypatch.setattr(compute_mod, "_pack_query_axis", spy)
+    _spy_masks(monkeypatch, seen)
     return seen
 
 
@@ -533,7 +555,7 @@ def test_gpu_eligible_filter_is_left_at_full_height(text_ds, mask_spy):
 
 def test_uniform_text_filter_has_no_query_axis_to_narrow(text_ds, mask_spy):
     """A static `match_text` is uniform: `evaluate` returns `(rows,)`, which
-    `_pack_query_axis` never sees. Narrowing must not invent a query axis."""
+    the mask spy never sees. Narrowing must not invent a query axis."""
     res = _run(
         text_ds,
         "uniform",
@@ -733,9 +755,12 @@ def test_evaluate_on_narrowed_values_equals_the_row_slice(
     narrow = evaluate(f, corpus_table, {c: v[rows] for c, v in query_values.items()})
 
     assert full.ndim == 2, "fixture no longer exercises the per-query path"
+    # `.shape` is the LOGICAL (n_queries, rows) — the mask is row-bit-packed,
+    # and `full[rows]` narrows the (unpacked) query axis, so both sides are
+    # still directly comparable once expanded.
     assert narrow.shape == (len(rows), len(corpus_table))
     np.testing.assert_array_equal(
-        narrow, full[rows],
+        narrow.unpack(), full[rows].unpack(),
         err_msg=f"{filter_name}/{subset_name}: narrowing changed a query's own mask",
     )
 
@@ -744,10 +769,11 @@ def test_the_equivalence_fixture_actually_discriminates(corpus_table, query_valu
     """Guard on the fixture: if every query produced the same mask row, the
     test above would pass no matter how badly narrowing were implemented."""
     full = evaluate(EQUIV_FILTERS["all_three_groups"], corpus_table, query_values)
-    distinct = {row.tobytes() for row in full}
+    expanded = full.unpack()
+    distinct = {row.tobytes() for row in expanded}
     assert len(distinct) >= 4, f"only {len(distinct)} distinct mask rows — too weak"
-    assert full.any(), "fixture matches nothing at all"
-    assert not full.all(), "fixture matches everything"
+    assert expanded.any(), "fixture matches nothing at all"
+    assert not expanded.all(), "fixture matches everything"
 
 
 # ==========================================================================
@@ -791,11 +817,7 @@ def test_a_filter_shared_across_vector_types_spans_both(two_vt_ds, monkeypatch):
     too short for whichever one ran second, and would silently mask the wrong
     queries rather than raise."""
     seen = []
-    real = compute_mod._pack_query_axis
-    monkeypatch.setattr(
-        compute_mod, "_pack_query_axis",
-        lambda m: (seen.append(m.shape), real(m))[1],
-    )
+    _spy_masks(monkeypatch, seen)
     out = two_vt_ds["tmp"] / "two_vt"
     out.mkdir()
     cfg = BruteForceConfig(
@@ -834,11 +856,7 @@ def test_equal_but_distinct_filter_objects_are_one_group(two_vt_ds, monkeypatch)
     assert a is not b and a == b and hash(a) == hash(b), "premise broke"
 
     seen = []
-    real = compute_mod._pack_query_axis
-    monkeypatch.setattr(
-        compute_mod, "_pack_query_axis",
-        lambda m: (seen.append(m.shape), real(m))[1],
-    )
+    _spy_masks(monkeypatch, seen)
     out = two_vt_ds["tmp"] / "equal_filters"
     out.mkdir()
     cfg = BruteForceConfig(
@@ -927,8 +945,8 @@ def test_union_keep_tightens_only_when_foreign_rows_carry_real_values(
         widths = []
         real = compute_mod._union_keep
 
-        def spy(fs, keeps):
-            u = real(fs, keeps)
+        def spy(fs, keeps, n_rows):
+            u = real(fs, keeps, n_rows)
             widths.append(int(u.sum()))
             return u
 
@@ -1330,9 +1348,7 @@ def test_a_selector_covering_every_row_collapses_to_full_height(tmp_path, monkey
     by a different route than "no selector", and the resulting
     `_local_positions(rows, None)` must still be the identity."""
     seen = []
-    real = compute_mod._pack_query_axis
-    monkeypatch.setattr(compute_mod, "_pack_query_axis",
-                        lambda m: (seen.append(m.shape), real(m))[1])
+    _spy_masks(monkeypatch, seen)
 
     cdir = tmp_path / "corpus"
     cdir.mkdir()
@@ -1529,9 +1545,7 @@ def test_the_random_harness_covers_the_shapes_it_claims_to(tmp_path, monkeypatch
             saw["overlapping_subsets"] += 1
 
         heights = []
-        real = compute_mod._pack_query_axis
-        monkeypatch.setattr(compute_mod, "_pack_query_axis",
-                            lambda m: (heights.append(m.shape[0]), real(m))[1])
+        _spy_masks(monkeypatch, heights, height_only=True)
         run_compute(cfg)
         monkeypatch.undo()
         n_q = pq.read_table(cfg.queries.path).num_rows
@@ -1677,9 +1691,7 @@ def test_one_mask_read_through_both_compacted_and_uncompacted_batches(tmp_path,
         )
 
     seen = []
-    real = compute_mod._pack_query_axis
-    monkeypatch.setattr(compute_mod, "_pack_query_axis",
-                        lambda m: (seen.append(m.shape[0]), real(m))[1])
+    _spy_masks(monkeypatch, seen, height_only=True)
     narrowed = {n: _rows_of(p) for n, p in run_compute(build("seam_narrow")).items()}
     monkeypatch.undo()
     assert seen and set(seen) == {4}, (

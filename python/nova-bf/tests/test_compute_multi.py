@@ -471,40 +471,61 @@ def test_union_keep_ors_every_distinct_filter():
         "a": np.array([True, False, False, True]),
         "b": np.array([False, True, False, False]),
     }
-    union = compute_mod._union_keep(["a", "b"], keeps)
+    union = compute_mod._union_keep(["a", "b"], keeps, 4)
     assert union.tolist() == [True, True, False, True]
     # a single filter's union is just its own mask, copied (not aliased —
     # mutating the result must never corrupt `keeps`).
-    solo = compute_mod._union_keep(["a"], keeps)
+    solo = compute_mod._union_keep(["a"], keeps, 4)
     solo[0] = False
     assert keeps["a"][0]
 
 
-def test_pack_unpack_query_axis_round_trips():
-    """Unit test for `_pack_query_axis`/`_unpack_query_axis`: the CPU-fallback
-    per-query mask (`match_text`/`match_text_from_query`) is bit-packed along
-    the query axis to shrink the one `(n_queries, rows)` array still held for
-    a whole file's batch loop — round-tripping through pack/unpack must
-    reproduce the original mask exactly, including when `n_queries` isn't a
-    multiple of 8 (the padding-bit case `count=` exists to trim)."""
+def test_pack_unpack_row_axis_round_trips():
+    """Unit test for `filters.pack_rows`/`compute._unpack_row_axis`: the
+    CPU-fallback per-query mask (`match_text`/`match_text_from_query`) is
+    bit-packed along the ROW axis to shrink the one `(n_queries, rows)` array
+    still held for a whole file's batch loop — round-tripping must reproduce
+    the original mask exactly, including when `n_rows` isn't a multiple of 8
+    (the padding-bit case `count=` exists to trim).
+
+    The row axis, not the query axis, because that is the CONTIGUOUS one: the
+    fused combine packs each finished row in one `np.packbits` call at ~30
+    GB/s, where `packbits(axis=0)` was a strided scalar loop at 0.85. See
+    `docs/brute-force/perf-design-2026-09-05.md` R1."""
+    from nova_bf.filters import pack_rows
+
     rng = np.random.default_rng(0)
-    for n_queries in (1, 7, 8, 9, 30, 64):
-        mask = rng.random((n_queries, 11)) < 0.5
-        packed = compute_mod._pack_query_axis(mask)
-        assert packed.dtype == np.uint8
-        assert packed.shape == (-(-n_queries // 8), 11)  # ceil(n_queries / 8)
-        unpacked = compute_mod._unpack_query_axis(packed, n_queries)
+    for n_rows in (1, 7, 8, 9, 30, 64):
+        mask = rng.random((11, n_rows)) < 0.5
+        pm = pack_rows(mask)
+        assert pm.packed.dtype == np.uint8
+        assert pm.packed.shape == (11, -(-n_rows // 8))  # ceil(n_rows / 8)
+        assert pm.shape == mask.shape                    # the LOGICAL shape
+        unpacked = compute_mod._unpack_row_axis(pm.packed, n_rows)
         assert unpacked.dtype == bool
         assert unpacked.shape == mask.shape
         assert np.array_equal(unpacked, mask)
+        assert np.array_equal(pm.unpack(), mask)
 
-    # row-slicing the packed bytes (as `select()` does via `true_rows`)
-    # BEFORE unpacking must agree with slicing then packing.
-    mask = rng.random((13, 20)) < 0.5
-    packed = compute_mod._pack_query_axis(mask)
-    true_rows = np.array([0, 5, 19, 3])
-    sliced_then_unpacked = compute_mod._unpack_query_axis(packed[:, true_rows], 13)
-    assert np.array_equal(sliced_then_unpacked, mask[:, true_rows])
+    # Row-slicing the packed bytes (as `select()` does) BEFORE unpacking must
+    # agree with slicing the expanded mask. Under ROW packing a row range is a
+    # byte range, so the window is rounded outwards and `bit_offset` trims the
+    # rows that ride along in the first byte — including when the range does
+    # not start on a byte boundary, which is the case `select` must not
+    # assume away.
+    mask = rng.random((13, 40)) < 0.5
+    packed = pack_rows(mask).packed
+    for r0, r1 in [(0, 8), (0, 40), (3, 11), (8, 24), (37, 40), (5, 6)]:
+        window = packed[:, r0 >> 3 : (r1 + 7) >> 3]
+        got = compute_mod._unpack_row_axis(window, r1 - r0, r0 & 7)
+        assert np.array_equal(got, mask[:, r0:r1]), (r0, r1)
+
+    # The scattered `true_rows` form (a compacted batch): bytes gathered, bit
+    # selected. This is what `select` does off the production path.
+    true_rows = np.array([0, 5, 19, 3, 39])
+    sel = np.uint8(1) << (7 - (true_rows & 7)).astype(np.uint8)
+    got = (packed[:, true_rows >> 3] & sel) != 0
+    assert np.array_equal(got, mask[:, true_rows])
 
 
 def test_to_query_array_scans_every_value_not_just_the_first():
@@ -1868,7 +1889,7 @@ def test_row_union_ands_static_must_leaf_in_exactly():
     assert union.tolist() == [True, True, False, False, False, True]
     # Safety: still a superset of the rows ANY query actually wants.
     fine = filters_evaluate(f, table, qvals)
-    assert not np.any(fine.any(axis=0) & ~union)
+    assert not np.any(fine.unpack().any(axis=0) & ~union)
 
 
 def test_row_union_static_must_leaf_tightens_when_per_query_leaf_outside_must():
@@ -1893,7 +1914,7 @@ def test_row_union_static_must_leaf_tightens_when_per_query_leaf_outside_must():
     union = compute_mod._row_union_from_gpu_leaves(f, leaf_arrays, qvals, len(table))
     assert union.tolist() == [True, False, True, True]
     fine = filters_evaluate(f, table, qvals)
-    assert not np.any(fine.any(axis=0) & ~union)
+    assert not np.any(fine.unpack().any(axis=0) & ~union)
 
 
 def test_row_union_ands_two_per_query_must_leaves():
@@ -1925,7 +1946,7 @@ def test_row_union_ands_two_per_query_must_leaves():
     # cost 3) are dropped, where the old OR kept both.
     assert union.tolist() == [True, False, True, False, False, True]
     fine = filters_evaluate(f, table, qvals)
-    assert not np.any(fine.any(axis=0) & ~union)
+    assert not np.any(fine.unpack().any(axis=0) & ~union)
 
 
 def test_mixed_static_and_per_query_must_filter_matches_ground_truth(tmp_path, caplog):

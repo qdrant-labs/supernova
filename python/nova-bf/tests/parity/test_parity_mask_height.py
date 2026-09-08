@@ -23,21 +23,14 @@ the CPU-fallback path that materializes the packed `(n_queries, rows)` mask at
 all, so those are the filters used here — a GPU-native per-query filter never
 builds one and would test nothing about its height.
 
-One asymmetry worth knowing before adding an assertion here. `_unpack_query_axis`
-reads the first `n` bits of a packed array, so getting the height WRONG is only
-a correctness bug in one direction:
-
-  * too SHORT truncates the mask, and a spec whose queries run past the end
-    reads rows that are not there — caught (mutating the height to the
-    vector_type's, which is what the pre-narrowing bug did, or to the smallest
-    filter's, fails this suite);
-  * too TALL only appends all-False padding rows, and `spec_qsel` never indexes
-    them, so the answer is unchanged. That is the CONSERVATIVE direction, and
-    it is exactly what the code did before the narrowing (the whole file's
-    height is the maximum). A test that failed on an over-tall mask would be
-    pinning the memory optimization rather than an answer — deliberately not
-    asserted, for the same reason `test_parity_combinations` lets a
-    `_union_keep` that stops compacting pass.
+Getting the height wrong is now caught in BOTH directions, and not only by the
+answers. The mask is packed along the ROW axis, so its height is literally its
+query count, and `_process_shared_batch`'s `select` compares it against
+`filter_n_q` and raises on any mismatch — too short (a spec whose queries run
+past the end would read rows that are not there) and too tall alike. Under the
+old query-axis packing the tall direction merely appended all-False padding
+rows that `spec_qsel` never indexed, so it was silently conservative; that is
+no longer true, and a mutation in either direction fails this suite.
 """
 
 from __future__ import annotations

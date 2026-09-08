@@ -63,7 +63,7 @@ def test_empty_vocab_needs_no_lut():
 def test_lut_declined_for_ineligible_vocabularies():
     """A LUT is only valid for bounded, non-negative integer vocabularies —
     everything else must still work through `searchsorted`."""
-    over = np.array([0, C._VOCAB_LUT_MAX_BYTES // 8 + 10], dtype=np.int64)
+    over = np.array([0, C._VOCAB_LUT_MAX_BYTES // C._VOCAB_LUT_ITEMSIZE + 10], dtype=np.int64)
     assert C._build_vocab_lut(over) is None, "budget cap not enforced"
     assert np.array_equal(
         C._vocab_lookup(over, np.array([0, 7], dtype=np.int64)),

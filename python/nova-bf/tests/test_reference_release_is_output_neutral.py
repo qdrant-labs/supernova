@@ -27,11 +27,11 @@ just the easy one:
     filter at all, so `filter_cols == []` and the guard's own branch runs;
   * multivector, filtered and unfiltered.
 
-It also runs both corpus dense dtypes, because the narrowing's safety argument
-is REFCOUNTING, not copying, and which one happens depends on the dtype: fp16
-is widened to fp32 by `dense_to_2d` (a real copy), while fp32 is a zero-copy
-VIEW into the Arrow buffer. Production is fp16; fp32 is the case where a
-mistaken in-place mutation of `arrs` would corrupt a live Arrow buffer.
+It also runs both corpus dense dtypes. The narrowing's safety argument is
+REFCOUNTING, not copying, and since R3 stopped widening float16 in
+`dense_to_2d` BOTH dtypes are zero-copy views into the Arrow buffer — so both
+are now the case where a mistaken in-place mutation of `arrs`, or a dropped
+reference, would corrupt or free live Arrow memory. Production is fp16.
 """
 from __future__ import annotations
 
@@ -59,8 +59,8 @@ REVERSE_PATCHES = [
     # 1. release the raw inputs after their last use
     ("                table = masks = mask = None\n", ""),
     # 2. release the hand-off locals after `fq.put`
-    ("                arrs = batches = batch_orig_rows = raw_stats = None\n"
-     "                keeps = leaf_arrays = ids = b = union = None\n", ""),
+    ("                    arrs = batches = batch_orig_rows = raw_stats = None\n"
+     "                    keeps = leaf_arrays = ids = b = union = None\n", ""),
     # 3. narrow the table to the filter columns before `evaluate`.
     #    Only the narrowing is stripped. `n_rows_file = len(table)` STAYS: read
     #    timing references it twice more, and removing it left those pointing at
@@ -69,8 +69,8 @@ REVERSE_PATCHES = [
     #    by `len(table)` either, since patch 1 sets `table` to None by then.
     #    Keeping it is harmless: patch 4 restores `n_rows = len(table)`, so the
     #    un-optimised path is reproduced either way.
-    ("                if filter_cols:\n"
-     "                    table = table.select(filter_cols)\n", ""),
+    ("                    if filter_cols:\n"
+     "                        table = table.select(filter_cols)\n", ""),
     ("                n_rows = n_rows_file\n",
      "                n_rows = len(table)\n"),
 ]
@@ -92,8 +92,8 @@ def _make_data(root: pathlib.Path, dense_dtype: str = "float32") -> pathlib.Path
     float column and on a date column).
 
     `dense_dtype` selects the corpus dense storage type: "float16" is
-    production and makes `dense_to_2d` copy; "float32" makes it a zero-copy
-    view. Queries stay fp32 either way, as in production.
+    production. Since R3 both are zero-copy views into the Arrow buffer.
+    Queries stay fp32 either way, as in production.
     """
     rng = np.random.default_rng(5)
     pa_dense = pa.float16() if dense_dtype == "float16" else pa.float32()

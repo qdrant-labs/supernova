@@ -1,29 +1,20 @@
-"""Evaluating a corpus-side `Filter` (see config.py) against one corpus file.
+"""Evaluate a corpus-side `Filter` against one corpus file.
 
-Runs once per file, over the whole file at once, via `pyarrow.compute` — O(rows),
-independent of query count, UNLESS `filt` has a per-query condition
-(`match_from_query`/`range_from_query`/`match_text_from_query`), in which case
-`evaluate()`'s result is `(n_queries, rows)` instead of `(rows,)` — see its
-docstring. A uniform (non-per-query) filter restricts which corpus points are
-eligible neighbors for every query in the run, evaluated before scoring, not
-per (query, row), same as a Qdrant search filter only ever touches the points
-being searched; a per-query condition restricts each query independently, via
-`compute.py`'s masked-fill path rather than row compaction (see there).
+Uniform filters produce a `(rows,)` boolean mask and are evaluated once per
+file before scoring. Per-query conditions produce a row-packed
+`PackedRowMask` over `(queries, rows)` and are applied per query during
+scoring rather than by compacting corpus rows.
 
-Text matching (`match_text`/`match_text_from_query`) uses Qdrant `word`-
-tokenizer semantics — split on non-alphanumeric, lowercase each token, AND
-of query tokens against each row's token set (`nova_bf.tokenize` /
-`_token_row_masks`) — matching what a real Qdrant full-text index
-(`tokenizer: word`, `lowercase: true`) computes, rather than the `\b`-regex
-substring approximation this module previously used. Query strings and the
-corpus column run through the SAME Arrow kernels, so the two sides agree on
-tokens by construction (see `nova_bf.tokenize`'s module docstring).
+Text filters use Qdrant-style `word` tokenization: split on non-alphanumeric
+characters, lowercase tokens, and require all query tokens to occur in the
+row's token set. Query and corpus text use the same tokenization path.
 """
 
 from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import numpy as np
 import pyarrow as pa
@@ -32,6 +23,167 @@ import pyarrow.compute as pc
 from nova_bf.config import Filter, FilterCondition
 from nova_bf.tokenize import TOKEN_SPLIT_PATTERN, tokenize, tokenize_many
 
+class PackedRowMask:
+    """A `(queries, rows)` boolean mask packed along the row axis.
+
+    `packed` has shape `(n_queries, ceil(n_rows / 8))` using NumPy's
+    big-endian bit order. Row packing reduces mask residency 8x while keeping
+    contiguous row ranges cheap to slice.
+
+    `n_rows` records the true width because the final byte may contain padding.
+    """
+
+    __slots__ = ("packed", "n_rows")
+
+    def __init__(self, packed: np.ndarray, n_rows: int):
+        if packed.ndim != 2 or packed.dtype != np.uint8:
+            raise ValueError(
+                f"PackedRowMask wants a 2-D uint8 array, got "
+                f"{packed.ndim}-D {packed.dtype}"
+            )
+        if n_rows < 0 or packed.shape[1] != (n_rows + 7) // 8:
+            # Require exactly the byte width implied by `n_rows`.
+            raise ValueError(
+                f"n_rows={n_rows} needs exactly {(max(0, n_rows) + 7) // 8} "
+                f"packed bytes, got {packed.shape[1]}"
+            )
+        self.packed = packed
+        self.n_rows = n_rows
+
+    @property
+    def n_queries(self) -> int:
+        return self.packed.shape[0]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Shape of the unpacked mask."""
+        return (self.packed.shape[0], self.n_rows)
+
+    @property
+    def ndim(self) -> int:
+        """Always 2 — `compute.py` still tells the per-query case from the
+        uniform `(rows,)` bool array by `ndim`."""
+        return 2
+
+    def __getitem__(self, qrows) -> "PackedRowMask":
+        """Narrow the query axis. `qrows` must KEEP that axis 2-D.
+
+        A bare integer drops it, and the constructor would then complain that
+        the array is 1-D — pointing at the packing rather than at the index
+        that caused it. Refuse it here, with the fix, since `pm[q]` is the
+        natural thing to reach for. Not `bool`: `packed[True]` ADDS an axis
+        rather than dropping one, so that message would be untrue; the
+        constructor's ndim check catches it.
+        """
+        if isinstance(qrows, (int, np.integer)) and not isinstance(qrows, bool):
+            raise TypeError(
+                f"PackedRowMask must stay 2-D: indexing with the integer "
+                f"{qrows} would drop the query axis. Use "
+                f"`[{qrows}:{qrows + 1}]` to keep query {qrows} as a 1-tall "
+                f"mask, or `.unpack()[{qrows}]` for its bool row."
+            )
+        return PackedRowMask(self.packed[qrows], self.n_rows)
+
+    def any(self) -> bool:
+        """Whether any REAL row bit is set.
+
+        Masks the last byte's padding instead of reading the raw bytes. Those
+        padding bits sit outside `n_rows`, so a mask carrying them would
+        report True here while `unpack()` — which trims with `count=n_rows` —
+        reports False: two methods of one object contradicting each other.
+
+        Every mask this module builds keeps the padding at 0 (`_tail_mask`
+        records why, and the combine's closing `&` against `_packed_ones`
+        enforces it whatever the parts held), so the raw read agreed in
+        practice. Masking makes that a property of the class rather than a
+        promise about its callers — the same reason
+        `compute._packed_slice_any` is exact about its head and tail bytes.
+        """
+        if not self.packed.shape[1]:
+            return False
+        if bool(self.packed[:, :-1].any()):
+            return True
+        return bool((self.packed[:, -1] & _tail_mask(self.n_rows)).any())
+
+    def unpack(self) -> np.ndarray:
+        """Expand to the represented `(n_queries, n_rows)` boolean mask."""
+        return np.unpackbits(
+            self.packed, axis=1, count=self.n_rows
+        ).astype(bool)
+
+
+
+def _tail_mask(n_rows: int) -> int:
+    """Mask of valid bits in the final row-packed byte.
+
+    `np.packbits` is big-endian, so partial-byte rows occupy the high bits.
+    Packed operations preserve zero padding except `~`, which must re-mask.
+    """
+    r = n_rows & 7
+    return 0xFF if r == 0 else (0xFF << (8 - r)) & 0xFF
+
+
+def _packed_not(packed: np.ndarray, n_rows: int) -> np.ndarray:
+    """Invert a packed row mask while keeping tail padding bits zero."""
+    out = ~packed
+
+    # `~` also flips padding bits; clear them in the final byte.
+    if n_rows & 7 and out.shape[-1]:
+        out[..., -1] &= _tail_mask(n_rows)
+    return out
+
+
+def _packed_ones(n_rows: int) -> np.ndarray:
+    """An all-True packed row (padding bits still 0)."""
+    out = np.full((n_rows + 7) // 8, 0xFF, dtype=np.uint8)
+    if n_rows & 7 and len(out):
+        out[-1] = _tail_mask(n_rows)
+    return out
+
+
+class TokenGrid:
+    """Row-packed token membership over a corpus file.
+
+    Maps each token to a `(ceil(n_rows / 8),)` uint8 mask in NumPy `packbits`
+    order. Packing reduces row-mask storage and combine traffic by 8x and lets
+    downstream phrase masks remain packed throughout combination.
+
+    `grid[token]` returns the packed row mask; `grid.mask(token)` expands it to
+    `(n_rows,)` bool for reference/test paths.
+    """
+
+    __slots__ = ("packed", "n_rows", "_index")
+
+    def __init__(self, packed: np.ndarray, n_rows: int, ordered: list[str]):
+        self.packed = packed
+        self.n_rows = n_rows
+        self._index = {t: i for i, t in enumerate(ordered)}
+
+    def __contains__(self, token) -> bool:
+        return token in self._index
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __iter__(self):
+        return iter(self._index)
+
+    def keys(self):
+        return self._index.keys()
+
+    def __getitem__(self, token) -> np.ndarray:
+        return self.packed[self._index[token]]
+
+    def mask(self, token) -> np.ndarray:
+        """The `(n_rows,)` bool row. Allocates; not for the hot path."""
+        return np.unpackbits(self[token], count=self.n_rows).astype(bool)
+
+
+def pack_rows(mask: np.ndarray) -> PackedRowMask:
+    """Bit-pack an `(n_queries, n_rows)` bool mask along the row axis."""
+    return PackedRowMask(np.packbits(mask, axis=1), mask.shape[1])
+
+
 # Per-batch text-byte target for `_token_row_masks`: bounds every transient
 # the scan materializes (the split token copy, its lowered copy, parent/code
 # index arrays — a few multiples of the batch's text bytes) by BYTES, not
@@ -39,6 +191,54 @@ from nova_bf.tokenize import TOKEN_SPLIT_PATTERN, tokenize, tokenize_many
 # token count far below the 2^31 list-offset ceiling `split_pattern_regex`'s
 # `list<large_string>` output still has even after the `large_string` cast.
 _BATCH_TEXT_BYTES = 32 << 20
+
+
+def _pool_width(pool) -> int:
+    """Return the thread-count estimate used to size scan batches.
+
+    Uses the shared pool's width when present; otherwise returns the usable CPU
+    count, which may exceed the private pool's actual concurrency.
+    """
+    width = getattr(pool, "_max_workers", None)
+    if width:
+        return width
+    # Respect affinity/cgroup CPU limits. Import lazily to avoid an import cycle.
+    from nova_bf.compute import _usable_cpu_count
+
+    return _usable_cpu_count()
+
+
+# Per-task cap on the temporary bool sub-grid built before row packing.
+# Bounds `n_tokens * batch_rows` bytes; concurrent tasks scale this transient
+# with pool width while avoiding the full-height bool grid.
+_SUBGRID_BYTES = 16 << 20
+
+
+def _scan_batch_rows(col_nbytes: int, n_rows: int, width: int,
+                     n_tokens: int = 1) -> int:
+    """Choose a byte-aligned tokenization batch size.
+
+    Size is limited by estimated text bytes, the exact temporary bool-grid
+    size, and a target of roughly two batches per worker. A 4096-row preferred
+    minimum is overridden by tighter memory limits.
+
+    Batches are multiples of 8 so concurrent tasks own disjoint bytes in the
+    packed output. If a memory cap implies fewer than 8 rows, 8 is the smallest
+    representable batch and necessarily exceeds that cap.
+    """
+    bytes_per_row = max(1, col_nbytes // max(1, n_rows))
+
+    # Text uses a file-wide average; the bool-grid bound is exact.
+    cap = min(
+        _BATCH_TEXT_BYTES // bytes_per_row,
+        _SUBGRID_BYTES // max(1, n_tokens),
+    )
+
+    # Prefer enough batches to keep the pool fed without creating tiny tasks.
+    rows = max(4_096, min(cap, -(-n_rows // (2 * max(1, width)))))
+
+    # Memory limits override the preferred minimum; keep boundaries byte-aligned.
+    return max(8, min(rows, cap) & ~7)
 
 
 def _corpus_null_mask(table: pa.Table, field: str) -> np.ndarray:
@@ -161,63 +361,49 @@ def _range_from_query_mask(
 
 
 def _token_row_masks(
-    col: pa.ChunkedArray, tokens: set[str], n_rows: int,
-) -> dict[str, np.ndarray]:
-    r"""`{token: (n_rows,) np.bool}` — for each query `token` (already
-    lowercase, from `nova_bf.tokenize`), which rows of `col` contain it as
-    one of their own tokens. THE text-matching primitive: both static
-    `match_text` and per-query `match_text_from_query` are ANDs of these
-    masks (`_phrase_mask`). Built in ONE tokenization pass over the column
-    (`split_pattern_regex` then `utf8_lower` per row-batch — the same
-    kernels, in the same split-then-lower order, the query side runs — then
-    a vectorized `index_in`-against-the-query-vocabulary scatter). Cost is
-    O(total text bytes + total corpus tokens), essentially independent of
-    how many distinct query tokens are being asked for, where the old
-    regex-per-word implementation paid a full column scan per distinct word.
+    col: pa.ChunkedArray, tokens: set[str], n_rows: int, pool=None,
+) -> TokenGrid:
+    """Build row-packed corpus membership masks for query tokens.
+    
+    Tokenizes the corpus once using the same split-then-lower path as query
+    text, then scatters matching occurrences into a packed
+    `(n_tokens, ceil(n_rows / 8))` grid. Static and per-query text filters
+    combine these masks with `_phrase_mask`.
 
-    A null corpus row splits to a null token-list, which `list_flatten`/
-    `list_parent_indices` simply skip — so null rows stay `False` in every
-    mask ("a null payload value never matches") with no explicit fill step.
+    Null corpus rows produce no tokens and therefore match nothing.
 
-    The masks are rows of ONE `(n_tokens, n_rows)` array, and each batch
-    scatters its own matches directly into that grid from its worker thread:
-    batches own disjoint row-ranges (disjoint grid columns), so concurrent
-    writes never touch the same byte, no per-batch result accumulates on the
-    calling thread, and there's no sort/group step at all — just one boolean
-    scatter per batch. The Arrow kernels release the GIL, so the thread pool
-    is real parallelism.
+    Batches write directly into disjoint byte ranges of the shared packed
+    grid. Batch sizing balances estimated text size, temporary bool-grid
+    memory, and scan parallelism.
 
-    Batch size is derived, not fixed: at most `_BATCH_TEXT_BYTES` of text
-    per batch (bounds every transient BY BYTES, huge documents included, and
-    stays far under the 2^31 per-batch token-count list-offset ceiling), and
-    at least ~2 batches per core when the file is big enough to split
-    (parallelism on small files), floored so tiny batches don't drown in
-    per-batch overhead. The accumulated grid is the same `n_tokens × n_rows`
-    bytes the old per-word cache held, so steady-state memory is unchanged.
+    String input is widened to `large_string` before chunk combination to
+    avoid 32-bit string-offset overflow on large inputs.
 
-    `col` is cast to `large_string` up front: `combine_chunks()` on a batch
-    concatenates chunk buffers, and a 32-bit `string` column's offsets can
-    overflow there on huge-document corpora ("offset overflow while
-    concatenating arrays"). `string`/`large_string` tokenize identically, so
-    this is purely a capacity fix."""
+    `pool` may provide the process-wide scan pool; otherwise a private pool
+    is used.
+    """
     ordered = sorted(tokens)
-    grid = np.zeros((len(ordered), n_rows), dtype=bool)
-    masks = {t: grid[i] for i, t in enumerate(ordered)}
+    n_tok = len(ordered)
+    grid = np.zeros((n_tok, (n_rows + 7) // 8), dtype=np.uint8)
+    out = TokenGrid(grid, n_rows, ordered)
     if not ordered or n_rows == 0:
-        return masks
+        return out
     if pa.types.is_string(col.type):
         col = pc.cast(col, pa.large_string())
     value_set = pa.array(ordered, type=pa.large_string())
 
-    cpus = os.cpu_count() or 1
-    bytes_per_row = max(1, col.nbytes // n_rows)
-    batch_rows = max(
-        4_096,
-        min(_BATCH_TEXT_BYTES // bytes_per_row, -(-n_rows // (2 * cpus))),
-    )
+    batch_rows = _scan_batch_rows(col.nbytes, n_rows, _pool_width(pool), n_tok)
+
+    # Concurrent batches must own disjoint packed bytes.
+    batch_rows = max(8, batch_rows & ~7)
 
     def scan(off: int) -> None:
         chunk = col.slice(off, batch_rows).combine_chunks()
+        n_here = len(chunk)
+        
+        # Build this batch's bool grid, then pack it directly into its
+        # byte-aligned region of the shared output.
+        sub_grid = np.zeros((n_tok, n_here), dtype=bool)
         toks = pc.split_pattern_regex(chunk, pattern=TOKEN_SPLIT_PATTERN)
         lowered = pc.utf8_lower(pc.list_flatten(toks))
         parent = pc.list_parent_indices(toks)
@@ -225,25 +411,48 @@ def _token_row_masks(
         valid = pc.is_valid(codes)
         c = pc.filter(codes, valid).to_numpy(zero_copy_only=False)
         r = pc.filter(parent, valid).to_numpy(zero_copy_only=False)
-        grid[c, r + off] = True  # disjoint column range per batch → thread-safe
+        sub_grid[c, r] = True
+        grid[:, off >> 3 : (off + n_here + 7) >> 3] = np.packbits(sub_grid, axis=1)
 
     offsets = range(0, n_rows, batch_rows)
-    workers = min(16, cpus, len(offsets))
+    if pool is not None and len(offsets) > 1:
+        # Submit individual batches to the shared pool so work from concurrent
+        # readers can share its fixed global concurrency.
+        futures = []
+        try:
+            for off in offsets:
+                futures.append(pool.submit(scan, off))
+        except BaseException as exc:
+            for f in futures:
+                try:
+                    f.result()
+                except BaseException:
+                    pass
+            raise exc
+        # Drain already-submitted tasks before abandoning their shared grid.
+        error = None
+        for f in futures:
+            try:
+                f.result()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                error = error or exc
+        if error is not None:
+            raise error
+        return out
+    from nova_bf.compute import _usable_cpu_count
+
+    workers = min(16, _usable_cpu_count(), len(offsets))
     if workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(scan, offsets))
+        with ThreadPoolExecutor(max_workers=workers) as own:
+            list(own.map(scan, offsets))
     else:
         for off in offsets:
             scan(off)
-    return masks
+    return out
 
 
-def _phrase_mask(token_masks: dict[str, np.ndarray], toks) -> np.ndarray:
-    """AND-fold of one phrase's token masks — the single place the rule
-    "a row matches a phrase iff EVERY phrase token is one of its tokens"
-    is spelled out; both the static and per-query paths call this.
-    `toks` must be non-empty (callers resolve token-less phrases to
-    all-False / reject them at config load)."""
+def _phrase_mask(token_masks: "TokenGrid", toks) -> np.ndarray:
+    """Return the packed rows containing every token in a non-empty phrase."""
     toks = list(toks)
     mask = token_masks[toks[0]]
     for t in toks[1:]:
@@ -251,25 +460,29 @@ def _phrase_mask(token_masks: dict[str, np.ndarray], toks) -> np.ndarray:
     return mask
 
 
-def _text_prep(
-    filt: Filter, table: pa.Table, query_values: dict[str, np.ndarray] | None,
-) -> tuple[dict[str, dict[str, np.ndarray]], dict[FilterCondition, list[frozenset[str] | None]]]:
-    """The one up-front tokenization step `evaluate()` does for a filter:
+@dataclass(frozen=True)
+class TextQueryPrep:
+    """File-independent preprocessing for per-query text filters.
 
-    - `text_masks`: `{field: {token: (rows,) mask}}` for EVERY text condition
-      anywhere in `filt`, built with one `_token_row_masks` pass per FIELD —
-      a filter with several text conditions on the same column (e.g. a
-      should-group of per-query slots all on `url`) tokenizes that column
-      once, not once per condition.
-    - `cond_qsets`: for each `match_text_from_query` condition, each query's
-      phrase as a `frozenset` of tokens (`None` for a null/NaN/token-less
-      phrase — the "matches nothing" convention), tokenized once here and
-      shared by the fused combine in `evaluate()`.
+    `field_tokens` collects all requested tokens per corpus field.
+    `cond_qsets` stores each `match_text_from_query` condition's token set per
+    query, with `None` for phrases that match nothing.
 
-    Direct `_condition_mask`/`_match_text_from_query_mask` callers (tests,
-    and any future direct caller — compute.py's leaf path is gated by
-    `_gpu_eligible` and never reaches the text branches) skip this and each
-    condition builds its own masks."""
+    Built once by `prepare_text_queries()` and reused across corpus files.
+    The prep stores no provenance, so callers must pair it with the same filter
+    and query values it was built from; `evaluate()` checks condition coverage
+    and query counts but cannot detect same-length stale query values.
+    """
+
+    field_tokens: dict[str, set[str]]
+    cond_qsets: dict[FilterCondition, list[frozenset[str] | None]]
+
+
+def prepare_text_queries(
+    filt: Filter, query_values: dict[str, np.ndarray] | None,
+) -> TextQueryPrep:
+    """Tokenize this filter's static phrases and every per-query phrase ONCE
+    for a whole run. See `TextQueryPrep`."""
     field_tokens: dict[str, set[str]] = {}
     cond_qsets: dict[FilterCondition, list[frozenset[str] | None]] = {}
     for cond in filt.all_conditions():
@@ -285,8 +498,63 @@ def _text_prep(
                 else:
                     qsets.append(None)
             cond_qsets[cond] = qsets
+    return TextQueryPrep(field_tokens, cond_qsets)
+
+
+def _text_prep(
+    filt: Filter, table: pa.Table, query_values: dict[str, np.ndarray] | None,
+    pool=None, prep: "TextQueryPrep | None" = None,
+) -> tuple[dict[str, TokenGrid], dict[FilterCondition, list[frozenset[str] | None]]]:
+    """Build corpus token masks and per-query phrase token sets for a filter.
+
+    Corpus text is tokenized once per field using the union of tokens requested
+    by that field's text conditions. `prep` may supply the file-independent
+    query-side preprocessing; otherwise it is built here.
+    """
+    if prep is None:
+        prep = prepare_text_queries(filt, query_values)
+    else:
+         # Reject preps missing any per-query text condition.
+        missing = [
+            c for c in filt.all_conditions()
+            if c.match_text_from_query is not None and c not in prep.cond_qsets
+        ]
+        if missing:
+            raise ValueError(
+                f"TextQueryPrep does not cover {len(missing)} of this filter's "
+                f"match_text_from_query condition(s); it was built for a "
+                f"different filter"
+            )
+        for c in filt.all_conditions():
+            if c.match_text is None:
+                continue
+            need = set(tokenize(c.match_text))
+            have = prep.field_tokens.get(c.field)
+            if have is None or not need <= have:
+                raise ValueError(
+                    f"TextQueryPrep does not cover static match_text "
+                    f"{c.match_text!r} on field {c.field!r}; it was built "
+                    f"for a different filter"
+                )
+
+         # When query values are available, also verify the query count.
+        for c in filt.all_conditions():
+            col = c.match_text_from_query
+            if col is None:
+                continue
+            vals = None if query_values is None else query_values.get(col)
+            if vals is None:
+                continue
+            want = len(vals)
+            got = len(prep.cond_qsets[c])
+            if got != want:
+                raise ValueError(
+                    f"TextQueryPrep was built for {got} queries but "
+                    f"query_values[{col!r}] has {want}; it is stale"
+                )
+    field_tokens, cond_qsets = prep.field_tokens, prep.cond_qsets
     text_masks = {
-        field: _token_row_masks(table[field], tokens, len(table))
+        field: _token_row_masks(table[field], tokens, len(table), pool)
         for field, tokens in field_tokens.items()
     }
     return text_masks, cond_qsets
@@ -294,7 +562,7 @@ def _text_prep(
 
 def _match_text_static_mask(
     cond: FilterCondition, table: pa.Table,
-    text_masks: dict[str, dict[str, np.ndarray]] | None,
+    text_masks: dict[str, TokenGrid] | None,
 ) -> np.ndarray:
     """`(rows,)` — static `match_text`: every token of the phrase must be a
     token of the row (Qdrant MatchText vs. a `word`-tokenizer index; see
@@ -303,12 +571,17 @@ def _match_text_static_mask(
     token_masks = (text_masks or {}).get(cond.field)
     if token_masks is None:
         token_masks = _token_row_masks(table[cond.field], toks, len(table))
-    return _phrase_mask(token_masks, toks)
+    # Packed in the grid (see `TokenGrid`); this builder's contract is a
+    # `(rows,)` bool, so unpack here. Off the production path — the fused
+    # combine in `evaluate()` keeps everything packed.
+    return np.unpackbits(
+        _phrase_mask(token_masks, toks), count=len(table)
+    ).astype(bool)
 
 
 def _match_text_from_query_mask(
     cond: FilterCondition, table: pa.Table, query_values: dict[str, np.ndarray],
-    text_masks: dict[str, dict[str, np.ndarray]] | None = None,
+    text_masks: dict[str, TokenGrid] | None = None,
 ) -> np.ndarray:
     """`(n_queries, rows)` — each query's own free-text phrase, matched with
     the SAME tokenized semantics as static `match_text` (see
@@ -350,13 +623,15 @@ def _match_text_from_query_mask(
             table[cond.field], set().union(*by_tokens), n_rows,
         )
     for toks, qidxs in by_tokens.items():
-        result[qidxs, :] = _phrase_mask(token_masks, toks)
+        result[qidxs, :] = np.unpackbits(
+            _phrase_mask(token_masks, toks), count=n_rows
+        ).astype(bool)
     return result
 
 
 def _condition_mask(
     cond: FilterCondition, table: pa.Table, query_values: dict[str, np.ndarray] | None = None,
-    text_masks: dict[str, dict[str, np.ndarray]] | None = None,
+    text_masks: dict[str, TokenGrid] | None = None,
 ) -> np.ndarray:
     if cond.match_from_query is not None:
         return _match_from_query_mask(cond, table, query_values)
@@ -405,33 +680,30 @@ def _static_first(conds) -> list[FilterCondition]:
 
 def evaluate(
     filt: Filter, table: pa.Table, query_values: dict[str, np.ndarray] | None = None,
-) -> np.ndarray:
-    """A boolean mask of which rows satisfy `filt` — shape `(len(table),)` if
-    `filt` has no per-query condition anywhere (unchanged from before
-    per-query filters existed: same cost, same shape), or `(n_queries,
-    len(table))` the moment ANY condition, in ANY group, is per-query
-    (`match_from_query`/`range_from_query`/`match_text_from_query`).
+    pool=None, prep: "TextQueryPrep | None" = None,
+) -> "np.ndarray | PackedRowMask":
+    """Evaluate `filt` against one corpus file.
 
-    Uses non-in-place `&`/`|`/`~` (not `&=`/`|=`) deliberately: this is what
-    lets the `(rows,)` accumulator silently promote to `(n_queries, rows)`
-    via numpy broadcasting the first time a NON-TEXT per-query condition's
-    mask appears, regardless of group. Per-query TEXT conditions
-    (`match_text_from_query`) never materialize per-condition 2-D masks at
-    all — they take the fused, query-major path below (see the inline
-    rationale), which writes each query's finished row into the one output
-    array directly. Either way the contract is the same: callers
-    (`compute.py`) tell which case they got via `mask.ndim`."""
+    Uniform filters return a `(rows,)` boolean mask. If any condition is
+    per-query, returns a row-packed `PackedRowMask` representing
+    `(n_queries, rows)`.
+
+    Text conditions share one corpus tokenization pass per field.
+    `match_text_from_query` conditions use a packed, query-major combine so
+    per-condition `(n_queries, rows)` masks are never materialized.
+
+    `pool` may supply the shared text-scan pool, and `prep` may supply
+    file-independent query-text preprocessing.
+
+    The pre-fusion accumulators use non-in-place boolean operations so a 1-D
+    mask can broadcast to 2-D when a non-text per-query condition appears.
+    """
     n = len(table)
-    # One tokenization pass per FIELD for every text condition in the filter,
-    # plus each per-query phrase's token set (see `_text_prep`) — both empty
-    # when the filter has no text condition.
-    text_masks, cond_qsets = _text_prep(filt, table, query_values)
 
-    # Split each group into its `match_text_from_query` members (combined by
-    # the FUSED, query-major path below) and everything else (combined
-    # condition-major, exactly as before — static masks are (rows,) and
-    # cheap; non-text per-query masks are built 2-D by their own builders
-    # either way).
+    # Tokenize each text field once and reuse its token masks across conditions.
+    text_masks, cond_qsets = _text_prep(filt, table, query_values, pool, prep)
+
+    # Handle per-query text conditions separately in the packed query-major path.
     must_t = [c for c in filt.must if c.match_text_from_query is not None]
     should_t = [c for c in filt.should if c.match_text_from_query is not None]
     mnot_t = [c for c in filt.must_not if c.match_text_from_query is not None]
@@ -456,23 +728,10 @@ def evaluate(
         # No per-query text condition: the pre-fusion combine, unchanged.
         if rest_or is not None:
             keep = keep & rest_or
-        return keep
+        return pack_rows(keep) if keep.ndim == 2 else keep
 
-    # --- fused, query-major combine for the per-query text conditions ---
-    # Rationale: expanding every text condition to its own (n_queries, rows)
-    # array and combining those was ~80% of filter time on the production
-    # workload — pure memory traffic. Instead, group queries by their COMBO
-    # of token sets across all text conditions (real query sets dedupe
-    # heavily), compute each distinct combo's combined (rows,) result once
-    # from the shared per-token masks, and write each query's final row
-    # exactly ONCE. Bit-identical by construction: AND/OR are elementwise
-    # and every (query, row) cell sees the same boolean formula, just
-    # evaluated query-major instead of condition-major.
-    # Every query column referenced by the filter must agree on n_queries —
-    # mismatched lengths raised a loud broadcast ValueError on the old
-    # condition-major path, and silently truncating here instead would be a
-    # correctness trap for direct evaluate() callers (compute.py always
-    # draws all columns from one queries table, so it can't hit this).
+    # Group queries with identical text-condition token sets so each distinct
+    # boolean combination is evaluated once.
     lengths = {len(cond_qsets[c]) for c in (*must_t, *should_t, *mnot_t)}
     if len(lengths) > 1:
         raise ValueError(
@@ -494,12 +753,7 @@ def evaluate(
         )
         combos.setdefault(key, []).append(q)
 
-    # (field, token-set) → (rows,) phrase mask, shared across combos. Entries
-    # are refcounted by how many still-unprocessed combos need them and
-    # evicted at zero, so peak cache size tracks LIVE masks, not every
-    # distinct phrase the whole query set uses (which would grow linearly
-    # with text-condition count on poorly-deduping query sets, where the old
-    # condition-major path's peak was constant in condition count).
+    # Cache packed phrase masks while they still have remaining uses.
     def _combo_key_list(mkey, skey, nkey) -> list[tuple[str, frozenset[str]]]:
         """The cache keys processing this combo will touch — mirrors the
         combo loop exactly, including the dead-combo early-out."""
@@ -525,18 +779,27 @@ def evaluate(
 
     keep_2d = keep.ndim == 2
     rest_or_2d = rest_or is not None and rest_or.ndim == 2
-    out = np.empty((n_q, n), dtype=bool)
+
+    # Build the per-query result directly in row-packed form. Text phrase masks
+    # remain packed throughout; non-text accumulators are packed once before the
+    # combo loop.
+    nb = (n + 7) // 8
+    keep_p = None if keep_2d else np.packbits(keep)
+    keep_pk = np.packbits(keep, axis=1) if keep_2d else None
+    rest_or_p = (np.packbits(rest_or)
+                 if rest_or is not None and not rest_or_2d else None)
+    rest_or_pk = np.packbits(rest_or, axis=1) if rest_or_2d else None
+    out = np.empty((n_q, nb), dtype=np.uint8)
     for (mkey, skey, nkey), qidxs in combos.items():
         if any(ts is None for ts in mkey):
-            # a null/token-less phrase in a `must` matches nothing for that
-            # query, so the whole row is False regardless of anything else.
-            out[qidxs] = False
+            # A null/token-less required phrase makes this query combo impossible.
+            out[qidxs] = 0
             continue
-        # 1-D parts shared by every query in this combo:
+        # 1-D PACKED parts shared by every query in this combo:
         parts: list[np.ndarray] = [_pmask(c, ts) for c, ts in zip(must_t, mkey)]
         for c, ts in zip(mnot_t, nkey):
             if ts is not None:  # None: matches nothing → ¬nothing keeps all
-                parts.append(~_pmask(c, ts))
+                parts.append(_packed_not(_pmask(c, ts), n))
         or_2d = None
         if filt.should:
             s = None  # this combo's OR over the should group's text members
@@ -547,29 +810,31 @@ def evaluate(
                 s = pm if s is None else (s | pm)
             if rest_or is None:
                 # should group is all-text: s (or nothing matched → False row)
-                parts.append(s if s is not None else np.zeros(n, dtype=bool))
+                parts.append(s if s is not None else np.zeros(nb, dtype=np.uint8))
             elif not rest_or_2d:
-                parts.append(rest_or if s is None else (rest_or | s))
+                parts.append(rest_or_p if s is None else (rest_or_p | s))
             else:
-                or_2d = rest_or[qidxs] if s is None else (rest_or[qidxs] | s)
+                or_2d = (rest_or_pk[qidxs] if s is None
+                         else (rest_or_pk[qidxs] | s))
         if not keep_2d:
-            parts.append(keep)
-        # parts can be empty (e.g. every must_not phrase null for this combo
-        # while `keep` is 2-D) — the combo then constrains nothing 1-D.
-        row = np.ones(n, dtype=bool)
+            parts.append(keep_p)
+        # Start from packed all-True and apply the combo's shared constraints.
+        row = _packed_ones(n)
         for p in parts:
-            row = row & p
+            row &= p
         if keep_2d or or_2d is not None:
+             # Remaining non-text constraints vary by query within the combo.
             block = row[None, :]
             if keep_2d:
-                block = block & keep[qidxs]
+                block = block & keep_pk[qidxs]
             if or_2d is not None:
                 block = block & or_2d
             out[qidxs] = block
         else:
+            # The production shape: one packed row, broadcast to the combo.
             out[qidxs] = row
         for k in _combo_key_list(mkey, skey, nkey):
             key_refs[k] -= 1
             if key_refs[k] == 0:
                 phrase_cache.pop(k, None)
-    return out
+    return PackedRowMask(out, n)

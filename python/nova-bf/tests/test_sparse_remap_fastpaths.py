@@ -186,7 +186,11 @@ def test_lookup_matches_binary_search(seed, dtype):
     ids = rng.integers(0, 700, size=200).astype(dtype)
     got = compute_mod._vocab_lookup(vocab, ids)
     np.testing.assert_array_equal(got, _reference_lookup(vocab, ids))
-    assert got.dtype == np.int64
+    # int32, not int64: a lookup result is a POSITION in the vocabulary, and
+    # the narrower result halves the nnz-sized array `_remap_sparse_file`
+    # allocates per corpus file (R2). Both paths must agree on it, or the
+    # LUT/binary-search choice would be observable downstream.
+    assert got.dtype == np.int32
 
 
 def test_lookup_edges():

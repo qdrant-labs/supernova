@@ -136,19 +136,13 @@ def _sparse_array(rows) -> pa.Array:
 
 
 def build(tmp_path, n_queries: int = N_QUERIES) -> Dataset:
-    """Generate the corpus + queries under `tmp_path` and return the truth.
+    """Generate the corpus and queries and return the expected truth.
 
-    `n_queries` varies ONLY the query side: the corpus is drawn first, from the
-    same seeded generator, so every dataset built here has bit-identical
-    documents regardless of how many queries accompany them. That is what lets
-    the mask-height suite ask for a taller query file and still reuse the one
-    Qdrant collection everything else was loaded into.
+    `n_queries` changes only the query side; the corpus is generated first, so
+    its contents remain identical across query counts.
 
-    Why it needs one: a per-query filter mask is bit-PACKED along the query
-    axis (`compute._pack_query_axis`), so with 8 queries every mask — whatever
-    its height — is a single byte, and reading one at the wrong height is
-    invisible. Heights only become distinguishable once they span different
-    numbers of bytes.
+    Variable query counts exercise `PackedRowMask` height validation and make
+    per-query row-union narrowing observable in the test fixture.
     """
     rng = np.random.default_rng(SEED)
     corpus_dir = tmp_path / "corpus"

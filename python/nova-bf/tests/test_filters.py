@@ -20,6 +20,22 @@ from nova_bf.config import (
 from nova_bf.filters import _static_first, _token_row_masks, evaluate
 
 
+def _ev(filt, table, query_values=None):
+    """`evaluate()` with the per-query result expanded.
+
+    A filter with any per-query condition returns a `filters.PackedRowMask`
+    (row-bit-packed) rather than an `(n_queries, rows)` bool array — the
+    production `filtered_text` mask is 10.8 GB per file unpacked, so the packed
+    form is the real one and `.unpack()` is the debug view. These tests assert
+    on cell values at fixture sizes, so they expand. A uniform filter still
+    returns a plain `(rows,)` array and passes straight through.
+    """
+    mask = evaluate(filt, table, query_values)
+    return mask.unpack() if hasattr(mask, "unpack") else mask
+
+
+
+
 def _table(**cols):
     return pa.table(cols)
 
@@ -27,25 +43,25 @@ def _table(**cols):
 def test_match_scalar_equality():
     t = _table(language=["eng", "fra", "eng", "deu"])
     f = Filter(must=[FilterCondition(field="language", match="eng")])
-    assert evaluate(f, t).tolist() == [True, False, True, False]
+    assert _ev(f, t).tolist() == [True, False, True, False]
 
 
 def test_match_any_of_list():
     t = _table(language=["eng", "fra", "spa", "deu"])
     f = Filter(must=[FilterCondition(field="language", match=["eng", "spa"])])
-    assert evaluate(f, t).tolist() == [True, False, True, False]
+    assert _ev(f, t).tolist() == [True, False, True, False]
 
 
 def test_range_single_bound():
     t = _table(cost=[1, 5, 10, 20])
     f = Filter(must=[FilterCondition(field="cost", range=RangeCondition(lt=10))])
-    assert evaluate(f, t).tolist() == [True, True, False, False]
+    assert _ev(f, t).tolist() == [True, True, False, False]
 
 
 def test_range_combined_bounds_within_one_condition():
     t = _table(cost=[1, 5, 10, 20])
     f = Filter(must=[FilterCondition(field="cost", range=RangeCondition(gte=5, lt=20))])
-    assert evaluate(f, t).tolist() == [False, True, True, False]
+    assert _ev(f, t).tolist() == [False, True, True, False]
 
 
 def test_must_is_and():
@@ -54,7 +70,7 @@ def test_must_is_and():
         FilterCondition(field="language", match="eng"),
         FilterCondition(field="cost", range=RangeCondition(lt=10)),
     ])
-    assert evaluate(f, t).tolist() == [True, False, False, False]
+    assert _ev(f, t).tolist() == [True, False, False, False]
 
 
 def test_should_is_any_of():
@@ -63,25 +79,25 @@ def test_should_is_any_of():
         FilterCondition(field="language", match="eng"),
         FilterCondition(field="language", match="fra"),
     ])
-    assert evaluate(f, t).tolist() == [True, True, False]
+    assert _ev(f, t).tolist() == [True, True, False]
 
 
 def test_must_not_excludes():
     t = _table(language=["eng", "fra", "deu"])
     f = Filter(must_not=[FilterCondition(field="language", match="fra")])
-    assert evaluate(f, t).tolist() == [True, False, True]
+    assert _ev(f, t).tolist() == [True, False, True]
 
 
 def test_null_payload_value_never_matches():
     t = _table(cost=[1, None, 10])
     f = Filter(must=[FilterCondition(field="cost", range=RangeCondition(lt=100))])
-    assert evaluate(f, t).tolist() == [True, False, True]
+    assert _ev(f, t).tolist() == [True, False, True]
 
 
 def test_match_text_single_word():
     t = _table(text=["a chronic illness", "a brief cold", "chronically ill"])
     f = Filter(must=[FilterCondition(field="text", match_text="chronic")])
-    assert evaluate(f, t).tolist() == [True, False, False]
+    assert _ev(f, t).tolist() == [True, False, False]
 
 
 def test_match_text_requires_all_words():
@@ -92,25 +108,25 @@ def test_match_text_requires_all_words():
         "unrelated text",
     ])
     f = Filter(must=[FilterCondition(field="text", match_text="chronic fatigue syndrome")])
-    assert evaluate(f, t).tolist() == [True, False, False, False]
+    assert _ev(f, t).tolist() == [True, False, False, False]
 
 
 def test_match_text_case_insensitive():
     t = _table(text=["Chronic Fatigue", "chronic fatigue", "CHRONIC FATIGUE SYNDROME"])
     f = Filter(must=[FilterCondition(field="text", match_text="chronic fatigue")])
-    assert evaluate(f, t).tolist() == [True, True, True]
+    assert _ev(f, t).tolist() == [True, True, True]
 
 
 def test_match_text_word_boundary():
     t = _table(text=["a cat sat", "category theory", "cats and dogs"])
     f = Filter(must=[FilterCondition(field="text", match_text="cat")])
-    assert evaluate(f, t).tolist() == [True, False, False]
+    assert _ev(f, t).tolist() == [True, False, False]
 
 
 def test_match_text_null_field_never_matches():
     t = _table(text=["chronic fatigue", None, "chronic fatigue syndrome"])
     f = Filter(must=[FilterCondition(field="text", match_text="chronic fatigue")])
-    assert evaluate(f, t).tolist() == [True, False, True]
+    assert _ev(f, t).tolist() == [True, False, True]
 
 
 def test_condition_requires_exactly_one_of_match_range_or_match_text():
@@ -155,7 +171,7 @@ def test_match_from_query_scalar():
     t = _table(tenant_id=["A", "B", "A", "C"])
     f = Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")])
     qv = {"tenant_id": np.array(["A", "C"], dtype=object)}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.shape == (2, 4)
     assert mask.tolist() == [
         [True, False, True, False],   # query 0 wants tenant A
@@ -169,7 +185,7 @@ def test_match_from_query_list_any():
     f = Filter(must=[FilterCondition(field="category", match_from_query="allowed")])
     qv = {"allowed": np.empty(2, dtype=object)}
     qv["allowed"][:] = [["books", "toys"], ["electronics"]]
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.tolist() == [
         [True, False, True, True],
         [False, True, False, False],
@@ -186,7 +202,7 @@ def test_match_from_query_list_any_with_null_corpus_value():
     f = Filter(must=[FilterCondition(field="category", match_from_query="allowed")])
     qv = {"allowed": np.empty(1, dtype=object)}
     qv["allowed"][:] = [["books", "toys"]]
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.tolist() == [[True, False, True]]
 
 
@@ -194,7 +210,7 @@ def test_match_from_query_null_never_matches_on_either_side():
     t = _table(tenant_id=["A", None, "C"])
     f = Filter(must=[FilterCondition(field="tenant_id", match_from_query="tenant_id")])
     qv = {"tenant_id": np.array(["A", None], dtype=object)}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     # query 0 (wants "A"): matches row 0 only, never the null corpus row
     assert mask[0].tolist() == [True, False, False]
     # query 1 (itself null): matches nothing, including the null corpus row
@@ -212,7 +228,7 @@ def test_match_from_query_list_any_with_nan_query_value():
     f = Filter(must=[FilterCondition(field="category", match_from_query="allowed")])
     qv = {"allowed": np.empty(3, dtype=object)}
     qv["allowed"][:] = [["books", "toys"], np.nan, None]
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.tolist() == [
         [True, False, True],
         [False, False, False],  # NaN query: matches nothing, same as None
@@ -224,7 +240,7 @@ def test_range_from_query_single_bound():
     t = _table(cost=[5.0, 15.0, 8.0, 3.0])
     f = Filter(must=[FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget"))])
     qv = {"max_budget": np.array([10.0, 5.0, 20.0])}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.tolist() == [
         [True, False, True, True],
         [False, False, False, True],
@@ -238,7 +254,7 @@ def test_range_from_query_multi_bound_in_one_condition():
         field="cost", range_from_query=RangeFromQuery(gte="lo", lt="hi"),
     )])
     qv = {"lo": np.array([2.0]), "hi": np.array([15.0])}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.tolist() == [[False, True, True, False]]
 
 
@@ -246,7 +262,7 @@ def test_range_from_query_null_query_value_never_matches():
     t = _table(cost=[1.0, 5.0, 10.0])
     f = Filter(must=[FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget"))])
     qv = {"max_budget": np.array([100.0, np.nan])}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask[0].tolist() == [True, True, True]
     assert mask[1].tolist() == [False, False, False]
 
@@ -255,7 +271,7 @@ def test_range_from_query_null_corpus_value_never_matches():
     t = _table(cost=[1.0, None, 10.0])
     f = Filter(must=[FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget"))])
     qv = {"max_budget": np.array([100.0])}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask[0].tolist() == [True, False, True]
 
 
@@ -269,7 +285,7 @@ def test_range_from_query_and_static_range_combine_as_two_conditions():
         FilterCondition(field="cost", range_from_query=RangeFromQuery(lt="max_budget")),
     ])
     qv = {"max_budget": np.array([10.0])}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.tolist() == [[False, True, True, False]]
 
 
@@ -277,7 +293,7 @@ def test_match_text_from_query_basic():
     t = _table(title=["wireless mouse", "keyboard combo", "wireless keyboard"])
     f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
     qv = {"phrase": np.array(["wireless", "keyboard"], dtype=object)}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.tolist() == [
         [True, False, True],
         [False, True, True],
@@ -288,7 +304,7 @@ def test_match_text_from_query_dedup_shares_result_for_identical_phrase():
     t = _table(title=["wireless mouse", "gaming keyboard"])
     f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
     qv = {"phrase": np.array(["mouse", "keyboard", "mouse"], dtype=object)}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     # queries 0 and 2 share an identical phrase -> identical row masks
     assert mask[0].tolist() == mask[2].tolist() == [True, False]
     assert mask[1].tolist() == [False, True]
@@ -298,7 +314,7 @@ def test_match_text_from_query_null_phrase_never_matches():
     t = _table(title=["wireless mouse", "gaming keyboard"])
     f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
     qv = {"phrase": np.array(["mouse", None], dtype=object)}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask[0].tolist() == [True, False]
     assert mask[1].tolist() == [False, False]
 
@@ -312,7 +328,7 @@ def test_match_text_from_query_blank_phrase_never_matches():
     t = _table(title=["wireless mouse", "gaming keyboard"])
     f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
     qv = {"phrase": np.array(["mouse", "", "   "], dtype=object)}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.shape == (3, 2)
     assert mask[0].tolist() == [True, False]
     assert mask[1].tolist() == [False, False]
@@ -329,7 +345,7 @@ def test_match_text_from_query_shared_word_across_phrases():
     t = _table(title=["wireless mouse", "wireless keyboard", "wired mouse", "gaming chair"])
     f = Filter(must=[FilterCondition(field="title", match_text_from_query="phrase")])
     qv = {"phrase": np.array(["wireless mouse", "Wireless keyboard"], dtype=object)}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask[0].tolist() == [True, False, False, False]
     assert mask[1].tolist() == [False, True, False, False]
 
@@ -343,16 +359,17 @@ def test_token_row_masks_whole_token_null_and_absent():
 
     col = pa.chunked_array([pa.array(["tax season", "taxes are due", None, "no match here", "TAX"])])
     masks = _token_row_masks(col, {"tax", "zzznowhere"}, len(col))
-    assert masks["tax"].tolist() == [True, False, False, False, True]
-    assert masks["zzznowhere"].tolist() == [False, False, False, False, False]
+    # `masks` is a bit-packed `TokenGrid` (R7); `.mask()` materialises a row.
+    assert masks.mask("tax").tolist() == [True, False, False, False, True]
+    assert masks.mask("zzznowhere").tolist() == [False, False, False, False, False]
 
 
 def test_static_only_filter_stays_one_dimensional():
-    """No per-query condition anywhere -> evaluate() returns (rows,), exactly
+    """No per-query condition anywhere -> _ev() returns (rows,), exactly
     the pre-per-query-filters shape/cost, not (n_queries, rows)."""
     t = _table(language=["eng", "fra"])
     f = Filter(must=[FilterCondition(field="language", match="eng")])
-    mask = evaluate(f, t, None)
+    mask = _ev(f, t, None)
     assert mask.ndim == 1
     assert mask.tolist() == [True, False]
 
@@ -363,7 +380,7 @@ def test_any_per_query_condition_in_any_group_promotes_to_two_dimensional(group)
     cond = FilterCondition(field="tenant_id", match_from_query="tenant_id")
     f = Filter(**{group: [cond]})
     qv = {"tenant_id": np.array(["A", "B"])}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.ndim == 2
     assert mask.shape == (2, 2)
 
@@ -375,7 +392,7 @@ def test_should_group_mixes_static_and_per_query_condition():
         FilterCondition(field="tenant_id", match_from_query="tenant_id"),
     ])
     qv = {"tenant_id": np.array(["B"])}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     # row 0: public -> always eligible. row 1: matches this query's own tenant B.
     # row 2: neither public nor this query's tenant -> excluded.
     assert mask.tolist() == [[True, True, False]]
@@ -392,7 +409,7 @@ def test_must_group_mixes_static_and_per_query_condition():
         FilterCondition(field="status", match="active"),
     ])
     qv = {"tenant_id": np.array(["A", "B"], dtype=object)}
-    mask = evaluate(f, t, qv)
+    mask = _ev(f, t, qv)
     assert mask.shape == (2, 4)
     # query 0 (tenant A): rows 0/2 are tenant A, but row 2 is archived.
     # query 1 (tenant B): row 1 is tenant B and active.

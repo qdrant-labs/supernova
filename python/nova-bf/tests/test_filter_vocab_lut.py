@@ -13,6 +13,7 @@ import pytest
 
 from nova_bf.compute import (
     _VOCAB_LUT_MAX_BYTES,
+    _VOCAB_LUT_ITEMSIZE,
     _build_vocab_lut,
     _encode_against_vocab,
     _vocab_lookup,
@@ -63,7 +64,7 @@ def test_a_vocab_over_the_byte_cap_gets_no_table():
     handful of widely-spread ids can ask for gigabytes. Past the cap there is no
     table and `_vocab_lookup` falls back — the behaviour this fix must preserve,
     because that is the case where prebuilding would be worst."""
-    too_big = np.array([0, _VOCAB_LUT_MAX_BYTES // 8 + 10], dtype=np.int64)
+    too_big = np.array([0, _VOCAB_LUT_MAX_BYTES // _VOCAB_LUT_ITEMSIZE + 10], dtype=np.int64)
     assert _build_vocab_lut(too_big) is None
     vals = np.array([0, 7], dtype=np.int64)
     assert _encode_against_vocab(too_big, vals, None).tolist() == [0, -1]
@@ -182,8 +183,8 @@ def test_the_two_budgets_are_independent_knobs():
 
     assert isinstance(_VOCAB_LUT_PREBUILD_BYTES, int)
     # `_lut_vocab_ok` — the speed decision — must consult only the per-table cap
-    fits = np.array([0, _VOCAB_LUT_MAX_BYTES // 8 - 5], dtype=np.int64)
-    over = np.array([0, _VOCAB_LUT_MAX_BYTES // 8 + 10], dtype=np.int64)
+    fits = np.array([0, _VOCAB_LUT_MAX_BYTES // _VOCAB_LUT_ITEMSIZE - 5], dtype=np.int64)
+    over = np.array([0, _VOCAB_LUT_MAX_BYTES // _VOCAB_LUT_ITEMSIZE + 10], dtype=np.int64)
     assert _lut_vocab_ok(fits) and not _lut_vocab_ok(over)
 
 

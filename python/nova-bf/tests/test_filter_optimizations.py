@@ -33,6 +33,22 @@ from nova_bf.filters import _condition_mask, _match_text_from_query_mask, _token
 from nova_bf.tokenize import tokenize
 
 
+def _ev(filt, table, query_values=None):
+    """`evaluate()` with the per-query result expanded.
+
+    A filter with any per-query condition returns a `filters.PackedRowMask`
+    (row-bit-packed) rather than an `(n_queries, rows)` bool array — the
+    production `filtered_text` mask is 10.8 GB per file unpacked, so the packed
+    form is the real one and `.unpack()` is the debug view. These tests assert
+    on cell values at fixture sizes, so they expand. A uniform filter still
+    returns a plain `(rows,)` array and passes straight through.
+    """
+    mask = evaluate(filt, table, query_values)
+    return mask.unpack() if hasattr(mask, "unpack") else mask
+
+
+
+
 def _ref_tokens(text):
     """Independent reference tokenizer — same SEMANTICS (split alphanumeric
     runs, then lowercase), deliberately different formulation and engine
@@ -118,7 +134,7 @@ def test_query_and_corpus_tokenize_identically_on_divergent_codepoints():
         ("οδυσσευσ", [False, True, False]),   # arrow-lowercased spelling (σ)
     ]:
         f = Filter(must=[FilterCondition(field="text", match_text=phrase)])
-        assert evaluate(f, t).tolist() == expect, phrase
+        assert _ev(f, t).tolist() == expect, phrase
         got = _match_text_from_query_mask(_cond(), t, {"kw": np.array([phrase], dtype=object)})
         assert got[0].tolist() == expect, phrase
 
@@ -164,7 +180,7 @@ def test_fuzz_evaluate_must_should_vs_reference(seed):
             FilterCondition(field="url", match_text_from_query="d2"),
         ],
     )
-    got = evaluate(f, t, {"kw": kw, "d1": d1, "d2": d2})
+    got = _ev(f, t, {"kw": kw, "d1": d1, "d2": d2})
     ref = _ref_mask(texts, kw) & (_ref_mask(urls, d1) | _ref_mask(urls, d2))
     assert np.array_equal(got, ref), f"seed={seed}"
 
@@ -173,7 +189,7 @@ def _condition_major_evaluate(filt, table, qv=None):
     """The pre-fusion combine: every condition expands to its own mask
     (per-query text conditions each materialize (n_queries, rows)), then
     groups AND/OR the full arrays — the reference the fused, query-major
-    `evaluate()` must match bit-for-bit."""
+    `_ev()` must match bit-for-bit."""
     n = len(table)
     keep = np.ones(n, dtype=bool)
     for cond in filt.must:
@@ -238,7 +254,7 @@ def test_fuzz_fused_evaluate_bit_identical_to_condition_major(seed):
         groups["must"].append(rand_cond())
     filt = Filter(**{g: tuple(cs) for g, cs in groups.items()})
 
-    got = evaluate(filt, t, qv)
+    got = _ev(filt, t, qv)
     ref = _condition_major_evaluate(filt, t, qv)
     assert got.ndim == ref.ndim and got.shape == ref.shape, f"seed={seed} {got.shape} vs {ref.shape}"
     assert np.array_equal(got, ref), (
@@ -253,7 +269,7 @@ def test_static_match_text_same_tokenized_semantics():
     t = pa.table({"text": pa.array(["high-fat diet", "a HIGH fat meal", "low-fat", "fat", None])})
     for query in ("high-fat", "high fat", "HIGH FAT!", "fat...high"):
         f = Filter(must=[FilterCondition(field="text", match_text=query)])
-        got = evaluate(f, t)
+        got = _ev(f, t)
         assert got.tolist() == [True, True, False, False, False], query
 
 
@@ -285,7 +301,7 @@ def test_token_row_masks_multi_batch_and_threads():
     for tok in ("fever", "dna", "gene", "fat"):
         base_ref = [t is not None and tok in _ref_tokens(t) for t in base]
         ref = np.array(base_ref * 2000, dtype=bool)
-        assert np.array_equal(got[tok], ref), tok
+        assert np.array_equal(got.mask(tok), ref), tok
 
 
 def test_large_string_column_smoke():
@@ -295,3 +311,182 @@ def test_large_string_column_smoke():
     t = pa.table({"text": pa.array(["chronic fatigue", "acute onset", None], type=pa.string())})
     got = _match_text_from_query_mask(_cond(), t, {"kw": np.array(["chronic", "acute"], dtype=object)})
     assert got.tolist() == [[True, False, False], [False, True, False]]
+
+
+# ==========================================================================
+# R4b: the shared scan pool
+# ==========================================================================
+def _multi_batch_column(n_rows=40_000, seed=3):
+    """A text column big enough that `_token_row_masks` splits it into
+    several batches — otherwise the pool is never exercised and a test on it
+    proves nothing."""
+    rng = np.random.default_rng(seed)
+    vocab = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta",
+             "theta", "iota", "kappa"]
+    rows = []
+    for _ in range(n_rows):
+        k = int(rng.integers(3, 12))
+        rows.append(" ".join(rng.choice(vocab, size=k)))
+    # a few nulls, which take the "null row splits to a null token list" path
+    rows[7] = None
+    rows[n_rows // 2] = None
+    return pa.chunked_array([pa.array(rows, type=pa.large_string())])
+
+
+def test_shared_scan_pool_gives_identical_masks():
+    """R4b moves tokenisation onto one process-wide pool so filter throughput
+    stops being a function of `io_workers`. It must be a pure scheduling
+    change: the masks are a scatter into disjoint column ranges of one grid,
+    so WHICH thread runs a batch cannot matter — this pins that it does not.
+
+    Run against the same column three ways: no pool (serial/private), a
+    private pool (today's default), and a shared pool of a deliberately
+    awkward width that does not divide the batch count.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from nova_bf.filters import _token_row_masks
+
+    col = _multi_batch_column()
+    tokens = {"alpha", "delta", "kappa", "absent"}
+    n = len(col)
+
+    ref = _token_row_masks(col, tokens, n, None)
+    # The premise: this really did split into more than one batch. `nbytes > 0`
+    # used to stand in for that and proved nothing — ask the sizer directly.
+    from nova_bf.filters import _scan_batch_rows
+
+    _bs = _scan_batch_rows(col.nbytes, n, 1)
+    assert _bs < n, (
+        f"batch of {_bs} rows over {n} rows is a single batch; this test is "
+        f"not exercising the split it claims to")
+    for width in (1, 3, 8, 32):
+        with ThreadPoolExecutor(max_workers=width) as pool:
+            got = _token_row_masks(col, tokens, n, pool)
+        assert set(got) == set(ref)
+        for t in ref:
+            np.testing.assert_array_equal(got[t], ref[t], err_msg=f"{t} @ {width}")
+    # and the masks are not vacuous
+    assert ref.mask("alpha").any() and not ref.mask("absent").any()
+
+
+def test_shared_pool_batch_sizing_tracks_the_pool_not_the_machine():
+    """`batch_rows` is derived from whatever will RUN the batches.
+
+    With a shared pool the machine's core count is no longer that number, and
+    sizing against it would hand a 2-thread pool 64 tiny batches. The byte cap
+    is orthogonal and must still bind on a wide pool with fat rows.
+    """
+    from nova_bf.filters import _BATCH_TEXT_BYTES, _scan_batch_rows
+
+    n_rows = 1_000_000
+    nbytes = 50 * n_rows                       # 50 B/row: the byte cap is loose here
+    narrow = _scan_batch_rows(nbytes, n_rows, 2)
+    wide = _scan_batch_rows(nbytes, n_rows, 32)
+    assert narrow > wide, (narrow, wide)
+    # R7: every answer owns whole bytes of the packed grid.
+    assert narrow % 8 == 0 and wide % 8 == 0
+    assert narrow == (n_rows // 4) & ~7         # ~2 batches per thread
+    assert wide == (n_rows // 64) & ~7
+
+    # Fat rows: the BYTE cap binds instead, and the pool width stops mattering.
+    #
+    # The cap really does bind now. This used to assert
+    # `max(4096, (_BATCH_TEXT_BYTES // fat) & ~7)`, i.e. the anti-tiny-batch
+    # floor overriding the byte cap — which contradicted this test's own
+    # docstring and let a batch allocate far past the documented bound. The
+    # floor is a preference on the PARALLELISM term only; a memory bound wins.
+    fat = 4 << 20                              # 4 MiB/row
+    capped = max(8, (_BATCH_TEXT_BYTES // fat) & ~7)
+    assert _scan_batch_rows(fat * n_rows, n_rows, 2) == \
+        _scan_batch_rows(fat * n_rows, n_rows, 32) == capped
+    assert capped < 4096, "this case is meant to show the cap beating the floor"
+
+    # And the 4096-row floor survives a pool so wide it would ask for less.
+    assert _scan_batch_rows(100 * 10_000, 10_000, 4096) == 4096
+
+    # R7's third cap: the per-batch BOOL sub-grid. A big vocabulary shrinks
+    # the batch even when text bytes and pool width would both allow more.
+    from nova_bf.filters import _SUBGRID_BYTES
+    many = _scan_batch_rows(nbytes, n_rows, 2, n_tokens=20_000)
+    assert many < narrow
+    # Same correction as the byte cap above: the token bound binds, and the
+    # 4096 floor does not get to override it. 832 rows x 20k tokens is a
+    # 16.6 MB sub_grid; the old `max(4096, ...)` asked for 82 MB, per thread.
+    assert many == max(8, (_SUBGRID_BYTES // 20_000) & ~7)
+    assert many * 20_000 <= _SUBGRID_BYTES
+
+
+def test_a_failing_reader_does_not_leak_the_shared_scan_pool(tmp_path):
+    """The shared `bf-scan` pool lives for the whole scan, so `run_compute` owns
+    it in a `try/finally`. Without that, a reader thread that raises (here: a
+    filter on a column the corpus does not have) propagates out of `run_compute`
+    past the `shutdown()` and leaves `cpu_thread_count` idle threads alive for
+    the life of the process — every subsequent run stacking another pool on top.
+    """
+    import threading
+
+    import pyarrow.parquet as pq
+    import torch  # noqa: F401  — run_compute needs it
+
+    from nova_bf.compute import run_compute
+    from nova_bf.config import (
+        BruteForceConfig, CorpusConfig, OutputConfig, ParamsConfig,
+        QueriesConfig, SearchSpec,
+    )
+
+    def _live_scan_threads():
+        return [t for t in threading.enumerate()
+                if t.is_alive() and t.name.startswith("bf-scan")]
+
+    assert not _live_scan_threads(), "a previous test already leaked one"
+
+    # File 0 is big enough that the text scan splits into several batches and
+    # therefore actually SUBMITS to the shared pool (a one-batch scan never
+    # spawns a thread, and the leak would be invisible). File 1 has no `text`
+    # column at all, so `evaluate()` raises in the reader after the pool's
+    # threads exist.
+    rng = np.random.default_rng(0)
+    cdir = tmp_path / "c"
+    cdir.mkdir()
+    n0 = 12_000
+    pq.write_table(pa.table({
+        "dense_embedding": pa.array(
+            rng.standard_normal((n0, 3)).astype(np.float32).tolist(),
+            pa.list_(pa.float32())),
+        "id": pa.array([f"a{r}" for r in range(n0)]),
+        "text": pa.array([f"doc {r}" for r in range(n0)]),
+    }), str(cdir / "f0.parquet"))
+    pq.write_table(pa.table({
+        "dense_embedding": pa.array(
+            rng.standard_normal((4, 3)).astype(np.float32).tolist(),
+            pa.list_(pa.float32())),
+        "id": pa.array([f"b{r}" for r in range(4)]),
+    }), str(cdir / "f1.parquet"))
+    qpath = tmp_path / "q.parquet"
+    pq.write_table(pa.table({
+        "dense_embedding": pa.array(
+            rng.standard_normal((2, 3)).astype(np.float32).tolist(),
+            pa.list_(pa.float32())),
+        "qid": pa.array(["q0", "q1"]),
+    }), str(qpath))
+    out = tmp_path / "out"
+    out.mkdir()
+
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=str(cdir), id_column="id"),
+        queries=QueriesConfig(path=str(qpath), id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(io_workers=1, cpu_thread_count=3),
+        searches=[SearchSpec(
+            name="bad", metric="dot", k=2,
+            # a `match_text` leaf keeps this off the GPU path, so it reaches
+            # `evaluate()` — fine on file 0, absent column on file 1.
+            filter=Filter(must=[FilterCondition(field="text", match_text="doc")]),
+        )],
+    )
+    with pytest.raises(RuntimeError, match="reader thread failed"):
+        run_compute(cfg)
+
+    assert not _live_scan_threads(), (
+        "run_compute left its shared scan pool running after a reader failure")
