@@ -2,8 +2,8 @@
 
 `topk_triton._cutfill` no longer writes anything into a pruned row — not the
 k sentinel keys, not the k ids. That fill was hardening, and at the production
-shape it cost 1.2 GB of stores per slice on output nobody reads, on ~97% of
-rows once a rank reaches steady state (G1 in
+shape it cost substantial stores per slice on output nobody reads, on the
+vast majority of rows once a rank reaches steady state (G1 in
 `docs/brute-force/perf-design-2026-09-05.md`). What replaced it is this file.
 
 The fill made a stray read SURVIVABLE — a sentinel loses to every real

@@ -98,7 +98,7 @@ def test_fallback_retains_no_dense_query_copy(case, monkeypatch):
     on the RUN-WIDE cache. That is a second full copy of the largest resident
     tensor (`n_q x vocab` float32), allocated on the branch taken precisely
     when the slice is already too big for the dense operand, and never freed —
-    7.2 -> 14.4 GiB at the fineweb shape on a 24 GB card.
+    doubling it at the production shape, past the card's capacity.
 
     The existing fallback tests could not catch it: each passes a FRESH cache,
     so nothing crosses slices. This one reuses one cache across several slices
@@ -162,7 +162,7 @@ def test_chunked_scoring_matches_the_whole_dense_path(case, monkeypatch):
     columns are independent of every other chunk's, so splitting must not
     change the answer beyond ordinary matmul rounding: not the zero-gate set,
     and not the values past float tolerance. (Not asserted bit-identical:
-    the doc above measured chunked vs. unchunked dense differing on
+    the doc above found chunked vs. unchunked dense differing on
     5/100,000 queries at production scale, attributed to the dense branch's
     own float accumulation rather than to chunking.)"""
     Q, Cb = case
@@ -512,7 +512,7 @@ def test_zero_row_slice_does_not_crash_chunked_scoring_or_gate(monkeypatch, devi
     kernels have historically had rough edges on zero-sized operands the CPU
     path doesn't share, and a corpus slice CAN filter down to 0 rows mid-run
     (not just the whole-file-empty case guarded upstream in
-    `_process_batch_group`) — verified once by hand against a live A10G
+    `_process_batch_group`) — verified once by hand against a live GPU
     worker; this is what makes that verification permanent and repeatable
     instead of a one-off manual check."""
     from nova_bf.compute import SparseBatchSlice
@@ -711,8 +711,8 @@ def _csr_parts(t):
 def test_query_csr_is_identical_however_it_is_blocked(monkeypatch, n_q, vocab,
                                                       kind):
     """`_csr` builds the pattern in row blocks so the transient `(rows, vocab)`
-    bool is bounded by block height rather than by `n_q` (1.8 GiB at 100k x
-    18k, live next to the 7.2 GiB `Q` it comes from). Blocking must be a pure
+    bool is bounded by block height rather than by `n_q` (a large transient at
+    production shape, live next to the `Q` it comes from). Blocking must be a pure
     memory optimisation: the crow prefix sum composes across blocks, so every
     block height has to give the same CSR.
     """

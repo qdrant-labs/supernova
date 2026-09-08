@@ -4,7 +4,7 @@
 inputs after their last use (`table`, `masks`, `mask`), releasing the hand-off
 locals after `fq.put` (`arrs`, `batches`, `keeps`, ...), and narrowing the
 table to just the filter columns before `evaluate`, its peak phase. Together
-they are worth roughly -20 GiB of peak host RSS, and all three are only safe
+they are worth a large reduction in peak host RSS, and all three are only safe
 because Arrow buffers are refcounted: whatever is still referenced downstream
 keeps exactly the buffers it needs alive.
 

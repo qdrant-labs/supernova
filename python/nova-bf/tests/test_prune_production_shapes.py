@@ -183,8 +183,9 @@ def _big_corpus(tmp_path, n_files=8, per_file=300_000, seed=0):
     """~2.4M rows. At k=1000 the corpus has to be MILLIONS of rows before
     anything is prunable: a slice is only dead if its whole max falls below
     the 1000th best score, and with a small corpus almost every slice still
-    holds a top-1000 candidate. Measured prunability for dense cosine at
-    k=1000 is ~8% at 2^21 rows, so anything smaller makes this test vacuous.
+    holds a top-1000 candidate. Prunability for dense cosine at k=1000 only
+    becomes non-trivial around 2^21 rows, so anything smaller makes this test
+    vacuous.
     """
     rng = np.random.default_rng(seed)
     cdir = tmp_path / "cbig"

@@ -6,7 +6,7 @@
     tier 2  GPU, int32 key halves, two passes per 8 id bytes
     tier 3  CPU, Arrow's string sort         no CUDA, or ids not fixed-width
 
-Measured on a real shard (315M ids): 10.6s / 24.6s / 503.1s. Speed is the whole
+The tiers differ by orders of magnitude on a real shard. Speed is the whole
 point of the split, which is exactly why it needs pinning -- a fast path that
 quietly ranks differently would corrupt ground truth rather than fail.
 
@@ -192,7 +192,7 @@ def test_all_three_ordinal_paths_return_identical_hits(ds_fixed, monkeypatch):
 
     NOT the "strong claim" an earlier version of this docstring asserted: this
     corpus has no exact score ties, so the tie-break decides nothing and these
-    hits would match even if `build_ordinals` were wrong — measured, by
+    hits would match even if `build_ordinals` were wrong — observed, by
     reversing the ranking entirely and seeing 0 of 16 results move. What it
     does pin is that swapping the ranking path leaves the sharded pipeline
     undisturbed. The ordinals are pinned by
@@ -221,7 +221,7 @@ def test_all_three_paths_produce_identical_ORDINALS():
 
     The result-level tests above can pass while the ranking is wrong: this
     corpus has no exact score ties, so the tie-break never decides anything and
-    `build_ordinals` could return garbage without moving a single hit. (Measured:
+    `build_ordinals` could return garbage without moving a single hit. (Observed:
     fully REVERSING the ranking changed 0 of 16 query results.) Ordinals are
     observable regardless of ties, so this is the assertion that actually pins
     the three paths together.

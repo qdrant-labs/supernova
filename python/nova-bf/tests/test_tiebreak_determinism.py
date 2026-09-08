@@ -343,8 +343,8 @@ def test_scores_are_emitted_descending(tmp_path):
 
 def test_the_decode_sort_is_exact_however_it_is_chunked(tmp_path, monkeypatch):
     """The decode sort is chunked over query rows to bound its transient (it is
-    ~3x the top-K state live at once, and it scales with QUERY count — 100k
-    queries at k=1000 would be ~3 GiB unchunked). Per-row sorts are independent,
+    several times the top-K state live at once, and it scales with QUERY count
+    — prohibitive at production query counts unchunked). Per-row sorts are independent,
     so chunking must be exact, not an approximation. Forced to one row per chunk
     here so every boundary is crossed."""
     import nova_bf.compute as cp

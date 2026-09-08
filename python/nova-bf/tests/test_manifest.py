@@ -364,7 +364,7 @@ def test_kernel_usage_reports_what_RAN_not_what_was_permitted(monkeypatch):
 def test_kernel_usage_shows_a_kernel_that_ran_then_STOPPED(monkeypatch):
     """The combination the old report could not express at all: a kernel that
     worked for most of a run and then `disable()`d itself after a launch
-    failure, leaving the rest of a multi-hour run ~4x slower on the portable
+    failure, leaving the rest of a long run substantially slower on the portable
     path. `launches > 0` with a reason set is the signature."""
     from nova_bf import topk_triton
 

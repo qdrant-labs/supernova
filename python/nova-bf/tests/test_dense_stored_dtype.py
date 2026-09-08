@@ -2,7 +2,7 @@
 the device.
 
 `io.dense_to_2d` used to upcast float16 to float32 in the reader thread — a
-3.35 GB allocation and ~2.2 s per fineweb corpus file — and then send twice
+large extra allocation per corpus file — and then send twice
 the bytes over PCIe. Now the host array carries the parquet's dtype and
 `DenseCorpusBatch.transfer` casts on the GPU.
 

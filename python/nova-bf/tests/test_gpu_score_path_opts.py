@@ -196,7 +196,7 @@ def test_no_leftover_divide_on_the_output(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Configurations an adversarial review found untested
+# Configurations review found untested
 # ---------------------------------------------------------------------------
 # Every other fixture in-tree gives each filter exactly one spec whose rows ARE
 # the filter's union, so the mask's local row numbering coincides with the

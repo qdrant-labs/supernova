@@ -171,7 +171,7 @@ def test_the_split_is_reset_before_any_reader_reports(tmp_path, monkeypatch):
     into `profiling.configure()` looks like tidying -- that function already
     resets stale profiler state -- but `configure` runs ~100 lines and one
     thread-launch later, so it would throw away timings files have already
-    reported. Measured at 82% of the split silently lost, with the same field
+    reported. Observed with most of the split silently lost, with the same field
     names and plausible values.
 
     The existing tests only pin that the reset is UNCONDITIONAL, which the moved

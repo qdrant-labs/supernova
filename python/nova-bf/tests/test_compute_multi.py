@@ -489,8 +489,9 @@ def test_pack_unpack_row_axis_round_trips():
     (the padding-bit case `count=` exists to trim).
 
     The row axis, not the query axis, because that is the CONTIGUOUS one: the
-    fused combine packs each finished row in one `np.packbits` call at ~30
-    GB/s, where `packbits(axis=0)` was a strided scalar loop at 0.85. See
+    fused combine packs each finished row in one vectorised `np.packbits`
+    call, where `packbits(axis=0)` was a strided scalar loop orders of
+    magnitude slower. See
     `docs/brute-force/perf-design-2026-09-05.md` R1."""
     from nova_bf.filters import pack_rows
 

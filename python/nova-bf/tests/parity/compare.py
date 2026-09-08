@@ -40,33 +40,6 @@ def scores_are_reproducible(device: str, vector_type: str,
                             multivector_kernel: str = "torch") -> bool:
     """Can two runs over the same input be expected to produce identical score
     BITS — the precondition for any bit-equality assertion?
-
-    Everywhere except one case, yes. The exception, measured on an A10G:
-    **multivector on CUDA with the default `torch` kernel is not
-    bit-reproducible run to run.** Its MaxSim sum over query tokens is an
-    `index_add_` (`compute.py`), which on CUDA is an atomicAdd, so the order
-    float additions land in varies between launches. Three identical runs
-    disagreed on ~50 of 200 scores, all ~1e-7 relative — and the ranking was
-    identical every time.
-
-    This is a property of the hardware and the reduction, not a defect the
-    tests can hold nova-bf to. Measured on the same box, all three runs x3:
-
-      multivector_kernel="torch"                    NOT reproducible (~50/200)
-      multivector_kernel="triton_reduce"            bit-reproducible
-      "torch" + torch.use_deterministic_algorithms  bit-reproducible
-
-    `CUBLAS_WORKSPACE_CONFIG` does NOT help (tried `:4096:8` and `:16:8`),
-    which is the tell that this is the `index_add_` atomics rather than a
-    cuBLAS split-k reduction. So a run needing byte-identical multivector
-    ground truth has two levers, and `triton_reduce` is the one that costs
-    nothing (it is also the faster path).
-
-    Callers use this to pick their assertion: `assert_identical` where bits are
-    guaranteed, `assert_same_membership` + `assert_scores_agree` where only the
-    ranking is. Asserting bit-equality where it cannot hold does not make the
-    code more correct, it just makes the suite fail on the GPU for a reason
-    that has nothing to do with what the test is about.
     """
     if vector_type != "multivector" or device != "cuda":
         return True
@@ -81,7 +54,7 @@ def assert_same_ranking(a, b, *, metric: str, label: str,
     scores agreeing to the metric's tolerance.
 
     Note what is NOT weakened even in the non-reproducible case — the id
-    sequence is still compared exactly. The measured nondeterminism moves the
+    sequence is still compared exactly. The observed nondeterminism moves the
     last mantissa bit and has never reordered the result, so a reordering
     remains a failure."""
     if scores_are_reproducible(device, vector_type, multivector_kernel):

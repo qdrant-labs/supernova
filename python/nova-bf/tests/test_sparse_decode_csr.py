@@ -1,7 +1,7 @@
 """R2: the per-file sparse decode stays in CSR instead of expanding to COO.
 
 `_remap_sparse_file` and `_sparse_file_norms` used to build an `np.repeat`'d
-row-id array — one int64 per nonzero, 1.76 GB on a fineweb corpus file — so
+row-id array — one int64 per nonzero, gigabytes on a production corpus file — so
 that a COO helper could decide something the CSR structure already knows.
 These tests pin the rewrite against the OLD implementations, reproduced here
 verbatim as oracles, over shapes that exercise every branch: empty rows,

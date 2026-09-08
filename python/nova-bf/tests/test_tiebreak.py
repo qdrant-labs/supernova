@@ -288,7 +288,7 @@ def test_pack_is_the_three_elementwise_ops_it_claims_to_be():
     """`pack` used to run a `torch.compile`d body with an eager fallback, and
     a test pinned the two bit-identical. The compile is gone (R4: the Triton
     pre-top-K emits packed keys itself, so `pack` is a cold path and the
-    inductor compile cost ~15 s of per-rank startup). Pin the keys directly
+    inductor compile cost a large share of per-rank startup). Pin the keys directly
     against the transform they are defined by, so removing the compile cannot
     have moved a bit."""
     rng = np.random.default_rng(3)
@@ -302,7 +302,7 @@ def test_pack_is_the_three_elementwise_ops_it_claims_to_be():
 
 def test_pack_does_not_compile_anything(monkeypatch):
     """No inductor on the import or the call path: the compile it used to do
-    triggered ~15 s of a ~30 s per-rank startup, once per process."""
+    triggered most of the per-rank startup cost, once per process."""
     assert not hasattr(tb, "_compiled_pack")
     assert not hasattr(tb, "_pack_eager")
     called = []
@@ -405,8 +405,8 @@ def test_the_gate_declines_shapes_whose_offsets_overflow_int32(mod_name):
     returns i32 at 2**31 - 1 and i64 at 2**31). So the product wraps and the
     load silently reads a different query's row: wrong ground truth, no error.
 
-    Widening the row index to int64 fixes it and was measured to cost 27% — it
-    took `topk_triton` from 104 registers to 156 on an A10G — so the gate
+    Widening the row index to int64 fixes it but costs real throughput — it
+    raises `topk_triton`'s register pressure substantially on GPU — so the gate
     declines the oversized shape instead and the portable torch path, which has
     no such limit, takes over.
 
@@ -419,7 +419,7 @@ def test_the_gate_declines_shapes_whose_offsets_overflow_int32(mod_name):
     mod = importlib.import_module(f"nova_bf.{mod_name}")
 
     # everything production actually runs must still be accepted — a false
-    # decline is a silent ~4x slowdown that no test or log would show
+    # decline is a silent, substantial slowdown that no test or log would show
     assert mod._offsets_fit_int32(10_000, 4096, 1000)
     assert mod._offsets_fit_int32(110_000, 4096, 1000), "the largest real query set"
     assert mod._offsets_fit_int32(110_000, 1024, 1000)
@@ -548,9 +548,9 @@ def test_two_real_candidates_can_never_share_a_packed_key():
 def test_encoded_ids_survive_above_the_32_bit_boundary(device):
     """Encoded row ids are `gidx * MAX_ROWS_PER_FILE + row` with
     `MAX_ROWS_PER_FILE = 100_000_000`, so they cross `2**31` at file index 21
-    and reach ~3.2e10 on a production rank of 317 files. Every fixture in this
+    and reach far higher on a production rank. Every fixture in this
     suite builds at most 10 files (max id 9e8), so the whole id path was
-    exercised only in the low 31 bits — 15x below where production runs.
+    exercised only in the low 31 bits — well below where production runs.
 
     A truncation to 31 bits anywhere in that path (the kernel's ENC store, the
     portable gather, the int64 widening) would hand back ids pointing at the
@@ -605,7 +605,7 @@ def test_the_enc_contract_is_enforced_condition_by_condition():
     Each rule is a silent-wrong-answer guard. The kernel indexes `enc` by
     COLUMN and loads 8 bytes per lane, so a short, strided, non-int64 or
     foreign-device `enc` yields ids for the WRONG corpus rows, with plausible
-    scores and no error. Declining costs ~4x on that slice; accepting costs the
+    scores and no error. Declining costs throughput on that slice; accepting costs the
     ground truth.
     """
     import nova_bf.topk_triton as tk

@@ -1,6 +1,6 @@
 """`build_ordinals` has two paths; they must be indistinguishable.
 
-Ranking a rank's ids is the whole cost of `tiebreak='id'` -- 429s of a 500s
+Ranking a rank's ids is the whole cost of `tiebreak='id'` -- nearly all of
 startup on a real shard, single-threaded, while the GPU is idle. The fast path
 packs FIXED-WIDTH ids into uint64 lanes and sorts them on the GPU, which is
 sound because for byte strings of equal length lexicographic order IS the
@@ -217,8 +217,8 @@ def _force_free_vram(monkeypatch, nbytes):
 def test_narrow_key_mode_matches_wide_key_mode(monkeypatch, dup):
     """A device that fits int32 halves but not int64 keys must still be exact.
 
-    This is the tier that exists so a small GPU degrades to 24.7s rather than
-    surrendering to the 503s CPU path -- it has to be bit-identical to be worth
+    This is the tier that exists so a small GPU degrades gracefully rather than
+    surrendering to the much slower CPU path -- it has to be bit-identical to be worth
     having.
     """
     ids = _ids(40_000, seed=21, dup=dup)

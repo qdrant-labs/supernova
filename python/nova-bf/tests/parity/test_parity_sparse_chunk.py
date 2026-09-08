@@ -5,7 +5,7 @@ docs/brute-force/sparse-chunked-scoring-2026-09-02.md.
 the dense `(vocab, rows)` corpus operand fits `_SPARSE_SWAP_MAX_DENSE_BYTES`
 it densifies and runs one dense GEMM ("fits"); otherwise `params.sparse_chunk`
 (default True) decides between splitting the corpus rows into several smaller
-dense GEMMs (staying on the branch the doc measured as both faster and far
+dense GEMMs (staying on the branch the doc found to be both faster and far
 more reproducible — on CUDA; this file exercises it on CPU, where the branch
 is reachable but the nondeterminism it targets is not) or falling back to a
 sparse-CSR transpose matmul (`sparse_chunk: false`).

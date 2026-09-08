@@ -130,7 +130,7 @@ def test_reduce_bounds_how_many_partials_are_resident(scenario, monkeypatch, tmp
     This is the property the whole partial-major rewrite exists for. The old
     shape opened ALL W partials and read the same query batch from each in
     lockstep; because parquet's smallest read unit is the row group, that cost
-    W x row-group, not W x batch -- 176 GB for a 32-rank dense merge, which is
+    W x row-group, not W x batch -- far past host memory for a sharded dense merge, which is
     what actually OOMed. Asserting the fold's ORDER would be wrong (the reduce
     is commutative on purpose); the invariant worth pinning is the ceiling on
     concurrent readers.
@@ -196,8 +196,8 @@ def test_mismatched_partial_counts_across_searches_raises(scenario, tmp_path):
 def test_merge_window_is_derived_from_bytes_not_a_fixed_count():
     """The window must scale with how big a partial actually is.
 
-    A fixed count is wrong in both directions: one partial is ~0.2 GB for a
-    small search and ~5.5 GB for a 100k-query dense one, so the same number is
+    A fixed count is wrong in both directions: a partial for a small search and
+    one for a large dense search differ by orders of magnitude, so the same number is
     either wasteful or an OOM. This pins the shape of the derivation rather
     than a magic value.
     """
@@ -223,7 +223,7 @@ def test_merge_window_is_derived_from_bytes_not_a_fixed_count():
     hit = ["hit_ids", "hit_scores"]
     small = m._hit_bytes_per_partial([_R(1 << 20)], hit)      # 1 MiB per col
     big   = m._hit_bytes_per_partial([_R(1 << 30)], hit)      # 1 GiB per col
-    # Scales with the hit columns and EXCLUDES payload (the 1 GB `query` column
+    # Scales with the hit columns and EXCLUDES payload (the `query` column
     # must not appear), and is >= the encoded size because a parsed table is
     # bigger than its dictionary-encoded form.
     assert small >= 2 << 20, small

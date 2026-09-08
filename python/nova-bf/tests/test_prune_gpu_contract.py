@@ -199,9 +199,9 @@ def test_kernel_takes_no_sentinel_argument_any_more():
 
     `_cutfill` used to write k sentinel keys and k zero indices into every
     pruned row so that a consumer which read one would lose rather than
-    corrupt. At the production shape that was 1.2 GB of stores per slice for
-    output nobody reads — and once the run reaches steady state ~97% of rows
-    are dead, so it was most of the kernel's write traffic. See G1 in
+    corrupt. At the production shape that was substantial stores per slice for
+    output nobody reads — and once the run reaches steady state the vast
+    majority of rows are dead, so it was most of the kernel's write traffic. See G1 in
     `docs/brute-force/perf-design-2026-09-05.md`.
 
     What replaced it is not a weaker guarantee, it is a different one: NOBODY

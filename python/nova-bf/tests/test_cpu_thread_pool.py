@@ -1,6 +1,6 @@
 """`params.cpu_thread_count` — pyarrow's CPU pool, not its IO pool.
 
-The bug this guards against was silent and cost ~30% of read time on a real
+The bug this guards against was silent and cost a large share of read time on a real
 run: pyarrow takes its CPU-pool default from OMP_NUM_THREADS, GPU images
 commonly pin that to 1, and nova-bf used to set only the IO pool. A decode
 pool of one thread throttles every reader thread at once and presents exactly

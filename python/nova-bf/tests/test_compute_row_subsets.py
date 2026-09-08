@@ -86,7 +86,7 @@ def _write(path, dense, sparse_rows, **columns):
 @pytest.fixture
 def union_ds(tmp_path):
     """A queries file that UNIONS two query sets, exactly like the combined
-    MS MARCO file: `query_set` says which spec owns a row, and each spec's
+    combined queries file: `query_set` says which spec owns a row, and each spec's
     per-query filter column carries a match-nothing sentinel on the rows it
     does not own (so the same file works with or without `rows`)."""
     rng = np.random.default_rng(7)

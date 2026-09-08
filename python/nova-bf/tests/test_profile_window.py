@@ -1,7 +1,7 @@
 """`NOVA_BF_PROFILE_FILES` — the steady-state profiling window.
 
 `prof_gpu.py` profiles from file 1, which is the wrong regime entirely: the
-top-K state is still filling, ~90% of rows are live and the two-pass has not
+top-K state is still filling, nearly every row is live and the two-pass has not
 engaged. This window runs the scan normally and records only the files asked
 for, so what lands in the trace is the steady state.
 

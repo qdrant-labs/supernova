@@ -183,7 +183,7 @@ def test_the_line_carries_the_live_fractions(tmp_path, caplog):
     # The stronger `fmean == total` law needs EQUAL WEIGHTS, and the weight is
     # (queries x slices per file) -- not rows, as an earlier version of this
     # comment claimed. Unequal row counts do not break it; a configured
-    # `*_batch_size` does, by giving files different slice counts (measured:
+    # `*_batch_size` does, by giving files different slice counts (observed:
     # fmean 0.477 vs a manifest 0.319 at dense_batch_size=16). Every production
     # config sets 4096, so assert the precondition rather than the folklore --
     # this fails loudly the day someone adds a batch size to the fixture.

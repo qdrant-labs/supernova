@@ -1,7 +1,7 @@
 """Regression tests for the partial-major reduce in `merge._reduce`.
 
 Concurrency / resource / failure-mode invariants. Each test below started life
-as a reproducer for a defect found in adversarial review; they are inverted here
+as a reproducer for a defect found in review; they are inverted here
 to pin the fixed behaviour, so a regression fails loudly rather than silently
 returning the old shape. Every test that could hang runs the merge on a watchdog
 thread and fails on timeout rather than blocking the suite.
@@ -176,7 +176,7 @@ def test_failed_reduce_surfaces_the_error_and_strands_no_reader_thread(
     failure) and holds a semaphore permit until the consumer releases it. A
     consumer that stopped at the first sentinel left the rest blocked forever --
     those holding a permit in `q.put` (queue full), the rest in
-    `window.acquire()` (no permit ever returned). Measured before the fix: 6 of
+    `window.acquire()` (no permit ever returned). Observed before the fix: 6 of
     8 reader threads still alive after the failure. `daemon=True` only defers
     that to interpreter exit; inside a live process they are simply lost.
     """
@@ -219,7 +219,7 @@ def test_failed_reduce_pins_no_partial_table_in_memory(tmp_path, monkeypatch):
     Under the early-break consumer they were not: the wedged reader threads kept
     the `_read` closure -- and with it the Queue and every table sitting in it --
     reachable, so `gc.collect()` could not free them. At production shape that is
-    `window_n x ~5.5 GB` lost per failed search.
+    `window_n` whole parsed partials lost per failed search.
     """
     cfg = _cfg(str(tmp_path / "out"))
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
@@ -418,7 +418,7 @@ def _fixture_partial(tmp_path, n_q, k, universe, payload_len, name="p.parquet"):
                                             (200_000, "high-cardinality ids")])
 def test_hit_bytes_per_partial_covers_the_parsed_table(tmp_path, universe, label):
     """`total_uncompressed_size` is the ENCODED size (dictionary + RLE), not what
-    pyarrow allocates once parsed -- measured 3.36x under on a small id universe.
+    pyarrow allocates once parsed -- observed well under on a small id universe.
     `_PARSE_EXPANSION` must close that, whichever way the ids compress."""
     path = _fixture_partial(tmp_path, 4000, 100, universe, 1)
     reader = pq.ParquetFile(path)
@@ -434,7 +434,7 @@ def test_ranged_get_estimate_includes_the_raw_whole_file_buffer(tmp_path):
     """With `merge_ranged_reads`, `Store._ranged_download` allocates
     np.empty(file_size) for the ENTIRE partial -- payload columns included --
     and holds it while parsing. That sits on top of the parsed table and used to
-    be invisible to the window (measured 12.3x the budgeted hit bytes), so the
+    be invisible to the window (many times the budgeted hit bytes), so the
     `ranged=True` estimate must add it."""
     import os
     path = _fixture_partial(tmp_path, 3000, 4, 5000, 600)
@@ -578,15 +578,15 @@ def test_row_misaligned_partials_are_rejected(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Adversarial review, 2026-09-05: resource / lifetime / shutdown.
+# Review, 2026-09-05: resource / lifetime / shutdown.
 # ---------------------------------------------------------------------------
 
 def test_window_budget_is_not_fooled_by_dictionary_encoded_ids(tmp_path):
     """`total_uncompressed_size` is the ENCODED size. With dictionary encoding
     on -- pyarrow's default, and it reports RLE_DICTIONARY even when the
     dictionary overflowed -- it tracks the dictionary, not the parsed strings.
-    Measured on `<urn:uuid:...>` ids, the production id shape, the old estimate
-    came to 0.47-0.60 of the real parsed bytes, so the window ran ~2x wider than
+    On `<urn:uuid:...>` ids, the production id shape, the old estimate came to
+    well under the real parsed bytes, so the window ran far wider than
     it had budgeted for. Under-budgeting costs the run; over-budgeting only
     costs parallelism."""
     import uuid
@@ -658,7 +658,7 @@ def test_a_failure_before_the_drain_does_not_strand_readers(tmp_path, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# Adversarial review round 2: defects introduced BY the round-1 fixes.
+# Review round 2: defects introduced BY the round-1 fixes.
 # ---------------------------------------------------------------------------
 
 class _SliceBoom:
@@ -725,7 +725,7 @@ def test_a_consumer_failure_keeps_its_location(tmp_path, monkeypatch):
 
 def test_variable_width_ids_do_not_collapse_the_window(tmp_path):
     """The width estimate multiplies out the MAX bound, which for variable-width
-    ids is the single longest value in the partial -- measured ~75x over on
+    ids is the single longest value in the partial -- observed far over on
     url-shaped ids, which drives the window to one reader and tells the operator
     to find a bigger box. Only a fixed width may be multiplied out."""
     q, k = 200, 4
@@ -761,7 +761,7 @@ def test_an_interrupt_in_the_drain_still_releases_every_reader(tmp_path, monkeyp
     """Ctrl-C lands in `q.get()`, outside anything the loop catches. Only the
     consumer returns window permits, so an abandoned drain wedges every reader
     on `window.acquire()` for the life of the process -- each holding a parsed
-    partial (~6.7 GB at production shape)."""
+    partial (a large allocation at production shape)."""
     cfg = _cfg(str(tmp_path / "out"))
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
     _write_partials(cfg, pdir, n_partials=8, n_queries=150)
@@ -818,7 +818,7 @@ def test_a_data_error_outranks_a_transient_read_error(tmp_path, monkeypatch):
     """`errors[0]` is first-append-wins and the two failures race: a reader can
     append its transient S3 error while the consumer is still inside the fold
     that is about to raise a row-misalignment. One is retriable and one is not,
-    and reporting the wrong one sends the operator round another 153 GB.
+    and reporting the wrong one sends the operator round the whole corpus again.
 
     The sleeps force the losing order deterministically -- the reader appends
     first, so a naive `errors[0]` yields the OSError.
@@ -906,7 +906,7 @@ def test_a_null_hit_scores_row_says_so(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# External adversarial review (GPT), 2026-09-06.
+# External review (GPT), 2026-09-06.
 # ---------------------------------------------------------------------------
 
 def _stamped(cfg, pdir, ranks, num_jobs, n_queries=8, tiebreak=None,
@@ -1021,10 +1021,11 @@ def test_a_folded_partial_is_freed_before_its_window_permit_is_returned(
         tmp_path, monkeypatch):
     """`sl = tbl.slice(...)` is a zero-copy VIEW, so `del tbl` frees nothing
     while it is bound. Releasing the permit there admits the next partial on top
-    of the previous one -- one whole partial beyond the window budget, ~6.7 GB
-    at production shape. It was cleared only on the fold-FAILURE path.
+    of the previous one -- one whole partial beyond the window budget at
+    production shape. It was cleared only on the fold-FAILURE path.
 
-    Measured at the release point: 0.94 partials with the fix, 1.94 without.
+    At the release point: under one partial resident with the fix, nearly two
+    without.
     """
     cfg = _cfg(str(tmp_path / "out"))
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])

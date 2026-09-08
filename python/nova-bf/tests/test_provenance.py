@@ -102,7 +102,7 @@ def test_storage_dtypes_are_recorded(tmp_path):
     corpus = rng.standard_normal((12, DIM)).astype(np.float32)
     pq.write_table(
         pa.table({
-            # fp16 on disk, like the FineWeb corpus
+            # fp16 on disk, like the production corpus
             "dense_embedding": pa.array(corpus.tolist(), type=pa.list_(pa.float16())),
             "id": pa.array([f"c{i}" for i in range(12)]),
         }),

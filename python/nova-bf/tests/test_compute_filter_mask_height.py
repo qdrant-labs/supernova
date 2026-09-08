@@ -10,10 +10,9 @@ file's whole batch loop. It is the only allocation in a run whose size is
 Its query axis used to be the whole queries FILE. That made it the one cost
 that grew when unrelated query sets were unioned into a single file behind
 `SearchSpec.rows` selectors, even though the filter's own specs never look at
-the foreign rows: on FineWeb-10B (~1.15M rows/shard) a 5,000-query text search
-paid 1.33 GiB per in-flight file from its own 10k-row queries file and 14.7 GiB
-from a 110k-row union file — an 11x rise for a search whose own row count never
-changed.
+the foreign rows: at production scale a text search paid a modest mask per
+in-flight file from its own queries file, but many times that from a large
+union file — a steep rise for a search whose own row count never changed.
 
 It is now built over the union of its own specs' `rows` (`run_compute`'s
 `filter_rows`), and `spec_qrows[m]` indexes POSITIONS WITHIN that union rather
@@ -1867,7 +1866,7 @@ def test_the_reader_releases_the_table_and_unpacked_masks_before_compacting(
 ):
     """Python loop bodies do not scope, so `reader()` used to hold the previous
     file's whole Arrow table AND its unpacked masks until they were rebound a
-    file later — measured at 6.4 GiB and 5.1 GiB on a 1.09M-row shard, mostly
+    file later — a large amount of retained host memory at production scale, mostly
     while the thread was blocked on `window.acquire()`.
 
     Pins the ORDERING that makes the fix worth anything: the table must already

@@ -1,4 +1,4 @@
-"""Live-Qdrant parity for multivector (ColBERT / late-interaction MaxSim) GT.
+"""Live-Qdrant parity for multivector (late-interaction MaxSim) GT.
 
 Confirms nova-bf's MaxSim ranking selects EXACTLY the same top-K points, with
 matching scores, as Qdrant's native multivector MaxSim comparator on the same

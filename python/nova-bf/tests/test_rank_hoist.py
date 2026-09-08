@@ -138,7 +138,7 @@ def test_a_bad_rank_propagates_instead_of_disabling_the_kernel(monkeypatch):
     """`topk`'s `rank` validation says "this is a raise, not a silent
     recompute", because a wrong rank breaks tie-breaking among equal scores
     while leaving results plausible. `pack_topk`'s blanket `except Exception ->
-    disable()` used to swallow it: the caller bug became a ~4x slower run for
+    disable()` used to swallow it: the caller bug became a much slower run for
     the whole process, announced by a log line blaming the kernel and promising
     "results are unaffected". Only compile/launch failures may be swallowed."""
     import torch
@@ -184,8 +184,8 @@ def test_a_compile_failure_still_falls_back_quietly(monkeypatch):
 
 def test_the_subset_ordinals_are_shared_so_the_rank_hoist_can_fire():
     """The hoist keys on the ordinal vector's IDENTITY, so a filtered search
-    that rebuilds `ordinals[sel_cols]` per member could never hit it — measured
-    0 hits / 671 misses across a suite run before this. `sel_cols` is what
+    that rebuilds `ordinals[sel_cols]` per member could never hit it — it
+    never hit once across a suite run before this. `sel_cols` is what
     `select()` memoizes per filter, so keying the subset on it makes every
     member of the slice see the SAME ordinal object, which is what lets
     `_rank_for` hit."""

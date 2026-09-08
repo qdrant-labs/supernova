@@ -136,7 +136,7 @@ def test_a_null_id_stringifies_to_None():
 # that -- it returns an array whose offsets have wrapped NEGATIVE, and nothing
 # notices until the parquet writer dereferences them and the process dies of
 # SIGSEGV, after the entire corpus scan has been paid for and with no output
-# written at all. (Observed on an A10G: 8 files scanned, `bf-bench` logged,
+# written at all. (Observed on GPU: 8 files scanned, `bf-bench` logged,
 # then signal 11 in `pyarrow.parquet.write_table`; the commit before the
 # vectorized decode wrote all four partials fine.)
 #

@@ -1,4 +1,4 @@
-"""Correctness tests for the multivector (ColBERT / late-interaction MaxSim)
+"""Correctness tests for the multivector (late-interaction MaxSim)
 brute-force compute path.
 
 Mirrors test_compute_sparse.py's fixture/ground-truth pattern, but over
@@ -230,7 +230,7 @@ def test_fused_triton_matches_torch_ragged(metric, dim, kernel):
     """Cross-check the fused reducer over empty, multi-tile, and tail shapes.
 
     D=33 exercises a masked K tail; query/document lengths around 16 exercise
-    both exact tile boundaries and ragged tails; D=1024 is the PubMed BGE-M3
+    both exact tile boundaries and ragged tails; D=1024 is the
     production shape.  This test is intentionally CUDA-only and is expected to
     run in the later SkyPilot validation job.
     """
@@ -453,8 +453,8 @@ def test_allow_tf32_flag_roundtrips_and_is_correct(ds):
     """`params.allow_tf32` is accepted and a run with it set still produces the
     exact ranking. On this CPU box it's a no-op (torch's TF32 flag is CUDA-only),
     so results must be identical to the default run — this pins the plumbing;
-    the actual TF32 speedup + ranking-preservation + Qdrant parity were measured
-    live on an A10G (see docs/brute-force/multivector-maxsim.md)."""
+    the actual TF32 speedup + ranking-preservation + Qdrant parity were verified
+    live on GPU (see docs/brute-force/multivector-maxsim.md)."""
     base = _run(ds["tmp"], ds["cdir"], ds["qpath"], metric="dot", k=8)
     out = ds["tmp"] / "out_tf32"
     out.mkdir(exist_ok=True)

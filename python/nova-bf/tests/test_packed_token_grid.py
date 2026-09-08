@@ -1,7 +1,7 @@
 """R7: the corpus token grid, and the whole fused combine, are bit-packed.
 
 `_token_row_masks` used to return one `(n_rows,)` bool per query token — an
-`(n_tokens, n_rows)` array, 3.8 GB per corpus file per reader thread on the
+`(n_tokens, n_rows)` array, prohibitively large per corpus file per reader thread on the
 production filter — and `evaluate`'s combine moved a megabyte per token per
 query combo before packing the finished row on the way out. Both are packed
 now.
@@ -256,7 +256,7 @@ def test_a_two_dimensional_keep_still_narrows_per_query():
 # --- the three checks that were correct but undefended ----------------------
 #
 # None of these could produce a wrong answer as the code stands. Each was
-# reverted by an adversarial reviewer with ZERO test failures, which is the
+# reverted by a reviewer with ZERO test failures, which is the
 # failure mode that produced most of this change's findings: a guard defended
 # only by a comment.
 

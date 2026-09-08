@@ -3,8 +3,8 @@
 `topk_triton` and `merge_triton` both decline shapes whose pointer arithmetic
 would overflow int32 (see `test_tiebreak.py::
 test_the_gate_declines_shapes_whose_offsets_overflow_int32`, which also records
-WHY the alternative was rejected: widening the row index to int64 measured 27%
-in `topk_triton`). `multivector_kernels` did the same arithmetic with no guard
+WHY the alternative was rejected: widening the row index to int64 costs real
+throughput in `topk_triton`). `multivector_kernels` did the same arithmetic with no guard
 at all, so a `P` past 2**31 - 1 elements silently read another query's tokens.
 
 These live outside the GPU-gated multivector suites on purpose: the guard is
@@ -19,8 +19,7 @@ import pytest
 from nova_bf.multivector_kernels import _INT32_MAX, offsets_fit_int32
 
 
-# The production multivector config (configs/brute_force/
-# pubmed_bge_m3_all_modalities.yaml) at the time of writing.
+# The shipped multivector config at the time of writing.
 _BUDGET = 170_000_000
 _QUERY_BLOCK = 256
 
@@ -120,7 +119,7 @@ def test_a_declined_block_falls_back_and_matches_the_torch_reference(monkeypatch
     The tests above are pure arithmetic — they prove the predicate answers
     correctly, and nothing more. The fallback they trigger is real code that no
     shape in any suite reaches, because every tested shape is far below the
-    threshold (the shipped config sits ~12x under it). So force it: make the
+    threshold (the shipped config sits well under it). So force it: make the
     predicate refuse everything and assert the answer is byte-identical to the
     torch reference, which is what the fallback runs.
 
@@ -168,7 +167,7 @@ def test_a_declined_block_falls_back_and_matches_the_torch_reference(monkeypatch
         # (`compute._segment_max_over_cols`'s caller), and `index_add_`
         # accumulates through CUDA atomics, so the summation order varies run
         # to run. Two back-to-back identical calls already disagree by ~1 ulp
-        # (measured 9.54e-07 on an A10G, on the rows of the queries with the
+        # (observed ~1e-06 on GPU, on the rows of the queries with the
         # most tokens — more terms, more order to vary). `torch.equal` here
         # could only ever pass by luck. Same tolerance as the kernel comparison
         # below, deliberately.

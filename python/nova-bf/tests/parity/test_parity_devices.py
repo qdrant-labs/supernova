@@ -189,7 +189,7 @@ def test_multivector_ranking_is_stable_across_identical_cuda_runs(kernel, ds):
     Not the score bits, as it turns out. On CUDA the default `torch`
     multivector kernel sums each query token's MaxSim with `index_add_`, an
     atomicAdd, so two runs over identical input disagree on roughly a quarter
-    of the scores by ~1e-7 relative (measured on an A10G; see
+    of the scores by ~1e-7 relative (observed on GPU; see
     `compare.scores_are_reproducible` for the full table and the two ways to
     make it reproducible).
 

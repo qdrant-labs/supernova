@@ -139,7 +139,7 @@ def test_variable_width_ids_decline_the_packed_fold_unless_asked(monkeypatch):
 
 def test_ranking_every_row_does_not_copy_the_id_buffers():
     """`take` on a complete selection reproduces an array we already hold. At
-    the production batch shape that copy is ~940 MB per fold."""
+    the production batch shape that copy is substantial per fold."""
     from nova_bf import merge as merge_mod
 
     flat = pa.array(["b", "a", "d", "c"], pa.large_string())
@@ -159,7 +159,7 @@ def test_ranking_every_row_does_not_copy_the_id_buffers():
 
 
 # ---------------------------------------------------------------------------
-# Defects found by adversarial review, 2026-09-05.
+# Defects found by review, 2026-09-05.
 # ---------------------------------------------------------------------------
 
 def _nan_case():

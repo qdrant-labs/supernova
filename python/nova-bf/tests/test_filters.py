@@ -25,7 +25,7 @@ def _ev(filt, table, query_values=None):
 
     A filter with any per-query condition returns a `filters.PackedRowMask`
     (row-bit-packed) rather than an `(n_queries, rows)` bool array — the
-    production `filtered_text` mask is 10.8 GB per file unpacked, so the packed
+    production `filtered_text` mask is very large per file unpacked, so the packed
     form is the real one and `.unpack()` is the debug view. These tests assert
     on cell values at fixture sizes, so they expand. A uniform filter still
     returns a plain `(rows,)` array and passes straight through.
