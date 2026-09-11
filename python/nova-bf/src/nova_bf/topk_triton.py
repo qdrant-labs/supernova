@@ -222,8 +222,7 @@ def disable(exc: BaseException) -> None:
     _UNAVAILABLE = f"{type(exc).__name__}: {exc}"
     logger.warning(
         "tie-break top-K: the Triton kernel failed to launch (%s); using the "
-        "portable path for the rest of this run — results are unaffected, this "
-        "is a ~4x slower select",
+        "portable path for the rest of this PROCESS",
         exc,
     )
 

@@ -43,7 +43,7 @@ params:
   # dense_batch_size: 4096   # bound GPU memory on huge files; omit = whole file at once
   # sparse_batch_size: 4096  # same, for vector_type: sparse searches
   # merge_batch_size: null   # merge tuning, see Performance & tuning
-  # merge_prefetch: false
+  # merge_ranged_reads: false
 
 searches:
   - name: dense_all          # optional, unique if set, [A-Za-z0-9_-]+ — goes into the output filename
@@ -146,11 +146,25 @@ A per-query filter whose leaves are all `match_from_query` / `range_from_query`
 / static is evaluated GPU-natively, per corpus batch, and never materializes a
 CPU-side mask at all. One with a `match_text` / `match_text_from_query` leaf
 cannot be (torch has no string tensor type), so it falls back to
-`filters.evaluate`'s numpy path and materializes a real
-`(n_queries, file_rows)` boolean mask — bit-packed 8 queries/byte, but built
-once per corpus file and held for that file's whole batch loop, once per
-in-flight reader. It is the only allocation in a run that scales as
-`n_queries × file_rows`, which makes its query axis worth being precise about.
+`filters.evaluate`'s numpy path and produces a `filters.PackedRowMask`
+standing for an `(n_queries, file_rows)` boolean mask — bit-packed 8 ROWS to
+the byte, built once per corpus file and held for that file's whole batch
+loop, once per in-flight reader. The bool array is never allocated: the fused
+combine packs each distinct query combo's finished `(rows,)` row once,
+contiguously, and broadcasts the bytes to that combo's queries. It is still
+the only allocation in a run that scales as `n_queries × file_rows`, which
+makes its query axis worth being precise about.
+
+The packed bytes are also what crosses to the compute device: each batch slice
+takes the BYTE range covering its rows — a view, no gather — and expands it
+there (`compute._unpack_row_axis_device`, with a `bit_offset` trimming the
+extra leading rows when the slice does not start on a byte), so the
+host-to-device copy is 1/8 the size and the consumer thread never materializes
+one bool per query. The "is anything set in this slice" early-out is tested on
+the packed bytes by `compute._packed_slice_any`, which masks off the boundary
+bits EXACTLY: a boundary byte also carries rows belonging to the adjacent
+slice, so plain byte truthiness would keep slices that hold nothing for this
+one — and skipping a slice is not the same as masking it.
 
 That axis is the **union of the `rows` of the specs that use that filter** —
 not the queries file's height, and not the vector_type's row union either.
@@ -417,5 +431,36 @@ The work splits into three layers: **reading** corpus parquet from S3, **decodin
 A good starting point for a large corpus on AWS: a high-vCPU single-GPU instance, `io_thread_count: 128`, `io_workers: 32–64`. Raising query count shifts the balance toward the GPU — at that point batch the matmul (`params.dense_batch_size`/`sparse_batch_size`) and add GPUs/workers.
 
 > **Reading fewer bytes** helps every layer: `compute` projects only the vector column(s) any search needs (plus `id_column`/`filter` fields when configured), so the heavy work is unavoidable corpus data. Storing the dense column as fp16 (half the bytes to transfer *and* decode) is the next lever if the read path is still the bottleneck.
+
+### Two-pass dense scoring
+
+Once a rank has seen a few files, most (query, corpus-slice) pairs cannot
+produce a hit: the query's running top-K already holds `k` candidates better
+than anything the slice offers. Measured on the 10 B fineweb corpus, ~97% of
+rows are in that state after ~100 files.
+
+`nova-bf` exploits it in two passes. Pass one scores the slice in **half
+precision** and uses a rigorous error bound to decide which query rows could
+still reach their threshold; pass two computes the **exact float32 scores for
+those rows only**, with the same code the one-pass path uses. Reported scores
+are always the float32 ones — the approximation decides what to skip, never
+what to return.
+
+It is exact, and checked rather than assumed: the live-row GEMM height is
+padded to a quantum where cuBLAS provably picks the same kernel as the
+full-height product, and every distinct height a run uses is verified
+bit-identical once at runtime — a height that fails turns the two-pass off for
+the rest of the run rather than moving a score. Production partials are
+byte-identical with it on and off.
+
+The switch is driven by the measured live fraction. Set
+`params.two_pass: off` to force the regular one-pass fp32 path; its default,
+`auto`, enables the optimization only when eligible and worthwhile.
+`NOVA_BF_NO_TWOPASS=1` remains a temporary environment kill switch, and
+`NOVA_BF_TWOPASS_THRESHOLD` moves the crossover (default `0.50`). The run
+manifest records the requested policy in `params.two_pass` and the actual
+decision under `params.kernels.twopass`. Derivation and the full measurement:
+[`two-pass-bound.md`](two-pass-bound.md) and
+[`gpu-profile/2026-09-05-twopass/RESULTS.md`](gpu-profile/2026-09-05-twopass/RESULTS.md).
 
 The `timing`/`bf-bench` log lines' `rows`/`gb` are the corpus's raw pre-filter row/byte count for each vector_type actually read, summed across every search sharing the run — not "rows that survived a filter," and not broken out per search, since several searches with different filters no longer have one single count to report.

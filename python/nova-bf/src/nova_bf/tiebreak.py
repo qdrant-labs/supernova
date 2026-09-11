@@ -250,7 +250,18 @@ def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
     # decision the kernel makes from the full row.
     if encoded is not None:
         idx = encoded[idx]
-    return keys, idx, None if thr is None else live_rows(keys, thr)
+    live = None if thr is None else live_rows(keys, thr)
+    if live is not None and topk_triton._poisoning():
+        # Poison dead rows on the portable path too, so tests catch consumers
+        # that read outputs without first checking `live`.
+        dead = live == 0
+        if bool(dead.any()):
+            keys = keys.clone()
+            idx = idx.clone()
+            keys[dead] = topk_triton.POISON_KEY
+            idx[dead] = (topk_triton.POISON_ID if encoded is not None
+                         else 0x7FFFFFFF)
+    return keys, idx, live
 
 
 # --- id-order ordinals --------------------------------------------------------
@@ -340,22 +351,14 @@ def _pack_lanes(chunks: list, W: int, total: int, workers: int) -> np.ndarray:
 
 
 def _is_oom(exc: BaseException) -> bool:
-    """Whether `exc` is an out-of-memory condition we can degrade away from.
+    """Return whether `exc` represents an out-of-memory condition.
 
-    Matched by MESSAGE as well as type on purpose: a cub/`argsort` workspace
-    exhaustion often surfaces as a plain `RuntimeError: CUDA error: out of
-    memory` from inside the library rather than the caching allocator's typed
-    `OutOfMemoryError`, so narrowing to the type alone would turn a graceful
-    degrade into a hard crash.
+    The shared matcher handles both typed allocator errors and message-only
+    CUDA/library OOM failures.
     """
-    try:
-        import torch
+    from .twopass import is_oom
 
-        if isinstance(exc, torch.cuda.OutOfMemoryError):
-            return True
-    except Exception:
-        pass
-    return "out of memory" in str(exc).lower()
+    return is_oom(exc)
 
 
 def _gpu_ready() -> bool:
@@ -487,8 +490,9 @@ def _gpu_perm(lanes: np.ndarray, mode: int) -> np.ndarray | None:
         return out
     except Exception as exc:
         if _is_oom(exc):
-            # The one failure the CPU can absorb.
-            logger.warning("tiebreak='id': GPU ranking out of device memory "
+            # Host or device OOM can both recover here; earlier temporary buffers
+            # have already been released before the CPU fallback runs.
+            logger.warning("tiebreak='id': GPU ranking out of memory "
                            "(%s); ranking on CPU instead", exc)
             try:
                 torch.cuda.empty_cache()

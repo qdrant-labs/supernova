@@ -196,3 +196,33 @@ def test_partials_and_the_merged_output_both_carry_it(tmp_path):
     assert partials, "sharded run wrote partials"
     for p in partials:
         assert _meta(str(p))["nova_bf.metric"] == "dot"
+
+
+def test_a_later_run_does_not_inherit_tf32_from_an_earlier_one(tmp_path):
+    """`torch.backends.cuda.matmul.allow_tf32` is process-global, and
+    `run_compute` used to only ever turn it ON.
+
+    So in any process that runs more than once — the test suite, `nova dist`
+    in-process — a run configured `allow_tf32=False` inherited True from an
+    earlier run and produced scores perturbed by ~3e-4 relative, while its own
+    manifest recorded `allow_tf32: false`. Ground truth that does not match
+    its own provenance record is the failure this guards.
+    """
+    import torch
+
+    torch.backends.cuda.matmul.allow_tf32 = True          # as a prior run left it
+    cdir, qpath = _dataset(tmp_path)
+    out = tmp_path / "out_no_tf32"
+    out.mkdir()
+    cfg = BruteForceConfig(
+        corpus=CorpusConfig(path=cdir, id_column="id"),
+        queries=QueriesConfig(path=qpath, id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(allow_tf32=False),
+        searches=[SearchSpec(name="gt", vector_type="dense", metric="dot", k=5)],
+    )
+    run_compute(cfg)
+    assert torch.backends.cuda.matmul.allow_tf32 is False, (
+        "a run configured allow_tf32=False left the global flag ON, so the "
+        "next run in this process scores with TF32 while recording that it "
+        "did not")

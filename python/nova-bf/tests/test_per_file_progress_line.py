@@ -29,8 +29,19 @@ LINE = re.compile(
     r"rows=(?P<rows>\d+)(?P<rest>.*)$"
 )
 
+# The adjacent two-pass row, emitted only for files some of whose dense slices
+# actually took the two-pass.
+TP_LINE = re.compile(
+    r"twopass file=(?P<gidx>\d+) slices=(?P<tp>\d+)/(?P<total>\d+) "
+    r"live=(?P<live>[\d.]+) padded=(?P<padded>[\d.]+)(?P<rest>.*)$"
+)
 
-def _corpus(root, n_files=4, rows=32, dim=8, seed=0):
+
+# `dim` is 64, not 8: the closed-form bound's P6 requires `64 <= d <= 2**20`
+# (Lemma 2' needs `d >= 64` for its block count), so below it `upper_bounds`
+# refuses every row, the two-pass never engages, and no progress rows exist to
+# take a delta of.
+def _corpus(root, n_files=4, rows=32, dim=64, seed=0):
     rng = np.random.default_rng(seed)
     root.mkdir(parents=True, exist_ok=True)
     for f in range(n_files):
@@ -41,7 +52,7 @@ def _corpus(root, n_files=4, rows=32, dim=8, seed=0):
         }), root / f"c{f:03d}.parquet")
 
 
-def _queries(root, n=6, dim=8, seed=1):
+def _queries(root, n=6, dim=64, seed=1):
     rng = np.random.default_rng(seed)
     root.mkdir(parents=True, exist_ok=True)
     v = rng.standard_normal((n, dim)).astype(np.float32)
@@ -227,3 +238,65 @@ def test_deltas_sum_to_the_run_totals(tmp_path, caplog, monkeypatch):
     assert sum(float(r["dgpu"]) for r in rows) <= float(got["gpu_s"]) + 0.05
     assert sum(float(r["dio"]) for r in rows) == pytest.approx(
         float(got["io_wait_s"]), abs=0.05)
+
+
+def test_the_twopass_line_reports_per_file_deltas(tmp_path, caplog, monkeypatch):
+    """`twopass.stats()` is cumulative for the whole run; this line is not.
+
+    It sits next to the `per-file` row precisely so a run's two regimes can be
+    separated, and cumulative values cannot do that — the live-heavy first
+    files would be smeared into every later row and the transition the line
+    exists to show would be invisible. The check is exact rather than
+    approximate: every two-pass slice belongs to exactly one file, so the
+    per-file `slices=` numerators must sum to the manifest's `launches`,
+    which a running total cannot do for more than one file.
+    """
+    import json
+
+    from nova_bf import twopass
+
+    # Fixture scale. None of these is a correctness parameter (see
+    # `tests/test_twopass_pipeline.py`); the run has 6 query rows.
+    monkeypatch.setenv("NOVA_BF_TWOPASS_ON_CPU", "1")
+    monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", "1.0")
+    monkeypatch.setattr(twopass, "PAD_QUANTUM", 2)
+    monkeypatch.setattr(twopass, "PAD_FLOOR", 2)
+    monkeypatch.setattr(twopass, "PAD_SMALL", ())
+    monkeypatch.setattr(twopass, "MIN_QUERY_ROWS", 4)
+
+    caplog.set_level("INFO", logger="nova_bf.compute")
+    run_compute(_cfg(tmp_path, 5))
+
+    rows = [m for m in (TP_LINE.search(r.getMessage()) for r in caplog.records)
+            if m]
+    assert len(rows) >= 2, (
+        "fewer than two two-pass rows, so no delta was exercised and this "
+        f"test proved nothing: {[r.group(0) for r in rows]}")
+
+    doc = json.loads(
+        next((tmp_path / "out").rglob("*manifest*.json")).read_text())
+    tp = doc["params"]["kernels"]["twopass"]
+    assert tp["launches"] > 0, tp
+
+    # Against `slices_twopass`, NOT `launches`. The line's numerator is a
+    # `slices_twopass` delta, while `launches` counts narrowed exact GEMMs —
+    # and those differ by every slice whose live set came out empty, which
+    # `_twopass_prepare` calls "not a degenerate case: at steady state a whole
+    # slice can fail to beat any query's threshold". Measured on a corpus that
+    # produces them: numerators summed to 199 against 95 launches. Comparing
+    # to `launches` only passed because this fixture never fully prunes a
+    # slice, so it pinned an identity that is false in general.
+    assert sum(int(r["tp"]) for r in rows) == tp["slices_twopass"], (
+        f"the per-file numerators {[r['tp'] for r in rows]} sum to "
+        f"{sum(int(r['tp']) for r in rows)} against "
+        f"{tp['slices_twopass']} two-pass slices in the manifest — the line "
+        "is reporting a running total, not a delta")
+    for r in rows:
+        assert 0 < int(r["total"]) <= 2, (
+            f"{r['total']} slices attributed to one file of a fixture that "
+            "scores each file in a single slice — a cumulative count")
+        assert int(r["tp"]) <= int(r["total"]), r.group(0)
+        live, padded = float(r["live"]), float(r["padded"])
+        assert 0.0 <= live <= 1.0, r.group(0)
+        # the padding only ever adds rows to the exact GEMM
+        assert live <= padded <= 1.0, r.group(0)

@@ -296,3 +296,34 @@ def test_merge_of_unstamped_partials_leaves_no_run_key_on_the_artifact(tmp_path)
     merged = run_merge(cfg)["t"]
     md = pq.read_schema(merged).metadata or {}
     assert RUN_KEY not in md, "merge stamped a fabricated run fingerprint"
+
+
+def test_disabling_the_twopass_verification_changes_the_run_identity(ds, tmp_path,
+                                                                     monkeypatch):
+    """`NOVA_BF_TWOPASS_NO_VERIFY` must split the fingerprint.
+
+    It is the one switch that makes the two-pass NOT output-neutral: it
+    disables the proof that a padded GEMM height is bit-identical to the
+    full-height one, and its own warning says padded and full-height scores
+    "can disagree and reorder near-ties". Without it in the identity, a
+    partial produced with the proof disabled merges silently with partials
+    produced without it, and nothing downstream can tell them apart — the
+    exact mixing `merge` refuses for every other reproducibility-affecting
+    setting.
+
+    `allow_tf32` is in the identity for the same reason, and like it this is
+    the SETTING rather than the outcome: it splits even on a run where the
+    switch happened to have no effect, which is the safe direction.
+    """
+    from nova_bf.results import config_identity
+
+    cfg = _cfg(ds, tmp_path / "out")
+    monkeypatch.delenv("NOVA_BF_TWOPASS_NO_VERIFY", raising=False)
+    clean = config_identity(cfg, cfg.searches[0])
+
+    monkeypatch.setenv("NOVA_BF_TWOPASS_NO_VERIFY", "1")
+    unverified = config_identity(cfg, cfg.searches[0])
+
+    assert clean != unverified, (
+        "a run with the exactness proof disabled has the same identity as one "
+        "without it, so their partials would merge silently")

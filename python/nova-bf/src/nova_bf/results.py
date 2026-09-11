@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import logging
 
@@ -115,6 +116,8 @@ def config_identity(cfg: BruteForceConfig, spec: SearchSpec) -> str:
             else cfg.queries.dense_column
         ),
         "allow_tf32": cfg.params.allow_tf32,
+        "twopass_verify_disabled": bool(
+            os.environ.get("NOVA_BF_TWOPASS_NO_VERIFY")),
         "corpus_date_fields": cfg.corpus.date_fields,
         "queries_date_fields": cfg.queries.date_fields,
     }

@@ -158,7 +158,11 @@ def _workspace_version(start: str) -> str | None:
     return None
 
 
-def kernel_usage(prune_launches: int, live_stats: dict | None = None) -> dict:
+def kernel_usage(
+    prune_launches: int,
+    live_stats: dict | None = None,
+    two_pass_policy: str = "auto",
+) -> dict:
     """Report GPU fast paths that actually ran.
 
     Each entry records whether the path was permitted, how many times it ran,
@@ -197,10 +201,50 @@ def kernel_usage(prune_launches: int, live_stats: dict | None = None) -> dict:
             for name, v in live_stats.items()
         }
 
+    from nova_bf import twopass
+
+    tp = twopass.stats()
+    # `rows_live / rows_full` is what the two-pass actually skipped; the gap
+    # between it and `rows_padded / rows_full` is what the GEMM-height padding
+    # cost to keep cuBLAS on one kernel (see docs/brute-force/two-pass-bound.md).
+    tp["live_fraction"] = (
+        round(tp["rows_live"] / tp["rows_full"], 6) if tp["rows_full"] else None
+    )
+    tp["padded_fraction"] = (
+        round(tp["rows_padded"] / tp["rows_full"], 6) if tp["rows_full"] else None
+    )
+    # THE COUNTER IDENTITY, checked on the real run rather than only in tests.
+    # Recorded, never raised: a manifest that fails to write costs a rank its
+    # provenance, which is worse than an inconsistent counter.
+    ran = tp["slices_fused"] + tp["slices_unfused"]
+    booked = tp["slices_twopass"] + tp["slices_discarded"]
+    tp["counters_consistent"] = ran == booked
+    if ran != booked:
+        logger.warning(
+            "two-pass counters are inconsistent: %d pass-one runs "
+            "(fused %d + unfused %d) against %d booked (twopass %d + "
+            "discarded %d). One of them is miscounting; the run's RESULTS are "
+            "unaffected, but the manifest's accounting of two-pass work "
+            "cannot be trusted.",
+            ran, tp["slices_fused"], tp["slices_unfused"], booked,
+            tp["slices_twopass"], tp["slices_discarded"],
+        )
+    # `off` is an explicit reproducible run policy from YAML. The environment
+    # variable remains a diagnostic/temporary kill switch and wins over auto.
+    tp["policy"] = two_pass_policy
+    tp["permitted"] = (
+        two_pass_policy == "auto" and not os.environ.get("NOVA_BF_NO_TWOPASS")
+    )
+    # `launches` is the number of slices actually scored in two passes. 
+    tp["launches"] = tp.pop("gemms", 0)
+
+
     return {
         "prune": prune,
         "fold_kernel": merge_triton.usage(),
         "topk_kernel": topk_triton.usage(),
+        "twopass": tp,
+        "fused_rowmax_kernel": twopass.fuse_usage(),
     }
 
 

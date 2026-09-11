@@ -69,8 +69,11 @@ params:
   # CUDA-only: overlap the next multivector slice's pinned H2D transfer with
   # current-slice scoring and top-k. Slice and merge order remain unchanged.
   # multivector_double_buffer: false
+  # Exact dense scoring optimization: `auto` (default) uses a safe two-pass
+  # screen when worthwhile; `off` always uses the regular one-pass fp32 path.
+  # two_pass: auto
   # merge_batch_size: null
-  # merge_prefetch: false
+  # merge_ranged_reads: false
   # Which of two EXACTLY-tied candidates wins (see
   # docs/brute-force/overview.md#ties). `ordinal` (default) takes the earlier
   # corpus row and is free; `id` takes the lower `corpus.id_column`, which

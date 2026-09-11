@@ -1,46 +1,37 @@
-"""The `compute` phase: score corpus slices and produce an exact per-query top-K.
+"""Compute exact per-query top-K results over streamed corpus data.
 
-Each worker loads its queries onto the GPU, streams its assigned corpus files, and
-incrementally merges each file's results into a running top-K. I/O is prefetched
-in parallel with GPU computation, and large files can be processed in row batches
-to bound GPU memory. The final top-K is written as one Parquet file per worker.
+Each worker loads its queries, streams assigned corpus files, scores them in
+GPU-memory-bounded batches, and incrementally merges candidates into a running
+top-K. Corpus IDs are resolved only for final winners; the GPU state instead
+carries encoded source-file/row identifiers.
 
-The running state stores `(score, encoded_row)` rather than materializing corpus
-IDs on the GPU. `encoded_row` identifies the source file and row; final IDs are
-resolved only for the winning K entries. If `corpus.id_column` is provided, those
-IDs are read from the corpus instead.
+One run may execute multiple dense, sparse, multi-vector, filtered, and
+unfiltered `SearchSpec`s. Searches remain independent ranked lists, while
+compatible work is shared across specs, including decoded corpus batches,
+GPU-resident data, and score computations.
 
-One invocation may evaluate multiple independent `SearchSpec`s, including dense,
-sparse, multi-vector, filtered, and unfiltered searches. Searches remain
-independent ranked lists, but redundant work is shared: each required vector type
-is decoded and transferred once per batch, and searches using the same vector
-type reuse the same GPU-resident data and score computations.
+Dense metrics can share a `Q @ C^T` product and derive dot, cosine, or
+Euclidean scores from it; sparse dot and cosine similarly share their sparse
+product when applicable.
 
-For dense search, multiple metrics share one `Q @ C^T` product and derive dot,
-cosine, and Euclidean scores from it. Sparse dot and cosine similarly share their
-underlying sparse product.
+Uniform filters compact corpus rows before scoring when no unfiltered baseline
+requires the full batch. Multiple filtered searches sharing a vector type use
+the union of their surviving rows and select their own subsets from that shared
+batch.
 
-Filters are applied before or during scoring. Uniform filters compact the corpus
-to surviving rows before GPU transfer. When several filtered searches share a
-vector type, their surviving rows are unioned into one shared batch and each
-search masks that batch back to its own subset. If any search is unfiltered, the
-whole batch is scored once and filtered searches reuse those scores.
+Per-query filters instead mask individual `(query, row)` scores before top-K
+selection. Eligible numeric/categorical filters are evaluated on the GPU;
+text predicates use the CPU fallback, which stores their per-query row masks as
+row-packed `PackedRowMask`s and unpacks only the needed slice on device.
 
-Per-query filters cannot be represented by one shared row subset, so they retain
-the necessary candidate columns and mask individual `(query, row)` scores to
-`-inf` before top-K selection. Numeric and categorical per-query filters are
-evaluated GPU-natively when possible; text predicates fall back to the CPU path.
-
-The CPU-fallback mask is the one `(n_queries, file_rows)` array a run
-materializes, held for a whole corpus file's batch loop. Its query axis is that
-FILTER's own row union (`run_compute`'s `filter_rows`), not the queries file's
-height, so it does not grow when unrelated query sets are unioned into one file
-behind a `SearchSpec.rows` selector.
+`SearchSpec.rows` narrows each spec to its own query rows, while shared query
+and filter structures may span larger run-wide unions.
 """
 
 from __future__ import annotations
 
 import logging
+import operator
 import os
 import re
 import time
@@ -60,6 +51,7 @@ from tqdm import tqdm
 from nova_bf import manifest as run_manifest
 from nova_bf import profiling
 from nova_bf import topk_triton
+from nova_bf import twopass
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import (
     PackedRowMask,
@@ -862,6 +854,16 @@ class DenseCorpusBatch:
         self.share_gram = False
 
     @property
+    def exact_fp16(self) -> bool:
+        """Whether this file was stored as float16.
+
+        Stored float16 values widen exactly to float32, so converting them back
+        to float16 introduces no corpus-side input rounding in the two-pass
+        bound. Other storage dtypes conservatively pay the conversion bound.
+        """
+        return self.arr.dtype == np.float16
+
+    @property
     def n_rows(self) -> int:
         return self.arr.shape[0]
 
@@ -894,7 +896,7 @@ class DenseCorpusBatch:
         assert Cb.dtype is torch.float32, (
             f"dense slices must reach the scoring path as float32, got {Cb.dtype}"
         )
-        return DenseBatchSlice(Cb, self.share_gram)
+        return DenseBatchSlice(Cb, self.share_gram, exact_fp16=self.exact_fp16)
 
 
 @dataclass
@@ -924,13 +926,35 @@ class DenseBatchSlice:
 
     Cb: object  # torch.Tensor, (n_rows, dim)
     share_gram: bool = False
+    # Carried from the FILE, not recomputed here: whether the corpus values are
+    # exactly fp16-representable.
+    exact_fp16: bool = False
     _raw: object = None       # lazy Q @ Cbᵀ — only ever built when share_gram
     _c_norms: object = None   # lazy per-row L2 norms (cosine)
+    _c_norms_raw: object = None  # lazy per-row L2 norms, UNCLAMPED (the guards)
     _c_sq: object = None      # lazy per-row squared L2 norms (euclidean)
 
     @property
     def n_rows(self) -> int:
         return self.Cb.shape[0]
+
+    def col_norms(self):
+        """Return corpus L2 norms with the `1e-12` normalization clamp.
+
+        Shared by cosine scoring and the two-pass column scaling.
+        """
+        if self._c_norms is None:
+            self._c_norms = self.col_norms_raw().clamp_min(1e-12)
+        return self._c_norms
+
+    def col_norms_raw(self):
+        """Return corpus L2 norms before the normalization clamp.
+
+        Two-pass guards use these so the clamp cannot hide near-zero rows.
+        """
+        if self._c_norms_raw is None:
+            self._c_norms_raw = self.Cb.norm(dim=1)
+        return self._c_norms_raw
 
     def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
         if not self.share_gram:
@@ -945,10 +969,9 @@ class DenseBatchSlice:
             # stays safe to alias for the other metrics below.
             return raw
         if metric == "cosine":
-            if self._c_norms is None:
-                # clamp matches F.normalize's eps, so a zero corpus row scores
-                # 0 rather than NaN — identical convention to `_scores`.
-                self._c_norms = self.Cb.norm(dim=1).clamp_min(1e-12)
+            # clamp matches F.normalize's eps, so a zero corpus row scores
+            # 0 rather than NaN — identical convention to `_scores`.
+            self.col_norms()
             # `raw` is shared with dot/euclidean scoring, so normalize out of place first,
             # then in place on the resulting copy.
             #
@@ -1068,6 +1091,8 @@ _PRUNE_APPLIED = {"count": 0}
 def _reset_prune_instrumentation() -> None:
     _PRUNE_APPLIED["count"] = 0
     _LIVE_STATS.clear()
+    twopass.reset()
+    _reset_twopass_hints()
 
 
 # Track how many query/slice rows survive pruning, overall and per search.
@@ -2215,6 +2240,600 @@ def _ragged_batch_ranges(
     return ranges
 
 
+# --- two-pass dense scoring ---------------------------------------------------
+#
+# See `nova_bf.twopass` for the bound. The pieces live here because they need
+#  `_scores` — the exact fp32 scoring the reported results must come from — 
+# and the shape of `_process_batch_group`'s member loop.
+
+# Last observed live fraction per score-matrix group, used to decide whether
+# two-pass scoring is worthwhile.
+_TP_LIVE_HINT: dict[tuple, float] = {}
+_TP_TF32_WARNED = False
+
+
+def _reset_twopass_hints() -> None:
+    global _TP_OUT_DTYPE, _TP_TF32_WARNED
+
+    _TP_LIVE_HINT.clear()
+    _ROW_SCALE.clear()
+    # Warn-once state is per run, not per process.
+    _TP_TF32_WARNED = False
+
+    # Re-probe the output dtype for each run so an earlier GPU/device state
+    # cannot pin the bound used by later runs.
+    _TP_OUT_DTYPE = _TP_UNSET
+
+
+def _certify_two_pass(Q, Cb, metric, col_scale, row_scale, q_norms,
+                      out_dtype):
+    """Certify the two-pass bound on this configuration and machine.
+
+    Returns `None` when certified, a reason string when the configuration must
+    be refused, or `False` when this attempt was inconclusive and should be
+    retried without pruning.
+
+    Runs the structural/hardware probes, validates applied scaling, and checks
+    the bound against exact scores from one real corpus slice.
+    """
+    import torch
+
+    d = int(Q.shape[1])
+
+    # Structural and hardware checks.
+    reason = twopass.certify_closed_form(d, Q.device)
+    if reason is not None:
+        return reason
+
+    # Verify that the factors actually applied by pass one stay within the bound.
+    reason = twopass.probe_scales(col_scale, Cb.norm(dim=1).clamp_min(1e-12),
+                                  row_scale, q_norms)
+    if reason is not None:
+        return reason
+
+    # Certification is overhead, so preserve per-slice accounting counters.
+    # Machine-health maxima intentionally survive the probe.
+    before = {k: twopass._STATS[k] for k in (
+        "slices_fused", "slices_unfused", "slices_pass_one_oom",
+        "slices_guard_refused", "eps_evaluations", "eps_cache_hits")}
+    try:
+        upper, approx, eps = twopass.upper_bounds(
+            Q, Cb, col_scale, row_scale, out_dtype, metric=metric,
+            with_parts=True)
+        used_fused = twopass._STATS["slices_fused"] > before["slices_fused"]
+    finally:
+        twopass._STATS.update(before)
+
+    # On CUDA, certify only when pass one's float32 accumulator is under our
+    # control; the bound cannot verify cuBLAS's requested accumulation mode.
+    if not twopass.accumulator_is_ours(Q.device, used_fused):
+        return (
+            "pass one would run through cuBLAS rather than the fused kernel, "
+            "and the bound's gamma_d term assumes float32 accumulation that "
+            "only a torch flag requests — nothing can read back whether the "
+            "library honoured it. The fused kernel accumulates in float32 by "
+            "construction; without it there is no way to be sure, so this "
+            "run takes the one-pass path"
+        )
+    # Compare against the same exact scoring path used for ground truth, in the
+    # same scaled units as `upper`. OOM makes this attempt inconclusive, not unsafe.
+    try:
+        exact = _scores(Q, Cb, metric, q_norms, scale_in_packer=False)
+        top = exact.max(dim=1).values
+        del exact
+    except Exception as exc:                       # noqa: BLE001
+        if not _is_oom(exc):
+            raise
+        logger.warning(
+            "two-pass: could not allocate the certification GEMM for a "
+            "%d x %d slice; leaving this configuration UNCERTIFIED (so it "
+            "will not prune) and retrying on the next slice.",
+            int(Q.shape[0]), int(Cb.shape[0]),
+        )
+        return False
+
+    # -inf is unsafe: it can make a row prunable regardless of its true score.
+    neg_inf = torch.isneginf(upper)
+    n_neg = int(neg_inf.sum())
+    if n_neg:
+        return (
+            f"pass one produced an upper bound of -inf on {n_neg} of "
+            f"{int(upper.numel())} query rows; `-inf < thr` holds for every "
+            f"finite threshold, so each of those rows would be pruned "
+            f"regardless of its exact score"
+        )
+
+    # NaN/+inf upper bounds force the row live. After rejecting -inf above,
+    # every remaining upper is finite and must dominate the exact top.
+    forced_live = torch.isnan(upper) | torch.isposinf(upper)
+    needs_bound = ~forced_live
+    n_checked = int(needs_bound.sum())
+    if n_checked == 0:
+        # Nothing on this slice exercised the bound; stay uncertified so the
+        # next slice tries again, rather than recording a pass on no evidence.
+        return False
+
+    # A NaN exact top cannot certify a prunable row.
+    if bool((needs_bound & torch.isnan(top)).any()):
+        return False
+
+    # Fail closed: this also catches top=+inf against a finite upper.
+    bad = needs_bound & ~(upper >= top)
+    n_bad = int(bad.sum())
+    if n_bad:
+        worst = float((top - upper)[bad].max())
+        return (
+            f"the error bound does not hold on this machine: {n_bad} of "
+            f"{n_checked} checked query rows have an exact top score above "
+            f"their upper bound, by as much as {worst:.3e}. Pruning on this "
+            f"bound would call live rows dead"
+        )
+
+    # Record how much of the closed-form margin the observed pass-one error uses.
+    C_d = twopass._cf.C_const(
+        d, twopass._cf.U16,
+        0.0 if twopass.float32_is_exactly_fp16(Cb) else twopass._cf.U16)
+    ok_rows = needs_bound & torch.isfinite(top) & torch.isfinite(approx)
+    if bool(ok_rows.any()) and C_d > 0.0:
+        shortfall = float((top - approx)[ok_rows].max()) / C_d
+        twopass._STATS["shortfall_worst_ratio"] = max(
+            twopass._STATS.get("shortfall_worst_ratio") or 0.0, shortfall)
+        if shortfall > 0.75:
+            # NOT a refusal: the bound held on every row, which is the safety
+            # property. It is a signal that the real error has little of the
+            # margin the model predicts, i.e. that a term may be missing.
+            logger.warning(
+                "two-pass: the first pass fell %.2fx C(d) below the exact "
+                "maximum on this slice (d=%d, C=%.4e). The bound HELD on every "
+                "row, but Sec.9.3 red-flags anything above 0.75 — the worst "
+                "previously recorded was 0.42. Check the accumulation probe "
+                "and the storage formats before trusting this configuration.",
+                shortfall, d, C_d,
+            )
+        else:
+            logger.info(
+                "two-pass: probe A passed at d=%d — worst shortfall %.3f x C(d) "
+                "(C = %.4e), over %d rows.", d, shortfall, C_d, n_checked)
+    return None
+
+
+class _TwoPassPlan:
+    """Exact scores and row mappings for one two-pass score matrix.
+
+    The first `n_live` rows of `scores` correspond to live query rows; any
+    remaining rows are padding. `span[m]` selects member `m`'s live rows and
+    `dst[m]` maps them back into that member's full top-K state.
+    """
+
+    __slots__ = ("scores", "span", "dst", "height", "n_live", "n_full")
+
+    def __init__(self, scores, span, dst, height, n_live, n_full):
+        self.scores = scores
+        self.span = span
+        self.dst = dst
+        self.height = height
+        self.n_live = n_live
+        self.n_full = n_full
+
+
+# Cache each query-norm tensor's reciprocal for the run. Stable `row_scale`
+# identity lets the two-pass query/eps caches persist across corpus files.
+# Entries retain `q_norms` strongly so their id cannot be recycled.
+_ROW_SCALE: dict[int, tuple] = {}
+
+
+def _row_scale_for(q_norms):
+    """Return a cached reciprocal, invalidated by in-place norm changes."""
+    got = _ROW_SCALE.get(id(q_norms))
+    if got is not None and got[0] is q_norms and got[2] == q_norms._version:
+        return got[1]
+    rs = q_norms.reciprocal()
+    _ROW_SCALE[id(q_norms)] = (q_norms, rs, q_norms._version)
+    return rs
+
+
+def _twopass_groups(batch, score_groups, spec_Q, spec_q_norms,
+                    spec_qsel, device, prune, two_pass=True):
+    """Which score matrices this batch group may score in two passes.
+
+    Decided ONCE per batch group, from things that cannot change slice to
+    slice. Every member reading a matrix has to be eligible: the two-pass
+    skips rows of the matrix itself, so a single member that cannot have its
+    liveness decided would silently lose candidates.
+    """
+    import torch
+
+    if not (two_pass and twopass.enabled() and prune
+            and isinstance(batch, DenseCorpusBatch)):
+        return {}
+    # CUDA only unless debugging
+    on_cuda = str(device).startswith("cuda")
+    if not (on_cuda or os.environ.get("NOVA_BF_TWOPASS_ON_CPU")):
+        return {}
+    # The shared-Gram derivation caches one raw `Q @ Cbᵀ` across metrics; the
+    # two-pass narrows the query axis, so the two cannot share a matrix.
+    if getattr(batch, "share_gram", False):
+        return {}
+    # TF32 changes CUDA exact-path arithmetic and is not covered by the bound.
+    if on_cuda and torch.backends.cuda.matmul.allow_tf32:
+        global _TP_TF32_WARNED
+        if not _TP_TF32_WARNED:
+            _TP_TF32_WARNED = True
+            logger.warning(
+                "two-pass dense scoring is off for this run: params.allow_tf32 "
+                "is enabled, and the two-pass error bound assumes the non-TF32 "
+                "float32 path. Falling back to ordinary one-pass scoring."
+            )
+        return {}
+    out = {}
+    for score_key, members in score_groups.items():
+        metric, scale_in_packer = score_key
+        if metric not in ("cosine", "dot"):
+            continue
+        Q = spec_Q[members[0]]
+        if not (hasattr(Q, "shape") and Q.ndim == 2 and Q.dtype is torch.float32):
+            continue
+        if Q.shape[0] < twopass.MIN_QUERY_ROWS:
+            continue
+        # Every member of a group must read the SAME query matrix — the
+        # score cache already assumes it, but the two-pass would produce
+        # wrong rows rather than a redundant GEMM if it were ever false.
+        if any(spec_Q[m] is not Q for m in members):
+            continue
+
+        # Members must select contiguous, unit-stride blocks of the shared query
+        # matrix because downstream represents each selection by `(start, stop)`.
+        # `operator.index` accepts Python/NumPy integer scalars while rejecting
+        # non-index values such as floats.
+        def _plain_block(q):
+            if q is None:
+                return True
+            if not isinstance(q, slice) or q.step not in (None, 1):
+                return False
+            if q.start is None or q.stop is None:
+                return False
+            try:
+                start = operator.index(q.start)
+                stop = operator.index(q.stop)
+            except TypeError:
+                return False
+            return 0 <= start <= stop <= Q.shape[0]
+
+        if any(not _plain_block(spec_qsel[m]) for m in members):
+            continue
+        q_norms = spec_q_norms[members[0]]
+        if metric == "cosine":
+            if q_norms is None or any(spec_q_norms[m] is not q_norms for m in members):
+                continue
+            row_scale = _row_scale_for(q_norms)
+        else:
+            row_scale = None
+        out[score_key] = {
+            "members": list(members),
+            "metric": metric,
+            "scale_in_packer": scale_in_packer,
+            "Q": Q,
+            "q_norms": q_norms,
+            "row_scale": row_scale,
+            "key": tuple(members),
+        }
+    return out
+
+
+def _tp_out_dtype():
+    """Return pass one's requested GEMM output dtype.
+
+    The default is float16 to reduce pass-one memory traffic. When
+    `NOVA_BF_TWOPASS_FP32_OUT` is set, probe once whether the CUDA GEMM path
+    supports float32 output from float16 inputs; otherwise fall back to
+    float16. The bound accounts for the selected output rounding.
+    """
+    import torch
+
+    if not os.environ.get("NOVA_BF_TWOPASS_FP32_OUT"):
+        return None
+    global _TP_OUT_DTYPE
+    if _TP_OUT_DTYPE is _TP_UNSET:
+        try:
+            x = torch.zeros(8, 8, device="cuda", dtype=torch.half)
+            _TP_OUT_DTYPE = (torch.float32
+                             if torch.mm(x, x, out_dtype=torch.float32).dtype
+                             is torch.float32 else None)
+        except Exception:
+            _TP_OUT_DTYPE = None
+        if _TP_OUT_DTYPE is None:
+            logger.info("two-pass: NOVA_BF_TWOPASS_FP32_OUT is set but this "
+                        "torch has no float32 output for a half GEMM; using a "
+                        "float16 result and the matching output-rounding term")
+    return _TP_OUT_DTYPE
+
+
+_TP_UNSET = object()
+_TP_OUT_DTYPE = _TP_UNSET
+
+
+def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
+                     audit_members=None):
+    """Build two-pass plans for eligible score matrices in this slice.
+
+    Uses the approximate upper bound to identify live query rows, verifies a
+    bit-identical padded GEMM height, and computes exact scores only for those
+    rows. Groups that cannot safely or profitably use two-pass fall back to
+    ordinary full-height scoring.
+    """
+    import torch
+
+    plans = {}
+    # Apply stats only if the whole group loop succeeds.
+    notes = []          
+    thresh = twopass.threshold()
+
+    for score_key, g in tp_groups.items():
+        hint = _TP_LIVE_HINT.get(g["key"])
+        if hint is None or hint > thresh:
+            twopass._STATS["slices_plain"] += 1
+            # One-pass scoring seeds/updates the live-fraction hint.
+            continue
+        Q = g["Q"]
+        n_full = int(Q.shape[0])
+        metric = g["metric"]
+        col_scale = sl.col_norms().reciprocal() if metric == "cosine" else None
+
+        # Certify each execution configuration before allowing it to prune.
+        cert_key = (g["key"], int(Q.shape[0]), int(sl.Cb.shape[0]),
+                    int(Q.shape[1]), str(device), str(_tp_out_dtype()),
+                    bool(sl.exact_fp16))
+        if not twopass.is_certified(cert_key) and not os.environ.get(
+                "NOVA_BF_TWOPASS_NO_CERTIFY"):
+            why = _certify_two_pass(
+                Q, sl.Cb, metric, col_scale, g["row_scale"], g["q_norms"],
+                _tp_out_dtype())
+            if why is False:
+                # Certification was INCONCLUSIVE — no verdict either way.
+                twopass._STATS["certify_inconclusive"] += 1
+                continue
+            twopass.note_certified(why, None if why else cert_key)
+            if why is not None:
+                logger.warning(
+                    "two-pass dense scoring is DISABLED for this run: %s. "
+                    "Ground truth is unaffected — the one-pass path produces "
+                    "the same results, without the speedup.", why,
+                )
+                twopass.disable(why)
+                return {}
+            logger.info(
+                "two-pass: the error bound is certified for %s at d=%d, "
+                "%d queries x %d columns — no row of this slice exceeded its "
+                "upper bound.", g["key"], int(Q.shape[1]), int(Q.shape[0]),
+                int(sl.Cb.shape[0]),
+            )
+
+        # Distinguish a measured pass one from guard/OOM all-live fallbacks.
+        oom_before = twopass._STATS["slices_pass_one_oom"]
+        po_before = (twopass._STATS["slices_fused"]
+                     + twopass._STATS["slices_unfused"])
+        upper, _approx_dbg, _eps_dbg = twopass.upper_bounds(
+            Q, sl.Cb, col_scale, g["row_scale"], _tp_out_dtype(),
+            metric=metric, cn=sl.col_norms_raw(),
+            corpus_exact_fp16=sl.exact_fp16, with_parts=True)
+        # Largest epsilon gives a conservative audit margin ratio.
+        eps_for_audit = float(_eps_dbg.max()) if _eps_dbg.numel() else 0.0
+        del _approx_dbg, _eps_dbg
+        ran_pass_one = (twopass._STATS["slices_fused"]
+                        + twopass._STATS["slices_unfused"]) > po_before
+        
+        # Union live rows across every member sharing this score matrix.
+        live = torch.zeros(n_full, dtype=torch.bool, device=device)
+        bnds = []
+        dead_probe = []
+        for m in g["members"]:
+            qsel = spec_qsel[m]
+            thr_s = unpack_score(spec_thr[m])
+            want = n_full if qsel is None else (qsel.stop - qsel.start)
+
+            # Require the exact 1-D threshold shape; numel() alone can broadcast.
+            if thr_s.ndim != 1 or int(thr_s.shape[0]) != want:
+                raise RuntimeError(
+                    f"two-pass: member {m}'s threshold has shape "
+                    f"{tuple(thr_s.shape)}, expected ({want},) to match its "
+                    f"query span — any other shape would broadcast and "
+                    f"silently mark the wrong rows dead"
+                )
+            if qsel is None:
+                live |= ~(upper < thr_s)
+                bnds.extend((0, n_full))
+                dead_probe.append((m, slice(0, n_full), upper < thr_s, thr_s))
+            else:
+                live[qsel] |= ~(upper[qsel] < thr_s)
+                bnds.extend((qsel.start, qsel.stop))
+                dead_probe.append((m, qsel, upper[qsel] < thr_s, thr_s))
+
+        # Optional exact audit of prune/keep decisions.
+        _dr = twopass.dead_audit_rate()
+        if _dr:
+            twopass._STATS["dead_audit_offered"] += 1
+        if _dr and ((twopass._STATS["dead_audit_offered"] - 1) % _dr == 0):
+            twopass._STATS["dead_audit_sampled"] += 1
+            for _m, _rng, _dead, _thr in dead_probe:
+                if audit_members is not None and _m not in audit_members:
+                    # Filtered members would distort live/wasted-live grading.
+                    twopass._STATS["dead_audit_skipped_filtered"] += 1
+                    continue
+                twopass.audit_decisions(
+                    Q[_rng], sl.Cb, metric, ~_dead, _thr,
+                    None if g["q_norms"] is None else g["q_norms"][_rng])
+                if not twopass.enabled():
+                    break
+
+            # Audit failure occurs before pass two, so this slice can fall back.
+            if not twopass.enabled():
+                twopass._STATS["slices_plain"] += 1
+                if ran_pass_one:
+                    twopass._STATS["slices_discarded"] += 1
+                return {}
+
+        idx = live.nonzero(as_tuple=True)[0]
+        n_live = int(idx.numel())
+        pass_one_oom = twopass._STATS["slices_pass_one_oom"] > oom_before
+        if not pass_one_oom:
+            _TP_LIVE_HINT[g["key"]] = n_live / max(1, n_full)
+        
+        M = twopass.pad_height(n_live, n_full)
+        if M >= n_full:
+            # No useful query-row reduction remains.
+            twopass._STATS["slices_plain"] += 1
+            if ran_pass_one:
+                twopass._STATS["slices_discarded"] += 1
+            continue
+
+        # Every host-side number this plan needs, in one device->host round
+        # trip: the member spans within the sorted live index.
+        spans = torch.searchsorted(
+            idx, torch.tensor(bnds, dtype=idx.dtype, device=device)
+        ).tolist()
+
+        span, dst, height = {}, {}, {}
+        for i, m in enumerate(g["members"]):
+            span[m] = (spans[2 * i], spans[2 * i + 1])
+            height[m] = n_full if spec_qsel[m] is None else (
+                spec_qsel[m].stop - spec_qsel[m].start)
+        if n_live == 0:
+            # Every row was safely pruned; no exact GEMM is needed.
+            plans[score_key] = _TwoPassPlan(None, span, dst, height, 0, n_full)
+            notes.append((0, n_full, 0))
+            continue
+
+        # Verify, once per distinct shape, that an M-row GEMM agrees
+        # bit-for-bit with the full-height one.
+        unchecked = False
+        for cand in twopass.pad_candidates(n_live, n_full):
+            if cand >= n_full:
+                M = n_full
+                break
+            verdict = twopass._verify_shape(Q, sl.Cb, cand)
+            if verdict is twopass.UNVERIFIED:
+                unchecked = True
+                continue
+            if verdict:
+                M = cand
+                break
+        else:
+            # Unreachable: `pad_candidates` always ends with `n_full` and the
+            # loop breaks on `cand >= n_full`, so the `for` cannot run to
+            # exhaustion. Kept as the same value the loop would have set, so
+            # that a future change to the ladder cannot leave `M` undefined.
+            M = n_full
+        if M >= n_full:
+            twopass._STATS["slices_plain"] += 1
+            twopass._STATS["slices_discarded"] += 1
+            if unchecked:
+                if twopass.warn_unchecked_once():
+                    logger.warning(
+                        "two-pass: could not complete the bit-identity check "
+                        "for a %d-row slice (out of memory); skipping the "
+                        "two-pass for that slice and any later one that hits "
+                        "the same thing. See verifications_incomplete for "
+                        "the count.", n_full,
+                    )
+                if twopass.note_unchecked_slice():
+                    twopass.disable(
+                        f"the padded-height bit-identity check could not be "
+                        f"COMPLETED (out of memory) for "
+                        f"{twopass.MAX_UNCHECKED_SLICES} consecutive slices; "
+                        f"this is no longer plausibly transient. No height "
+                        f"was found to disagree — none could be measured."
+                    )
+                return {}
+            # Every candidate height was checked and disagreed. Disable the 2 pass approach
+            twopass.disable(
+                f"no padded GEMM height in {twopass.pad_candidates(n_live, n_full)} "
+                f"is bit-identical to the full {n_full}-row one on this device"
+            )
+            return {}
+
+        twopass.note_checked_slice()
+
+        # Pad by repeating the last live row; padded rows are never consumed.
+        idx_pad = idx if M == n_live else torch.cat(
+            (idx, idx[-1:].expand(M - n_live))
+        )
+        Qs = Q.index_select(0, idx_pad)
+        qn = g["q_norms"]
+        scores = _scores(
+            Qs, sl.Cb, metric,
+            None if qn is None else qn.index_select(0, idx_pad),
+            scale_in_packer=g["scale_in_packer"],
+        )
+        del Qs, idx_pad
+
+        # Optionally verify exact live-row maxima against the upper bound
+        rate = twopass.audit_rate()
+        if rate and n_live and (twopass._STATS["slices_twopass"] % rate == 0):
+            twopass.audit_live_rows(
+                scores, n_live, idx, upper,
+                g["row_scale"] if g["scale_in_packer"] else None,
+                eps_used=eps_for_audit)
+        del upper
+
+        # Map group-level live rows back into each member's local state.
+        for m in g["members"]:
+            lo, hi = span[m]
+            base = 0 if spec_qsel[m] is None else spec_qsel[m].start
+            dst[m] = idx[lo:hi] - base
+        plans[score_key] = _TwoPassPlan(scores, span, dst, height, n_live, n_full)
+        notes.append((n_live, n_full, M))
+
+    # Count only two-pass plans whose results are actually returned.
+    for note in notes:
+        _tp_note(*note)
+    return plans
+
+
+def _tp_note(n_live: int, n_full: int, M: int) -> None:
+    st = twopass._STATS
+    st["slices_twopass"] += 1
+    st["rows_full"] += n_full
+    st["rows_live"] += n_live
+    st["rows_padded"] += M
+
+    # An all-pruned slice uses two-pass but launches no exact GEMM.
+    if M:
+        st["gemms"] += 1
+
+
+def _tp_scatter_part(part_key, part_enc, live, dst, height: int):
+    """Scatter a live-row top-K part back to the member's full height.
+
+    Dead rows remain uninitialized and are masked out by `full_live`.
+    """
+
+    import torch
+
+    n_live, k = part_key.shape
+    full_key = torch.empty((height, k), dtype=part_key.dtype,
+                           device=part_key.device)
+    if topk_triton._poisoning():
+        full_key.fill_(topk_triton.POISON_KEY)
+    full_key.index_copy_(0, dst, part_key)
+
+    if part_enc.ndim == 2:
+        full_enc = torch.empty((height, part_enc.shape[1]),
+                               dtype=part_enc.dtype, device=part_enc.device)
+        if topk_triton._poisoning():
+            full_enc.fill_(topk_triton.POISON_ID)
+        full_enc.index_copy_(0, dst, part_enc)
+    else:
+        # Shared column IDs do not depend on query row.
+        full_enc = part_enc
+
+    full_live = torch.zeros(height, dtype=torch.uint8, device=part_key.device)
+    if live is not None:
+        full_live.index_copy_(0, dst, live)
+    else:
+        full_live.index_fill_(0, dst, 1)
+    return full_key, full_enc, full_live
+
+
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_key, spec_top_enc, spec_thr,
@@ -2225,26 +2844,12 @@ def _process_batch_group(
     ordinal_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
+    two_pass: bool = True,
 ) -> float:
-    """Process one vector-type batch, sharing transfer and scoring across members.
+    """Process one vector-type batch, sharing work across search members.
 
-    The batch is sliced by `batch_size`; each slice is transferred once, scored
-    once per distinct metric, then merged into each member's top-k state.
-
-    `orig_rows` maps compacted single-file rows back to true file rows for
-    filtering. `encoded_row_ids` separately provides output IDs when rows cannot
-    be encoded from `gidx` alone, as in coalesced multi-file batches.
-
-    `ordinal_base`/`ordinal_row_ids` similarly provide deterministic tie-break
-    ordinals: the scalar form is used when they can be derived from row position,
-    otherwise the caller supplies per-row values.
-
-    `select(...)` returns optional row/column selection and a per-query cell mask.
-    `spec_qsel` selects queries in the shared score matrix, while `spec_qrows`
-    selects queries in a filter's own mask; these are distinct query spaces.
-
-    Returns wall-clock time spent in the processing loop. Any CPU-side compaction
-    must happen before this call and is therefore excluded from this timing.
+    Slices are transferred/scored once where possible and folded into each
+    member's top-K state. Returns processing-loop wall time.
     """
     import torch
 
@@ -2255,9 +2860,7 @@ def _process_batch_group(
     step = batch_size or n_rows
     max_doc_tokens = None
     if isinstance(batch, MultiVectorCorpusBatch) and multivector_token_budget is not None:
-        # Every backend (torch and triton_reduce alike) materializes the
-        # (block_query_tokens x slice_doc_tokens) matrix P, so the budget is
-        # always enforced against the worst actual query block.
+        # Size document slices against the largest query-token block.
         max_query_tokens = max(
             1, max(spec_Q[m].max_block_tokens for m in member_idxs)
         )
@@ -2266,26 +2869,43 @@ def _process_batch_group(
         ranges = _ragged_batch_ranges(batch.doc_offsets, step, max_doc_tokens)
     else:
         ranges = [(r0, min(r0 + step, n_rows)) for r0 in range(0, n_rows, step)]
-    # Count consumers of each distinct score matrix so single-use matrices are
-    # not cached. Include `scale_in_packer` because it changes score semantics,
-    # even when the metric is the same.
+
+    # Cache only score matrices shared by multiple members.
     score_share_count = Counter(
         (specs[m].metric, spec_cos_scale[m] is not None) for m in member_idxs
     )
 
-    # Dense only: if multiple metrics score this batch, derive them from one shared
-    # Gram matrix instead of one GEMM per metric. Count metrics, not score keys.
+    # Multiple dense metrics share one raw Gram matrix.
     if isinstance(batch, DenseCorpusBatch):
         batch.share_gram = len({specs[m].metric for m in member_idxs}) > 1
 
-    # Amortize running top-k by buffering pre-topk'd slice candidates and merging
-    # once >= k columns are pending. All members are flushed before returning.
+    # Which members READ each score matrix.
+    score_groups: dict[tuple, list[int]] = {}
+    for m in member_idxs:
+        score_groups.setdefault(
+            (specs[m].metric, spec_cos_scale[m] is not None), []
+        ).append(m)
+
+    # Buffer slice top-Ks so they can be merged in larger batches.
     pending: dict[int, list[tuple]] = {m: [] for m in member_idxs}
     pending_cols: dict[int, int] = {m: 0 for m in member_idxs}
 
     # Decide pruning once per batch group so pruned parts are never flushed
     # through an unpruned path. A stale threshold only prunes less, never wrongly.
     prune = not os.environ.get("NOVA_BF_NO_PRUNE")
+
+    # Determine which shared dense score matrices can use two-pass scoring.
+    tp_groups = _twopass_groups(
+        batch, score_groups, spec_Q, spec_q_norms, spec_qsel, device, prune,
+        two_pass=two_pass,
+    )
+
+    twopass._STATS["groups_seen"] += 1
+    if not tp_groups:
+        twopass._STATS["groups_refused"] += 1
+    
+    # Probe one ordinary slice to seed two-pass profitability.
+    tp_probe = [bool(tp_groups)]
 
     def _flush_pending(m: int) -> None:
         if not pending[m]:
@@ -2305,9 +2925,7 @@ def _process_batch_group(
     def process_slice(r0: int, r1: int, sl) -> None:
         if orig_rows is None:
             # No CPU round-trip: build the row-index tensor directly on
-            # device, and use a plain slice (a view, not a gather-copy) to
-            # index a filter's keep-mask below — position already IS the
-            # true row here, so there's nothing to remap.
+            # device
             rows = torch.arange(r0, r0 + sl.n_rows, dtype=torch.int64, device=device)
             true_rows = slice(r0, r0 + sl.n_rows)
         else:
@@ -2331,95 +2949,137 @@ def _process_batch_group(
         cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
         rank_cache: dict[int, tuple] = {}
         subset_cache: dict[int, tuple] = {}
+
+        tp_plan = {}
+        # Two-pass runs only on full-width slices to avoid verifying tail shapes.
+        if tp_groups and sl.n_rows == step:
+            unfiltered = {m for m in range(len(specs))
+                          if _is_unfiltered(specs[m].filter)}
+            tp_plan = _twopass_prepare(
+                tp_groups, sl, spec_thr, spec_qsel, device,
+                audit_members=unfiltered,
+            )
+            if not twopass.enabled():
+                tp_groups.clear()
+        probe = tp_probe[0] and not tp_plan
+        probe_live: dict[tuple, list] = {}
+
         for m in member_idxs:
             s = specs[m]
-            # Dense cosine's query-norm divide happens in the packer, so the
-            # flag is part of the cache key — see `score_share_count`.
+            # Query scaling changes score semantics, so it is part of the key.
             scale_in_packer = spec_cos_scale[m] is not None
             score_key = (s.metric, scale_in_packer)
-            scores = score_cache.get(score_key)
-            if scores is None:
-                scores = sl.score(
-                    spec_Q[m], s.metric, spec_q_norms[m],
-                    scale_in_packer=scale_in_packer,
-                )
-                if score_share_count[score_key] > 1:
-                    score_cache[score_key] = scores
+            plan = tp_plan.get(score_key)
+            scores = None
+            if plan is None:
+                scores = score_cache.get(score_key)
+                if scores is None:
+                    scores = sl.score(
+                        spec_Q[m], s.metric, spec_q_norms[m],
+                        scale_in_packer=scale_in_packer,
+                    )
+                    if score_share_count[score_key] > 1:
+                        score_cache[score_key] = scores
 
             sel_rows, sel_cols, cell_mask = select(m, rows, true_rows, cache)
             if sel_rows is None:
                 continue
-            sel_scores = scores if sel_cols is None else scores[:, sel_cols]
+            
+            qsel = spec_qsel[m]
+            if plan is None:
+                sel_scores = scores if sel_cols is None else scores[:, sel_cols]
+                if qsel is not None:
+                    sel_scores = sel_scores[qsel]
+                dst = None
+                full_height = sel_scores.shape[0]
+                thr_m = spec_thr[m]
+                cos_scale = spec_cos_scale[m]
+            else:
+                # Two-pass: select this member's live rows from the compact score matrix.
+                lo, hi = plan.span[m]
+                full_height = plan.height[m]
+                if hi <= lo:
+                    # Every query row for this member was pruned by the bound.
+                    _PRUNE_APPLIED["count"] += 1
+                    _live_stats_add(
+                        m,
+                        torch.zeros(full_height, dtype=torch.uint8, device=device),
+                        full_height,
+                    )
+                    continue
+                dst = plan.dst[m]
+                sub = plan.scores[lo:hi]
+                sel_scores = sub if sel_cols is None else sub[:, sel_cols]
+                thr_m = spec_thr[m].index_select(0, dst)
+                cos_scale = (
+                    None if spec_cos_scale[m] is None
+                    else spec_cos_scale[m].index_select(0, dst)
+                )
             sel_encoded = encoded_rows if sel_cols is None else encoded_rows[sel_cols]
             sel_ordinals = (ordinals if sel_cols is None
                             else _subset_for(subset_cache, ordinals, sel_cols))
-            # Query-row subset (`SearchSpec.rows`). The score matrix spans this
-            # vector_type's whole row union — every spec sharing the type reads
-            # the same one — so a spec that owns only part of it slices here,
-            # BEFORE the top-k.
-            qsel = spec_qsel[m]
-            if qsel is not None:
-                sel_scores = sel_scores[qsel]
             if cell_mask is not None:
                 if qsel is not None:
-                    # `cell_mask` is built over the FILTER's query axis (the union of the
-                    # `rows` of every spec sharing it), not the file's, so it is
-                    # indexed by FILE row (`spec_qrows`), not by position
-                    # within this spec's slice (`spec_qsel`). Rebinding, never
-                    # mutating: the mask may be cached and shared with another
-                    # spec that has a different subset.
+                    # Convert from the filter's query space to this member's rows.
                     cell_mask = cell_mask[spec_qrows[m]]
+                if dst is not None:
+                    # Follow two-pass query-row compaction.
+                    cell_mask = cell_mask.index_select(0, dst)
                 sel_scores = sel_scores.masked_fill(~cell_mask, float("-inf"))
 
-            # Append to the pending buffer (pre-topk wide slices down to k so
-            # the buffer, and any slice score matrix it would otherwise pin
-            # alive, stays bounded); merge only once >= k columns accumulate.
-            cos_scale = spec_cos_scale[m]
-
+            # Append to the pending buffer; merge only once
+            # >= k columns accumulate.
             if sel_scores.shape[1] > s.k:
                 if prune:
                     _PRUNE_APPLIED["count"] += 1
-                # The kernel's tie-break descent ranks the ordinals, which
-                # depends on the COLUMNS only — so every member of a slice was
-                # computing the same argsort + scatter (four launches) over
-                # again. Built once per distinct ordinal vector instead.
-                #
-                # Computed HERE, not beside `sel_ordinals`, because this is the
-                # only branch that consumes it: the narrow-slice `pack` below
-                # never takes a rank, and on a filtered run that is the common
-                # case. Hoisting it above the branch cost `rank_of` on every
-                # member whether or not anything read the result (measured
-                # 97 us CPU / 121 us CUDA at n=8192, and 11,866 unused calls
-                # across one CPU suite run).
+                # Ranking depends only on the selected ordinal vector, so cache it.
                 sel_rank = _rank_for(rank_cache, sel_ordinals)
-                # `encoded=` makes the selection return the encoded ROW IDS
-                # directly. On the Triton path the kernel loads them for kept
-                # lanes, so the int32->int64 widening and the
-                # `sel_encoded[part_local]` gather that used to follow every
-                # slice are gone (G2); on the portable path `pack_topk` does
-                # the same gather internally. `sel_encoded` is dense int64 on
-                # device either way — the whole slice's `encoded_rows`, or the
-                # column-selected subset for a uniform filter.
+
                 part_key, part_enc, live = pack_topk(
                     sel_scores, sel_ordinals, s.k, cos_scale,
-                    thr=spec_thr[m] if prune else None,
+                    thr=thr_m if prune else None,
                     encoded=sel_encoded, rank=sel_rank)
-                if live is not None:
-                    _live_stats_add(m, live, live.shape[0])
             else:
                 part_key = pack(sel_scores, sel_ordinals, cos_scale)
                 part_enc = sel_encoded
-                # Narrow slices skip the pre-top-K, so the prune decision the
-                # kernel would have made is applied here by the same rule.
+                # Narrow slices apply the same prune rule after packing.
                 if prune:
                     _PRUNE_APPLIED["count"] += 1
-                live = live_rows(part_key, spec_thr[m]) if prune else None
-                if live is not None:
-                    _live_stats_add(m, live, live.shape[0])
+                live = live_rows(part_key, thr_m) if prune else None
+            if dst is not None:
+                # Restore the member's full query height before folding.
+                part_key, part_enc, live = _tp_scatter_part(
+                    part_key, part_enc, live, dst, full_height)
+            if live is not None:
+                _live_stats_add(m, live, live.shape[0])
+                if probe and score_key in tp_groups:
+                    probe_live.setdefault(score_key, []).append((m, live))
             pending[m].append((part_key, part_enc, live))
             pending_cols[m] += part_key.shape[1]
             if pending_cols[m] >= s.k:
                 _flush_pending(m)
+
+        if probe and probe_live:
+            # Seed profitability from the union of live score-matrix rows. Filtering
+            # may underestimate liveness, causing at most one wasted two-pass attempt;
+            # _twopass_prepare then replaces it with its bound-based measurement.
+            for key, lives in probe_live.items():
+                g = tp_groups.get(key)
+                if g is None:
+                    continue
+                n_full = int(g["Q"].shape[0])
+                
+                union = torch.zeros(n_full, dtype=torch.bool, device=device)
+                for mi, lv in lives:
+                    qsel = spec_qsel[mi]
+                    flat = lv.reshape(-1).bool()
+                    if qsel is None:
+                        union |= flat
+                    else:
+                        union[qsel] |= flat
+                _TP_LIVE_HINT[g["key"]] = (
+                    int(union.sum(dtype=torch.int64).item()) / max(1, n_full))
+            tp_probe[0] = False
 
     use_double_buffer = (
         multivector_double_buffer
@@ -2916,6 +3576,7 @@ def _process_shared_batch(
     ordinal_row_ids: np.ndarray | None = None,
     multivector_token_budget: int | None = None,
     multivector_double_buffer: bool = False,
+    two_pass: bool = True,
 ) -> float:
     """Process one shared corpus batch for all searches of a vector type.
 
@@ -3004,6 +3665,7 @@ def _process_shared_batch(
         ordinal_base=ordinal_base, ordinal_row_ids=ordinal_row_ids,
         multivector_token_budget=multivector_token_budget,
         multivector_double_buffer=multivector_double_buffer,
+        two_pass=two_pass,
         spec_qsel=spec_qsel, spec_qrows=spec_qrows,
         spec_cos_scale=spec_cos_scale,
     )
@@ -3272,12 +3934,12 @@ def run_compute(
                     "multivector scoring uses cuBLAS FP32 matmul plus the "
                     "fused Triton ragged reducer"
                 )
-    # Opt-in TF32 tensor-core matmuls (see ParamsConfig.allow_tf32). CUDA-only;
-    # torch's flag is a no-op on CPU, but gate on device anyway so the log is
-    # honest. OFF by default keeps GT bit-exact f32 (matching Qdrant).
-    if cfg.params.allow_tf32 and device == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # Set TF32 explicitly each run because these flags are process-global and may
+    # otherwise retain a previous run's setting. Two-pass requires TF32 to be off.
+    want_tf32 = bool(cfg.params.allow_tf32) and str(device).startswith("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = want_tf32
+    torch.backends.cudnn.allow_tf32 = want_tf32
+    if want_tf32:
         logger.warning(
             "params.allow_tf32=True: TF32 matmuls enabled (CUDA) — ~1.75x faster "
             "multivector/dense matmul, but scores are NOT bit-exact f32 (~3e-4 "
@@ -4220,6 +4882,7 @@ def run_compute(
                 multivector_double_buffer=(
                     cfg.params.multivector_double_buffer if vt == "multivector" else False
                 ),
+                two_pass=cfg.params.two_pass == "auto",
             )
             coalesce_buf[vt] = []
             coalesce_rows[vt] = 0
@@ -4234,6 +4897,11 @@ def run_compute(
                 profiling.PROFILE_FILES, *prof_window,
             )
         prev_t, prev_gpu, prev_io = wall0, gpu_secs, io_wait
+        # `twopass.stats()` is cumulative for the whole run, and the per-file
+        # line reports DELTAS, so the previous reading has to be carried the
+        # same way `prev_gpu` is.
+        prev_tp = {"slices_twopass": 0, "slices_plain": 0, "rows_full": 0,
+                   "rows_live": 0, "rows_padded": 0}
         with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
             for want_gidx, _f in mine:
                 w0 = time.perf_counter()
@@ -4320,6 +4988,7 @@ def run_compute(
                                 if vt == "multivector"
                                 else False
                             ),
+                            two_pass=cfg.params.two_pass == "auto",
                         )
 
                 # Per-file live fractions from cumulative device counters.
@@ -4350,6 +5019,23 @@ def run_compute(
                 prev_t, prev_gpu, prev_io = now, gpu_secs, io_wait
                 profiling.stop(bar.n)
 
+                # Report this file's two-pass behavior from per-file stat deltas.
+                tp = twopass.stats()
+                d_full = tp["rows_full"] - prev_tp["rows_full"]
+                if d_full:
+                    logger.info(
+                        "twopass file=%d slices=%d/%d live=%.4f padded=%.4f%s",
+                        gidx,
+                        tp["slices_twopass"] - prev_tp["slices_twopass"],
+                        (tp["slices_twopass"] - prev_tp["slices_twopass"]
+                         + tp["slices_plain"] - prev_tp["slices_plain"]),
+                        (tp["rows_live"] - prev_tp["rows_live"]) / d_full,
+                        (tp["rows_padded"] - prev_tp["rows_padded"]) / d_full,
+                        "" if tp["unavailable"] is None
+                        else f" DISABLED: {tp['unavailable']}",
+                    )
+                prev_tp = {k: tp[k] for k in prev_tp}
+
                 if bar.n % 200 == 0:
                     postfix = f"io_wait={io_wait:.0f}s gpu={gpu_secs:.0f}s"
                     if any_filter:
@@ -4374,9 +5060,12 @@ def run_compute(
                 ", ".join(sorted(coalesce_eligible_vts)) or "none",
             )
     finally:
-        # Nothing can submit to the pool past this point: every reader has
-        # finished, failed, or been abandoned by the exception on its way out.
-        filter_pool.shutdown()
+        # No more filter work can be submitted after this point.
+        try:
+            filter_pool.shutdown()
+        finally:
+            # Release run-local two-pass device caches, including on failure.
+            twopass.release()
 
     wall = time.perf_counter() - wall0
     gb = bytes_seen / 1e9
@@ -4780,6 +5469,7 @@ def run_compute(
             _PRUNE_APPLIED["count"],
             # Keyed by SEARCH NAME, not member index
             {specs[m].name: st for m, st in live_fractions().items()},
+            two_pass_policy=cfg.params.two_pass,
         ),
     })
     doc.update({

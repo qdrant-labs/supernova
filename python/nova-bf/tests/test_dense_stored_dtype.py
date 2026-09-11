@@ -9,9 +9,11 @@ the bytes over PCIe. Now the host array carries the parquet's dtype and
 Two places, and only two, are allowed to know the stored dtype. These tests
 pin that: everything below `transfer` sees float32, the scores do not move
 (fp16 -> fp32 is exact), `compact` preserves the dtype, `_concat_dense_batches`
-widens a mixed-dtype group exactly and uniformly, and the run's reported
+widens a mixed-dtype group exactly and uniformly, the run's reported
 throughput/byte counters stay on the float32-equivalent width so they are
-comparable across corpora stored at different widths.
+comparable across corpora stored at different widths, and the two-pass bound's
+corpus residual is exactly zero for float16-sourced data WITHOUT any dtype
+branch in the bound.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import json
 import logging
 
 import numpy as np
+import torch
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -193,3 +196,52 @@ def test_reported_decoded_bytes_do_not_depend_on_the_stored_width(tmp_path):
     assert counts["h"] == counts["f"], counts
     # and it is the float32-equivalent count: 9 rows x 6 dims x 4 bytes
     assert counts["f"] == 9 * 6 * 4
+
+
+def test_the_twopass_charges_a_float16_stored_corpus_no_conversion_error():
+    """The closed form's version of "the corpus residual is zero".
+
+    The measured-residual bound computed `dc = ||c - c_h||` and got exactly
+    zero for a float16-stored corpus. The closed form has no residual to
+    measure: it charges the corpus axis a conversion roundoff `u_c` from
+    Lemma 1, and the whole term VANISHES (`u_c = eta_c = 0`) when the values
+    are already fp16-exact, because then `.half()` is the identity.
+
+    Same fact, and it must still survive the path — host fp16, widened on the
+    device — with no dtype branch anywhere in `twopass`. At d = 768 it is worth
+    41% of `eps` (7.187e-4 against 1.208e-3), so getting it wrong in the
+    optimistic direction would be a silent under-bound.
+    """
+    from nova_bf import twopass
+    from nova_bf import closed_form as cf
+
+    a16 = np.ascontiguousarray(
+        np.random.default_rng(6).standard_normal((128, 16)).astype(np.float16))
+    batch = C.DenseCorpusBatch(a16)
+    assert batch.exact_fp16, "the per-FILE verdict must read the stored dtype"
+    sl = batch.transfer(0, 128, "cpu")
+    assert sl.exact_fp16, "and it must be carried to every slice of that file"
+    # The slice arrives as float32 (the reader widens it), and the values are
+    # nonetheless all fp16-representable — which is the fact the bound uses.
+    assert sl.Cb.dtype is torch.float32
+    assert twopass.float32_is_exactly_fp16(sl.Cb)
+
+
+def test_a_float32_stored_corpus_is_charged_the_conversion_term():
+    """The counterpart: the term is DERIVED from the data rather than switched
+    off, so genuinely-fp32 data still pays for it — and pays more."""
+    from nova_bf import twopass
+    from nova_bf import closed_form as cf
+
+    a32 = np.ascontiguousarray(
+        np.random.default_rng(7).standard_normal((128, 16)).astype(np.float32))
+    batch = C.DenseCorpusBatch(a32)
+    assert not batch.exact_fp16
+    sl = batch.transfer(0, 128, "cpu")
+    assert not sl.exact_fp16
+    assert not twopass.float32_is_exactly_fp16(sl.Cb)
+    # And the bound it produces is strictly larger than the fp16-stored one.
+    cheap = float(cf.eps_cos(768, cf.U16, 0.0, eta_q=cf.ETA16))
+    dear = float(cf.eps_cos(768, cf.U16, cf.U16, eta_q=cf.ETA16,
+                            eta_c=cf.ETA16))
+    assert dear > cheap * 1.5, (cheap, dear)

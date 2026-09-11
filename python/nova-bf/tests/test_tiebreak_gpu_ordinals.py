@@ -544,6 +544,18 @@ def test_is_oom_matches_untyped_cuda_oom_but_not_real_bugs():
 
     assert _is_oom(RuntimeError("CUDA error: out of memory"))
     assert _is_oom(torch.cuda.OutOfMemoryError("tried to allocate"))
+    # The message this predicate was consolidated with `twopass.is_oom` FOR.
+    # cuBLAS asks the driver for its own workspace, so an allocation failure
+    # in it arrives with neither the typed exception nor the words "out of
+    # memory" — and this test, which is the only thing guarding the
+    # predicate, did not exercise it, so the exact regression the shared
+    # implementation prevents was invisible here.
+    assert _is_oom(RuntimeError(
+        "cuBLAS API failed with status 15: CUBLAS_STATUS_ALLOC_FAILED"))
+    # torch's HOST allocator, the one flavour reproducible without a GPU.
+    assert _is_oom(RuntimeError(
+        "[enforce fail at alloc_cpu.cpp:127] DefaultCPUAllocator: can't "
+        "allocate memory: you tried to allocate 40000000000000 bytes."))
     assert not _is_oom(RuntimeError("device-side assert triggered"))
     assert not _is_oom(ValueError("shape mismatch"))
     assert not _is_oom(TypeError("_gpu_perm() missing 1 required argument"))

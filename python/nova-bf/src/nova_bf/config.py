@@ -261,6 +261,10 @@ class ParamsConfig(BaseModel):
     # pathological score ties at your k). Affects every vector_type's dense
     # matmul (dense scoring, multivector MaxSim); sparse SpMM is unaffected.
     allow_tf32: bool = False
+    # Exact dense-score optimization: `auto` (the default) uses the two-pass
+    # path when its runtime eligibility, safety, and crossover checks agree;
+    # `off` always uses the ordinary one-pass fp32 path.
+    two_pass: Literal["auto", "off"] = "auto"
     # Merge partials in row batches and stream results to disk to bound memory.
     # `None` auto-sizes for ~20M candidate slots; set explicitly to trade more
     # memory for larger batches and fewer parquet row groups. Merge warns when 

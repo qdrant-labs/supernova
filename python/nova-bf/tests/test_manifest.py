@@ -149,6 +149,36 @@ def test_single_node_manifest_describes_the_run(ds, tmp_path):
         assert (out / name).exists()
 
 
+def test_manifest_records_the_configured_twopass_policy(ds, tmp_path):
+    out = tmp_path / "twopass-off"
+    out.mkdir()
+    cfg = _cfg(ds, out)
+    cfg.params.two_pass = "off"
+
+    run_compute(cfg)
+
+    doc = _read(out / "_bf_manifest_queries_compute.json")
+    assert doc["params"]["two_pass"] == "off"
+    twopass = doc["params"]["kernels"]["twopass"]
+    assert twopass["policy"] == "off"
+    assert twopass["permitted"] is False
+    assert twopass["live_row_audit_rate"] == 1
+
+
+def test_manifest_records_the_live_row_audit_sampling_rate(ds, tmp_path,
+                                                            monkeypatch):
+    """The manifest must state whether live-row verification was sampled."""
+    monkeypatch.setenv("NOVA_BF_TWOPASS_AUDIT", "7")
+    out = tmp_path / "audit-rate"
+    out.mkdir()
+
+    run_compute(_cfg(ds, out))
+
+    doc = _read(out / "_bf_manifest_queries_compute.json")
+    assert (doc["params"]["kernels"]["twopass"]
+            ["live_row_audit_rate"]) == 7
+
+
 def test_sharded_run_writes_one_manifest_per_rank_and_a_merge_manifest(ds, tmp_path):
     out = tmp_path / "sharded"
     out.mkdir()
@@ -311,7 +341,8 @@ def test_code_versions_omits_git_when_the_repo_is_not_ours(monkeypatch, tmp_path
 
 def _clear_switches(monkeypatch):
     for var in ("NOVA_BF_NO_PRUNE", "NOVA_BF_NO_FOLD_KERNEL",
-                "NOVA_BF_NO_TOPK_KERNEL"):
+                "NOVA_BF_NO_TOPK_KERNEL", "NOVA_BF_NO_TWOPASS",
+                "NOVA_BF_NO_FUSED_ROWMAX"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -319,17 +350,56 @@ def test_kernel_usage_reports_the_resolved_switches(monkeypatch):
     _clear_switches(monkeypatch)
     got = run_manifest.kernel_usage(0)
     assert {k: v["permitted"] for k, v in got.items()} == {
-        "prune": True, "fold_kernel": True, "topk_kernel": True}
+        "prune": True, "fold_kernel": True, "topk_kernel": True,
+        "twopass": True, "fused_rowmax_kernel": True}
 
     monkeypatch.setenv("NOVA_BF_NO_PRUNE", "1")
     monkeypatch.setenv("NOVA_BF_NO_FOLD_KERNEL", "1")
     got = run_manifest.kernel_usage(0)
     assert {k: v["permitted"] for k, v in got.items()} == {
-        "prune": False, "fold_kernel": False, "topk_kernel": True}
+        "prune": False, "fold_kernel": False, "topk_kernel": True,
+        "twopass": True, "fused_rowmax_kernel": True}
 
     # `""` is unset-shaped and must not read as "disabled"
     monkeypatch.setenv("NOVA_BF_NO_PRUNE", "")
     assert run_manifest.kernel_usage(0)["prune"]["permitted"] is True
+
+
+def test_kernel_usage_records_a_configured_twopass_opt_out(monkeypatch):
+    _clear_switches(monkeypatch)
+
+    got = run_manifest.kernel_usage(0, two_pass_policy="off")["twopass"]
+
+    assert got["policy"] == "off"
+    assert got["permitted"] is False
+
+
+def test_a_missing_triton_does_not_report_the_twopass_as_unavailable(monkeypatch):
+    """`kernels.twopass.unavailable` must mean the two-pass turned ITSELF off.
+
+    A machine without Triton still runs the two-pass: pass one takes
+    `approx_rowmax`'s portable chunked row max and the bound is unchanged. So
+    the Triton import error belongs to `fused_rowmax_kernel`, which is the
+    entry that describes the kernel — reporting it under `twopass` would have
+    the manifest call a feature that ran unavailable, which is the one thing
+    the manifest must not get wrong.
+    """
+    from nova_bf import twopass
+
+    _clear_switches(monkeypatch)
+    # Exactly the state the module lands in when `import triton` fails.
+    monkeypatch.setattr(twopass, "_UNAVAILABLE", "ImportError: no module triton")
+    monkeypatch.setattr(twopass, "_gemm_rowmax", None)
+    monkeypatch.setattr(twopass, "_rowmax_scaled", None)
+    got = run_manifest.kernel_usage(0)
+    assert got["twopass"]["unavailable"] is None, got["twopass"]
+    assert got["twopass"]["permitted"] is True
+    assert "triton" in got["fused_rowmax_kernel"]["unavailable"]
+
+    # A real two-pass disable IS reported there.
+    monkeypatch.setattr(twopass, "_DISABLED_REASON", "a height failed")
+    got = run_manifest.kernel_usage(0)
+    assert got["twopass"]["unavailable"] == "a height failed"
 
 
 def test_kernel_usage_reports_what_RAN_not_what_was_permitted(monkeypatch):
@@ -640,7 +710,9 @@ def test_kernel_usage_counters_actually_MOVE_in_a_real_run(tmp_path):
 
     doc = json.loads(next(out.rglob("*manifest*.json")).read_text())
     kernels = doc["params"]["kernels"]
-    assert set(kernels) == {"prune", "fold_kernel", "topk_kernel"}, kernels
+    assert set(kernels) == {"prune", "fold_kernel", "topk_kernel",
+                            "fused_rowmax_kernel",
+                            "twopass"}, kernels
     base = {"permitted", "launches", "unavailable"}
     for name, entry in kernels.items():
         assert base <= set(entry), (name, entry)
@@ -653,6 +725,19 @@ def test_kernel_usage_counters_actually_MOVE_in_a_real_run(tmp_path):
         "by_search"}, kernels["prune"]
     for name in ("fold_kernel", "topk_kernel"):
         assert set(kernels[name]) == base, (name, kernels[name])
+    # `twopass` carries what it skipped as well as whether it ran: the live
+    # fraction it measured, and the padded fraction the GEMM actually scored
+    # (the gap between them is what keeping cuBLAS on one kernel costs).
+    assert base <= set(kernels["twopass"]), kernels["twopass"]
+    assert {"slices_twopass", "slices_plain", "rows_full", "rows_live",
+            "rows_padded", "live_fraction", "padded_fraction",
+            "verifications"} <= set(kernels["twopass"]), kernels["twopass"]
+    # `unavailable` here means the two-pass DISABLED itself, and nothing else.
+    # A missing Triton is not that: pass one falls back to the portable
+    # chunked row max and the two-pass keeps working, so inheriting the import
+    # error would report a working feature as unavailable. Triton's own status
+    # is `fused_rowmax_kernel`'s to report.
+    assert kernels["twopass"]["unavailable"] is None, kernels["twopass"]
     assert kernels["prune"]["permitted"] is True
     assert kernels["prune"]["launches"] > 0, (
         "the prune counter never incremented, so the manifest is reporting the "

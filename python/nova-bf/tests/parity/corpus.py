@@ -41,7 +41,7 @@ from . import naive
 
 SEED = 20260829
 
-DIM = 16          # dense width
+DIM = 64          # dense width
 MV_DIM = 8        # multivector token width
 VOCAB = 40        # sparse token ids a query may use
 FILE_SIZES = (97, 61, 79, 63)   # 300 corpus rows, none a multiple of any batch size
