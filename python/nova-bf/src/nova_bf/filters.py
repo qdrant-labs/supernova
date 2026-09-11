@@ -20,6 +20,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from nova_bf import nativetok
 from nova_bf.config import Filter, FilterCondition
 from nova_bf.tokenize import TOKEN_SPLIT_PATTERN, tokenize, tokenize_many
 
@@ -390,7 +391,12 @@ def _token_row_masks(
         return out
     if pa.types.is_string(col.type):
         col = pc.cast(col, pa.large_string())
-    value_set = pa.array(ordered, type=pa.large_string())
+    # If available, the native scanner consumes Arrow's buffers directly in
+    # one Rust call per batch.  It derives its Unicode tables from this Arrow
+    # build and self-checks against the pipeline below; a missing extension or
+    # any failed check leaves the established Arrow path untouched.
+    native = nativetok.prepare(ordered)
+    value_set = pa.array(ordered, type=pa.large_string()) if native is None else None
 
     batch_rows = _scan_batch_rows(col.nbytes, n_rows, _pool_width(pool), n_tok)
 
@@ -404,14 +410,17 @@ def _token_row_masks(
         # Build this batch's bool grid, then pack it directly into its
         # byte-aligned region of the shared output.
         sub_grid = np.zeros((n_tok, n_here), dtype=bool)
-        toks = pc.split_pattern_regex(chunk, pattern=TOKEN_SPLIT_PATTERN)
-        lowered = pc.utf8_lower(pc.list_flatten(toks))
-        parent = pc.list_parent_indices(toks)
-        codes = pc.index_in(lowered, value_set=value_set)
-        valid = pc.is_valid(codes)
-        c = pc.filter(codes, valid).to_numpy(zero_copy_only=False)
-        r = pc.filter(parent, valid).to_numpy(zero_copy_only=False)
-        sub_grid[c, r] = True
+        if native is not None:
+            nativetok.scan_into(chunk, native, sub_grid)
+        else:
+            toks = pc.split_pattern_regex(chunk, pattern=TOKEN_SPLIT_PATTERN)
+            lowered = pc.utf8_lower(pc.list_flatten(toks))
+            parent = pc.list_parent_indices(toks)
+            codes = pc.index_in(lowered, value_set=value_set)
+            valid = pc.is_valid(codes)
+            c = pc.filter(codes, valid).to_numpy(zero_copy_only=False)
+            r = pc.filter(parent, valid).to_numpy(zero_copy_only=False)
+            sub_grid[c, r] = True
         grid[:, off >> 3 : (off + n_here + 7) >> 3] = np.packbits(sub_grid, axis=1)
 
     offsets = range(0, n_rows, batch_rows)

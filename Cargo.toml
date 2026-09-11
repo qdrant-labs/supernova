@@ -4,6 +4,7 @@ members = [
     "crates/nova-storm",
     "crates/nova-load",
     "crates/nova-inspect",
+    "crates/nova-textscan",
 ]
 version = "0.0.12"
 
@@ -12,6 +13,16 @@ version = "0.0.12"
 [profile.dev]
 debug = 0                      # no debug symbols — the biggest artifact-size win
 split-debuginfo = "unpacked"   # keep any remaining symbols out of the main binary
+
+# `nova-textscan` is built as a Python extension through maturin.  A custom
+# profile keeps its hot-loop LTO tuning out of the release builds for the Rust
+# CLIs, while still defining the profile at the workspace root as Cargo
+# requires.
+[profile.release-textscan]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
 
 [workspace.dependencies]
 async-trait="0.1.89"

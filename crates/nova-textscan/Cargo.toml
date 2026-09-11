@@ -1,0 +1,15 @@
+[package]
+name = "nova-textscan"
+version = "0.0.12"
+edition = "2021"
+
+# A Python extension module, not a Rust library anybody links: `cdylib` only.
+# The importable name is `nova_textscan` (see `#[pymodule]` in lib.rs and the
+# `module-name` in pyproject.toml).
+[lib]
+name = "nova_textscan"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+numpy = "0.23"

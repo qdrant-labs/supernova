@@ -95,7 +95,9 @@ def _rust_worker_setup(binary: str) -> str:
     )
 
 
-def _python_worker_setup(binary: str, pip_spec: str) -> str:
+def _python_worker_setup(
+    binary: str, pip_spec: str, *, with_specs: tuple[str, ...] = (),
+) -> str:
     """
     Install a Python tool (`binary`, from `pip_spec`) on a worker. Works on BOTH
     a root CUDA container and a non-root GPU VM:
@@ -104,25 +106,37 @@ def _python_worker_setup(binary: str, pip_spec: str) -> str:
       - `sudo` only when not root;
       - apt-get curl/git if missing (a minimal CUDA container lacks both; a real
         VM AMI has them, so this no-ops there);
-      - install the console script to ~/.local/bin (pinned via UV_TOOL_BIN_DIR),
-        then symlink into /usr/local/bin — which IS on PATH in the separate run
-        shell (an `export PATH` here would not be).
+      - install the console script and any requested companion packages into
+        one isolated tool environment, then symlink into /usr/local/bin —
+        which IS on PATH in the separate run shell (an `export PATH` here
+        would not be).
     """
+    with_args = "".join(f" --with '{spec}'" for spec in with_specs)
+    native_build_setup = (
+        # A source-installed native extension needs Cargo during uv's maturin
+        # build. Keep the toolchain install conditional for AMIs that already
+        # provide it — and omit it entirely for Python tools without a native
+        # companion package.
+        'if ! command -v cargo >/dev/null; then curl --proto "=https" --tlsv1.2 -sSf '
+        'https://sh.rustup.rs | sh -s -- -y; . "$HOME/.cargo/env"; fi\n'
+        if with_specs else ""
+    )
     return (
         "set -e\n"
-        'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"\n'
+        + 'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"\n'
         # ffmpeg: newer `datasets` (pulled in by sentence-transformers) imports
         # torchcodec, which dlopens libavutil/libavcodec at import time — a GPU
         # AMI without FFmpeg makes the whole ST backend unimportable.
-        "command -v curl >/dev/null && command -v git >/dev/null && command -v ffmpeg >/dev/null || "
+        + "command -v curl >/dev/null && command -v git >/dev/null && command -v ffmpeg >/dev/null || "
         "($SUDO apt-get update && $SUDO apt-get install -y curl git ffmpeg)\n"
-        "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
-        'export PATH="$HOME/.local/bin:$PATH"\n'
+        + "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
+        + 'export PATH="$HOME/.local/bin:$PATH"\n'
+        + native_build_setup
         # --python pins the tool env: unpinned, uv grabs the newest CPython
         # (3.14+), where missing wheels/support markers make the resolver
         # backtrack to prehistoric transitive versions that crash at import.
-        f"UV_TOOL_BIN_DIR=\"$HOME/.local/bin\" uv tool install --python 3.12 '{pip_spec}'\n"
-        f'$SUDO ln -sf "$HOME/.local/bin/{binary}" /usr/local/bin/{binary}'
+        + f"UV_TOOL_BIN_DIR=\"$HOME/.local/bin\" uv tool install --python 3.12{with_args} '{pip_spec}'\n"
+        + f'$SUDO ln -sf "$HOME/.local/bin/{binary}" /usr/local/bin/{binary}'
     )
 
 
@@ -177,6 +191,9 @@ DEFAULTS: dict[str, dict] = {
         "setup": _python_worker_setup(
             "nova-bf",
             f"nova-bf[compute] @ git+{_REPO}@master#subdirectory=python/nova-bf",
+            with_specs=(
+                f"nova-textscan @ git+{_REPO}@master#subdirectory=crates/nova-textscan",
+            ),
         ),
     },
 }

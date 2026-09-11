@@ -50,7 +50,7 @@ inspect:
 # `nova bf` — Python brute-force ground truth. `[compute]` pulls torch (GPU);
 # drop the extra for a controller that only runs `nova bf merge`.
 bf:
-	uv pip install -e 'python/nova-bf[compute]'
+	uv pip install -e 'python/nova-bf[compute]' ./crates/nova-textscan
 
 # `nova dist` — SkyPilot orchestrator. Controller-side only (your laptop / a
 # dispatch box); workers never need it. Still part of `make all` (pulls in
@@ -74,7 +74,7 @@ docs-build:
 test:
 	cargo test
 	uv run --directory python/nova-embed --extra dev pytest -q || true
-	uv run --directory python/nova-bf --extra dev pytest -q || true
+	uv run --directory python/nova-bf --extra dev --with $(CURDIR)/crates/nova-textscan pytest -q
 	uv run --directory python/nova-sweep --extra dev pytest -q || true
 
 # nova-bf three-way parity: nova-bf vs a plain-Python reference vs a live

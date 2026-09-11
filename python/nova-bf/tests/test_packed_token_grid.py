@@ -1,4 +1,4 @@
-"""R7: the corpus token grid, and the whole fused combine, are bit-packed.
+"""The corpus token grid, and the whole fused combine, are bit-packed.
 
 `_token_row_masks` used to return one `(n_rows,)` bool per query token — an
 `(n_tokens, n_rows)` array, prohibitively large per corpus file per reader thread on the
@@ -346,6 +346,9 @@ def test_a_failing_scan_batch_waits_for_its_siblings():
         monkeypatch.setattr(F, "_scan_batch_rows", lambda *a, **k: 8)
         monkeypatch.setattr(F.np, "packbits", counting_packbits)
         monkeypatch.setattr(F.pc, "split_pattern_regex", failing_split)
+        # This test injects the failure into Arrow's splitter.  Keep that
+        # seam explicit now that the native scanner normally bypasses Arrow.
+        monkeypatch.setattr(F.nativetok, "prepare", lambda tokens: None)
         try:
             F._token_row_masks(col, tokens, len(rows), pool)
         except RuntimeError as exc:

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nova-textscan"
+requires-python = ">=3.10"
+description = "The match_text corpus scan, in one compiled pass with the GIL released"
+classifiers = ["Programming Language :: Rust"]
+dynamic = ["version"]
+
+[tool.maturin]
+module-name = "nova_textscan"
+features = ["pyo3/extension-module"]
+profile = "release-textscan"
+editable-profile = "release-textscan"
