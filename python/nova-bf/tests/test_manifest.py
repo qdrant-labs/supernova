@@ -86,6 +86,108 @@ def _read(path) -> dict:
     return json.loads(path.read_text())
 
 
+@pytest.mark.parametrize("failure", ["build", "submit", "drain"])
+def test_write_failure_shuts_down_pool(ds, tmp_path, monkeypatch, failure):
+    from concurrent.futures import ThreadPoolExecutor
+    from nova_bf import compute
+
+    pools = []
+
+    class TrackingPool(ThreadPoolExecutor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.is_writer = kwargs.get("thread_name_prefix") == "bf-write"
+            self.submissions = 0
+            self.shutdown_options = None
+            if self.is_writer:
+                pools.append(self)
+
+        def submit(self, *args, **kwargs):
+            self.submissions += 1
+            if self.is_writer and failure == "submit" and self.submissions == 2:
+                raise RuntimeError("injected write failure")
+            return super().submit(*args, **kwargs)
+
+        def shutdown(self, **kwargs):
+            self.shutdown_options = kwargs
+            return super().shutdown(**kwargs)
+
+    monkeypatch.setattr(compute, "ThreadPoolExecutor", TrackingPool)
+    original_build = compute.build_result_table
+    builds = 0
+
+    def build(*args, **kwargs):
+        nonlocal builds
+        builds += 1
+        if failure == "build" and builds == 2:
+            raise RuntimeError("injected write failure")
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(compute, "build_result_table", build)
+    if failure == "drain":
+        def fail_write(*args, **kwargs):
+            raise RuntimeError("injected write failure")
+        monkeypatch.setattr(compute.Store, "write", fail_write)
+    cfg = _cfg(ds, tmp_path)
+    if failure == "drain":
+        cfg.searches = [SearchSpec(name=f"s{i}", metric="dot", k=K) for i in range(33)]
+    with pytest.raises(RuntimeError, match="injected write failure"):
+        run_compute(cfg)
+    assert len(pools) == 1
+    assert pools[0].shutdown_options == {"wait": True, "cancel_futures": True}
+    assert not any(t.is_alive() for t in pools[0]._threads)
+    assert not list(tmp_path.glob("*manifest*.json"))
+    if failure == "drain":
+        assert pools[0].submissions == 32
+
+
+def test_scan_failure_before_id_coordinator_starts(ds, tmp_path, monkeypatch):
+    from threading import Event, Thread
+    from nova_bf import compute
+
+    release = Event()
+    coordinators = []
+    reads = []
+
+    def thread(*args, **kwargs):
+        target = kwargs.get("target")
+        if target is not None and target.__name__ == "_rank_ids":
+            def delayed():
+                if release.wait(10):
+                    target()
+            kwargs["target"] = delayed
+            worker = Thread(*args, **kwargs)
+            coordinators.append(worker)
+            return worker
+        return Thread(*args, **kwargs)
+
+    original_read = compute.Store.read_columns
+
+    def read(store, path, columns, *args, **kwargs):
+        if str(path).startswith(ds["cdir"]):
+            if columns == ["id"]:
+                reads.append(path)
+            else:
+                raise RuntimeError("injected scan failure")
+        return original_read(store, path, columns, *args, **kwargs)
+
+    monkeypatch.setattr(compute, "Thread", thread)
+    monkeypatch.setattr(compute.Store, "read_columns", read)
+    cfg = _cfg(ds, tmp_path)
+    cfg.params.tiebreak = "id"
+    try:
+        with pytest.raises(RuntimeError, match="a reader thread failed") as exc:
+            run_compute(cfg)
+        assert str(exc.value.__cause__) == "injected scan failure"
+    finally:
+        release.set()
+        for worker in coordinators:
+            worker.join(timeout=10)
+    assert len(coordinators) == 1
+    assert not coordinators[0].is_alive()
+    assert reads == []
+
+
 def test_single_node_manifest_describes_the_run(ds, tmp_path):
     out = tmp_path / "single"
     out.mkdir()

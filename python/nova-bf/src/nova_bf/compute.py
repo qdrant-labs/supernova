@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import cached_property
 from queue import Empty, Queue
-from threading import Semaphore, Thread
+from threading import Event, Lock, Semaphore, Thread
 
 import numpy as np
 
@@ -87,6 +87,9 @@ from nova_bf.tiebreak import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How many id columns the `tiebreak="id"` startup pass fetches at once.
+ID_PASS_WORKERS = max(1, int(os.environ.get("NOVA_BF_ID_PASS_WORKERS", "32")))
 
 PREFETCH_QUEUE_SIZE = 4
 # Limit how many top-K entries are decoded/sorted at once to bound peak GPU
@@ -4477,31 +4480,104 @@ def run_compute(
                 f"params.tiebreak='id' needs an integer or string "
                 f"corpus.id_column; {id_col!r} is {_t}. Use params.tiebreak='ordinal'."
             )
+    # Rank ids concurrently with corpus reads. Readers do not use `id_ordinals`;
+    # the consumer joins this pass before its first ordinal fold.
+    id_rank: dict[str, object] = {}
+    id_rank_cancel = Event()
+    id_rank_lock = Lock()
+
     if tiebreak == "id" and mine:
         t_ord = time.perf_counter()
-        pool_n = max(1, min(io_workers or 8, 32))
-        with ThreadPoolExecutor(max_workers=pool_n) as pool:
-            # `map` preserves input order, which is what makes the ordinals
-            # line up with `mine` — and `mine` is ascending `gidx`, so the
-            # secondary "earliest corpus position wins" rule among duplicate
-            # ids means what it says.
-            id_arrays = list(pool.map(
-                lambda f: cstore.read_columns(f.read_path, [id_col])[id_col],
-                [f for _, f in mine],
-            ))
-        id_ordinals = dict(zip([g for g, _ in mine], build_ordinals(id_arrays)))
-        n_ids = sum(len(a) for a in id_arrays)
-        del id_arrays
-        logger.info(
-            "params.tiebreak='id': ranked %s ids from this worker's %d file(s) "
-            "in %.1fs; ties go to the lowest %r, then to the earliest corpus row.",
-            f"{n_ids:,}", len(mine), time.perf_counter() - t_ord, id_col,
-        )
-    # Union of every spec's filter fields — read_cols below stays exactly (and only)
-    # the columns some spec actually references, same guarantee the single-search
-    # path always made.
-    filter_cols = sorted({c for s in specs if s.filter for c in s.filter.fields()})
+
+        def _rank_ids() -> None:
+            try:
+                # `map` preserves file order, including duplicate-id tie order.
+                pool_n = max(1, min(ID_PASS_WORKERS, len(mine)))
+                with id_rank_lock:
+                    if id_rank_cancel.is_set():
+                        return
+                    pool = ThreadPoolExecutor(max_workers=pool_n)
+                    id_rank["pool"] = pool
+                try:
+                    futures = []
+                    for _, f in mine:
+                        # Serialize each submission with scan cancellation, without
+                        # holding the lock while reads or future results finish.
+                        with id_rank_lock:
+                            if id_rank_cancel.is_set():
+                                return
+                            futures.append(pool.submit(
+                                lambda f=f: cstore.read_columns(f.read_path, [id_col])[id_col]
+                            ))
+                    # Resolve in file order, preserving the old `map`
+                    # guarantee. A failed scan cancels all queued reads.
+                    id_arrays = []
+                    for future in futures:
+                        if id_rank_cancel.is_set():
+                            return
+                        id_arrays.append(future.result())
+                except BaseException:
+                    # Submission and read failures both cancel queued work.
+                    id_rank_cancel.set()
+                    raise
+                finally:
+                    pool.shutdown(
+                        wait=not id_rank_cancel.is_set(), cancel_futures=True
+                    )
+                    id_rank.pop("pool", None)
+
+                if id_rank_cancel.is_set():
+                    return
+
+                id_rank["ordinals"] = dict(zip(
+                    [g for g, _ in mine],
+                    build_ordinals(id_arrays),
+                ))
+
+                n_ids = sum(len(a) for a in id_arrays)
+                logger.info(
+                    "params.tiebreak='id': ranked %s ids from this worker's %d "
+                    "file(s) in %.1fs (%d-way, in parallel with scan reads); ties "
+                    "go to the lowest %r, then to the earliest corpus row.",
+                    f"{n_ids:,}",
+                    len(mine),
+                    time.perf_counter() - t_ord,
+                    pool_n,
+                    id_col,
+                )
+            except BaseException as exc:
+                id_rank["error"] = exc
+
+        rank_thread = Thread(target=_rank_ids, daemon=True)
+        id_rank["thread"] = rank_thread
+
+
+    def _await_ordinals() -> None:
+        """Join the id pass and publish its result once."""
+        nonlocal id_ordinals
+
+        rank_thread = id_rank.pop("thread", None)
+        if rank_thread is None:
+            return
+
+        rank_thread.join()
+
+        if "error" in id_rank:
+            raise id_rank["error"]
+
+        id_ordinals = id_rank.pop("ordinals")
+
+
+    # Read only fields referenced by at least one filter.
+    filter_cols = sorted({
+        c
+        for s in specs
+        if s.filter
+        for c in s.filter.fields()
+    })
+
     corpus_date_fmts = normalize_date_fields(cfg.corpus.date_fields)
+
     read_cols = list(dict.fromkeys(
         ([dense_col] if "dense" in vts_needed else [])
         + ([sparse_col] if "sparse" in vts_needed else [])
@@ -4576,6 +4652,9 @@ def run_compute(
 
     # Shut down the shared filter pool on any scan exit; wait for in-flight tasks
     # because they may still be writing into arrays owned by this process.
+    rank_thread = id_rank.get("thread")
+    if rank_thread is not None:
+        rank_thread.start()
     try:
         work: Queue = Queue()
         for item in mine:
@@ -4945,6 +5024,7 @@ def run_compute(
                     )
                 
                 # Consume each file's precomputed ordinal mapping once and release it.
+                _await_ordinals()
                 file_ordinals = None if id_ordinals is None else id_ordinals.pop(gidx)
 
                 for vt in vts_needed:
@@ -5060,6 +5140,14 @@ def run_compute(
                 ", ".join(sorted(coalesce_eligible_vts)) or "none",
             )
     finally:
+        # A scan failure must not make the daemon coordinator fetch the rest
+        # of this rank's ids. Active reads are not interruptible, but queued
+        # reads are cancelled and no failure path joins the coordinator.
+        with id_rank_lock:
+            id_rank_cancel.set()
+            rank_pool = id_rank.get("pool")
+        if rank_pool is not None:
+            rank_pool.shutdown(wait=False, cancel_futures=True)
         # No more filter work can be submitted after this point.
         try:
             filter_pool.shutdown()
@@ -5293,144 +5381,166 @@ def run_compute(
         needs_ordinate = False
     want_tie_column = needs_ordinate and num_jobs is not None
 
-    for i, s in enumerate(specs):
-       # Sort the final top-K by packed key so ties follow deterministic tie-break
-        # order. Process query rows in chunks to bound peak GPU memory during sorting.
-        h_i = spec_top_key[i].shape[0]
-        chunk = max(1, min(h_i, DECODE_CHUNK_SLOTS // max(1, s.k)))
-        enc_parts, sc_parts = [], []
-        for r0 in range(0, h_i, chunk):
-            kb, order = torch.sort(
-                spec_top_key[i][r0 : r0 + chunk], dim=1, descending=True
-            )
-            enc_parts.append(spec_top_enc[i][r0 : r0 + chunk].gather(1, order).cpu().numpy())
-            del order
-            # Recover scores from the packed keys.
-            sc_parts.append(unpack_score(kb).cpu().numpy())
-            del kb
-        enc = enc_parts[0] if len(enc_parts) == 1 else np.concatenate(enc_parts)
-        sc = sc_parts[0] if len(sc_parts) == 1 else np.concatenate(sc_parts)
-        del enc_parts, sc_parts
-        # Release this search's GPU state before decoding results on the CPU.
-        spec_top_key[i] = spec_top_enc[i] = None
-        valid = sc > float("-inf")
-        # A spec with a `rows` subset wrote state for its OWN queries only, so
-        # its output covers those rows — ids and payload are sliced to match.
-        # `query_ids`/`payload` stay full-length upstream (both loaders return
-        # every row) precisely so this slice is the only place that has to know.
-        rows_i = spec_rows[i]
-        out_n = sc.shape[0]
-        import pyarrow as pa
+    # Each result write is independent. Keep at most 32 submitted tables alive:
+    # compression/upload of one result overlaps building the next, while a
+    # pathological number of searches cannot retain every table at once.
+    pending_writes: list[tuple[SearchSpec, int, str, int, dict, object]] = []
+    write_pool = ThreadPoolExecutor(
+        max_workers=min(32, max(1, len(specs))), thread_name_prefix="bf-write"
+    )
 
-        counts = valid.sum(axis=1).astype(np.int64)
-        # `ListArray` offsets are int32; casting silently wraps on overflow and would
-        # corrupt the output. Guard `n_q * k` rather than switching to `LargeListArray`,
-        # which would change the published GT schema.
-        total_hits = int(counts.sum())
-        if total_hits > np.iinfo(np.int32).max:
-            raise ValueError(
-                f"search {s.name!r}: {total_hits:,} hits overflows the int32 "
-                f"ListArray offsets (limit {np.iinfo(np.int32).max:,}). Reduce k "
-                f"or the query count, or switch this producer and merge.py's to "
-                f"pa.LargeListArray — which changes the output schema."
-            )
-        offsets = pa.array(
-            np.concatenate(([0], np.cumsum(counts))).astype(np.int32), type=pa.int32()
-        )
-        flat_enc = enc[valid]                       # row-major == list order
-        hit_scores = pa.ListArray.from_arrays(
-            offsets, pa.array(sc[valid], type=pa.float32())
-        )
+    def _collect_write(item: tuple[SearchSpec, int, str, int, dict, object]) -> None:
+        s_w, _i_w, _name_w, out_n_w, entry_w, future = item
+        path = future.result()
+        logger.info("search=%r wrote %s (%d queries)", s_w.name, path, out_n_w)
+        results[s_w.name] = path
+        entry_w["output_path"] = path
 
-        raw_taken = None  # the id values for these hits, resolved ONCE
-        if id_col is not None:
-            values, base = _flat_ids()
-            flat_idx = (base[flat_enc // MAX_ROWS_PER_FILE]
-                        + (flat_enc % MAX_ROWS_PER_FILE))
-            raw_taken = values.take(pa.array(flat_idx))
-            hit_ids = pa.ListArray.from_arrays(
-                # `large_string`, NOT `string`: see `_flat_ids`. Casting down
-                # here would wrap the offsets again.
-                offsets, raw_taken.cast(pa.large_string()).fill_null("None")
-            )
-        else:
-            # make_point_id is an md5 per hit and cannot be vectorized into
-            # Arrow
-            keys = [f.key for f in all_files]
-            hit_ids = pa.ListArray.from_arrays(offsets, pa.array(
-                [make_point_id(keys[int(e) // MAX_ROWS_PER_FILE],
-                               int(e) % MAX_ROWS_PER_FILE) for e in flat_enc],
-                type=pa.large_string(),   # 1e8 x 36-byte UUIDs = 3.6 GB > 2 GiB
-            ))
+    try:
+        for i, s in enumerate(specs):
+            # Sort the final top-K by packed key so ties follow deterministic tie-break
+            # order. Process query rows in chunks to bound peak GPU memory during sorting.
+            h_i = spec_top_key[i].shape[0]
+            chunk = max(1, min(h_i, DECODE_CHUNK_SLOTS // max(1, s.k)))
+            enc_parts, sc_parts = [], []
+            for r0 in range(0, h_i, chunk):
+                kb, order = torch.sort(
+                    spec_top_key[i][r0 : r0 + chunk], dim=1, descending=True
+                )
+                enc_parts.append(spec_top_enc[i][r0 : r0 + chunk].gather(1, order).cpu().numpy())
+                del order
+                # Recover scores from the packed keys.
+                sc_parts.append(unpack_score(kb).cpu().numpy())
+                del kb
+            enc = enc_parts[0] if len(enc_parts) == 1 else np.concatenate(enc_parts)
+            sc = sc_parts[0] if len(sc_parts) == 1 else np.concatenate(sc_parts)
+            del enc_parts, sc_parts
+            # Release this search's GPU state before decoding results on the CPU.
+            spec_top_key[i] = spec_top_enc[i] = None
+            valid = sc > float("-inf")
+            # A spec with a `rows` subset wrote state for its OWN queries only, so
+            # its output covers those rows — ids and payload are sliced to match.
+            # `query_ids`/`payload` stay full-length upstream (both loaders return
+            # every row) precisely so this slice is the only place that has to know.
+            rows_i = spec_rows[i]
+            out_n = sc.shape[0]
+            import pyarrow as pa
 
-        hit_tie = None
-        if want_tie_column:
-            if resolve_tie is None:
-                # ordinal mode: the encoded value already IS the global corpus
-                # position, so no resolution at all.
-                tie_vals = pa.array(flat_enc.astype(np.int64), type=pa.int64())
+            counts = valid.sum(axis=1).astype(np.int64)
+            # `ListArray` offsets are int32; casting silently wraps on overflow and would
+            # corrupt the output. Guard `n_q * k` rather than switching to `LargeListArray`,
+            # which would change the published GT schema.
+            total_hits = int(counts.sum())
+            if total_hits > np.iinfo(np.int32).max:
+                raise ValueError(
+                    f"search {s.name!r}: {total_hits:,} hits overflows the int32 "
+                    f"ListArray offsets (limit {np.iinfo(np.int32).max:,}). Reduce k "
+                    f"or the query count, or switch this producer and merge.py's to "
+                    f"pa.LargeListArray — which changes the output schema."
+                )
+            offsets = pa.array(
+                np.concatenate(([0], np.cumsum(counts))).astype(np.int32), type=pa.int32()
+            )
+            flat_enc = enc[valid]                       # row-major == list order
+            hit_scores = pa.ListArray.from_arrays(
+                offsets, pa.array(sc[valid], type=pa.float32())
+            )
+
+            raw_taken = None  # the id values for these hits, resolved ONCE
+            if id_col is not None:
+                values, base = _flat_ids()
+                flat_idx = (base[flat_enc // MAX_ROWS_PER_FILE]
+                            + (flat_enc % MAX_ROWS_PER_FILE))
+                raw_taken = values.take(pa.array(flat_idx))
+                hit_ids = pa.ListArray.from_arrays(
+                    # `large_string`, NOT `string`: see `_flat_ids`. Casting down
+                    # here would wrap the offsets again.
+                    offsets, raw_taken.cast(pa.large_string()).fill_null("None")
+                )
             else:
-                # `id` mode over a numeric column. Reuses `raw_taken` rather
-                # than resolving every element a second time
-                tie_vals = id_order_array(raw_taken, tie_unsigned)
-            hit_tie = pa.ListArray.from_arrays(offsets, tie_vals)
+                # make_point_id is an md5 per hit and cannot be vectorized into
+                # Arrow
+                keys = [f.key for f in all_files]
+                hit_ids = pa.ListArray.from_arrays(offsets, pa.array(
+                    [make_point_id(keys[int(e) // MAX_ROWS_PER_FILE],
+                                   int(e) % MAX_ROWS_PER_FILE) for e in flat_enc],
+                    type=pa.large_string(),   # 1e8 x 36-byte UUIDs = 3.6 GB > 2 GiB
+                ))
 
-        if rows_i is None:
-            out_ids, out_payload = query_ids, payload
-        else:
-            out_ids = [query_ids[r] for r in rows_i]
-            out_payload = {c: [v[r] for r in rows_i] for c, v in payload.items()}
-        # Stamped on the PARTIALS too, not just the final file: a partial is a
-        # parquet someone can pick up on its own, and a merge that mixed
-        # partials from two different runs is exactly the mistake this makes
-        # visible.
-        dtypes = _dtypes_for(s)
-        table = build_result_table(
-            out_ids, out_payload, hit_ids, hit_scores,
-            provenance(
-                cfg, s, dtypes,
-                corpus_sha=corpus_fp["sha256"],
-                num_jobs=num_jobs,
-                job_rank=job_rank,
-                # A `--max-files` run read only part of its own slice, so its
-                # output is not ground truth. Fingerprinting it separately is
-                # what stops a benchmarking partial from ever merging with a
-                # real one.
-                max_files=max_files,
-            ),
-            hit_tie=hit_tie,
-        )
-        short_i = int((counts < s.k).sum())
-        if num_jobs is not None:
-            width = max(3, len(str(num_jobs - 1)))
-            name = f"{partial_dir(cfg, s)}/rank{job_rank:0{width}d}.parquet"
-            # This worker's slice of the corpus naturally has fewer than k
-            # candidates per query most of the time (stride partitioning spreads
-            # the corpus thin) -- that's expected here, not a signal of anything.
-            # Only `merge` (or this function's own single-node path below) sees
-            # the true final count, so that's the only place worth warning.
-        else:
-            name = result_name(cfg, s)
-            warn_if_short(short_i, out_n, s.k, s.name, logger)
-        path = out.write(name, table)
-        logger.info("search=%r wrote %s (%d queries)", s.name, path, out_n)
-        results[s.name] = path
-        entry = run_manifest.search_entry(s)
-        entry.update({
-            "queries": out_n,
-            "output_file": name,
-            "output_path": path,
-            "hit_tie_column": want_tie_column,
-            # Storage dtypes of the vectors actually scored.
-            "corpus_dtype": dtypes.get("corpus_dtype"),
-            "queries_dtype": dtypes.get("queries_dtype"),
-        })
-        if num_jobs is None:
-            # Only a whole-corpus run can say anything true about short top-Ks.
-            # On a partial, "fewer than k hits" is the normal state of a stride
-            # slice, so reporting it would read as a defect that isn't one.
-            entry["queries_short_of_k"] = short_i
-        manifest_searches.append(entry)
+            hit_tie = None
+            if want_tie_column:
+                if resolve_tie is None:
+                    # ordinal mode: the encoded value already IS the global corpus
+                    # position, so no resolution at all.
+                    tie_vals = pa.array(flat_enc.astype(np.int64), type=pa.int64())
+                else:
+                    # `id` mode over a numeric column. Reuses `raw_taken` rather
+                    # than resolving every element a second time
+                    tie_vals = id_order_array(raw_taken, tie_unsigned)
+                hit_tie = pa.ListArray.from_arrays(offsets, tie_vals)
+
+            if rows_i is None:
+                out_ids, out_payload = query_ids, payload
+            else:
+                out_ids = [query_ids[r] for r in rows_i]
+                out_payload = {c: [v[r] for r in rows_i] for c, v in payload.items()}
+            # Stamped on the PARTIALS too, not just the final file: a partial is a
+            # parquet someone can pick up on its own, and a merge that mixed
+            # partials from two different runs is exactly the mistake this makes
+            # visible.
+            dtypes = _dtypes_for(s)
+            table = build_result_table(
+                out_ids, out_payload, hit_ids, hit_scores,
+                provenance(
+                    cfg, s, dtypes,
+                    corpus_sha=corpus_fp["sha256"],
+                    num_jobs=num_jobs,
+                    job_rank=job_rank,
+                    # A `--max-files` run read only part of its own slice, so its
+                    # output is not ground truth. Fingerprinting it separately is
+                    # what stops a benchmarking partial from ever merging with a
+                    # real one.
+                    max_files=max_files,
+                ),
+                hit_tie=hit_tie,
+            )
+            short_i = int((counts < s.k).sum())
+            if num_jobs is not None:
+                width = max(3, len(str(num_jobs - 1)))
+                name = f"{partial_dir(cfg, s)}/rank{job_rank:0{width}d}.parquet"
+                # This worker's slice of the corpus naturally has fewer than k
+                # candidates per query most of the time (stride partitioning spreads
+                # the corpus thin) -- that's expected here, not a signal of anything.
+                # Only `merge` (or this function's own single-node path below) sees
+                # the true final count, so that's the only place worth warning.
+            else:
+                name = result_name(cfg, s)
+                warn_if_short(short_i, out_n, s.k, s.name, logger)
+            entry = run_manifest.search_entry(s)
+            entry.update({
+                "queries": out_n,
+                "output_file": name,
+                "hit_tie_column": want_tie_column,
+                # Storage dtypes of the vectors actually scored.
+                "corpus_dtype": dtypes.get("corpus_dtype"),
+                "queries_dtype": dtypes.get("queries_dtype"),
+            })
+            if num_jobs is None:
+                # Only a whole-corpus run can say anything true about short top-Ks.
+                # On a partial, "fewer than k hits" is the normal state of a stride
+                # slice, so reporting it would read as a defect that isn't one.
+                entry["queries_short_of_k"] = short_i
+            manifest_searches.append(entry)
+            pending_writes.append((
+                s, i, name, out_n, entry, write_pool.submit(out.write, name, table)
+            ))
+            del table
+            if len(pending_writes) >= 32:
+                _collect_write(pending_writes.pop(0))
+        for item in pending_writes:
+            _collect_write(item)
+    finally:
+        write_pool.shutdown(wait=True, cancel_futures=True)
 
     # The run manifest — written LAST, so it only ever describes outputs that
     # actually landed, and best-effort, so it cannot fail a run that produced
