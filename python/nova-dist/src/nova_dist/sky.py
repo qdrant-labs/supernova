@@ -300,6 +300,18 @@ def launch_pool_and_jobs(
         output_stream=sys.stdout,
     )
 
+    launch_jobs_only(pool_name, job_path, num_jobs, envs)
+
+
+def launch_jobs_only(
+    pool_name: str, job_path: Path, num_jobs: int, envs: dict
+) -> None:
+    """
+    Submit `num_jobs` ranked jobs to an existing pool without updating it.
+    Workers must already carry the config at the path referenced in `run:`.
+    """
+    import sky
+
     job_task = sky.Task.from_yaml(str(job_path))
     if envs:
         job_task.update_envs(envs)
@@ -315,6 +327,13 @@ def print_dry_run(pool_name: str, num_jobs: int, pool_path: Path, job_path: Path
     print(f"  job:  {job_path}")
     print("\nrun manually with the sky CLI:")
     print(f"  sky jobs pool apply -p {pool_name} {pool_path}")
+    print(f"  sky jobs launch -p {pool_name} --num-jobs {num_jobs} {job_path}")
+
+
+def print_dry_run_jobs_only(pool_name: str, num_jobs: int, job_path: Path) -> None:
+    print(f"\n[dry run] would submit {num_jobs} job(s) to existing pool '{pool_name}'")
+    print(f"  job: {job_path}")
+    print("\nrun manually with the sky CLI:")
     print(f"  sky jobs launch -p {pool_name} --num-jobs {num_jobs} {job_path}")
 
 

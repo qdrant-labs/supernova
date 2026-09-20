@@ -1,0 +1,43 @@
+# Fleet load-test for FineWeb 10B — run via `nova dist storm` (replicated workers).
+#
+# Query parquet lives in GCS (me-west1). Workers read it via DuckDB httpfs;
+# export GCS HMAC keys as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (see
+# storm-gcp-me-west1.yaml).
+#
+#   export AWS_ACCESS_KEY_ID=...   # GCS HMAC access id
+#   export AWS_SECRET_ACCESS_KEY=... 
+#   nova dist storm configs/storm/fineweb_bf_k1000_fleet.yaml \
+#     --resources configs/skypilot/storm-gcp-me-west1.yaml \
+#     --num-jobs 10 \
+#     --pool-name nova-storm-fineweb-bf-k1000
+#
+# Re-runs (pool already provisioned; skips worker rollout):
+#   nova dist storm configs/storm/fineweb_bf_k1000_fleet.yaml \
+#     --resources configs/skypilot/storm-gcp-me-west1.yaml \
+#     --num-jobs 10 \
+#     --pool-name nova-storm-fineweb-bf-k1000 \
+#     --jobs-only
+
+target:
+  type: qdrant
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY:-}
+  collection_name: ${QDRANT_COLLECTION:-fineweb-10b}
+
+query:
+  vector_name: dense
+  top_k: 100
+  source:
+    uri: gs://qdrant-sa-storm-fineweb-me-west1/storm/bf_k1000_parsed_ids.parquet
+    column: dense_embedding
+    limit: 100000   # full bf_k1000_parsed_ids.parquet (100k rows)
+
+load:
+  concurrency: 16
+  duration_s: 1200   # 20 minutes per worker
+  batch_size: 1
+
+# Optional time-series output per worker (one file per rank if path is unique).
+# report:
+#   format: csv
+#   path: storm_ts_rank_${SKYPILOT_JOB_RANK}.csv

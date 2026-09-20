@@ -1,4 +1,5 @@
 target
+qdrant_storage
 data
 thirdparty
 tools

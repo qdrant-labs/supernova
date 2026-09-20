@@ -216,7 +216,7 @@ Request payload patterns:
 - `dist/load`: supports `resources`, `num_jobs`, `pool_name`, `dry_run`,
   `finalize`, and catalog build/staging flags.
 - `dist/storm`: supports `resources`, `num_jobs`, `pool_name`, `dry_run`,
-  `stage_query_source`, and `query_source_remote_dir`.
+  `jobs_only`, `stage_query_source`, and `query_source_remote_dir`.
 
 Example:
 

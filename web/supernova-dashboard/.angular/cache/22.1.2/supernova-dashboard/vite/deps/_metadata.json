@@ -1,0 +1,88 @@
+{
+  "hash": "d37e320d",
+  "configHash": "a7e35b6c",
+  "lockfileHash": "53b0a890",
+  "browserHash": "f92e32b6",
+  "optimized": {
+    "@angular/common": {
+      "src": "../../../../../../node_modules/@angular/common/fesm2022/common.mjs",
+      "file": "@angular_common.js",
+      "fileHash": "35a0113f",
+      "needsInterop": false
+    },
+    "@angular/common/http": {
+      "src": "../../../../../../node_modules/@angular/common/fesm2022/http.mjs",
+      "file": "@angular_common_http.js",
+      "fileHash": "7b7ce9b6",
+      "needsInterop": false
+    },
+    "@angular/core": {
+      "src": "../../../../../../node_modules/@angular/core/fesm2022/core.mjs",
+      "file": "@angular_core.js",
+      "fileHash": "f8f53b4a",
+      "needsInterop": false
+    },
+    "@angular/forms": {
+      "src": "../../../../../../node_modules/@angular/forms/fesm2022/forms.mjs",
+      "file": "@angular_forms.js",
+      "fileHash": "338a9477",
+      "needsInterop": false
+    },
+    "@angular/platform-browser": {
+      "src": "../../../../../../node_modules/@angular/platform-browser/fesm2022/platform-browser.mjs",
+      "file": "@angular_platform-browser.js",
+      "fileHash": "56c6a047",
+      "needsInterop": false
+    },
+    "@angular/router": {
+      "src": "../../../../../../node_modules/@angular/router/fesm2022/router.mjs",
+      "file": "@angular_router.js",
+      "fileHash": "2282e310",
+      "needsInterop": false
+    },
+    "d3": {
+      "src": "../../../../../../node_modules/d3/src/index.js",
+      "file": "d3.js",
+      "fileHash": "6c588d91",
+      "needsInterop": false
+    },
+    "rxjs": {
+      "src": "../../../../../../node_modules/rxjs/dist/esm5/index.js",
+      "file": "rxjs.js",
+      "fileHash": "a3869063",
+      "needsInterop": false
+    },
+    "umap-js": {
+      "src": "../../../../../../node_modules/umap-js/dist/index.js",
+      "file": "umap-js.js",
+      "fileHash": "1824ee40",
+      "needsInterop": true
+    }
+  },
+  "chunks": {
+    "_xhr-chunk-BSRdrpBn": {
+      "file": "_xhr-chunk-BSRdrpBn.js",
+      "isDynamicEntry": false
+    },
+    "common-D_Uo8xZP": {
+      "file": "common-D_Uo8xZP.js",
+      "isDynamicEntry": false
+    },
+    "core-D6zx-NCn": {
+      "file": "core-D6zx-NCn.js",
+      "isDynamicEntry": false
+    },
+    "esm5-ChK3bs0s": {
+      "file": "esm5-ChK3bs0s.js",
+      "isDynamicEntry": false
+    },
+    "http-EOEuZdzn": {
+      "file": "http-EOEuZdzn.js",
+      "isDynamicEntry": false
+    },
+    "platform-browser-nG-c1xvR": {
+      "file": "platform-browser-nG-c1xvR.js",
+      "isDynamicEntry": false
+    }
+  }
+}

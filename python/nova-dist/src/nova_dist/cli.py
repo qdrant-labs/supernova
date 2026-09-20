@@ -42,6 +42,7 @@ def _fanout(
     extra_file_mounts: dict[str, str] | None = None,
     extra_runtime_envs: dict[str, str] | None = None,
     dry_run_extra=None,
+    jobs_only: bool = False,
 ) -> None:
     """
     Stage the config, generate pool+job YAMLs from the user's resources YAML,
@@ -50,9 +51,13 @@ def _fanout(
     sky_cfg, source = sky.resolve_resources(tool, resources)
     pool = pool_name or f"nova-{tool}-{Path(config).stem}"
     run_dir = sky.make_run_dir(pool)
-    file_mounts, remote_cfg = sky.stage_config(run_dir, config)
-    if extra_file_mounts:
-        file_mounts.update(extra_file_mounts)
+    if jobs_only:
+        remote_cfg = f"/cfg/{Path(config).name}"
+        file_mounts: dict[str, str] = {}
+    else:
+        file_mounts, remote_cfg = sky.stage_config(run_dir, config)
+        if extra_file_mounts:
+            file_mounts.update(extra_file_mounts)
 
     # `run_cmd` is a template referencing {cfg} and {n}.
     cmd = run_cmd.format(cfg=remote_cfg, n=num_jobs)
@@ -62,9 +67,14 @@ def _fanout(
     click.echo(f"resources: {source}")
     click.echo(f"run: {cmd}")
     click.echo(f"staged: {run_dir}")
+    if jobs_only:
+        click.echo("mode: jobs-only (skipping pool apply; workers must already have the config mounted)")
 
     if dry_run:
-        sky.print_dry_run(pool, num_jobs, pool_path, job_path)
+        if jobs_only:
+            sky.print_dry_run_jobs_only(pool, num_jobs, job_path)
+        else:
+            sky.print_dry_run(pool, num_jobs, pool_path, job_path)
         if dry_run_extra:
             dry_run_extra()
         return
@@ -72,7 +82,10 @@ def _fanout(
     envs = sky.forward_env(config, env_extra)
     if extra_runtime_envs:
         envs.update(extra_runtime_envs)
-    sky.launch_pool_and_jobs(pool, pool_path, job_path, num_jobs, envs)
+    if jobs_only:
+        sky.launch_jobs_only(pool, job_path, num_jobs, envs)
+    else:
+        sky.launch_pool_and_jobs(pool, pool_path, job_path, num_jobs, envs)
     sky.print_monitor(pool)
 
 
@@ -291,6 +304,11 @@ def load(
     show_default=True,
     help="Remote mount directory used with --stage-query-source.",
 )
+@click.option(
+    "--jobs-only",
+    is_flag=True,
+    help="Submit jobs to an existing pool without updating it (no pool apply / worker rollout).",
+)
 def storm(
     config,
     resources,
@@ -299,10 +317,17 @@ def storm(
     dry_run,
     stage_query_source,
     query_source_remote_dir,
+    jobs_only,
 ):
     """
     Load-test a vector store with `num_jobs` replicated workers (not sliced).
     """
+    if jobs_only and stage_query_source:
+        raise click.UsageError(
+            "--jobs-only cannot be used with --stage-query-source "
+            "(staging query parquet requires a pool update)"
+        )
+
     cfg_for_fanout = config
     extra_mounts = None
     if stage_query_source:
@@ -322,6 +347,7 @@ def storm(
         run_cmd="nova-storm {cfg}",
         env_extra=["QDRANT_URL", "QDRANT_API_KEY"],
         extra_file_mounts=extra_mounts,
+        jobs_only=jobs_only,
     )
 
 

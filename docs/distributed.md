@@ -172,6 +172,13 @@ nova dist storm configs/storm/test.yaml --num-jobs 10
 nova dist storm configs/storm/test.yaml \
     --num-jobs 10 \
     --stage-query-source ./data/prepared/shared.parquet
+
+# Re-submit jobs to an existing pool without a rolling worker update
+# (workers must already carry the config at /cfg/<config>.yaml):
+nova dist storm configs/storm/test.yaml \
+    --num-jobs 10 \
+    --pool-name my-storm-pool \
+    --jobs-only
 ```
 
 ## Inspect before launching

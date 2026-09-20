@@ -1,0 +1,27 @@
+# Smoke load-test for FineWeb GTE 10B using bf_k1000 ground-truth queries.
+#
+#   export QDRANT_URL=http://<host>:6334   # nova-storm uses gRPC (6334), not REST (6333)
+#   export QDRANT_API_KEY=...
+#   export QDRANT_COLLECTION=fineweb-10b
+#   nova-storm run configs/storm/fineweb_bf_k1000_smoke.yaml
+#
+# Parquet: ~/workspace/qdrant-fineweb-gte-10b/data/bf_k1000_parsed_ids.parquet
+#   columns: query_id, dense_embedding (768-dim), hit_ids (optional; not used here)
+
+target:
+  type: qdrant
+  url: ${QDRANT_URL:-http://127.0.0.1:6333}
+  api_key: ${QDRANT_API_KEY:-}
+  collection_name: ${QDRANT_COLLECTION:-fineweb-10b}
+
+query:
+  vector_name: dense
+  top_k: 100
+  source:
+    uri: /home/mvasquez/workspace/qdrant-fineweb-gte-10b/data/bf_k1000_parsed_ids.parquet
+    column: dense_embedding
+    limit: 100000
+
+load:
+  concurrency: 8
+  duration_s: 30

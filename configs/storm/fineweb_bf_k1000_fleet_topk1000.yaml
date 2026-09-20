@@ -1,0 +1,28 @@
+# Fleet load-test for FineWeb 10B with top_k=1000 (same workload as fineweb_bf_k1000_fleet.yaml).
+#
+#   nova dist storm configs/storm/fineweb_bf_k1000_fleet_topk1000.yaml \
+#     --resources configs/skypilot/storm-gcp-me-west1.yaml \
+#     --num-jobs 10 \
+#     --pool-name nova-storm-fineweb-bf-k1000
+#
+# Re-runs (after config is staged on pool workers):
+#   ... --jobs-only
+
+target:
+  type: qdrant
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY:-}
+  collection_name: ${QDRANT_COLLECTION:-fineweb-10b}
+
+query:
+  vector_name: dense
+  top_k: 1000
+  source:
+    uri: gs://qdrant-sa-storm-fineweb-me-west1/storm/bf_k1000_parsed_ids.parquet
+    column: dense_embedding
+    limit: 100000
+
+load:
+  concurrency: 16
+  duration_s: 1200
+  batch_size: 1

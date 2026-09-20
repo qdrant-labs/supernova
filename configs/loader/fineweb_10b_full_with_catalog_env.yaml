@@ -38,7 +38,7 @@ vectors:
 
 vectorstore:
   type: qdrant
-  collection_name: fineweb_gte_10b_dense_v1
+  collection_name: fineweb_gte_10b_test_v1
   url: ${QDRANT_URL}
   api_key: ${QDRANT_API_KEY}
   upsert_wait: false
