@@ -1,11 +1,11 @@
 //! Loading the query-vector set.
 //!
 //! Storm cycles through a fixed set of query vectors pulled from a parquet file
-//! (a local path or an `s3://` URI), read once at startup via DuckDB. The set is
+//! (a local path, `s3://`, or `gs://` URI), read once at startup via DuckDB. The set is
 //! held in memory and reused round-robin across the whole run, so this is a
 //! one-shot synchronous read — there's nothing to stream or overlap. (Contrast
 //! `nova-load`, which downloads huge corpus files; a small query set reads fine
-//! straight from `s3://` via httpfs.)
+//! straight from `s3://` or `gs://` via httpfs.)
 //!
 //! If `source.ground_truth_column` is set, each row's known-correct top-k point
 //! ids are read alongside its vector in the *same* query — e.g. pointing
@@ -71,7 +71,7 @@ pub fn load_query_vectors(
     let conn = Connection::open_in_memory()?;
     // httpfs lets DuckDB read `s3://` (and `http(s)://`); harmless for local paths.
     conn.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
-    configure_s3(&conn)?;
+    configure_httpfs(&conn, &source.uri)?;
 
     let filter_columns: Vec<&str> = filter
         .map(|f| f.query_fields().into_iter().collect())
@@ -162,26 +162,128 @@ pub fn load_query_vectors(
     Ok(out)
 }
 
-/// Point DuckDB's httpfs at S3 using the standard AWS environment variables.
-fn configure_s3(conn: &Connection) -> Result<(), QueryLoadError> {
-    let region = std::env::var("AWS_REGION")
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-east-1".to_string());
-    conn.execute_batch(&format!("SET s3_region='{region}';"))?;
+fn is_gcs_uri(uri: &str) -> bool {
+    uri.starts_with("gs://") || uri.starts_with("gcs://")
+}
 
+fn is_s3_uri(uri: &str) -> bool {
+    uri.starts_with("s3://")
+}
+
+/// Escape a string for a single-quoted SQL literal.
+fn esc_sql_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Configure DuckDB httpfs for the query parquet URI.
+///
+/// - `s3://` — S3 credential chain (env, profile, instance role).
+/// - `gs://` / `gcs://` — GCS HMAC keys when set (`AWS_ACCESS_KEY_ID` /
+///   `AWS_SECRET_ACCESS_KEY`, the GCS interop convention), otherwise the GCE
+///   metadata-server access token (GCP worker service account / SkyPilot pool).
+/// - Local paths — httpfs loaded but no remote credentials configured.
+fn configure_httpfs(conn: &Connection, uri: &str) -> Result<(), QueryLoadError> {
+    if is_gcs_uri(uri) {
+        return configure_gcs(conn);
+    }
+    if is_s3_uri(uri) {
+        return configure_s3(conn);
+    }
+    Ok(())
+}
+
+/// GCS via DuckDB `TYPE gcs` secrets. Prefer explicit HMAC interop keys when
+/// present; on GCP workers fall back to the metadata-server OAuth token.
+fn configure_gcs(conn: &Connection) -> Result<(), QueryLoadError> {
     let key = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
     let secret = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
     if !key.is_empty() && !secret.is_empty() {
-        conn.execute_batch(&format!(
-            "SET s3_access_key_id='{key}'; SET s3_secret_access_key='{secret}';"
-        ))?;
+        let sql = format!(
+            "CREATE OR REPLACE SECRET nova_gcs (TYPE gcs, KEY_ID '{}', SECRET '{}');",
+            esc_sql_literal(&key),
+            esc_sql_literal(&secret),
+        );
+        conn.execute_batch(&sql)?;
+        return Ok(());
     }
-    if let Ok(token) = std::env::var("AWS_SESSION_TOKEN")
-        && !token.is_empty()
-    {
-        conn.execute_batch(&format!("SET s3_session_token='{token}';"))?;
+
+    if let Some(token) = gce_access_token()? {
+        let sql = format!(
+            "CREATE OR REPLACE SECRET nova_gcs (TYPE gcs, bearer_token '{}');",
+            esc_sql_literal(&token),
+        );
+        conn.execute_batch(&sql)?;
+        return Ok(());
     }
+
+    // Last resort: DuckDB may resolve credentials from the environment on newer
+    // httpfs builds; harmless when it fails and a clearer error follows on read.
+    let _ = conn.execute_batch(
+        "CREATE OR REPLACE SECRET nova_gcs (TYPE gcs, PROVIDER credential_chain);",
+    );
     Ok(())
+}
+
+/// S3 via DuckDB's credential chain — same approach as `nova-inspect`.
+fn configure_s3(conn: &Connection) -> Result<(), QueryLoadError> {
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .ok();
+    let sql = match region {
+        Some(r) => format!(
+            "CREATE OR REPLACE SECRET nova_s3 (TYPE s3, PROVIDER credential_chain, REGION '{}');",
+            esc_sql_literal(&r),
+        ),
+        None => "CREATE OR REPLACE SECRET nova_s3 (TYPE s3, PROVIDER credential_chain);".into(),
+    };
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
+/// Fetch an OAuth access token from the GCE metadata server when running on a
+/// GCP VM (including SkyPilot pool workers with an attached service account).
+fn gce_access_token() -> Result<Option<String>, QueryLoadError> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut stream = match TcpStream::connect_timeout(
+        &"metadata.google.internal:80"
+            .parse()
+            .map_err(|e| QueryLoadError::Other(format!("metadata server address: {e}")))?,
+        Duration::from_millis(300),
+    ) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| QueryLoadError::Other(format!("metadata server timeout: {e}")))?;
+
+    stream
+        .write_all(
+            b"GET /computeMetadata/v1/instance/service-accounts/default/token HTTP/1.1\r\n\
+              Host: metadata.google.internal\r\n\
+              Metadata-Flavor: Google\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .map_err(|e| QueryLoadError::Other(format!("metadata server write: {e}")))?;
+
+    let mut resp = String::new();
+    stream
+        .read_to_string(&mut resp)
+        .map_err(|e| QueryLoadError::Other(format!("metadata server read: {e}")))?;
+
+    let body = resp
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| QueryLoadError::Other("metadata server: empty response".into()))?;
+    let json: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| QueryLoadError::Other(format!("metadata server token json: {e}")))?;
+    Ok(json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
 }
 
 /// Coerce a DuckDB `LIST`/`ARRAY` of floats into a `Vec<f32>`.
@@ -400,6 +502,25 @@ mod tests {
             limit: 10,
             ground_truth_column: ground_truth_column.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn gcs_bearer_secret_syntax_is_accepted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("INSTALL httpfs; LOAD httpfs;").unwrap();
+        conn.execute_batch(
+            "CREATE OR REPLACE SECRET nova_gcs (TYPE gcs, bearer_token 'dummy-token');",
+        )
+        .expect("gcs bearer_token secret");
+    }
+
+    #[test]
+    fn uri_scheme_detection() {
+        assert!(is_gcs_uri("gs://bucket/key.parquet"));
+        assert!(is_gcs_uri("gcs://bucket/key.parquet"));
+        assert!(!is_gcs_uri("s3://bucket/key.parquet"));
+        assert!(is_s3_uri("s3://bucket/key.parquet"));
+        assert!(!is_s3_uri("/tmp/local.parquet"));
     }
 
     #[test]

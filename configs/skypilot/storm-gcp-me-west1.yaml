@@ -5,8 +5,6 @@
 #   export QDRANT_API_KEY=...
 #   export QDRANT_COLLECTION=fineweb-10b
 #
-#   export AWS_ACCESS_KEY_ID=...      # GCS HMAC (for gs:// query parquet)
-#   export AWS_SECRET_ACCESS_KEY=...
 #   nova dist storm configs/storm/fineweb_bf_k1000_fleet.yaml \
 #     --resources configs/skypilot/storm-gcp-me-west1.yaml \
 #     --num-jobs 10
@@ -24,16 +22,11 @@ resources:
 
 setup: |
   set -e
-  case "$(uname -m)" in
-    x86_64) t=x86_64-unknown-linux-gnu ;;
-    aarch64|arm64) t=aarch64-unknown-linux-gnu ;;
-    *) t= ;;
-  esac
-  if [ -n "$t" ] && curl -fsSL "https://github.com/qdrant-labs/supernova/releases/latest/download/nova-storm-$t" -o /tmp/nova-storm; then
-    sudo install -m 0755 /tmp/nova-storm /usr/local/bin/nova-storm
+  if [ -f /cfg/nova-storm-bin ]; then
+    sudo install -m 0755 /cfg/nova-storm-bin /usr/local/bin/nova-storm
   else
     command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     . "$HOME/.cargo/env"
-    cargo install --git https://github.com/qdrant-labs/supernova nova-storm
+    cargo install --git https://github.com/qdrant-labs/supernova --branch fineweb-10b --force nova-storm
     sudo install -m 0755 "$HOME/.cargo/bin/nova-storm" /usr/local/bin/nova-storm
   fi

@@ -1,0 +1,40 @@
+# FineWeb 10B max-RPS discovery — closed-loop, staggered fleet launch.
+#
+# Use with scripts/run_fineweb_storm_ramped_fleet.sh (workers join one at a time
+# so load ramps up instead of flash-flooding Qdrant). Each worker runs closed-loop
+# at `concurrency` until `duration_s`; aggregate max RPS ≈ sum of per-worker
+# `requests_per_sec` during the full-fleet plateau.
+#
+#   ./scripts/run_fineweb_storm_ramped_fleet.sh
+#
+# First time this config filename is used on the pool, stage it once:
+#   STAGE_CONFIG=true ./scripts/run_fineweb_storm_ramped_fleet.sh
+#
+# Or reuse an already-staged config on workers:
+#   STORM_CONFIG=configs/storm/fineweb_bf_k1000_fleet_topk1000.yaml \
+#     ./scripts/run_fineweb_storm_ramped_fleet.sh
+
+target:
+  type: qdrant
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY:-}
+  collection_name: ${QDRANT_COLLECTION:-fineweb-10b}
+
+query:
+  vector_name: dense
+  top_k: 1000
+  source:
+    uri: gs://qdrant-sa-storm-fineweb-me-west1/storm/bf_k1000_parsed_ids.parquet
+    column: dense_embedding
+    limit: 100000
+
+load:
+  # Closed-loop (no `rps`): each worker finds max sustainable throughput at this
+  # in-flight depth. Do not set `rps` here — that caps offered load.
+  concurrency: 16
+  # Per-worker run length. With staggered launch, full-fleet plateau length is:
+  #   duration_s - (num_workers - 1) * stagger_s
+  # Default script sets duration_s from FULL_FLEET_MIN=20, WORKER_COUNT=10,
+  # STAGGER_S=60 → 1740s (29 min/worker, 20 min at full fleet).
+  duration_s: 1740
+  batch_size: 1
