@@ -185,6 +185,7 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
         query.vector_type,
         query.filter.as_ref(),
         query.top_k,
+        query.max_cutoff_ties,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -203,17 +204,17 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
     let with_ground_truth = vectors.iter().filter(|v| v.ground_truth.is_some()).count();
 
     // `batch_size` is only checked for `> 0` at config-load time (it has no
-    // visibility into how many rows `query.source` will actually yield) — a
-    // `batch_size` bigger than the loaded set is harmless (each repeated
-    // position still scores independently and correctly, see `batch_indices`)
-    // but silently sends duplicate vectors within a single dispatch and does
-    // more work than the operator likely intended. Warn up front, the same
-    // way a too-short ground-truth list is warned about below.
+    // visibility into how many rows `query.source` will actually yield). A
+    // `batch_size` bigger than the loaded set wraps (`batch_indices`), so a
+    // dispatch carries the same vector more than once. That is not harmless:
+    // the repeat positions are masked out and score nothing (a query is scored
+    // at its first occurrence), so the extra work buys no measurement.
     if load.batch_size > vectors.len() {
         tracing::warn!(
-            "load.batch_size={} exceeds the {} loaded query vectors — each batch dispatch will \
-             contain duplicate vectors (harmless, but likely not intended; raise query.source.limit \
-             or lower batch_size)",
+            "load.batch_size={} exceeds the {} loaded query vectors — each dispatch will \
+             carry the same vector more than once. The repeats are not scored (a query is \
+             scored once), so they add load without adding measurement. Raise \
+             query.source.limit or lower batch_size.",
             load.batch_size,
             vectors.len(),
         );
@@ -271,13 +272,77 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
                 k = query.top_k,
             );
         }
+        // RBO's weight decays geometrically with depth, so a `p` chosen for a
+        // deeper run leaves much of the metric below `top_k` and unmeasured.
+        // Said up front, where the fix is a config edit — after the run it is
+        // only an explanation for why the number looks low.
+        let rbo_p = query.effective_rbo_p();
+        // The WORST residual any loaded query will actually have, not
+        // `p^top_k`: a query is measured only as deep as its own ground truth
+        // can answer, and the preflight above has just counted how many are
+        // shallower than `top_k`. Estimating at `top_k` told a run whose
+        // ground truths were all 3 deep that 99% of the weight was inside its
+        // depth, while the summary later reported a 25% residual.
+        // `powi`, matching how the summary derives every ceiling, so the
+        // estimate and the reported value agree to the last bit.
+        let depth_of = |v: &queries::QueryVector| {
+            let distinct = v.ground_truth.as_ref().map_or(0, |g| g.len()) as u64;
+            distinct.min(query.top_k).min(i32::MAX as u64) as i32
+        };
+        let worst_depth = vectors
+            .iter()
+            .filter(|v| v.ground_truth.as_ref().is_some_and(|g| !g.is_empty()))
+            .map(depth_of)
+            .min();
+        // No scorable ground truth loaded -> no RBO will be reported, so
+        // asserting a depth here would be a confident statement about a
+        // measurement that never happens.
+        if let Some(worst_depth) = worst_depth {
+            let residual = rbo_p.powi(worst_depth);
+            tracing::info!(
+                "rank agreement: rbo p={:.3} ({}, expected reading depth {:.0}), {:.1}% of its \
+                 weight inside the shallowest ground truth loaded (depth {})",
+                rbo_p,
+                if query.rbo_p.is_some() {
+                    "configured"
+                } else {
+                    "auto, derived from top_k"
+                },
+                1.0 / (1.0 - rbo_p),
+                (1.0 - residual) * 100.0,
+                worst_depth,
+            );
+            // Reachable two ways: a CONFIGURED `p` too large for this `top_k`,
+            // or ground truths shallower than `top_k` (the derived default only
+            // pins the residual at 1% for a query measured at the full depth).
+            // The bar matches the summary's own residual line, so a run cannot
+            // end up printing a residual the preflight said nothing about.
+            if residual > crate::config::RBO_DEFAULT_RESIDUAL * 1.5 {
+                tracing::warn!(
+                    "{:.1}% of RBO's weight sits below depth {} — the raw rbo of the \
+                     shallowest query will be a loose lower bound, topping out at {:.4} \
+                     rather than 1.0. Lower query.rbo_p, or read the normalized rbo, which \
+                     already accounts for it.",
+                    residual * 100.0,
+                    worst_depth,
+                    1.0 - residual,
+                );
+            }
+        }
     }
 
     // A spinner so a long run doesn't look frozen; hidden when not a TTY.
     let spinner = if std::io::stderr().is_terminal() {
         let pb = ProgressBar::new_spinner();
         pb.enable_steady_tick(Duration::from_millis(120));
-        pb.set_message(format!("storm running for {:.0}s…", load.duration_s));
+        // `passes` mode ignores `duration_s` entirely, so quoting it there
+        // would be misleading: a fixed-work run over a million queries would
+        // claim to be a 60-second run.
+        pb.set_message(if load.passes > 0 {
+            format!("storm: {} pass(es) over the query set…", load.passes)
+        } else {
+            format!("storm running for {:.0}s…", load.duration_s)
+        });
         pb
     } else {
         ProgressBar::hidden()
@@ -297,12 +362,25 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
                 && query.source.ground_truth_column.is_some(),
             engine_higher_is_better,
         },
+        runner::RboP(query.effective_rbo_p()),
         query.filter.is_some(),
         recorder,
     )
     .await;
     spinner.finish_and_clear();
 
+    // An empty summary from a dead collector is indistinguishable, on the
+    // page, from a target that answered nothing — and `main` only exits
+    // non-zero when `requests > 0 && errors == requests`, so a zeroed run
+    // would exit 0 and be recorded by `nova sweep` as a real measurement of
+    // `qps: 0`. Fail instead.
+    if results.collector_failed {
+        return Err(StormError::Other(
+            "the collector thread died, so every measurement from this run was lost — no \
+             summary can be produced. This is a bug in storm, not a result for the target."
+                .to_string(),
+        ));
+    }
     Ok(results.summary())
 }
 

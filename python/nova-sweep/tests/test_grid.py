@@ -4,6 +4,8 @@ plan's Verification items #5 (`expand_grid`) and #12 (`order_by_rebuild_cost`).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from nova_sweep.grid import expand_grid, order_by_rebuild_cost
 
 
@@ -99,3 +101,49 @@ def test_order_by_rebuild_cost_is_stable():
 
 def _freeze(d: dict) -> str:
     return repr(sorted(d.items()))
+
+
+def test_rbo_p_and_gt_scores_reach_the_query_block_not_the_load_block():
+    """`rbo_p` in a `searches` entry belongs to nova-storm's `query:` block.
+    Routed to `load:` (where every unrecognised key goes) it would hit
+    `deny_unknown_fields` and fail the run, leaving no way to pin `p` across a
+    sweep whose `top_k` varies — which silently mixes two different metrics
+    into one parquet column."""
+    from nova_sweep.backends.base import build_storm_query
+    from nova_sweep.config import QueriesConfig, SweepConfig
+
+    cfg = SimpleNamespace(
+        queries=QueriesConfig(
+            uri="s3://bucket/queries.parquet",
+            column="dense_embedding",
+            ground_truth_column="hit_ids",
+            ground_truth_score_column="hit_scores",
+            limit=100,
+        )
+    )
+    query, load = build_storm_query(
+        cfg, {"top_k": 100, "rbo_p": 0.95, "hnsw_ef": 64, "concurrency": 8}, {"hnsw_ef"}
+    )
+
+    assert query["rbo_p"] == 0.95
+    assert query["top_k"] == 100
+    assert "rbo_p" not in load, "would be rejected by nova-storm's load block"
+    # The score column is what makes every tie-aware bound (recall's and RBO's)
+    # available at all; without it the whole sweep reports point estimates.
+    assert query["source"]["ground_truth_score_column"] == "hit_scores"
+    assert query["search_params"] == {"hnsw_ef": 64}
+    assert load == {"concurrency": 8}
+
+
+def test_rbo_p_is_optional_and_absent_when_not_swept():
+    """Unset, nova-storm derives `p` from `top_k` — the config must not pin it
+    to some other default on the way through."""
+    from nova_sweep.backends.base import build_storm_query
+    from nova_sweep.config import QueriesConfig
+
+    cfg = SimpleNamespace(
+        queries=QueriesConfig(uri="s3://b/q.parquet", column="dense_embedding", limit=10)
+    )
+    query, _ = build_storm_query(cfg, {"top_k": 10}, set())
+    assert "rbo_p" not in query
+    assert "ground_truth_score_column" not in query["source"]

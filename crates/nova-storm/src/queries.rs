@@ -15,7 +15,7 @@
 //! files by an independently-derived query id: the vector and its ground truth
 //! arrive already paired, by construction.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use duckdb::Connection;
 use duckdb::types::Value;
@@ -71,20 +71,93 @@ pub struct GtCutoff {
     pub ascending: Option<bool>,
 }
 
+/// Where one ground-truth id sits in its query's ranking. Recall only ever
+/// asks "is this id present"; [`crate::runner::rbo_at_k`] also needs "at what
+/// rank", so the loader keeps the position rather than discarding it into a
+/// bare set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtRank {
+    /// 0-based rank among the DISTINCT ids of the ground truth's top-k. A
+    /// repeated id consumes one rank, not two, so these are dense — see the
+    /// map's construction for why a hole would be harmful.
+    pub rank: u32,
+    /// Rank of the FIRST entry sharing this one's score — identical for every
+    /// member of a tie group, so a metric keyed on `tied_rank` cannot punish
+    /// an engine for returning a different member of a tie than the ground
+    /// truth happened to record. Equals `rank` when no score column is
+    /// configured, when this row's score value is NULL, or when nothing ties.
+    pub tied_rank: u32,
+}
+
+/// Ground-truth ids that tie with the k-th place but fell BEYOND `top_k`.
+///
+/// The ground truth had to pick some order among documents that scored
+/// identically, and when that tie group straddles the `top_k` cutoff the
+/// choice of which members landed inside is arbitrary. An engine returning a
+/// different member is equally correct, so rank agreement's upper bound must
+/// be allowed to fill the group's slots with these too. Recall already credits
+/// them by score (its `near_ties` path); without this, RBO's upper bound would
+/// collapse onto its lower bound in exactly the case recall calls most
+/// ambiguous.
+///
+/// Kept apart from [`QueryVector::ground_truth`] rather than folded into it,
+/// because that map's `len()` is recall's denominator for a short ground
+/// truth — padding it with entries from outside the top-k would silently
+/// change what recall means.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutoffTies {
+    /// Compacted rank where the k-th place's tie group starts. Every id here
+    /// shares that group, since every one shares its score.
+    pub group_start: u32,
+    /// Members, as sorted indices into [`CutoffTies::table`]. Interned rather
+    /// than owned `String`s because a ground truth whose scores are flat keeps
+    /// its whole tail for EVERY query: measured at ~150 bytes per entry as a
+    /// per-query `HashMap<String, u32>` (1.16 GB for 10k queries against a
+    /// 1000-deep flat list), against 4 bytes here plus one shared copy of each
+    /// distinct id. Sorted so membership is a binary search.
+    ///
+    /// Keeping every member is deliberate and load-bearing: which ones the
+    /// engine returns is unknowable at load time, so dropping some by their
+    /// position in the ground truth's tail would decide the metric by the very
+    /// ordering it treats as meaningless.
+    pub ids: Vec<u32>,
+    /// Interning table shared by every query in the set — one `String` per
+    /// distinct member, however many queries mention it.
+    pub table: std::sync::Arc<HashMap<String, u32>>,
+}
+
+impl CutoffTies {
+    /// Whether `id` is one of the equally-correct answers that fell outside
+    /// this query's top-k. One hash into the shared table, then a binary
+    /// search; only reached for ids that are NOT already in the ground truth.
+    pub fn contains(&self, id: &str) -> bool {
+        self.table
+            .get(id)
+            .is_some_and(|idx| self.ids.binary_search(idx).is_ok())
+    }
+}
+
 /// One query vector plus its ground truth, if configured. Bundled into one
 /// struct (rather than two parallel `Vec`s) so the two can never drift out of
-/// index alignment. `ground_truth` is a `HashSet`, not the raw `Vec` the
+/// index alignment. `ground_truth` is a `HashMap`, not the raw `Vec` the
 /// column decodes to, so `recall_at_k` (called once per query *firing*, and
 /// queries cycle round-robin through a fixed, reused set of these) doesn't
-/// rebuild a set from the same ids over and over — it's built once, here, at
-/// load time.
+/// rebuild a lookup from the same ids over and over — it's built once, here,
+/// at load time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryVector {
     pub vector: VectorData,
+    /// Ground-truth id -> where it ranks (see [`GtRank`]). A map rather than a
+    /// set: membership answers recall, the rank answers rank-agreement (RBO).
+    ///
     /// `None` when `ground_truth_column` isn't configured, or when this row's
     /// value is SQL NULL — either way, just "no known-correct answer for this
     /// query," not an error: the query still runs and contributes latency.
-    pub ground_truth: Option<HashSet<String>>,
+    pub ground_truth: Option<HashMap<String, GtRank>>,
+    /// Equally-correct answers that fell just outside `top_k` — see
+    /// [`CutoffTies`]. `None` without a score column, or when the k-th place's
+    /// tie group ends inside the prefix (the common case).
+    pub gt_cutoff_ties: Option<CutoffTies>,
     /// The ground truth's score AT the top-k cutoff (its k-th best), and how
     /// many of its entries share that score. `None` when no score column is
     /// configured. Derived once here rather than carried as a full score list:
@@ -143,6 +216,7 @@ pub fn load_query_vectors(
     vector_type: VectorType,
     filter: Option<&Filter>,
     top_k: u64,
+    max_cutoff_ties: usize,
 ) -> Result<Vec<QueryVector>, QueryLoadError> {
     let conn = Connection::open_in_memory()?;
     // httpfs lets DuckDB read `s3://` (and `http(s)://`); harmless for local paths.
@@ -161,6 +235,30 @@ pub fn load_query_vectors(
     // denominator is `top_k`, so the operator should know why.
     let mut gt_duplicate_rows: usize = 0;
     let mut gt_max_depth: usize = 0;
+    // Ground-truth entries retained past `top_k` because they tie with the
+    // k-th place (see `CutoffTies`). Reported so a corpus whose scores are
+    // flat — where this is the whole tail of every list — is visible as a
+    // memory cost rather than a surprise.
+    let mut gt_cutoff_tie_ids: usize = 0;
+    // Shared across every query: one `String` per distinct cutoff-tie member,
+    // however many queries mention it. Each query then holds `u32` indices.
+    let mut tie_table: HashMap<String, u32> = HashMap::new();
+    // Queries whose tie group was too large to keep under
+    // `query.max_cutoff_ties`. The WHOLE group is dropped for such a query —
+    // never a prefix of it — so its upper bound narrows toward its exact value
+    // rather than being decided by the ground truth's tail order.
+    let mut gt_cutoff_ties_dropped: usize = 0;
+    // Ties ENCOUNTERED, whether or not the budget let us keep them. Keying the
+    // warning on the kept count meant that lowering `max_cutoff_ties` — the
+    // action the warning recommends — silenced it while the load behaved
+    // exactly the same, so the run went quiet right when it most needed not to.
+    let mut gt_cutoff_ties_seen: usize = 0;
+    // Warn WHILE loading, not after. A million-row query file takes minutes to
+    // read and emits nothing until it finishes, so a retention that is heading
+    // for an OOM currently announces itself only if the process survives to
+    // print it.
+    let mut tie_warned = false;
+    const TIE_WARN_AT: usize = 1_000_000;
 
     // Config is operator-authored (trusted). Columns are quoted so names with
     // odd characters survive. `cols` is the single source of truth for both the
@@ -289,36 +387,34 @@ pub fn load_query_vectors(
         // Pre-truncation length, kept so the id/score pairing check can't be
         // satisfied merely by a list that was cut down to top_k.
         let mut gt_full_depth = 0usize;
-        let ground_truth = match ground_truth {
+        // Ids in ground-truth rank order, truncated to top_k. Held as an
+        // ORDERED `Vec` until the score list below has been validated: the
+        // rank map pairs the two positionally, so it cannot be built before
+        // the scores it reads are known to be finite, ranked and the same
+        // length.
+        let gt_ids: Option<Vec<String>> = match ground_truth {
             None | Some(Value::Null) => None,
             Some(v) => {
-                let mut ids = string_list(v)?;
+                let ids = string_list(v)?;
                 let full_depth = ids.len();
                 gt_full_depth = full_depth;
                 if full_depth > top_k_usize {
-                    // Descending score order -> the prefix is the true top-k.
-                    ids.truncate(top_k_usize);
                     gt_truncated += 1;
                     gt_max_depth = gt_max_depth.max(full_depth);
                 }
-                // Positional depth, captured BEFORE the set collapses any
-                // duplicate ids.
-                gt_depth = ids.len();
-                let set = ids.into_iter().collect::<HashSet<_>>();
-                // Only a FULL-depth row is capped by a repeat: its denominator
-                // is `top_k` while a hit counts once. A shallow row divides by
-                // its own deduped length and can still reach 1.0, so warning
-                // about it would be wrong.
-                if set.len() < gt_depth && gt_depth >= top_k_usize {
-                    gt_duplicate_rows += 1;
-                }
-                Some(set)
+                // Descending score order -> the first `top_k` ARE the true
+                // top-k. Held as a depth rather than a `truncate()` so the
+                // entries just past it stay reachable: those tied with the
+                // k-th place are equally correct answers, and
+                // [`CutoffTies`] needs them. Positional, captured before the
+                // map below collapses any duplicate ids.
+                gt_depth = full_depth.min(top_k_usize);
+                Some(ids)
             }
         };
-        // The cutoff is the LAST score inside the (already truncated) top-k,
-        // and its tie count is how many of the whole list share it — the tie
-        // group can extend past k, which is exactly the ambiguous case.
-        let gt_cutoff = match (&ground_truth, gt_scores_raw) {
+        // The validated score list, positionally paired with the UNTRUNCATED
+        // id list. Feeds both the rank map's tie collapsing and the cutoff.
+        let gt_scores: Option<Vec<f32>> = match (&gt_ids, gt_scores_raw) {
             (Some(_), Some(v)) if !matches!(v, Value::Null) => {
                 let scores = float_list(v)?;
                 // NaN/inf would make `<`, `>` and `==` all silently false, so
@@ -357,23 +453,181 @@ pub fn load_query_vectors(
                         scores.len()
                     )));
                 }
-                let depth = gt_depth;
-                if depth == 0 {
-                    None
-                } else {
-                    // Ties are equality, so they read the same either way;
-                    // the cutoff SCORE is normalized to larger-is-better so it
-                    // can be compared against an engine score normalized the
-                    // same way. See `scores_descending`.
-                    let raw = scores[depth - 1];
-                    // EXACT equality, not `tie_epsilon`.
-                    let ties = scores.iter().filter(|s| **s == raw).count() as u32;
-                    Some(GtCutoff {
-                        score: raw,
-                        ties,
-                        ascending: scores_descending(&scores).map(|desc| !desc),
-                    })
+                Some(scores)
+            }
+            _ => None,
+        };
+        // id -> rank, plus the ids just past top_k that tie with its k-th
+        // place. Ranks are COMPACTED over distinct ids: a repeated id keeps its
+        // first (best) rank and consumes only one rank, so the ranks a query
+        // hands out are always `0..distinct_count` with no holes. A hole would
+        // be a rank no returned id can ever occupy, which would put the
+        // rank-agreement ceiling out of reach for a flawless response.
+        let mut gt_cutoff_ties: Option<CutoffTies> = None;
+        let ground_truth = gt_ids.map(|ids| {
+            let mut map: HashMap<String, GtRank> = HashMap::with_capacity(gt_depth);
+            // The score list is validated sorted best-first above, so a tie
+            // group is CONTIGUOUS: `tied` only moves when the score actually
+            // changes, leaving every member of a group pointing at the
+            // (compacted) rank where the group started. With no scores, every
+            // rank is its own group and `tied_rank == rank`.
+            let cutoff_score = gt_scores
+                .as_deref()
+                .and_then(|scores| (gt_depth > 0).then(|| scores[gt_depth - 1]));
+            let mut next_rank = 0u32;
+            let mut tied = 0u32;
+            // The tie group the k-th place belongs to, captured WHILE the
+            // prefix is being walked. Reading `tied` after the loop instead
+            // would read the value the first strictly-worse entry left behind:
+            // that entry starts a new group, so `tied` moves to `next_rank`
+            // and only then does the loop break. `next_rank` is by then the
+            // measured depth, and `rbo_at_k` drops every extra whose group
+            // starts at or past the depth — so the straddling-tie allowance
+            // would silently do nothing at all, for every ground truth that
+            // continues past its own tie group (i.e. essentially all of them).
+            let mut cutoff_group_start = 0u32;
+            // The tail is buffered as ids and interned only once the budget
+            // has passed. Interning first and clearing afterwards freed the
+            // 4-byte index and left the ~100-byte table entry behind, so the
+            // cap trimmed the steady state and left the PEAK — the thing that
+            // actually OOMs — exactly where it was.
+            let mut tail: Vec<String> = Vec::new();
+            let mut over_budget = false;
+            // Counted even once we stop buffering, so the diagnostics describe
+            // the ground truth rather than the budget. Breaking out early made
+            // `seen` equal the cap, which silenced the in-flight warning at
+            // exactly the setting an operator adopts to avoid an OOM.
+            let mut tail_seen = 0usize;
+            for (pos, id) in ids.into_iter().enumerate() {
+                // A NEW score starts a new tie group at the next free rank.
+                // Without scores every entry is its own group.
+                let new_group = match gt_scores.as_deref() {
+                    Some(scores) => pos == 0 || scores[pos] != scores[pos - 1],
+                    None => true,
+                };
+                if new_group {
+                    tied = next_rank;
                 }
+                if pos < gt_depth {
+                    // Last write wins, so this ends up holding the group of
+                    // the LAST prefix entry — the k-th place.
+                    cutoff_group_start = tied;
+                    if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(id) {
+                        slot.insert(GtRank {
+                            rank: next_rank,
+                            tied_rank: tied,
+                        });
+                        next_rank += 1;
+                    }
+                    continue;
+                }
+                // Past the measured prefix. Only the k-th place's own tie group
+                // continues — everything below it is genuinely worse, and the
+                // moment the score changes there is nothing left to collect.
+                let tied_with_cutoff = cutoff_score
+                    .is_some_and(|c| gt_scores.as_deref().is_some_and(|s| s[pos] == c));
+                if !tied_with_cutoff {
+                    break;
+                }
+                // EVERY member is kept, not the first few. Only
+                // `depth - group_start` of them can be credited at once, so a
+                // cap looks safe — but which ones are creditable depends on
+                // which the ENGINE returned, and keeping the first few by tail
+                // position decides that by the ground truth's order within the
+                // group, which is exactly the ordering this whole feature
+                // treats as meaningless. A flat-scored ground truth where the
+                // engine returned a perfectly good answer from further down
+                // the tail scored 0.0 against a recall of 0.0 – 1.0.
+                //
+                // The cost is real: a ground truth whose scores are flat
+                // retains its whole tail per query (bounded by the stored list
+                // length, and reported below).
+                // An id already inside the prefix is credited from the map;
+                // holding it here too would be a second, unusable copy.
+                if !map.contains_key(&id) {
+                    tail_seen += 1;
+                    if tail.len() >= max_cutoff_ties {
+                        // Stop BUFFERING, but keep walking: the rest of the
+                        // group still has to be counted. Nothing further is
+                        // retained, and the whole group goes below — never a
+                        // prefix of it.
+                        over_budget = true;
+                        continue;
+                    }
+                    tail.push(id);
+                }
+            }
+            gt_cutoff_ties_seen += tail_seen;
+            if over_budget {
+                gt_cutoff_ties_dropped += 1;
+                tail.clear();
+            }
+            // Interned only now that the budget has passed, so an over-budget
+            // query costs nothing beyond the transient buffer.
+            let mut extras: Vec<u32> = tail
+                .into_iter()
+                .map(|id| {
+                    let next = tie_table.len() as u32;
+                    *tie_table.entry(id).or_insert(next)
+                })
+                .collect();
+            // Sorted + deduplicated so membership is a binary search; a tail
+            // that repeats an id must not consume a slot twice.
+            extras.sort_unstable();
+            extras.dedup();
+            gt_cutoff_tie_ids += extras.len();
+            if gt_cutoff_ties_seen >= TIE_WARN_AT && !tie_warned {
+                tie_warned = true;
+                tracing::warn!(
+                    "already seen {gt_cutoff_ties_seen} ground-truth ids tied with their \
+                     query's k-th place, and the query file is still loading — this ground \
+                     truth's scores are flat enough that the whole tail past top_k={top_k} \
+                     ties. Roughly 12-150 bytes each depending on how much the ids repeat \
+                     across queries, and {gt_cutoff_tie_ids} kept so far under \
+                     max_cutoff_ties={max_cutoff_ties}. Lower that, or query.source.limit, \
+                     if this is heading somewhere you do not want it to."
+                );
+            }
+            if !extras.is_empty() {
+                gt_cutoff_ties = Some(CutoffTies {
+                    // Every extra shares the k-th place's score, so they all
+                    // belong to ONE group: the k-th place's own.
+                    group_start: cutoff_group_start,
+                    ids: extras,
+                    // Filled in once the whole set is read, so every query
+                    // shares one table.
+                    table: std::sync::Arc::new(HashMap::new()),
+                });
+            }
+            map
+        });
+        // Only a FULL-depth row is capped by a repeat: its denominator is
+        // `top_k` while a hit counts once. A shallow row divides by its own
+        // deduped length and can still reach 1.0, so warning about it would be
+        // wrong.
+        // `0` with no ground truth, where `gt_depth` is also 0 — so the
+        // comparison below is false and the row is not counted.
+        let deduped = ground_truth.as_ref().map_or(0, |map| map.len());
+        if deduped < gt_depth && gt_depth >= top_k_usize {
+            gt_duplicate_rows += 1;
+        }
+        // The cutoff is the LAST score inside the (already truncated) top-k,
+        // and its tie count is how many of the whole list share it — the tie
+        // group can extend past k, which is exactly the ambiguous case.
+        let gt_cutoff = match (&ground_truth, &gt_scores) {
+            (Some(_), Some(scores)) if gt_depth > 0 => {
+                // Ties are equality, so they read the same either way; the
+                // cutoff SCORE is normalized to larger-is-better so it can be
+                // compared against an engine score normalized the same way.
+                // See `scores_descending`.
+                let raw = scores[gt_depth - 1];
+                // EXACT equality, not `tie_epsilon`.
+                let ties = scores.iter().filter(|s| **s == raw).count() as u32;
+                Some(GtCutoff {
+                    score: raw,
+                    ties,
+                    ascending: scores_descending(scores).map(|desc| !desc),
+                })
             }
             _ => None,
         };
@@ -399,6 +653,7 @@ pub fn load_query_vectors(
         out.push(QueryVector {
             vector,
             ground_truth,
+            gt_cutoff_ties,
             gt_cutoff,
             gt_depth,
             filter_values,
@@ -423,6 +678,37 @@ pub fn load_query_vectors(
              (deepest list held {gt_max_depth} ids) — recall is measured against the \
              true top-{top_k}, NOT against every id in the list",
             if gt_truncated == 1 { "y" } else { "ies" },
+        );
+    }
+    if gt_cutoff_tie_ids > 0 {
+        // One allocation for the whole set; every query's `Vec<u32>` indexes
+        // into it. Done here rather than per row because the table is only
+        // complete once the last row has been read.
+        let table = std::sync::Arc::new(tie_table);
+        for v in &mut out {
+            if let Some(ties) = v.gt_cutoff_ties.as_mut() {
+                ties.table = std::sync::Arc::clone(&table);
+            }
+        }
+    }
+    if gt_cutoff_ties_dropped > 0 {
+        tracing::warn!(
+            "{gt_cutoff_ties_dropped} quer(y/ies) had more than max_cutoff_ties={max_cutoff_ties} \
+             ground-truth ids tied with their k-th place; the WHOLE allowance was dropped for \
+             each (never a subset, which would decide the metric by the ground truth's tail \
+             order). Their rank-agreement upper bound narrows toward the exact value. Raise \
+             query.max_cutoff_ties to keep them — budget ~12 bytes per id where a \
+             near-duplicate corpus makes the same ids recur across queries, and up to \
+             ~150 where every query's tail is distinct."
+        );
+    }
+    if gt_cutoff_tie_ids > 0 {
+        tracing::info!(
+            "kept {gt_cutoff_tie_ids} ground-truth id(s) past top_k={top_k} that tie with \
+             their query's k-th place — they are equally correct answers, so rank agreement's \
+             upper bound lets the engine return them (recall already credits them by score). \
+             A large number here means the ground truth's scores are flat, and this is the \
+             tail of every list."
         );
     }
     Ok(out)
@@ -853,6 +1139,24 @@ fn id_string(v: &Value) -> Option<String> {
 mod tests {
 
     use super::*;
+
+    /// The ground-truth map a list of ids in RANK ORDER should load as, with
+    /// nothing tied. Asserting against this rather than a bare set is what
+    /// pins the loader's rank assignment, which RBO depends on.
+    fn gt_map(ids: &[&str]) -> HashMap<String, GtRank> {
+        ids.iter()
+            .enumerate()
+            .map(|(rank, id)| {
+                (
+                    id.to_string(),
+                    GtRank {
+                        rank: rank as u32,
+                        tied_rank: rank as u32,
+                    },
+                )
+            })
+            .collect()
+    }
     /// Loads at the config's DEFAULT `top_k` (10) — the same value a real run
     /// uses, so these tests exercise the production path rather than a
     /// truncation-disabled one. The shared ground-truth fixtures are 2 ids
@@ -864,7 +1168,7 @@ mod tests {
         vector_type: VectorType,
         filter: Option<&Filter>,
     ) -> Result<Vec<QueryVector>, QueryLoadError> {
-        load_query_vectors(source, vector_type, filter, 10)
+        load_query_vectors(source, vector_type, filter, 10, usize::MAX)
     }
 
     fn write_parquet(path: &std::path::Path, rows: usize) {
@@ -959,11 +1263,11 @@ mod tests {
         assert_eq!(vectors[0].ground_truth, None);
         assert_eq!(
             vectors[1].ground_truth,
-            Some(HashSet::from(["gt-1-a".to_string(), "gt-1-b".to_string()]))
+            Some(gt_map(&["gt-1-a", "gt-1-b"]))
         );
         assert_eq!(
             vectors[4].ground_truth,
-            Some(HashSet::from(["gt-4-a".to_string(), "gt-4-b".to_string()]))
+            Some(gt_map(&["gt-4-a", "gt-4-b"]))
         );
     }
 
@@ -992,7 +1296,7 @@ mod tests {
         assert_eq!(vectors.len(), 3);
         assert_eq!(
             vectors[1].ground_truth,
-            Some(HashSet::from(["1".to_string(), "2".to_string()]))
+            Some(gt_map(&["1", "2"]))
         );
     }
 
@@ -1330,8 +1634,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(vectors.len(), 2);
-            assert!(vectors[0].ground_truth.as_ref().unwrap().contains("gt-0"));
-            assert!(vectors[1].ground_truth.as_ref().unwrap().contains("gt-2"));
+            assert!(vectors[0].ground_truth.as_ref().unwrap().contains_key("gt-0"));
+            assert!(vectors[1].ground_truth.as_ref().unwrap().contains_key("gt-2"));
         });
     }
 
@@ -1863,7 +2167,7 @@ mod tests {
 
         let mut src = source(file.display().to_string(), Some("hit_ids"));
         src.ground_truth_score_column = Some("hit_scores".to_string());
-        let vectors = load_query_vectors(&src, VectorType::Dense, None, 4).unwrap();
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, 4, usize::MAX).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         let cutoff = vectors[0].gt_cutoff.expect("cutoff derived");
@@ -1872,6 +2176,222 @@ mod tests {
             "cutoff must be the 4th score (0.1), not an earlier one — got {}",
             cutoff.score
         );
+    }
+
+    /// Build a one-row query file with the given ids/scores and load it at
+    /// `top_k`. The tie-group machinery is entirely score-driven, so these
+    /// tests need a real score column rather than the `gt_map` fixtures.
+    fn load_one_with_scores(
+        ids: &[&str],
+        scores: &[f32],
+        top_k: u64,
+        tag: &str,
+    ) -> (HashMap<String, GtRank>, Option<CutoffTies>) {
+        let dir = std::env::temp_dir().join(format!(
+            "nova_storm_ties_{tag}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        let id_list = ids
+            .iter()
+            .map(|i| format!("'{i}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let score_list = scores
+            .iter()
+            .map(|s| format!("{s}::FLOAT"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT] AS embedding, \
+             [{id_list}] AS hit_ids, [{score_list}] AS hit_scores) TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+        let mut src = source(file.display().to_string(), Some("hit_ids"));
+        src.ground_truth_score_column = Some("hit_scores".to_string());
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, top_k, usize::MAX).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let v = vectors.into_iter().next().expect("one row");
+        (v.ground_truth.expect("ground truth"), v.gt_cutoff_ties)
+    }
+
+    #[test]
+    fn a_tie_group_straddling_top_k_is_collected_with_the_group_s_own_start_rank() {
+        // `b` and `c` tie at the k-th place, so which of them the ground truth
+        // put inside top_k is arbitrary and `c` is an equally correct answer.
+        // `group_start` must name the rank where that group begins (1) — an
+        // off-by-one here is not a small error: `rbo_at_k` drops every extra
+        // whose group starts at or past the measured depth, so the whole
+        // straddling-tie allowance silently does nothing.
+        let (map, ties) = load_one_with_scores(&["a", "b", "c", "d"], &[3.0, 2.0, 2.0, 1.0], 2, "a");
+        assert_eq!(map.len(), 2, "the prefix holds two ids");
+        assert_eq!(map["a"], GtRank { rank: 0, tied_rank: 0 });
+        assert_eq!(map["b"], GtRank { rank: 1, tied_rank: 1 });
+        let ties = ties.expect("the cutoff's tie group continues past top_k");
+        assert_eq!(
+            ties.group_start, 1,
+            "the group containing the k-th place starts at rank 1, not at the \
+             depth the list happens to reach"
+        );
+        assert!(ties.contains("c"), "the straddling member is retained");
+        assert!(!ties.contains("a"), "prefix members are credited from the map");
+        assert_eq!(ties.ids.len(), 1);
+        // And it must be USABLE: the measured depth is 2, so a group starting
+        // at 2 or beyond could never fill a slot.
+        assert!(
+            (ties.group_start as usize) < map.len(),
+            "group_start {} is past the measured depth {} — the extras are dead",
+            ties.group_start,
+            map.len()
+        );
+    }
+
+    #[test]
+    fn a_tie_run_reaching_the_end_of_the_list_collects_the_same_way() {
+        // The same shape with nothing worse after it. This case happened to
+        // work even when `group_start` was read after the loop had moved on,
+        // which is why it has to be tested alongside the one above.
+        let (map, ties) = load_one_with_scores(&["a", "b", "c"], &[3.0, 2.0, 2.0], 2, "b");
+        let ties = ties.expect("tie group continues past top_k");
+        assert_eq!(ties.group_start, 1);
+        assert_eq!(ties.ids.len(), 1);
+        assert!((ties.group_start as usize) < map.len());
+    }
+
+    #[test]
+    fn every_member_of_the_cutoff_tie_group_is_retained() {
+        // All four score identically, so the ground truth's order among them is
+        // arbitrary and ANY of them is a correct answer at top_k=1. Keeping
+        // only the first few by tail position decides which answers count by
+        // the very ordering the feature exists to treat as meaningless.
+        let (map, ties) = load_one_with_scores(&["a", "b", "c", "d"], &[1.0, 1.0, 1.0, 1.0], 1, "f");
+        assert_eq!(map.len(), 1);
+        let ties = ties.expect("the whole list ties with the k-th place");
+        assert_eq!(
+            ties.ids.len(),
+            3,
+            "b, c and d are all equally correct — got {:?}",
+            ties.ids.len()
+        );
+    }
+
+    #[test]
+    fn cutoff_tie_ids_are_interned_and_shared_across_queries() {
+        // Two rows whose tails hold the SAME ids. Interning means one `String`
+        // per distinct id for the whole set, not one per query that mentions
+        // it — measured at 12 B/id shared vs 150 B/id distinct.
+        let dir = std::env::temp_dir().join(format!("nova_storm_intern_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES \
+               ([1.0::FLOAT,2.0::FLOAT,3.0::FLOAT], ['a','x','y'], [3.0::FLOAT,1.0::FLOAT,1.0::FLOAT]), \
+               ([4.0::FLOAT,5.0::FLOAT,6.0::FLOAT], ['b','x','y'], [3.0::FLOAT,1.0::FLOAT,1.0::FLOAT]) \
+             ) t(embedding, hit_ids, hit_scores)) TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+        let mut src = source(file.display().to_string(), Some("hit_ids"));
+        src.ground_truth_score_column = Some("hit_scores".to_string());
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, 2, usize::MAX).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (t0, t1) = (
+            vectors[0].gt_cutoff_ties.as_ref().expect("row 0 ties"),
+            vectors[1].gt_cutoff_ties.as_ref().expect("row 1 ties"),
+        );
+        // `y` straddles top_k=2 in both rows.
+        assert!(t0.contains("y") && t1.contains("y"));
+        assert!(!t0.contains("a"), "prefix members come from the map, not here");
+        assert!(!t0.contains("zzz"));
+        assert_eq!(
+            t0.table.len(),
+            1,
+            "one entry for `y`, shared by both rows — not one copy each"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&t0.table, &t1.table),
+            "every query must share ONE table, or interning saves nothing"
+        );
+    }
+
+    #[test]
+    fn an_oversized_tie_group_is_dropped_whole_not_truncated() {
+        // Keeping a prefix of the group would decide the metric by the ground
+        // truth's tail order — the ordering it exists to treat as meaningless.
+        // Over budget, the query loses the allowance entirely.
+        let (_, ties) = load_one_with_scores(
+            &["a", "b", "c", "d"],
+            &[1.0, 1.0, 1.0, 1.0],
+            1,
+            "cap",
+        );
+        assert_eq!(ties.expect("under the default cap").ids.len(), 3);
+
+        let dir = std::env::temp_dir().join(format!("nova_storm_cap_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT [1.0::FLOAT,2.0::FLOAT,3.0::FLOAT] AS embedding, \
+             ['a','b','c','d'] AS hit_ids, \
+             [1.0::FLOAT,1.0::FLOAT,1.0::FLOAT,1.0::FLOAT] AS hit_scores) TO '{}' (FORMAT PARQUET)",
+            sql_str(&file.display().to_string())
+        ))
+        .unwrap();
+        let mut src = source(file.display().to_string(), Some("hit_ids"));
+        src.ground_truth_score_column = Some("hit_scores".to_string());
+        // Budget of 2 against a 3-member tail.
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, 1, 2).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            vectors[0].gt_cutoff_ties.is_none(),
+            "over budget drops the WHOLE group, so no subset can be credited"
+        );
+    }
+
+    #[test]
+    fn no_cutoff_ties_when_the_k_th_place_is_not_tied() {
+        let (_, ties) = load_one_with_scores(&["a", "b", "c"], &[3.0, 2.0, 1.0], 2, "c");
+        assert!(ties.is_none(), "nothing ties with the k-th place");
+    }
+
+    #[test]
+    fn the_loader_assigns_tie_group_starts_across_the_whole_prefix() {
+        // Three groups inside the prefix; every member must point at its own
+        // group's first rank. Nothing else in the suite pins `tied_rank` as
+        // the loader actually produces it.
+        let (map, _) = load_one_with_scores(
+            &["a", "b", "c", "d", "e"],
+            &[9.0, 5.0, 5.0, 5.0, 1.0],
+            5,
+            "d",
+        );
+        assert_eq!(map["a"], GtRank { rank: 0, tied_rank: 0 });
+        assert_eq!(map["b"], GtRank { rank: 1, tied_rank: 1 });
+        assert_eq!(map["c"], GtRank { rank: 2, tied_rank: 1 });
+        assert_eq!(map["d"], GtRank { rank: 3, tied_rank: 1 });
+        assert_eq!(map["e"], GtRank { rank: 4, tied_rank: 4 });
+    }
+
+    #[test]
+    fn a_duplicate_inside_a_tie_group_does_not_shift_the_group_start() {
+        // `b` repeats, so it consumes ONE rank; `c`'s group start must still
+        // be the compacted rank where the group began.
+        let (map, _) = load_one_with_scores(
+            &["a", "b", "b", "c", "d"],
+            &[9.0, 5.0, 5.0, 5.0, 1.0],
+            5,
+            "e",
+        );
+        assert_eq!(map["a"], GtRank { rank: 0, tied_rank: 0 });
+        assert_eq!(map["b"], GtRank { rank: 1, tied_rank: 1 });
+        assert_eq!(map["c"], GtRank { rank: 2, tied_rank: 1 });
+        assert_eq!(map["d"], GtRank { rank: 3, tied_rank: 3 });
     }
 
     #[test]
@@ -1900,7 +2420,7 @@ mod tests {
         .unwrap();
         let mut src = source(file.display().to_string(), Some("hit_ids"));
         src.ground_truth_score_column = Some("hit_scores".to_string());
-        let err = load_query_vectors(&src, VectorType::Dense, None, 3).unwrap_err();
+        let err = load_query_vectors(&src, VectorType::Dense, None, 3, usize::MAX).unwrap_err();
         std::fs::remove_dir_all(&dir).ok();
         assert!(
             err.to_string().contains("not sorted best-first"),
@@ -1928,7 +2448,7 @@ mod tests {
         .unwrap();
         let mut src = source(file.display().to_string(), Some("hit_ids"));
         src.ground_truth_score_column = Some("hit_scores".to_string());
-        let vectors = load_query_vectors(&src, VectorType::Dense, None, 3).unwrap();
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, 3, usize::MAX).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(
             vectors[0].gt_cutoff.unwrap().ties,
@@ -1971,7 +2491,7 @@ mod tests {
         .unwrap();
         let mut src = source(file.display().to_string(), Some("hit_ids"));
         src.ground_truth_score_column = Some("hit_scores".to_string());
-        let vectors = load_query_vectors(&src, VectorType::Dense, None, 3).unwrap();
+        let vectors = load_query_vectors(&src, VectorType::Dense, None, 3, usize::MAX).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         let cutoff = vectors[0].gt_cutoff.expect("cutoff derived");
@@ -2002,7 +2522,7 @@ mod tests {
         .unwrap();
         let mut src = source(file.display().to_string(), Some("hit_ids"));
         src.ground_truth_score_column = Some("hit_scores".to_string());
-        let err = load_query_vectors(&src, VectorType::Dense, None, 3).unwrap_err();
+        let err = load_query_vectors(&src, VectorType::Dense, None, 3, usize::MAX).unwrap_err();
         std::fs::remove_dir_all(&dir).ok();
         assert!(
             err.to_string().contains("positionally paired"),
@@ -2029,6 +2549,7 @@ mod tests {
             VectorType::Dense,
             None,
             4,
+            usize::MAX,
         )
         .unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -2057,6 +2578,7 @@ mod tests {
             VectorType::Dense,
             None,
             3,
+            usize::MAX,
         )
         .unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -2070,13 +2592,13 @@ mod tests {
             );
             for rank in 0..3 {
                 assert!(
-                    gt.contains(&format!("gt-{i}-{rank}")),
+                    gt.contains_key(&format!("gt-{i}-{rank}")),
                     "row {i}: missing rank {rank}"
                 );
             }
             for rank in 3..10 {
                 assert!(
-                    !gt.contains(&format!("gt-{i}-{rank}")),
+                    !gt.contains_key(&format!("gt-{i}-{rank}")),
                     "row {i}: rank {rank} is below top_k=3 and must not count as a hit"
                 );
             }
@@ -2098,6 +2620,7 @@ mod tests {
             VectorType::Dense,
             None,
             10,
+            usize::MAX,
         )
         .unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -2120,6 +2643,7 @@ mod tests {
             VectorType::Dense,
             None,
             5,
+            usize::MAX,
         )
         .unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -2127,7 +2651,7 @@ mod tests {
         for (i, v) in vectors.iter().enumerate() {
             let gt = v.ground_truth.as_ref().unwrap();
             assert_eq!(gt.len(), 5);
-            assert!(gt.contains(&format!("gt-{i}-4")), "the 5th id must survive");
+            assert!(gt.contains_key(&format!("gt-{i}-4")), "the 5th id must survive");
         }
     }
 }

@@ -108,20 +108,28 @@ def build_storm_query(
     cfg: "SweepConfig", search: dict, search_param_keys: set[str]
 ) -> tuple[dict, dict]:
     """Split one `searches` grid entry into the `query` and `load` blocks every
-    backend's nova-storm config shares. `top_k` sets `query.top_k`; keys in
-    `search_param_keys` (the backend's own vocabulary) go to
-    `query.search_params`; everything else routes to nova-storm's
-    backend-neutral `load:` block. `query.source` is built from `cfg.queries`.
-    Only the `target` block is backend-specific, so each backend assembles that
-    itself. Returns `(query, load)`."""
+    backend's nova-storm config shares. `top_k` and `rbo_p` set their
+    `query.*` counterparts; keys in `search_param_keys` (the backend's own
+    vocabulary) go to `query.search_params`; everything else routes to
+    nova-storm's backend-neutral `load:` block. `query.source` is built from
+    `cfg.queries`. Only the `target` block is backend-specific, so each backend
+    assembles that itself. Returns `(query, load)`."""
     search_params: dict[str, Any] = {}
     load: dict[str, Any] = {}
     top_k = 10
+    rbo_p = None
     for key, value in search.items():
         if key == "_name":
             continue
         if key == "top_k":
             top_k = value
+        elif key == "rbo_p":
+            # Belongs to `query:`, not `load:`. Worth setting explicitly
+            # whenever `top_k` is itself a sweep axis: nova-storm otherwise
+            # derives `p` from each point's own `top_k`, and RBO values
+            # computed at different `p` are not comparable, so the column
+            # would silently blend two different metrics.
+            rbo_p = value
         elif key in search_param_keys:
             search_params[key] = value
         else:
@@ -134,8 +142,15 @@ def build_storm_query(
     }
     if cfg.queries.ground_truth_column:
         source["ground_truth_column"] = cfg.queries.ground_truth_column
+    # Without this every tie-aware number in the summary — recall's upper
+    # bound, `ties_at_cutoff`, RBO's upper bound — is withheld for the whole
+    # sweep, since nova-storm has no scores to recognise a tie with.
+    if cfg.queries.ground_truth_score_column:
+        source["ground_truth_score_column"] = cfg.queries.ground_truth_score_column
 
     query: dict[str, Any] = {"vector_name": VECTOR_NAME, "top_k": top_k, "source": source}
+    if rbo_p is not None:
+        query["rbo_p"] = rbo_p
     if search_params:
         query["search_params"] = search_params
     return query, load

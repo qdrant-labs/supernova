@@ -3,7 +3,7 @@
 //! The end-of-run [`Summary`](crate::runner::Summary) collapses the time axis —
 //! a latency spike at t=90s from the cluster re-optimizing is indistinguishable
 //! from the same samples spread evenly. A [`Recorder`] preserves it: the
-//! collector task (which already sees every [`DispatchSample`] off the hot
+//! collector thread (which already sees every [`DispatchSample`] off the hot
 //! path) forwards each sample to a dedicated writer thread ([`spawn_writer`])
 //! that owns the sink, so acute load behavior and cluster-adjustment transients
 //! can be plotted afterwards — and so the sink's blocking writes stay off the
@@ -32,8 +32,12 @@ use crate::runner::DispatchSample;
 /// slow consumer, a future db sink). We drop-and-count rather than either grow
 /// unbounded (OOM on a multi-minute high-rps run) or block the collector (which
 /// would push backpressure onto the load loop and bias the very latency numbers
-/// being measured). A local-disk CSV/JSONL sink outpaces dispatch by orders of
-/// magnitude, so this only fills under genuinely slow sinks.
+/// being measured). That trade-off applies only WHILE the load window is open:
+/// once it closes, `runner` waits on this queue instead of dropping, because
+/// there is no longer a measurement to protect and any collector backlog
+/// drains at CPU speed rather than dispatch speed. A local-disk CSV/JSONL sink
+/// outpaces dispatch by orders of magnitude, so this only fills under
+/// genuinely slow sinks.
 const WRITER_QUEUE_DEPTH: usize = 8192;
 
 /// The `report:` config section. Absent → no time-series output (just the
@@ -79,8 +83,14 @@ impl ReportConfig {
 /// Lifecycle: `begin()` once before the load starts (create the file / write
 /// the CSV header / create tables — fail HERE, not mid-run, so a bad path
 /// dies before load is offered, called on the caller's thread), then `record()`
-/// per dispatch in arrival order and `finish()` once at the end — both on the
+/// per dispatch and `finish()` once at the end — both on the
 /// dedicated writer thread ([`spawn_writer`]), never on a tokio runtime worker.
+///
+/// `record()` is called in ARRIVAL order — the order dispatches reached the
+/// collector — which is time order up to the jitter of concurrent workers
+/// racing to send. Every sample carries its own `t_s`, stamped at dispatch
+/// completion; an implementation that needs strict chronological order must
+/// sort by it rather than rely on call order.
 ///
 /// That thread placement is deliberate: `record()` may block (a file write's
 /// `write()` syscall, a db round-trip). Running it on a runtime worker would
@@ -99,8 +109,9 @@ pub trait Recorder: Send {
 /// Move an already-`begin()`-ed recorder onto a dedicated OS thread and return
 /// the bounded sender the collector forwards samples on, plus the join handle.
 ///
-/// The thread owns the recorder and does all blocking I/O; the collector only
-/// `try_send`s (see [`WRITER_QUEUE_DEPTH`] for the drop-on-full rationale).
+/// The thread owns the recorder and does all blocking I/O; the collector
+/// `try_send`s while the load window is open and waits only after it closes
+/// (see [`WRITER_QUEUE_DEPTH`] for the drop-on-full rationale).
 /// A `record()` error disables recording — the thread flushes what it has via
 /// `finish()` and exits, which disconnects the channel so the collector stops
 /// forwarding — but never touches the load test. The thread ends (and `finish()`
@@ -234,12 +245,25 @@ mod tests {
             .map(|recall| RecallSample {
                 recall,
                 tolerant: recall,
+                // The time-series row carries recall only, so RBO is not part
+                // of what these tests assert on. `rbo_depth` is still a REAL
+                // depth: a 0 would give a zero ceiling, and any test reusing
+                // this fixture against a `Summary` would silently lose the
+                // sample from every normalized mean.
+                rbo: 0.0,
+                rbo_tolerant: 0.0,
+                rbo_depth: 10,
+                rbo_overlap: 0,
                 short: false,
                 missing_from_gt: 0,
             })
             .chain(short.into_iter().map(|recall| RecallSample {
                 recall,
                 tolerant: recall,
+                rbo: 0.0,
+                rbo_tolerant: 0.0,
+                rbo_depth: 10,
+                rbo_overlap: 0,
                 short: true,
                 missing_from_gt: 0,
             }))

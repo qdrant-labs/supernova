@@ -57,6 +57,19 @@ impl StormConfig {
                 return Err(ConfigError::BadTieEpsilon(eps));
             }
         }
+        // p outside (0, 1) breaks the geometric weighting RBO is defined by:
+        // at 0 only depth 1 counts, at 1 the weights never decay (and the
+        // series does not converge), and outside the range they go negative or
+        // diverge — in every case the reported value is not RBO. Only a
+        // CONFIGURED value can be wrong; the derived default is in range by
+        // construction.
+        if let Some(p) = cfg
+            .query
+            .rbo_p
+            .filter(|p| !p.is_finite() || *p <= 0.0 || *p >= 1.0)
+        {
+            return Err(ConfigError::BadRboP(p));
+        }
         if cfg.load.batch_size == 0 {
             return Err(ConfigError::ZeroBatchSize);
         }
@@ -91,6 +104,15 @@ impl StormConfig {
             source,
         })?;
         Self::from_yaml(&yaml)
+    }
+}
+
+impl QueryConfig {
+    /// The `p` this run actually uses: configured, or derived from `top_k`.
+    /// Named apart from the field so a caller cannot read the raw `Option` by
+    /// accident and silently fall back to some other default of its own.
+    pub fn effective_rbo_p(&self) -> f64 {
+        self.rbo_p.unwrap_or_else(|| default_rbo_p_for(self.top_k))
     }
 }
 
@@ -130,6 +152,41 @@ pub struct QueryConfig {
     /// can't report its datatype or a quantization mode widens the gap.
     #[serde(default)]
     pub tie_epsilon: Option<f64>,
+    /// RBO's persistence parameter: the probability the notional reader
+    /// continues past each rank, which sets how hard the metric weights the
+    /// top of the ranking. Expected reading depth is `1/(1-p)`, and `p^top_k`
+    /// of the metric's weight sits BELOW `top_k`, where the run cannot observe
+    /// it (the summary reports that residual).
+    ///
+    /// `None` (default) derives it from `top_k` so exactly
+    /// [`RBO_DEFAULT_RESIDUAL`] is left unobserved — see
+    /// [`default_rbo_p_for`]. A FIXED default cannot serve both ends of the
+    /// `top_k` range: 0.95 leaves 0.6% unobserved at `top_k=100` but 60% at
+    /// `top_k=10`, where a perfect ranking would then score 0.40.
+    ///
+    /// Set it explicitly to weight the very top harder (larger `p`, bigger
+    /// residual) or to fix it across a sweep whose `top_k` varies. **State it
+    /// in any published result** — an RBO without its `p` is not reproducible,
+    /// and values at different `p` are not comparable.
+    #[serde(default)]
+    pub rbo_p: Option<f64>,
+    /// Most ground-truth ids to keep per query that tie with its k-th place
+    /// but fall outside `top_k` — the equally-correct answers rank agreement's
+    /// upper bound is allowed to credit (see `queries::CutoffTies`).
+    ///
+    /// Ids are interned once per query set, so they cost ~12 bytes each when
+    /// tails overlap across queries and up to ~150 when they do not (measured
+    /// — the interning shares the strings, not the indices). A ground truth whose scores are FLAT keeps its
+    /// whole tail for every query, which is where a cap earns its keep: a
+    /// 1000-deep all-tied list at `top_k=10` retains 990 per query.
+    ///
+    /// Exceeding it drops that query's allowance ENTIRELY, never a subset —
+    /// keeping the first few would decide the metric by the ground truth's
+    /// tail order, which is precisely the ordering it treats as meaningless.
+    /// A dropped query's upper bound narrows toward its exact value, and the
+    /// count is warned about.
+    #[serde(default = "default_max_cutoff_ties")]
+    pub max_cutoff_ties: usize,
     /// What payload the server returns with each hit. Default `false`
     /// (ids/scores only). `true` = every payload field; a LIST of field names
     /// (e.g. `[text]`) = only those fields — the shape a RAG workload has,
@@ -254,6 +311,53 @@ fn default_top_k() -> u64 {
     10
 }
 
+/// Default for [`QueryConfig::max_cutoff_ties`]. Generous because the ids are
+/// interned, so they cost ~12 bytes each where a near-duplicate corpus makes
+/// the same ids recur across queries, and up to ~150 where every query's tail
+/// is distinct (measured). 100k per query is generous for any real ground
+/// truth; it exists to stop a degenerate one taking the process with it.
+fn default_max_cutoff_ties() -> usize {
+    100_000
+}
+
+/// Share of RBO's weight the derived default leaves below `top_k` — the part
+/// the run cannot observe, reported as `rbo_residual`. 1% is small enough that
+/// a perfect ranking scores 0.99 (reading as "perfect" at the 4 decimals the
+/// summary prints) without pushing `p` so low that only the first two or three
+/// ranks carry any weight.
+pub const RBO_DEFAULT_RESIDUAL: f64 = 0.01;
+
+/// The `p` that leaves exactly [`RBO_DEFAULT_RESIDUAL`] of RBO's weight below
+/// `top_k`, i.e. `p^top_k == RBO_DEFAULT_RESIDUAL`.
+///
+/// Derived rather than fixed because the residual `p^top_k` depends entirely
+/// on the depth being measured: this yields ~0.63 at `top_k=10` and ~0.955 at
+/// `top_k=100`, where any single constant leaves one end badly truncated.
+///
+/// Be clear about what this costs. `p` is the METRIC — it sets how the
+/// weight is distributed over ranks — while depth is only a measurement limit;
+/// Webber et al.'s whole point is that at a FIXED `p`, rankings evaluated to
+/// different depths remain comparable up to the residual width. So deriving
+/// `p` from `top_k` does sacrifice comparability across depths: `rbo@10` at
+/// p=0.63 (expected reading depth 2.7) and `rbo@100` at p=0.955 (depth 22) are
+/// different metrics sharing a name. Set `rbo_p` explicitly for anything that
+/// compares across `top_k`, and state it.
+///
+/// It also goes degenerate at a shallow `top_k`, with no warning: `top_k=1`
+/// gives `p=0.01`, making `rbo@1` essentially `precision@1`, and `top_k=5`
+/// gives `p=0.398`, which puts 60% of the weight on rank 1 alone. A metric
+/// added because recall cannot see order collapses back toward a single-rank
+/// measure exactly where the ranking is shortest. Set `rbo_p` explicitly below
+/// a `top_k` of about 10.
+pub fn default_rbo_p_for(top_k: u64) -> f64 {
+    // `top_k == 0` is rejected before this is reachable; the `max` keeps a
+    // stray caller from dividing by zero into a p of 0. The upper clamp keeps
+    // the result strictly below 1 for an absurdly deep `top_k`, preserving the
+    // invariant the validation above enforces for configured values.
+    let k = top_k.max(1) as f64;
+    RBO_DEFAULT_RESIDUAL.powf(1.0 / k).min(0.999_999)
+}
+
 /// Score tolerance to use for a given stored `datatype`, when the config
 /// leaves `query.tie_epsilon` unset.
 ///
@@ -312,6 +416,11 @@ pub enum ConfigError {
          negative or NaN value makes every score comparison fail, hiding all ties"
     )]
     BadTieEpsilon(f64),
+    #[error(
+        "query.rbo_p must be strictly between 0 and 1 (got {0}) — it is a geometric decay \
+         factor over ranking depth, so 0, 1 and anything outside that range do not define an RBO"
+    )]
+    BadRboP(f64),
     #[error("query.top_k must be greater than 0")]
     ZeroTopK,
     #[error("load.batch_size must be greater than 0")]
@@ -460,6 +569,75 @@ query:
             StormConfig::from_yaml(yaml).unwrap_err(),
             ConfigError::ZeroTopK
         ));
+    }
+
+    #[test]
+    fn rbo_p_defaults_and_rejects_values_outside_the_open_unit_interval() {
+        let cfg = |line: &str| {
+            format!(
+                r#"
+target:
+  type: qdrant
+  url: http://localhost:6334
+  collection_name: c
+query:
+  top_k: 10
+{line}
+  source:
+    uri: /tmp/q.parquet
+    column: embedding
+"#
+            )
+        };
+        // Unset -> derived from top_k, so an existing config keeps working and
+        // still gets an RBO whose residual is 1% whatever depth it measures at.
+        let derived = StormConfig::from_yaml(&cfg("")).unwrap();
+        assert_eq!(derived.query.rbo_p, None, "nothing was configured");
+        assert!(
+            (derived.query.effective_rbo_p().powi(10) - RBO_DEFAULT_RESIDUAL).abs() < 1e-12,
+            "the derived p must leave exactly the target residual at top_k=10, got {}",
+            derived.query.effective_rbo_p()
+        );
+        // A configured value wins and is used verbatim.
+        let set = StormConfig::from_yaml(&cfg("  rbo_p: 0.98")).unwrap();
+        assert_eq!(set.query.rbo_p, Some(0.98));
+        assert_eq!(set.query.effective_rbo_p(), 0.98);
+        // The endpoints are excluded, not just the values beyond them: at 0
+        // only depth 1 would count, and at 1 the weights never decay.
+        for bad in ["0.0", "1.0", "-0.5", "1.5", ".nan"] {
+            assert!(
+                matches!(
+                    StormConfig::from_yaml(&cfg(&format!("  rbo_p: {bad}"))).unwrap_err(),
+                    ConfigError::BadRboP(_)
+                ),
+                "rbo_p: {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_derived_rbo_p_tracks_top_k_instead_of_being_one_constant() {
+        // The whole reason it is derived: a single constant is badly wrong at
+        // one end of the range. 0.95 would leave 60% of the metric unobserved
+        // at top_k=10 while being about right at 100.
+        let shallow = default_rbo_p_for(10);
+        let deep = default_rbo_p_for(100);
+        assert!(shallow < deep, "{shallow} < {deep}");
+        for k in [1u64, 5, 10, 100, 1000] {
+            let p = default_rbo_p_for(k);
+            assert!(p > 0.0 && p < 1.0, "top_k={k} gave p={p}, outside (0,1)");
+            assert!(
+                (p.powi(k as i32) - RBO_DEFAULT_RESIDUAL).abs() < 1e-9,
+                "top_k={k}: residual {} is not the target",
+                p.powi(k as i32)
+            );
+        }
+        // Absurd depths must still satisfy the `p < 1` invariant the config
+        // validation enforces for configured values, rather than rounding to 1.
+        assert!(default_rbo_p_for(u64::MAX) < 1.0);
+        // `top_k == 0` is rejected upstream; this must not divide by zero into
+        // a p of 0, which would make the weighting degenerate.
+        assert!(default_rbo_p_for(0) > 0.0);
     }
 
     #[test]

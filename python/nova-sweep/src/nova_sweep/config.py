@@ -67,6 +67,7 @@ class QueriesConfig(BaseModel):
     uri: str
     column: str
     ground_truth_column: str | None = None
+    ground_truth_score_column: str | None = None
     limit: int = 1000
 
 
