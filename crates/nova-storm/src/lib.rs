@@ -88,7 +88,12 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
     );
    
     let target = target.into_target(&query).await?;
-    let scoring = target.scoring_profile().await;
+    let scoring = resolve_scoring(
+        target.as_ref(),
+        &query,
+        Duration::from_secs_f64(query.scoring_probe_timeout_s),
+    )
+    .await;
     // A failed probe downgrades the tolerance to the conservative default and
     // disables tie reporting; an operator seeing those needs to know it was
     // a probe failure rather than a property of their collection.
@@ -384,6 +389,53 @@ pub async fn run(config: StormConfig) -> Result<Summary, StormError> {
     Ok(results.summary())
 }
 
+/// The scoring profile this run compares scores under: `query.scoring`'s
+/// declared fields, with the target's metadata probe filling in the rest.
+///
+/// Everything the profile feeds is score-based tie reporting, so the probe
+/// runs only when that is configured (both ground-truth columns set) and some
+/// field is still undeclared — a recall-only run never pays for it. The probe
+/// is bounded by `probe_timeout`, NOT the target's query timeout: on a large
+/// cluster the metadata RPC can stall for as long as the server lets it, and
+/// a run sized for hour-long queries would inherit that whole allowance.
+async fn resolve_scoring(
+    target: &dyn targets::QueryTarget,
+    query: &config::QueryConfig,
+    probe_timeout: Duration,
+) -> targets::ScoringProfile {
+    let declared = &query.scoring;
+    let needed = query.source.ground_truth_score_column.is_some()
+        && query.source.ground_truth_column.is_some()
+        && !declared.is_complete();
+    let probed = if needed {
+        match tokio::time::timeout(probe_timeout, target.scoring_profile()).await {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "scoring-metadata probe on {target} timed out after {:.1}s — treating the \
+                     collection's scoring config as unknown (set query.scoring to declare it, \
+                     or raise query.scoring_probe_timeout_s)",
+                    probe_timeout.as_secs_f64()
+                );
+                targets::ScoringProfile::default()
+            }
+        }
+    } else {
+        targets::ScoringProfile::default()
+    };
+    targets::ScoringProfile {
+        distance: declared
+            .distance
+            .map(|d| d.as_str().to_string())
+            .or(probed.distance),
+        datatype: declared
+            .datatype
+            .map(|d| d.as_str().to_string())
+            .or(probed.datatype),
+        quantized: declared.quantized.unwrap_or(probed.quantized),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::rescore_disabled;
@@ -421,5 +473,127 @@ mod tests {
         assert!(!rescore_disabled(&yaml("hnsw_ef: 128")));
         assert!(!rescore_disabled(&yaml("quantization: notamap")));
         assert!(!rescore_disabled(&None));
+    }
+
+    mod scoring {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+
+        use crate::config::QueryConfig;
+        use crate::queries::QueryVector;
+        use crate::resolve_scoring;
+        use crate::targets::{BatchOutcome, QueryTarget, ScoringProfile};
+
+        /// A target whose probe either answers or never returns, and counts
+        /// how often it was asked.
+        struct Probe {
+            hang: bool,
+            calls: AtomicUsize,
+        }
+
+        impl Probe {
+            fn new(hang: bool) -> Self {
+                Self { hang, calls: AtomicUsize::new(0) }
+            }
+        }
+
+        impl std::fmt::Display for Probe {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("probe")
+            }
+        }
+
+        #[async_trait]
+        impl QueryTarget for Probe {
+            async fn query_batch(&self, _: &[&QueryVector]) -> BatchOutcome {
+                unreachable!("resolve_scoring never queries")
+            }
+            async fn scoring_profile(&self) -> ScoringProfile {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.hang {
+                    std::future::pending::<()>().await;
+                }
+                ScoringProfile {
+                    datatype: Some("float16".into()),
+                    distance: Some("euclid".into()),
+                    quantized: true,
+                }
+            }
+        }
+
+        fn query(extra: &str) -> QueryConfig {
+            serde_yaml::from_str(&format!(
+                "source: {{uri: q.parquet, column: embedding{extra}}}\n"
+            ))
+            .unwrap()
+        }
+
+        fn scored() -> QueryConfig {
+            query(", ground_truth_column: ids, ground_truth_score_column: scores")
+        }
+
+        const T: Duration = Duration::from_secs(5);
+
+        #[tokio::test]
+        async fn recall_only_run_never_probes() {
+            let t = Probe::new(true);
+            let p = resolve_scoring(&t, &query(", ground_truth_column: ids"), T).await;
+            assert_eq!(p, ScoringProfile::default());
+            assert_eq!(t.calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn score_column_without_ids_never_probes() {
+            let t = Probe::new(true);
+            resolve_scoring(&t, &query(", ground_truth_score_column: scores"), T).await;
+            assert_eq!(t.calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn scored_run_probes() {
+            let t = Probe::new(false);
+            let p = resolve_scoring(&t, &scored(), T).await;
+            assert_eq!(p.distance.as_deref(), Some("euclid"));
+            assert_eq!(p.datatype.as_deref(), Some("float16"));
+            assert!(p.quantized);
+            assert_eq!(t.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn hung_probe_times_out_to_unknown() {
+            let t = Probe::new(true);
+            let p = resolve_scoring(&t, &scored(), Duration::from_millis(50)).await;
+            assert_eq!(p, ScoringProfile::default());
+            assert_eq!(t.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn fully_declared_scoring_skips_probe() {
+            let mut q = scored();
+            q.scoring = serde_yaml::from_str(
+                "{distance: cosine, datatype: float32, quantized: false}",
+            )
+            .unwrap();
+            let t = Probe::new(true);
+            let p = resolve_scoring(&t, &q, T).await;
+            assert_eq!(p.distance.as_deref(), Some("cosine"));
+            assert_eq!(p.datatype.as_deref(), Some("float32"));
+            assert!(!p.quantized);
+            assert_eq!(t.calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn partial_declaration_wins_over_probe() {
+            let mut q = scored();
+            q.scoring = serde_yaml::from_str("{distance: dot}").unwrap();
+            let t = Probe::new(false);
+            let p = resolve_scoring(&t, &q, T).await;
+            assert_eq!(p.distance.as_deref(), Some("dot"));
+            assert_eq!(p.datatype.as_deref(), Some("float16"));
+            assert!(p.quantized);
+            assert_eq!(t.calls.load(Ordering::SeqCst), 1);
+        }
     }
 }

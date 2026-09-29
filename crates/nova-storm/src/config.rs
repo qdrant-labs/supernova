@@ -52,6 +52,10 @@ impl StormConfig {
         // A negative or non-finite tolerance makes `scores_tied` false for
         // EVERY pair, including exactly-equal scores: ties would silently
         // vanish and every above-cutoff result would land in `missing_from_gt`.
+        let probe_timeout = cfg.query.scoring_probe_timeout_s;
+        if !probe_timeout.is_finite() || probe_timeout <= 0.0 {
+            return Err(ConfigError::BadScoringProbeTimeout(probe_timeout));
+        }
         if let Some(eps) = cfg.query.tie_epsilon {
             if !eps.is_finite() || eps < 0.0 {
                 return Err(ConfigError::BadTieEpsilon(eps));
@@ -152,6 +156,19 @@ pub struct QueryConfig {
     /// can't report its datatype or a quantization mode widens the gap.
     #[serde(default)]
     pub tie_epsilon: Option<f64>,
+    /// Declared scoring facts about the collection (distance, datatype,
+    /// quantization). Any field set here is used as-is and never probed; the
+    /// startup metadata probe runs only for the fields left unset, and only
+    /// when score-based tie reporting is configured at all. Set all three to
+    /// skip the probe entirely.
+    #[serde(default)]
+    pub scoring: ScoringOverride,
+    /// Upper bound, in seconds, on the startup scoring-metadata probe. On
+    /// expiry the run proceeds as if the probe had failed (unknown distance →
+    /// tie reporting disabled; exact recall unaffected). Deliberately separate
+    /// from the target's `timeout_s`, which is sized for queries.
+    #[serde(default = "default_scoring_probe_timeout_s")]
+    pub scoring_probe_timeout_s: f64,
     /// RBO's persistence parameter: the probability the notional reader
     /// continues past each rank, which sets how hard the metric weights the
     /// top of the ranking. Expected reading depth is `1/(1-p)`, and `p^top_k`
@@ -210,6 +227,66 @@ pub struct QueryConfig {
     /// (Only the Qdrant target supports filters today; milvus/elastic reject one.)
     #[serde(default)]
     pub filter: Option<Filter>,
+}
+
+/// `query.scoring`: what the operator already knows about how the collection
+/// scores. Each field is independent — unset means "probe it".
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScoringOverride {
+    #[serde(default)]
+    pub distance: Option<ScoringDistance>,
+    #[serde(default)]
+    pub datatype: Option<ScoringDatatype>,
+    #[serde(default)]
+    pub quantized: Option<bool>,
+}
+
+impl ScoringOverride {
+    /// Every field is declared, so there is nothing left to probe.
+    pub fn is_complete(&self) -> bool {
+        self.distance.is_some() && self.datatype.is_some() && self.quantized.is_some()
+    }
+}
+
+/// The distance vocabulary [`crate::targets::ScoringProfile`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringDistance {
+    Dot,
+    Cosine,
+    Euclid,
+    Manhattan,
+}
+
+impl ScoringDistance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dot => "dot",
+            Self::Cosine => "cosine",
+            Self::Euclid => "euclid",
+            Self::Manhattan => "manhattan",
+        }
+    }
+}
+
+/// The datatype vocabulary [`crate::targets::ScoringProfile`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringDatatype {
+    Float32,
+    Float16,
+    Uint8,
+}
+
+impl ScoringDatatype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Float32 => "float32",
+            Self::Float16 => "float16",
+            Self::Uint8 => "uint8",
+        }
+    }
 }
 
 /// `query.with_payload`: a plain bool, or a list of payload field names to
@@ -316,6 +393,13 @@ fn default_top_k() -> u64 {
 /// the same ids recur across queries, and up to ~150 where every query's tail
 /// is distinct (measured). 100k per query is generous for any real ground
 /// truth; it exists to stop a degenerate one taking the process with it.
+/// Default for [`QueryConfig::scoring_probe_timeout_s`]: long enough for a
+/// healthy metadata RPC, short enough that a stalled one costs seconds, not
+/// the query timeout.
+fn default_scoring_probe_timeout_s() -> f64 {
+    15.0
+}
+
 fn default_max_cutoff_ties() -> usize {
     100_000
 }
@@ -421,6 +505,8 @@ pub enum ConfigError {
          factor over ranking depth, so 0, 1 and anything outside that range do not define an RBO"
     )]
     BadRboP(f64),
+    #[error("query.scoring_probe_timeout_s must be a finite number of seconds > 0 (got {0})")]
+    BadScoringProbeTimeout(f64),
     #[error("query.top_k must be greater than 0")]
     ZeroTopK,
     #[error("load.batch_size must be greater than 0")]
@@ -755,6 +841,37 @@ query:
             "target:\n  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n\
              query:\n{extra}  source:\n    uri: /tmp/q.parquet\n    column: embedding\n"
         )
+    }
+
+    #[test]
+    fn scoring_probe_defaults_and_overrides() {
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras("")).expect("parses");
+        assert_eq!(cfg.query.scoring_probe_timeout_s, 15.0);
+        assert!(!cfg.query.scoring.is_complete());
+
+        let cfg = StormConfig::from_yaml(&yaml_with_query_extras(
+            "  scoring_probe_timeout_s: 2.5\n  scoring: {distance: euclid, datatype: float16, quantized: true}\n",
+        ))
+        .expect("parses");
+        assert_eq!(cfg.query.scoring_probe_timeout_s, 2.5);
+        assert!(cfg.query.scoring.is_complete());
+        assert_eq!(cfg.query.scoring.distance, Some(ScoringDistance::Euclid));
+
+        for bad in ["0", "-1", ".nan"] {
+            let err = StormConfig::from_yaml(&yaml_with_query_extras(&format!(
+                "  scoring_probe_timeout_s: {bad}\n"
+            )))
+            .unwrap_err();
+            assert!(matches!(err, ConfigError::BadScoringProbeTimeout(_)), "{bad}: {err}");
+        }
+        // Typos in the vocabulary are hard errors, not a silent "unknown".
+        for bad in ["{distance: l2}", "{datatype: fp16}", "{quantised: true}"] {
+            assert!(
+                StormConfig::from_yaml(&yaml_with_query_extras(&format!("  scoring: {bad}\n")))
+                    .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
