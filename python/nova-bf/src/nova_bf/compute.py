@@ -51,6 +51,7 @@ from tqdm import tqdm
 from nova_bf import manifest as run_manifest
 from nova_bf import mv_fp16
 from nova_bf import profiling
+from nova_bf import thresholds as _thresholds
 from nova_bf import topk_triton
 from nova_bf import twopass
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
@@ -67,9 +68,11 @@ from nova_bf.ids import make_point_id
 from nova_bf.io import ParquetFile, Store, dense_to_2d, multivector_to_ragged, sparse_to_coo_parts
 from nova_bf.results import (
     build_result_table,
+    config_identity,
     partial_dir,
     provenance,
     result_name,
+    run_identity,
     vector_dtype,
     warn_if_short,
 )
@@ -3410,6 +3413,7 @@ def _process_batch_group(
     multivector_double_buffer: bool = False,
     two_pass: bool = True,
     mv_prune=None,
+    spec_thr_ext: list | None = None,
 ) -> float:
     """Process one vector-type batch, sharing work across search members.
 
@@ -3475,6 +3479,26 @@ def _process_batch_group(
     # Mutable gate for the once-per-batch live-fraction probe; probing requires a sync.
     mv_probe = [mv_prune is not None]
 
+    def _thr(m: int):
+        """Effective pruning threshold for member `m`: the running state's own
+        threshold raised to any external (cross-worker) threshold. Read-only;
+        the state's threshold is what `_merge_topk` updates in place."""
+        t = spec_thr[m]
+        if spec_thr_ext is None or spec_thr_ext[m] is None:
+            return t
+        return torch.maximum(t, spec_thr_ext[m])
+
+    class _ThrView:
+        """`spec_thr`-shaped read-only view returning effective thresholds, so
+        the two-pass gate computes the max only for the members it touches."""
+        __slots__ = ("_f",)
+
+        def __init__(self, f):
+            self._f = f
+
+        def __getitem__(self, m):
+            return self._f(m)
+
     def _flush_pending(m: int) -> None:
         if not pending[m]:
             return
@@ -3524,7 +3548,7 @@ def _process_batch_group(
             unfiltered = {m for m in range(len(specs))
                           if _is_unfiltered(specs[m].filter)}
             tp_plan = _twopass_prepare(
-                tp_groups, sl, spec_thr, spec_qsel, device,
+                tp_groups, sl, _ThrView(_thr), spec_qsel, device,
                 audit_members=unfiltered,
             )
             if not twopass.enabled():
@@ -3567,7 +3591,7 @@ def _process_batch_group(
                 # member's running threshold), so they bypass `score_cache`.
                 scores = _mv_pruned_scores(
                     sl, spec_Q[m], s.metric, mv_prune if prune else None,
-                    spec_thr[m], spec_qsel[m], tally=mv_tally,
+                    _thr(m), spec_qsel[m], tally=mv_tally,
                 )
             if plan is None and scores is None:
                 scores = score_cache.get(score_key)
@@ -3588,7 +3612,7 @@ def _process_batch_group(
                 if (mv_probe[0] and mv_prune is not None and prune
                         and scores is not None):
                     if _mv_note_unpruned_rate(mv_prune, scores, spec_Q[m],
-                                              spec_thr[m], spec_qsel[m]):
+                                              _thr(m), spec_qsel[m]):
                         mv_probe[0] = False
 
             sel_rows, sel_cols, cell_mask = select(m, rows, true_rows, cache)
@@ -3602,7 +3626,7 @@ def _process_batch_group(
                     sel_scores = sel_scores[qsel]
                 dst = None
                 full_height = sel_scores.shape[0]
-                thr_m = spec_thr[m]
+                thr_m = _thr(m)
                 cos_scale = spec_cos_scale[m]
             else:
                 # Two-pass: select this member's live rows from the compact score matrix.
@@ -3620,7 +3644,7 @@ def _process_batch_group(
                 dst = plan.dst[m]
                 sub = plan.scores[lo:hi]
                 sel_scores = sub if sel_cols is None else sub[:, sel_cols]
-                thr_m = spec_thr[m].index_select(0, dst)
+                thr_m = _thr(m).index_select(0, dst)
                 cos_scale = (
                     None if spec_cos_scale[m] is None
                     else spec_cos_scale[m].index_select(0, dst)
@@ -4224,6 +4248,7 @@ def _process_shared_batch(
     multivector_double_buffer: bool = False,
     two_pass: bool = True,
     mv_prune=None,
+    spec_thr_ext: list | None = None,
 ) -> float:
     """Process one shared corpus batch for all searches of a vector type.
 
@@ -4315,6 +4340,7 @@ def _process_shared_batch(
         two_pass=two_pass, mv_prune=mv_prune,
         spec_qsel=spec_qsel, spec_qrows=spec_qrows,
         spec_cos_scale=spec_cos_scale,
+        spec_thr_ext=spec_thr_ext,
     )
 
 
@@ -4788,6 +4814,8 @@ def run_compute(
     # Applied BEFORE striding so the global file index — and thus make_point_id — is
     # over the filtered set, consistent between compute workers and merge.
     all_files = filter_corpus_files(all_files, cfg.corpus.include, cfg.corpus.exclude)
+    # Compute the corpus fingerprint for both the manifest and threshold exchange.
+    corpus_fp = run_manifest.corpus_fingerprint(all_files)
     if num_jobs is not None:
         mine = [(i, f) for i, f in enumerate(all_files) if i % num_jobs == job_rank]
     else:
@@ -4911,6 +4939,167 @@ def run_compute(
         # Per-query prune threshold: the weakest key currently in each top-k state.
         # Starts at the sentinel so nothing is pruned before the state fills.
         spec_thr.append(sentinel_key((h,), device))
+
+    # Cross-worker threshold exchange (see thresholds.py). `spec_thr_ext[m]`
+    # holds the packed external maximum for member m, or None; the effective
+    # pruning threshold is max(local, external) at the point of use.
+    spec_thr_ext: list = [None] * len(specs)
+    thr_exchange = None
+    thr_version_seen = 0
+    thr_exchange_stats: dict = {"enabled": False, "configured": bool(cfg.params.threshold_exchange)}
+    # Per search: the lowered external thresholds this worker ended up pruning
+    # against (host float32, -inf where none), written into its partial as the
+    # `applied_threshold` column for the merge to verify against.
+    spec_thr_applied: list = [None] * len(specs)
+
+    def _start_threshold_exchange() -> None:
+        """Constructed right before the scan's try/finally so that a failure
+        in the remaining setup cannot leak its threads."""
+        nonlocal thr_exchange, thr_exchange_stats
+        if not cfg.params.threshold_exchange:
+            return
+        if not num_jobs or num_jobs < 2:
+            thr_exchange_stats["reason"] = "single-worker run"
+            logger.warning(
+                "params.threshold_exchange is set but this is a single-worker run "
+                "(no --num-jobs); nothing to exchange, continuing without it"
+            )
+        elif os.environ.get("NOVA_BF_NO_PRUNE"):
+            thr_exchange_stats["reason"] = "NOVA_BF_NO_PRUNE"
+            logger.warning(
+                "params.threshold_exchange is set but NOVA_BF_NO_PRUNE disables "
+                "pruning; nothing to apply thresholds to, continuing without it"
+            )
+        else:
+            # Scope the exchange to THIS run
+            import hashlib as _hashlib
+            h = _hashlib.sha256("\n".join(sorted(
+                run_identity(config_identity(cfg, s_), corpus_fp["sha256"],
+                             num_jobs, max_files, cfg.params.tiebreak)
+                for s_ in specs
+            )).encode())
+
+            for vt in sorted(Q_np_by_vt):
+                h.update(vt.encode())
+                _thresholds.hash_array(h, Q_np_by_vt[vt])
+            if mv_q_offsets is not None:
+                _thresholds.hash_array(h, np.asarray(mv_q_offsets))
+            for f_ in all_files:
+                h.update(f"{f_.key}:{f_.size}\n".encode())
+            h.update(_thresholds.code_hash().encode())
+            exchange_id = h.hexdigest()
+            try:
+                thr_exchange = _thresholds.ThresholdExchange(
+                    Store(cfg.output.path), exchange_id, job_rank, num_jobs,
+                    {specs[m].name: (int(spec_thr[m].shape[0]),
+                                     _thresholds.publish_width(specs[m].k, num_jobs))
+                     for m in range(len(specs))},
+                    refresh_s=cfg.params.threshold_exchange_refresh_s,
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade to no exchange
+                thr_exchange = None
+                thr_exchange_stats["reason"] = f"setup failed: {exc}"
+                logger.warning(
+                    "params.threshold_exchange is set but the exchange could not be set "
+                    "up under %s (%s); continuing without it", cfg.output.path, exc,
+                )
+                return
+            thr_exchange.stats["configured"] = True
+            thr_exchange_stats = thr_exchange.stats
+            logger.info(
+                "threshold exchange ON: rank %d/%d publishes per-query thresholds "
+                "under %s/%s and prunes against the max over peers (refresh every "
+                "%.1fs; code hash %s — workers with a different one form a separate "
+                "exchange group)",
+                job_rank, num_jobs, cfg.output.path, thr_exchange.subdir,
+                cfg.params.threshold_exchange_refresh_s, _thresholds.code_hash()[:12],
+            )
+            # A worker starting after its peers inherits their thresholds for
+            # its very first file, not just from the second file on (-1 =
+            # before any file).
+            _apply_external_thresholds(-1)
+
+    _spec_dim_cache: dict[int, int | None] = {}
+
+    def _spec_dim(m: int) -> int | None:
+        """Longest fp32 accumulation behind one score of this search, for the
+        absolute term of the re-run allowance (`thresholds.lower_for_slack`):
+        dense = the vector dimension; sparse = the most non-zeros any query
+        carries (an overlap can be no longer); multivector = token dimension
+        times the most tokens any query has (MaxSim sums one dot per query
+        token). None falls back to the minimum allowance. Constant for the
+        run, so computed once (the sparse count scans the densified query
+        matrix, seconds at production shape)."""
+        if m in _spec_dim_cache:
+            return _spec_dim_cache[m]
+        _spec_dim_cache[m] = _spec_dim_compute(m)
+        return _spec_dim_cache[m]
+
+    def _spec_dim_compute(m: int) -> int | None:
+        vt = specs[m].vector_type
+        try:
+            q = Q_np_by_vt[vt]
+            if vt == "sparse":
+                return int(np.count_nonzero(np.asarray(q), axis=1).max()) if q.shape[0] else None
+            if vt == "multivector":
+                if mv_q_offsets is None:
+                    return None
+                toks = int(np.diff(np.asarray(mv_q_offsets)).max()) if len(mv_q_offsets) > 1 else 0
+                return int(q.shape[1]) * max(toks, 1)
+            return int(q.shape[1]) if q.ndim == 2 else None
+        except Exception:  # noqa: BLE001 — unexpected query layout: minimum allowance
+            return None
+
+    def _own_top_lists() -> list:
+        """This worker's current top-m scores per search, (h, m) float32 on
+        the device, non-finite entries (NaN/inf corpus rows, empty slots)
+        as -inf: what it publishes and what it unions with its peers."""
+        out = []
+        for m in range(len(specs)):
+            w = thr_exchange.sizes[specs[m].name][1]
+            sc = unpack_score(spec_top_key[m])                      # (h, k)
+            sc = torch.where(torch.isfinite(sc), sc, torch.full_like(sc, float("-inf")))
+            out.append(torch.topk(sc, w, dim=1, sorted=True).values if w < sc.shape[1] else sc)
+        return out
+
+    def _apply_external_thresholds(file_idx: int | None = None) -> None:
+        """Recompute the external bound from the peers' latest lists and this
+        worker's own current top-m (the union's k-th best), as packed keys."""
+        nonlocal thr_version_seen
+        if thr_exchange is None:
+            return
+        thr_version_seen, lists, changed = thr_exchange.latest(thr_version_seen)
+        if lists is not None:
+            own = _own_top_lists()
+            for m in range(len(specs)):
+                thr = _thresholds.union_kth(own[m], lists[specs[m].name], specs[m].k, device)
+                new_key = _thresholds.keys_from_scores(thr.cpu().numpy(), device, dim=_spec_dim(m))
+                # Never lower: the recorded applied value must be >= every key
+                # this worker ever pruned against (the lowering rounds 1-2 ulp
+                # near zero, and a peer list can be replaced by a shorter one).
+                spec_thr_ext[m] = (new_key if spec_thr_ext[m] is None
+                                   else torch.maximum(spec_thr_ext[m], new_key))
+            thr_exchange.stats["applies"] += 1
+            if changed:
+                thr_exchange.stats["versions_applied"] += 1
+            if thr_exchange.stats["first_applied_file"] is None:
+                thr_exchange.stats["first_applied_file"] = file_idx
+
+    def _publish_thresholds() -> None:
+        """Hand this worker's current per-query thresholds (scores only) to the
+        exchange. One small D2H copy; the network traffic is on its threads."""
+        if thr_exchange is None:
+            return
+        # The top-m lists, float16 rounded toward -inf ON the device (a
+        # published score never exceeds the real one), then one D2H copy.
+        out = {}
+        for m, lst in enumerate(_own_top_lists()):
+            x16 = lst.half()
+            lo = torch.nextafter(x16, torch.full_like(x16, float("-inf")))
+            x16 = torch.where(x16.float() > lst, lo, x16)
+            out[specs[m].name] = x16.cpu().numpy()
+        thr_exchange.publish(out)
+
 
     # Per-spec query selectors, built once per run:
     # `spec_qsel` indexes the vector-type score matrix; `spec_qrows` indexes the
@@ -5344,6 +5533,7 @@ def run_compute(
     if rank_thread is not None:
         rank_thread.start()
     try:
+        _start_threshold_exchange()
         work: Queue = Queue()
         for item in mine:
             work.put(item)
@@ -5681,6 +5871,7 @@ def run_compute(
                 ),
                 two_pass=cfg.params.two_pass == "auto",
                 mv_prune=mv_prune if vt == "multivector" else None,
+                spec_thr_ext=spec_thr_ext,
             )
             coalesce_buf[vt] = []
             coalesce_rows[vt] = 0
@@ -5790,7 +5981,12 @@ def run_compute(
                             two_pass=cfg.params.two_pass == "auto",
                             mv_prune=(
                                 mv_prune if vt == "multivector" else None),
+                            spec_thr_ext=spec_thr_ext,
                         )
+
+                # Threshold exchange: publish ours, pick up the peers' maximum.
+                _publish_thresholds()
+                _apply_external_thresholds(gidx)
 
                 # Per-file live fractions from cumulative device counters.
                 stats = live_fractions()
@@ -5849,6 +6045,21 @@ def run_compute(
         for vt in coalesce_eligible_vts:
             tail_gpu += _flush_coalesce_group(vt)
         gpu_secs += tail_gpu
+        if thr_exchange is not None:
+            # Final publish (so late-starting peers inherit this worker's fully
+            # converged thresholds) and stop the exchange threads.
+            _publish_thresholds()
+            thr_exchange.close(final=True)
+            # What this worker actually pruned against (the lowered, applied
+            # external thresholds), for the partial's `applied_threshold`
+            # column. Nothing prunes after this point (the tail flush above
+            # was the last scoring), so this is >= every threshold used.
+            for m in range(len(specs)):
+                spec_thr_applied[m] = (
+                    unpack_score(spec_thr_ext[m]).cpu().numpy().astype(np.float32, copy=False)
+                    if spec_thr_ext[m] is not None
+                    else np.full(int(spec_thr[m].shape[0]), -np.inf, dtype=np.float32)
+                )
         if prof_window is not None and tail_gpu > 0.0:
             logger.warning(
                 "%.2fs of GPU work ran in the trailing coalesce flush, which is "
@@ -5861,6 +6072,9 @@ def run_compute(
                 ", ".join(sorted(coalesce_eligible_vts)) or "none",
             )
     finally:
+        if thr_exchange is not None:
+            # No final publish from a failed scan; just stop the threads.
+            thr_exchange.close(final=False)
         # A scan failure must not make the daemon coordinator fetch the rest
         # of this rank's ids. Active reads are not interruptible, but queued
         # reads are cancelled and no failure path joins the coordinator.
@@ -6141,6 +6355,7 @@ def run_compute(
             # Release this search's GPU state before decoding results on the CPU.
             spec_top_key[i] = spec_top_enc[i] = None
             valid = sc > float("-inf")
+            nan_hits = np.isnan(sc).sum(axis=1).astype(np.int32) if num_jobs is not None else None
             # A spec with a `rows` subset wrote state for its OWN queries only, so
             # its output covers those rows — ids and payload are sliced to match.
             # `query_ids`/`payload` stay full-length upstream (both loaders return
@@ -6224,8 +6439,11 @@ def run_compute(
                     # what stops a benchmarking partial from ever merging with a
                     # real one.
                     max_files=max_files,
+                    threshold_exchange=(thr_exchange.run_id if thr_exchange is not None else False),
                 ),
                 hit_tie=hit_tie,
+                applied_threshold=(spec_thr_applied[i] if thr_exchange is not None else None),
+                nan_hits=nan_hits,
             )
             short_i = int((counts < s.k).sum())
             if num_jobs is not None:
@@ -6300,6 +6518,9 @@ def run_compute(
         # Dense H2D policy and actual use: 0 is pageable, 2 uses pinned memory
         # with one-slice copy-stream overlap.
         "dense_transfer": dense_transfer_usage(),
+        # The configured bool stays under `threshold_exchange`; what the
+        # exchange actually did is here.
+        "threshold_exchange_stats": thr_exchange_stats,
         # What actually RAN, not what the kill switches permitted.
         "kernels": run_manifest.kernel_usage(
             _PRUNE_APPLIED["count"],

@@ -32,6 +32,7 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from nova_bf import manifest as run_manifest
+from nova_bf import thresholds as _thresholds
 from nova_bf.config import BruteForceConfig, SearchSpec
 from nova_bf.io import ParquetFile, Store
 from nova_bf.tiebreak import SENTINEL_KEY, build_ordinals, _is_oom
@@ -41,6 +42,7 @@ from nova_bf.results import (
     JOB_RANK_KEY,
     NUM_JOBS_KEY,
     RESERVED,
+    EXCHANGE_KEY,
     RUN_KEY,
     TIEBREAK_KEY,
     config_identity,
@@ -1433,6 +1435,223 @@ def _drop_manifests(out: Store, names: list[str], why: str) -> None:
 
 # --- recorded escape hatch for merge provenance checks ------------------------
 
+def _meta_get(meta: dict, key: bytes) -> str | None:
+    value = meta.get(key)
+    return value.decode() if value is not None else None
+
+
+def _exchange_ids(stamps) -> set[str]:
+    """Exchange run ids carried by these partials ("false"/absent excluded)."""
+    ids = {_meta_get(meta, EXCHANGE_KEY) or "false" for _, meta in stamps}
+    ids.discard("false")
+    return ids
+
+
+def _exchange_need(cfg: BruteForceConfig, spec: SearchSpec,
+                   partials: list[ParquetFile], readers: list[pq.ParquetFile],
+                   n_rows: int) -> "tuple[np.ndarray | None, bool, np.ndarray | None]":
+    """Collect applied pruning thresholds and dropped NaN counts per query.
+
+    Returns the maximum applied threshold (or None), whether any rank used
+    a peer threshold, and the total dropped NaN hits. Merged results must
+    satisfy these thresholds to guarantee exact top-k.
+    """
+    need: "np.ndarray | None" = None
+    # NaN evictions on ANY rank count (a rank re-run with the exchange off,
+    # the merge's own remedy, carries nan_hits but no applied_threshold).
+    nan_total = np.zeros(n_rows, dtype=np.int64)
+    for f, r in zip(partials, readers):
+        names = r.schema_arrow.names
+        cols = [c for c in ("applied_threshold", "nan_hits") if c in names]
+        if not cols:
+            continue
+        tbl = r.read(columns=cols)
+        if tbl.num_rows != n_rows:
+            raise RuntimeError(
+                f"partial {f.read_path} has {tbl.num_rows} rows but the first "
+                f"partial has {n_rows}; partials must be row-aligned by query "
+                "(same queries, same order). A truncated/mismatched partial can't be merged."
+            )
+        if "applied_threshold" in cols:
+            if need is None:
+                need = np.full(n_rows, -np.inf, dtype=np.float32)
+            col = tbl.column("applied_threshold").to_numpy(zero_copy_only=False)
+            # fmax: a NaN entry never raises the requirement; +inf cannot occur
+            # (compute never applies one) but would only make the check stricter.
+            np.fmax(need, col.astype(np.float32, copy=False), out=need)
+        if "nan_hits" in cols:
+            nan_total += tbl.column("nan_hits").to_numpy(zero_copy_only=False).astype(np.int64)
+    active = _exchange_active(need)
+    if (nan_total > 0).any():
+        affected = int(((nan_total > 0) & (need > -np.inf)).sum()) if need is not None else 0
+        logger.warning(
+            "search=%r: %d of %d queries had NaN-scored corpus hits dropped on some "
+            "rank (NaN/inf embeddings in the corpus; %d of them also have an applied "
+            "peer threshold). Each such query's merged list is cut to its top "
+            "(k - dropped), which is what a single-node run returns for it (the NaN "
+            "hits took those slots), and that is what the threshold verification "
+            "covers.",
+            spec.name, int((nan_total > 0).sum()), n_rows, affected,
+        )
+    ids = _exchange_ids([(None, r.schema_arrow.metadata or {}) for r in readers])
+    if len(ids) > 1 and active:
+        logger.warning(
+            "search=%r: partials carry %d different threshold-exchange ids (%s): "
+            "those groups did not exchange thresholds with each other (different "
+            "nova-bf code, or a rank re-run after a config change). Harmless for "
+            "exactness, which is verified below, but the warm start was lost.",
+            spec.name, len(ids), sorted(i[:12] for i in ids),
+        )
+    return need, active, nan_total
+
+
+def _exchange_active(need: "np.ndarray | None") -> bool:
+    """Did any rank actually prune against a peer's threshold? Only then do
+    the partials depend on one another (and nothing may be forced)."""
+    return need is not None and bool((need > -np.inf).any())
+
+
+def _exchange_blame(partials: list[ParquetFile], readers: list[pq.ParquetFile],
+                    rows: "np.ndarray", limit: "np.ndarray") -> list[int]:
+    """Identify ranks whose pruning thresholds exceeded verified score limits.
+
+    A limit of -inf flags a short result, implicating any rank that pruned.
+    Other ranks remain valid because their thresholds reflect real scores.
+    """
+    ranks: set[int] = set()
+    for i, (f, r) in enumerate(zip(partials, readers)):
+        if "applied_threshold" not in r.schema_arrow.names:
+            continue
+        col = r.read(columns=["applied_threshold"]).column(0).to_numpy(zero_copy_only=False)
+        if (~(limit >= col[rows])).any():
+            rk = _meta_get(r.schema_arrow.metadata or {}, JOB_RANK_KEY)
+            ranks.add(int(rk) if rk is not None else i)
+    return sorted(ranks)
+
+
+def _check_exchange_batch(spec: SearchSpec, need: "np.ndarray", nan_total: "np.ndarray",
+                          row0: int, scores_arr: pa.ListArray) -> dict:
+    """Check whether merged results preserve cross-worker pruning guarantees.
+
+    Queries with a threshold must have at least k - N hits, where N is the
+    number of NaN-scored hits dropped. The (k - N)-th score must meet the
+    threshold. Queries with N >= k cannot be verified.
+
+    Returns batch-relative rows, score limits, and verification counts.
+    """
+    n = len(scores_arr)
+    sl = need[row0:row0 + n]
+    nn = nan_total[row0:row0 + n]
+    kk = spec.k - nn                       # how many hits the result must vouch for
+    # Every query with ANY applied threshold is checked, +inf included (an
+    # applied +inf pruned everything, so it must be caught, not skipped).
+    has = sl > -np.inf
+    checked = has & (kk >= 1)
+    empty = {"rows": np.zeros(0, np.int64), "limit": np.zeros(0, np.float32),
+             "short": 0, "low": 0, "checked": int(checked.sum()),
+             "skipped": int((has & ~checked).sum())}
+    if not checked.any():
+        return empty
+    col = scores_arr.combine_chunks() if isinstance(scores_arr, pa.ChunkedArray) else scores_arr
+    offsets = col.offsets.to_numpy()
+    lens = np.diff(offsets)
+    # `values` is the WHOLE child array even for a sliced ListArray; rebase so
+    # the last row's segment ends at its own offset, not at the child's end.
+    vals = col.values.to_numpy(zero_copy_only=False)[offsets[0]:offsets[-1]]
+    offsets = offsets - offsets[0]
+    # The score each row can vouch for: its kk-th best.
+    vouch = np.full(n, np.inf, dtype=np.float32)
+    nonempty = lens > 0
+    if nonempty.any():
+        vouch[nonempty] = np.fmin.reduceat(vals, offsets[:-1][nonempty])
+    for i in np.flatnonzero(checked & (nn > 0) & nonempty):
+        row = vals[offsets[i]:offsets[i + 1]]
+        row = np.sort(row[~np.isnan(row)])[::-1]
+        vouch[i] = row[kk[i] - 1] if len(row) >= kk[i] else -np.inf
+    short = checked & (lens < kk)
+    low = checked & ~short & ~(vouch >= sl)
+    bad = short | low
+    rows = np.flatnonzero(bad)
+    limit = np.where(short[rows], np.float32(-np.inf), vouch[rows]).astype(np.float32)
+    return {"rows": rows, "limit": limit, "short": int(short.sum()), "low": int(low.sum()),
+            "checked": int(checked.sum()), "skipped": int((has & ~checked).sum()),
+            "example": (int(rows[0]), int(lens[rows[0]]), int(kk[rows[0]]),
+                        float(vouch[rows[0]]), float(sl[rows[0]])) if len(rows) else None}
+
+
+def _truncate_lists(arr: pa.ListArray, keep: "np.ndarray") -> pa.ListArray:
+    """Each row of `arr` cut to its first `keep[i]` elements (rows already
+    shorter are left alone)."""
+    col = arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+    offsets = col.offsets.to_numpy().astype(np.int64)
+    lens = np.diff(offsets)
+    new_lens = np.minimum(lens, np.maximum(keep, 0))
+    if (new_lens == lens).all():
+        return col
+    starts = offsets[:-1]
+    new_offsets = np.zeros(len(lens) + 1, dtype=np.int64)
+    np.cumsum(new_lens, out=new_offsets[1:])
+    total = int(new_offsets[-1])
+    # Flat index of every kept element: row start + position within the row.
+    idx = (np.repeat(starts, new_lens)
+           + np.arange(total, dtype=np.int64)
+           - np.repeat(new_offsets[:-1], new_lens))
+    values = col.values.take(pa.array(idx, pa.int64()))
+    return pa.ListArray.from_arrays(pa.array(new_offsets.astype(np.int32)), values)
+
+
+def _exchange_verify(cfg: BruteForceConfig, spec: SearchSpec, need: "np.ndarray",
+                     nan_total: "np.ndarray", batches, batch_rows: int, blame,
+                     quiet: bool = False) -> int:
+    """Run `_check_exchange_batch` over every batch, then raise ONCE
+    (unforceably) naming every rank at fault across all batches, so the
+    operator re-runs the right set in one go. Returns the number of queries
+    verified."""
+    all_rows: list[np.ndarray] = []
+    all_limit: list[np.ndarray] = []
+    short = low = checked = skipped = 0
+    example = None
+    for bi, scores_arr in batches:
+        res = _check_exchange_batch(spec, need, nan_total, bi * batch_rows, scores_arr)
+        short += res["short"]; low += res["low"]
+        checked += res["checked"]; skipped += res["skipped"]
+        if len(res["rows"]):
+            all_rows.append(res["rows"] + bi * batch_rows)
+            all_limit.append(res["limit"])
+            if example is None:
+                r0, ln, kk, vo, th = res["example"]
+                example = (bi * batch_rows + r0, ln, kk, vo, th)
+    if skipped and not quiet:
+        logger.warning(
+            "search=%r: %d queries with an applied peer threshold dropped k or more "
+            "NaN-scored hits and cannot be verified at all.", spec.name, skipped,
+        )
+    if not all_rows:
+        return checked
+    rows = np.concatenate(all_rows); limit = np.concatenate(all_limit)
+    culprits = blame(rows, limit) if blame is not None else []
+    r0, ln, kk, vo, th = example
+    why = (f"only {ln} of the {kk} hits it must vouch for survived"
+           if ln < kk else f"{kk}-th score {vo:.6g} < applied threshold {th:.6g}")
+    remedy = (
+        f"re-run ONLY rank(s) {culprits} (`bf compute --num-jobs N --job-rank R`, "
+        "same config, with `threshold_exchange: false`) and merge again; the other "
+        "partials are valid"
+        if culprits else
+        f"delete {_thresholds.SUBDIR}/ and the partials, and re-run `bf compute`"
+    )
+    raise RuntimeError(
+        f"search={spec.name!r}: THRESHOLD-EXCHANGE VERIFICATION FAILED for "
+        f"{len(rows)} of {checked} checked queries ({short} short, {low} below "
+        f"threshold; e.g. row {r0}: {why}). Rank(s) {culprits or '?'} pruned against "
+        "thresholds that were not lower bounds for this corpus/queries (leftover "
+        f"files under {cfg.output.path}/{_thresholds.SUBDIR}/ from an earlier run with "
+        "different content under the same paths, or a rank re-scored with a different "
+        f"GPU/batch size under dot/euclidean/TF32). No output was written: {remedy}. "
+        "Refused even under NOVA_BF_MERGE_FORCE."
+    )
+
+
 def _refuse(forced: bool, spec_name: str, message: str) -> None:
     """Raise unless this merge was explicitly forced."""
     if not forced:
@@ -1462,6 +1681,7 @@ def _validate_one_run(
     partials: list[ParquetFile],
     readers: list[pq.ParquetFile],
     forced: bool = False,
+    exchange_active: bool = False,
 ) -> str | None:
     """Validate that partials form one complete, non-overlapping run.
 
@@ -1485,6 +1705,12 @@ def _validate_one_run(
     def _get(meta: dict, key: bytes) -> str | None:
         value = meta.get(key)
         return value.decode() if value is not None else None
+
+    # Partials that pruned against each other's thresholds are only exact as
+    # a complete, single-run, single-config set: none of the checks below may
+    # be forced for them (a forced merge would be WRONG, not just unverified).
+    if exchange_active:
+        forced = False
 
     # All stamped partials must belong to the same run.
     runs = {f.read_path: _get(meta, RUN_KEY) for f, meta in stamps}
@@ -1678,7 +1904,19 @@ def _validate_one_run(
             )
         )
 
-    # Missing coverage is incomplete but non-duplicated, so it may be forced.
+    # Missing coverage is incomplete but non-duplicated, so it may be forced —
+    # UNLESS the ranks pruned against each other's thresholds: then the
+    # present partials dropped candidates on the strength of the missing
+    # rank's witnesses, and merging without it is WRONG, not merely short.
+    if missing and exchange_active:
+        raise RuntimeError(
+            f"search={spec.name!r}: rank(s) {missing} are missing and the present "
+            "partials were computed with params.threshold_exchange, so they pruned "
+            "candidates that only the missing rank(s) can vouch for. Merging without "
+            "them would return a WRONG top-K (not just an incomplete one); this is "
+            "refused even under NOVA_BF_MERGE_FORCE. Re-run `bf compute --num-jobs "
+            f"{num_jobs} --job-rank R` for the missing rank(s) first."
+        )
     if missing:
         _refuse(
             forced,
@@ -1701,9 +1939,25 @@ def _reduce(
     """Reduce one search's partials into its final Parquet and manifest entry."""
     k = spec.k
     _reset_fold_used()
-    # Validate that all partials belong to the same complete compute run.
-    run_sha = _validate_one_run(cfg, spec, partials, readers, forced)
     n_rows = readers[0].metadata.num_rows
+    exchange_need, exchange_active, exchange_nan = _exchange_need(cfg, spec, partials, readers, n_rows)
+    exchange_verified = 0
+    nan_cut_queries = 0
+    # Partials that pruned against each other's thresholds are only exact as
+    # a complete, single-run, single-config set: nothing may be forced for
+    # them, and the output must not be stamped as forced either. Partials
+    # that carry the column but never applied a finite threshold (all -inf:
+    # the exchange was on but no peer was ever seen) are ordinary partials.
+    if exchange_active:
+        forced = False
+    # The reduced artifact records that its partials pruned against each
+    # other (and were verified): the single exchange id, or "mixed".
+    _xids = _exchange_ids([(None, r.schema_arrow.metadata or {}) for r in readers])
+    exchange_stamp: str | bool = (
+        (_xids.pop() if len(_xids) == 1 else "mixed") if exchange_active else False
+    )
+    # Validate that all partials belong to the same complete compute run.
+    run_sha = _validate_one_run(cfg, spec, partials, readers, forced, exchange_active)
     for f, r in zip(partials, readers):
         if r.metadata.num_rows != n_rows:
             raise RuntimeError(
@@ -1996,6 +2250,15 @@ def _reduce(
         existed = out.fs.get_file_info(path).type != fs.FileType.NotFound
     except Exception:
         existed = False
+    if exchange_need is not None:
+        # Verify EVERY batch before the output is opened: a failure here is
+        # wrong ground truth, and it must not destroy a previous good result
+        # under the same name (local streams truncate on open; a closed S3
+        # stream commits). The in-loop check below stays as a guard.
+        _blame = lambda rows, limit: _exchange_blame(partials, readers, rows, limit)  # noqa: E731
+        exchange_verified = _exchange_verify(
+            cfg, spec, exchange_need, exchange_nan,
+            ((bi, state[bi][1]) for bi in range(n_batches)), batch_rows, _blame)
     sink = out.fs.open_output_stream(path)
     writer: pq.ParquetWriter | None = None
     body_ok = False
@@ -2003,9 +2266,29 @@ def _reduce(
         for bi in range(n_batches):
             ids_state, scores_arr, _ = state[bi]
             base = head[bi]
-            lengths = ids_state.value_lengths().to_numpy(zero_copy_only=False)
             # Materialise the strings ONCE, here, if the state carried lanes.
             ids_arr = _as_ids_array(ids_state)
+            if exchange_need is not None:
+                # Before this batch is committed: a failure here takes the
+                # normal failed-merge path (output removed, manifest dropped).
+                _exchange_verify(cfg, spec, exchange_need, exchange_nan,
+                                 [(bi, scores_arr)], batch_rows, _blame, quiet=True)
+            # A query whose ranks dropped N NaN-scored hits: each rank kept
+            # only its top (k - its NaNs) real candidates, so places k-N+1..k
+            # of the merged list would be filled from other ranks' leftovers
+            # rather than true neighbours. Cut to the top (k - N), which is
+            # exactly what a single-node run returns for that query (its NaN
+            # hits dropped, list short) and what the verification covers.
+            nn = exchange_nan[bi * batch_rows: bi * batch_rows + len(scores_arr)]
+            if (nn > 0).any():
+                keep = (k - nn).astype(np.int64)
+                before = ids_arr.value_lengths().to_numpy(zero_copy_only=False)
+                # Rare path (NaN rows in the corpus); the `take` copies the
+                # child arrays, a few seconds per 110k x 1000 batch.
+                ids_arr = _truncate_lists(ids_arr, keep)
+                scores_arr = _truncate_lists(scores_arr, keep)
+                nan_cut_queries += int((before > np.maximum(keep, 0)).sum())
+            lengths = ids_arr.value_lengths().to_numpy(zero_copy_only=False)
             short_count += int((lengths < k).sum())
             cols = {"query_id": _col(base, "query_id")}
             for c in payload_cols:
@@ -2017,7 +2300,8 @@ def _reduce(
             table = table.replace_schema_metadata(
                 provenance(cfg, spec, carried_dtypes, run_sha=run_sha,
                            reducing=True, num_jobs=len(partials),
-                           forced=forced, inputs_forced=inputs_forced)
+                           forced=forced, inputs_forced=inputs_forced,
+                           threshold_exchange=exchange_stamp)
             )
             if writer is None:
                 writer = pq.ParquetWriter(sink, table.schema, compression="snappy")
@@ -2145,6 +2429,9 @@ def _reduce(
         "partials": len(partials),
         "partial_dir": partial_dir(cfg, spec),
         "merge_batch_rows": batch_rows,
+        **({"threshold_exchange_verified_queries": exchange_verified}
+           if exchange_need is not None else {}),
+        **({"nan_truncated_queries": nan_cut_queries} if nan_cut_queries else {}),
         "tiebreak_source": "hit_tie" if want_tie else "hit_ids",
         "run_sha": run_sha,
         "merge_fold": sorted(_FOLD_USED),

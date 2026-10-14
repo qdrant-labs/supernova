@@ -24,6 +24,7 @@ import pyarrow.parquet as pq
 class ParquetFile:
     read_path: str  # path handed to pyarrow (includes the bucket for s3)
     key: str        # loader-consistent filename used for id derivation
+    size: int | None = None   # bytes, from the listing (content-ish identity)
 
 
 # Parallel ranged-read tuning for LARGE parquet files (see Store.read_columns).
@@ -86,7 +87,7 @@ class Store:
         else:
             entries = self.fs.get_file_info(pafs.FileSelector(base, recursive=True))
         out = [
-            ParquetFile(read_path=e.path, key=self._loader_key(e.path))
+            ParquetFile(read_path=e.path, key=self._loader_key(e.path), size=e.size)
             for e in entries
             if e.type == pafs.FileType.File and e.path.endswith(".parquet")
         ]

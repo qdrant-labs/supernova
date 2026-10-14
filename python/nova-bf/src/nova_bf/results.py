@@ -7,6 +7,7 @@ import os
 import json
 import logging
 
+import numpy as np
 import pyarrow as pa
 
 from nova_bf.config import BruteForceConfig, SearchSpec
@@ -14,7 +15,7 @@ from nova_bf.config import BruteForceConfig, SearchSpec
 # Reserved output columns; everything else in a result row is carried payload.
 # `hit_tie` appears only on a SHARDED run's partials, and only when `merge`
 # cannot apply the tie-break rule from `hit_ids` alone — see `build_result_table`.
-RESERVED = ("query_id", "hit_ids", "hit_scores", "hit_tie")
+RESERVED = ("query_id", "hit_ids", "hit_scores", "hit_tie", "applied_threshold", "nan_hits")
 
 # Schema-metadata key recording which tie-break rule produced a result. `merge`
 # refuses partials whose rule disagrees with the config it was handed: editing
@@ -28,6 +29,10 @@ CONFIG_KEY = b"nova_bf.config_fingerprint"
 # Present (and "true") when the merge that wrote this artifact ran with its
 # provenance checks FORCED OFF. See `merge_forced`.
 FORCED_KEY = b"nova_bf.merge_forced"
+# Whether the worker pruned against OTHER workers' thresholds (see
+# thresholds.py). A partial written with it is only exact alongside every other
+# rank of the same run, so a merge missing a rank cannot be forced.
+EXCHANGE_KEY = b"nova_bf.threshold_exchange"
 NUM_JOBS_KEY = b"nova_bf.num_jobs"
 JOB_RANK_KEY = b"nova_bf.job_rank"
 
@@ -191,6 +196,7 @@ def provenance(
     reducing: bool = False,
     forced: bool = False,
     inputs_forced: bool = False,
+    threshold_exchange: str | bool = False,
 ) -> dict[bytes, bytes]:
     """How this ground truth was computed, for the parquet schema metadata.
 
@@ -254,6 +260,13 @@ def provenance(
     # `merge` — and only one of them used to do it, so a sharded run (the only
     # kind that produces the artifacts anyone ships) lost the record.
     out[TIEBREAK_KEY] = cfg.params.tiebreak.encode()
+    # "false", or the threshold-exchange run id this worker published under
+    # (informational: what the merge verifies against is the partial's own
+    # `applied_threshold` column, see `build_result_table`).
+    out[EXCHANGE_KEY] = (
+        threshold_exchange if isinstance(threshold_exchange, str) and threshold_exchange
+        else "false"
+    ).encode()
     # Which run this came from
     config_sha = config_identity(cfg, spec)
     out[CONFIG_KEY] = config_sha.encode()
@@ -288,6 +301,8 @@ def build_result_table(
     hit_scores: list[list[float]],
     metadata: dict[bytes, bytes] | None = None,
     hit_tie: list[list[int]] | None = None,
+    applied_threshold: "np.ndarray | None" = None,
+    nan_hits: "np.ndarray | None" = None,
 ) -> pa.Table:
     data: dict = {"query_id": pa.array(query_ids, pa.string())}
     for col, vals in payload.items():
@@ -312,6 +327,19 @@ def build_result_table(
     data["hit_scores"] = _list_col(hit_scores, pa.float32())
     if hit_tie is not None:
         data["hit_tie"] = _list_col(hit_tie, pa.int64())
+    if applied_threshold is not None:
+        # Partials of a `params.threshold_exchange` run only: the lowered
+        # external threshold this worker pruned each query against (-inf where
+        # none). It travels INSIDE the partial, so the merge can verify the
+        # result wherever the partials end up and without any sidecar file.
+        data["applied_threshold"] = pa.array(
+            np.asarray(applied_threshold, dtype=np.float32).reshape(-1), pa.float32()
+        )
+    if nan_hits is not None:
+        # Every sharded partial: how many NaN-scored hits were dropped from
+        # each query's list (see compute.py); the merge's threshold
+        # verification then covers that query's top (k - dropped).
+        data["nan_hits"] = pa.array(np.asarray(nan_hits, dtype=np.int32).reshape(-1), pa.int32())
     table = pa.table(data)
     # No tie-break stamp here: `provenance` carries it, so both this builder and
     # `merge`'s get it from one place.

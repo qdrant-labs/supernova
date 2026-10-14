@@ -325,6 +325,16 @@ class ParamsConfig(BaseModel):
     # rank coverage is refused regardless -- see `merge._refuse`. Overridable
     # per-invocation with NOVA_BF_MERGE_FORCE.
     merge_force: bool = False
+    # Cross-worker pruning-threshold exchange (distributed runs only). Each
+    # worker publishes its per-query running k-th best scores under
+    # `<output.path>/_thresholds/` and prunes against the elementwise MAX of
+    # every worker's thresholds. Exact: a candidate below another worker's
+    # k-th best cannot be in the global top-k. Best-effort: a missing or stale
+    # peer only prunes less. Removes the per-worker threshold warm-up that
+    # makes strong scaling sublinear. Ignored (with a warning) without
+    # `--num-jobs`; see thresholds.py for the partials-may-be-short caveat.
+    threshold_exchange: bool = False
+    threshold_exchange_refresh_s: float = Field(default=5.0, gt=0.0, strict=True)
 
     # Which of two EXACTLY-tied candidates wins.
     # Neither makes SCORES reproducible across batch sizes — re-tiling a matmul
