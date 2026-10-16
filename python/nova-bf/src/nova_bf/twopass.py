@@ -847,7 +847,10 @@ assert PAD_FLOOR % PAD_QUANTUM == 0, \
 MAX_PAD_TRIES = 4
 
 # Below this query height, two-pass pruning is not expected to pay for itself.
-MIN_QUERY_ROWS = 32768
+# At 8192 rows the smallest padded exact height (PAD_SMALL's 2048) is a quarter
+# of the full GEMM, so a late-run live fraction of a few percent still costs
+# ~0.25 (pass one) + 0.25 (padded pass two) of plain fp32.
+MIN_QUERY_ROWS = 8192
 
 # Maximum live fraction for using the two-pass path by default.
 DEFAULT_THRESHOLD = 0.50
