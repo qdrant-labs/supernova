@@ -3446,7 +3446,10 @@ def _process_batch_group(
     if n_rows == 0:
         return 0.0
     t0 = time.perf_counter()
-    step = batch_size or n_rows
+    # Capped at the file's rows: a file smaller than the batch is then ONE
+    # full-width slice (same ranges either way), so it still qualifies for
+    # two-pass, exactly as it did under whole-file slices.
+    step = min(batch_size, n_rows) if batch_size else n_rows
     max_doc_tokens = None
     if isinstance(batch, MultiVectorCorpusBatch) and multivector_token_budget is not None:
         # Size document slices against the largest query-token block.
