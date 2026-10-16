@@ -277,6 +277,21 @@ def available(scores, ordinal, k, scale=None, thr=None, enc=None, cscale=None) -
     return ok
 
 
+def kernel_may_apply() -> bool:
+    """Could the kernel run in this process at all — loaded, not disabled by
+    `NOVA_BF_NO_TOPK_KERNEL`, not ROCm, CUDA present? Per-call shape checks
+    (`available`) aside. Lets config-time advice stay quiet where the kernel
+    never applies anyway."""
+    import torch
+
+    return bool(
+        _cutfill is not None
+        and not os.environ.get("NOVA_BF_NO_TOPK_KERNEL")
+        and getattr(torch.version, "hip", None) is None
+        and torch.cuda.is_available()
+    )
+
+
 def _enc_ok(enc, n_cols: int, device) -> bool:
     """Whether `enc` satisfies the kernel's direct-indexing assumptions.
 

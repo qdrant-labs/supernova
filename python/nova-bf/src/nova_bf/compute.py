@@ -2295,19 +2295,38 @@ def _resolve_multivector_tiles(
     return bs, qb
 
 
-def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str) -> int | None:
-    """`configured` (`params.dense_batch_size`/`sparse_batch_size`) is fine
-    as-is whenever it's unset or already at/above `k_floor` (the largest `k`
-    among EVERY search of this vector_type) — a batch that size can already
-    fill any of these searches' own top-K in one pass. Below that, never
-    raise it: every search of the vector_type shares one batch grid
-    regardless of filter (see `run_compute`'s `has_baseline` and
-    `_union_keep`), so raising `configured` for one search's large `k` would
-    silently blow past a DIFFERENT, unrelated search's own memory bound —
-    exactly the OOM footgun `dense_batch_size`/`sparse_batch_size` exists to
-    prevent. Warn instead: the larger-`k` search just takes extra merge
-    rounds to fill its own top-K (more of them the further `configured` sits
-    below `k_floor`), at no extra GPU memory cost to anyone."""
+def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str,
+                           device=None) -> int | None:
+    """Preserve the configured batch size, even when below the largest k
+    for this vector type. All searches share a batch grid, so increasing it
+    could exceed another search's memory budget. Warn about extra top-K
+    merge rounds instead.
+
+    Also warn when batches exceed Triton's MAX_BLOCK, forcing slower
+    portable selection (~4x). Suppress warnings when the kernel is
+    unavailable or k_floor > MAX_BLOCK; use INFO for unbounded batches.
+    Multivector uses a separate token-based batch budget.
+    """
+    on_cuda = device is None or getattr(device, "type", str(device)) == "cuda"
+    if (vt in ("dense", "sparse") and on_cuda and k_floor <= topk_triton.MAX_BLOCK
+            and topk_triton.kernel_may_apply()):
+        if configured is not None and configured > topk_triton.MAX_BLOCK:
+            logger.warning(
+                "params.%s_batch_size=%d exceeds the Triton top-K kernel's "
+                "MAX_BLOCK=%d, so slices wider than that (unfiltered searches, "
+                "files with more rows) fall back to the portable torch top-K "
+                "(roughly 4x slower selection). "
+                "Results are identical; set %s_batch_size <= %d to use the kernel.",
+                vt, configured, topk_triton.MAX_BLOCK, vt, topk_triton.MAX_BLOCK,
+            )
+        elif configured is None:
+            logger.info(
+                "params.%s_batch_size is null, so each file is scored as one "
+                "slice; files over MAX_BLOCK=%d rows take the portable top-K "
+                "path (roughly 4x slower selection). Set %s_batch_size <= %d "
+                "to use the Triton kernel.",
+                vt, topk_triton.MAX_BLOCK, vt, topk_triton.MAX_BLOCK,
+            )
     if configured is None or configured >= k_floor:
         return configured
     logger.warning(
@@ -2483,9 +2502,10 @@ def _certify_budget_key(score_key, Q, device, out_dtype):
 
     Deliberately NOT `cert_key`. `cert_key` is right for certification -- a
     different GEMM shape genuinely has to be re-certified -- but two of its
-    components churn within a run: the corpus slice height (under the default
+    components churn within a run: the corpus slice height (under
     `dense_batch_size=None`, `step = batch_size or n_rows`, so it is the file's
-    row count, and shards differ) and the per-file `exact_fp16`. Keying the
+    row count, and shards differ; under the 8192 default the last slice of
+    each file differs) and the per-file `exact_fp16`. Keying the
     budget on it meant every file presented a fresh key with streak 0, so the
     cap could never fire in the DEFAULT configuration -- exactly where the
     unbounded retry it guards against is worst.
@@ -5283,7 +5303,8 @@ def run_compute(
         # which branch below applies, so k_floor spans ALL of them, not just a
         # same-filter subset — see _resolve_vt_batch_size's docstring.
         k_floor = max(specs[i].k for i in idxs)
-        vt_batch_size[vt] = _resolve_vt_batch_size(vt_configured_batch[vt], k_floor, vt)
+        vt_batch_size[vt] = _resolve_vt_batch_size(vt_configured_batch[vt], k_floor, vt,
+                                                   device)
         if has_baseline[vt]:
             logger.info(
                 "vector_type=%r: %d search(es) share one full-file batch pass (batch_size=%s)",

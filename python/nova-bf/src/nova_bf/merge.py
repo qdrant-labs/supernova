@@ -179,7 +179,9 @@ def _sliced(column, rows: int):
 # How many partials may be read into memory at once.
 _MERGE_WINDOW_DEFAULT = 2
 # Concurrent range GETs per in-flight partial are this divided by the window,
-# because `_ranged_download` builds its own pool PER FILE.
+# which bounds each file's own window of ranges. They all run on io's one
+# process-wide fetch pool (`io._fetch_pool`, default 512 threads), which caps
+# the total.
 _RANGED_GET_POOL = 24
 
 def _merge_window(cfg, n_partials: int) -> int:

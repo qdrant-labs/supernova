@@ -9,9 +9,11 @@ pyarrow's per-bucket resolution.
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 import numpy as np
@@ -41,6 +43,62 @@ class ParquetFile:
 _RANGED_GET_BYTES = 64 * 1024 * 1024
 _RANGED_GET_CONCURRENCY = 24
 _RANGED_GET_MIN_BYTES = 256 * 1024 * 1024
+# Process-wide pool for concurrent ranged GETs, capped at 512 threads.
+# Per-file concurrency is limited separately. Threads are created on demand;
+# NOVA_BF_FETCH_POOL_SIZE overrides the default at pool initialization.
+_FETCH_POOL_SIZE_DEFAULT = 512
+_FETCH_POOL: ThreadPoolExecutor | None = None
+_FETCH_POOL_PID: int | None = None
+_FETCH_POOL_LOCK = threading.Lock()
+
+logger = logging.getLogger(__name__)
+
+
+def _reset_fetch_pool_in_child() -> None:
+    # A fork while another thread held the lock would otherwise deadlock the
+    # child's first `_fetch_pool()`; the parent's pool threads don't exist there.
+    global _FETCH_POOL_LOCK, _FETCH_POOL
+    _FETCH_POOL_LOCK = threading.Lock()
+    _FETCH_POOL = None
+
+
+os.register_at_fork(after_in_child=_reset_fetch_pool_in_child)
+
+
+def _fetch_pool_size() -> int:
+    raw = os.environ.get("NOVA_BF_FETCH_POOL_SIZE", "").strip()
+    try:
+        size = int(raw) if raw else _FETCH_POOL_SIZE_DEFAULT
+        if size < 1:
+            raise ValueError(size)
+    except ValueError:
+        logger.warning("NOVA_BF_FETCH_POOL_SIZE=%r is not a positive integer; "
+                       "using %d", raw, _FETCH_POOL_SIZE_DEFAULT)
+        size = _FETCH_POOL_SIZE_DEFAULT
+    return size
+
+
+def _fetch_pool() -> ThreadPoolExecutor:
+    """The process-wide ranged-GET pool, created on first use.
+    
+    Re-created after a fork, since a child inherits the executor
+    object but not its threads."""
+    global _FETCH_POOL, _FETCH_POOL_PID
+    with _FETCH_POOL_LOCK:
+        if _FETCH_POOL is None or _FETCH_POOL_PID != os.getpid():
+            _FETCH_POOL = ThreadPoolExecutor(
+                max_workers=_fetch_pool_size(), thread_name_prefix="nova-bf-fetch",
+            )
+            _FETCH_POOL_PID = os.getpid()
+        return _FETCH_POOL
+
+
+def _copy_range(dst: np.ndarray, buf) -> None:
+    """Copy a fetched range without holding the GIL, avoiding GPU stalls.
+    Validate length to prevent unintended NumPy broadcasting."""
+    if len(buf) != dst.size:
+        raise OSError(f"ranged read returned {len(buf)} bytes, expected {dst.size}")
+    np.copyto(dst, np.frombuffer(buf, dtype=np.uint8))
 
 
 def _is_s3(uri: str) -> bool:
@@ -135,33 +193,39 @@ class Store:
                     pa.BufferReader(self._ranged_download(read_path, size)),
                     columns=columns,
                 )
-        return pq.read_table(read_path, filesystem=self.fs, columns=columns)
+        # Arrow-native read with column projection, parallel I/O, and decoding.
+        # Faster for files with many row groups; use io_ranged_get for few row groups.
+        return pq.read_table(read_path, filesystem=self.fs, columns=columns,
+                             pre_buffer=True, use_threads=True)
 
     def _ranged_download(self, read_path: str, size: int):
-        """The whole file via _RANGED_GET_CONCURRENCY concurrent byte-range
-        reads into one buffer (see the module comment above the constants).
-        Built from FileSystem API (`open_input_file`/`read_at`), so it runs
-        unchanged on s3 and on POSIX roots.
+        """Download a file using concurrent byte-range reads on S3 or POSIX.
 
-        `read_at` is documented thread-safe on one Arrow file handle and a
-        failed range re-raises out of the pool — the reader thread's existing
-        try/except turns that into a loud run failure, same as any other read
-        error. The raw buffer is dropped as soon as `read_columns` finishes
-        parsing (parquet decompression copies out of it), so peak memory adds
-        one file's raw size only while that file is being parsed."""
+        Limits per-file concurrency using the shared fetch pool. Copies release
+        the GIL; failed reads propagate after in-flight requests finish.
+        Temporarily requires one file's size in host RAM.
+        """
         data = np.empty(size, dtype=np.uint8)
-        view = memoryview(data)
+        width = max(1, self.ranged_get_concurrency)
+        pool = _fetch_pool()
         with self.fs.open_input_file(read_path) as f:
             def fetch(lo: int) -> None:
                 hi = min(lo + _RANGED_GET_BYTES, size)
-                view[lo:hi] = f.read_at(hi - lo, lo)
+                _copy_range(data[lo:hi], f.read_at(hi - lo, lo))
 
-            with ThreadPoolExecutor(max_workers=self.ranged_get_concurrency) as pool:
-                for fut in [
-                    pool.submit(fetch, lo)
-                    for lo in range(0, size, _RANGED_GET_BYTES)
-                ]:
+            pending: set = set()
+            try:
+                for lo in range(0, size, _RANGED_GET_BYTES):
+                    if len(pending) >= width:
+                        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        for fut in done:
+                            fut.result()
+                    pending.add(pool.submit(fetch, lo))
+                done, pending = wait(pending)
+                for fut in done:
                     fut.result()
+            finally:
+                wait(pending)
         return pa.py_buffer(data)
 
     def write(self, filename: str, table: pa.Table) -> str:
@@ -191,42 +255,57 @@ class Store:
         return path
 
 
-def dense_to_2d(col: pa.ChunkedArray) -> np.ndarray:
-    """A list/fixed-size-list-of-float column → a contiguous (n, dim) array in
-    the STORED float dtype.
+def dense_to_2d(col) -> np.ndarray:
+    """Convert an Arrow list column to a contiguous, NumPy-owned (n, dim) array.
 
-    Avoids per-row Python conversion: flattens the Arrow values buffer once and
-    reshapes. Assumes a uniform vector dimension and no null rows (always true
-    for embedding output).
-
-    It used to upcast to float32 here, unconditionally. On a fineweb corpus
-    file — 1.09 M rows x 768 dims stored as `halffloat` — that allocated
-    3.35 GB and spent ~2.2 s per file per reader thread widening bytes that
-    the GPU is about to receive anyway, and then sent 3.35 GB over PCIe
-    instead of 1.67 GB. The cast now happens on the DEVICE, inside
-    `compute.DenseCorpusBatch.transfer`, which is the only other place in the
-    system that is allowed to know the stored dtype: everything downstream of
-    `transfer` sees float32, exactly as before, and `transfer` asserts it.
-    The scores cannot move — widening float16 to float32 is exact, so the
-    float32 matrix the GPU ends up with is bit-identical to the one the host
-    used to build.
+    Validates uniform dimensions and non-null rows. Preserves float16/float32
+    to avoid unnecessary CPU conversion and PCIe traffic; other types use
+    float32. Copies release the GIL, avoiding GPU stalls from Arrow buffer
+    cleanup. Float16 conversion to float32 occurs on the GPU.
     """
-    col = col.combine_chunks()
-    n = len(col)
+    chunks = list(col.chunks) if isinstance(col, pa.ChunkedArray) else [col]
+    n = sum(len(c) for c in chunks)
     if n == 0:
         return np.zeros((0, 0), dtype=np.float32)
-    if pa.types.is_fixed_size_list(col.type):
-        dim = col.type.list_size
-        flat = col.flatten().to_numpy(zero_copy_only=False)
-    else:  # variable-length list, uniform width in practice
-        flat = col.values.to_numpy(zero_copy_only=False)
-        dim = len(flat) // n
-    if flat.dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
-        # float64, or an integer-typed list: widen once, here. Only float16
-        # and float32 are worth carrying at their stored width, and only
-        # those two widen to float32 exactly.
-        flat = flat.astype(np.float32, copy=False)
-    return np.ascontiguousarray(flat.reshape(n, dim))
+    typ = chunks[0].type
+    fixed = pa.types.is_fixed_size_list(typ)
+    if not (fixed or pa.types.is_list(typ) or pa.types.is_large_list(typ)):
+        raise TypeError(f"dense column must be a list of floats, got {typ}")
+    parts: list[tuple[int, np.ndarray]] = []
+    dim = typ.list_size if fixed else None
+    for ch in chunks:
+        if len(ch) == 0:
+            continue
+        if ch.null_count:
+            raise ValueError(
+                f"dense column has {ch.null_count} null row(s); every corpus "
+                "and query row needs a vector"
+            )
+        if not fixed:
+            # Uniform width, checked: O(rows), not O(values).
+            lens = np.diff(ch.offsets.to_numpy(zero_copy_only=False))
+            if dim is None:
+                dim = int(lens[0])
+            if not (lens == dim).all():
+                raise ValueError(
+                    f"dense column is ragged: list lengths {int(lens.min())}.."
+                    f"{int(lens.max())}, a dense vector needs one width"
+                )
+        # `flatten` honours a sliced chunk's logical offset for both list kinds.
+        parts.append((len(ch), ch.flatten().to_numpy(zero_copy_only=False)))
+    src = parts[0][1].dtype
+    dtype = src if src in (np.dtype(np.float16), np.dtype(np.float32)) else np.dtype(np.float32)
+    out = np.empty((n, dim), dtype=dtype)
+    r = 0
+    for rows, flat in parts:
+        if flat.size != rows * dim:
+            raise ValueError(
+                f"dense column chunk holds {flat.size} values for {rows} rows "
+                f"of width {dim}"
+            )
+        np.copyto(out[r:r + rows], flat.reshape(rows, dim), casting="unsafe")
+        r += rows
+    return out
 
 
 def _stitch_ragged_chunks(chunks: list) -> tuple[np.ndarray, np.ndarray]:

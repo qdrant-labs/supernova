@@ -29,9 +29,9 @@ just the easy one:
 
 It also runs both corpus dense dtypes. The narrowing's safety argument is
 REFCOUNTING, not copying, and since R3 stopped widening float16 in
-`dense_to_2d` BOTH dtypes are zero-copy views into the Arrow buffer — so both
-are now the case where a mistaken in-place mutation of `arrs`, or a dropped
-reference, would corrupt or free live Arrow memory. Production is fp16.
+`dense_to_2d` both dtypes take the same path. (`dense_to_2d` now returns a
+numpy-owned copy, so `arrs` no longer aliases Arrow memory; the test still
+guards every other narrowed reference.) Production is fp16.
 """
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ def _make_data(root: pathlib.Path, dense_dtype: str = "float32") -> pathlib.Path
     float column and on a date column).
 
     `dense_dtype` selects the corpus dense storage type: "float16" is
-    production. Since R3 both are zero-copy views into the Arrow buffer.
+    production. Both take the same `dense_to_2d` path.
     Queries stay fp32 either way, as in production.
     """
     rng = np.random.default_rng(5)

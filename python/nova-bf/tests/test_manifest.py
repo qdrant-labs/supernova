@@ -233,7 +233,7 @@ def test_single_node_manifest_describes_the_run(ds, tmp_path, monkeypatch):
     assert fp["first"].endswith("f0.parquet") and fp["last"].endswith("f1.parquet")
 
     # `params` is what RAN: sizes resolved at runtime, not the configured nulls.
-    assert doc["params"]["batch_size_by_vector_type"] == {"dense": None}
+    assert doc["params"]["batch_size_by_vector_type"] == {"dense": 8192}  # the dense_batch_size default
 
     assert doc["counts"]["queries_in_file"] == 4
     assert doc["counts"]["queries_searched"] == 4  # no search subsets its rows

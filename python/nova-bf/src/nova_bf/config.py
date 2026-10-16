@@ -170,46 +170,15 @@ class ParamsConfig(BaseModel):
     # the I/O thread pool. 0 uses os.cpu_count() rather than PyArrow's default,
     # which may inherit OMP_NUM_THREADS and unintentionally serialize decoding.
     cpu_thread_count: int = 0
-    # Opt-in: read each large corpus/queries parquet as MANY concurrent byte
-    # ranges before parsing (the `aws s3 cp` strategy). Files written with a
-    # large flush threshold hold ~ONE row group, so a single-column read
-    # degenerates into one sequential stream that `io_thread_count` cannot
-    # speed up; this restores full-bandwidth reads regardless of the file's
-    # internal layout, on s3 and POSIX roots alike, at the cost of one file's
-    # raw bytes of extra host RAM while that file is parsed. OFF by default.
+    # Use concurrent byte-range reads for large Parquet files with few row groups,
+    # improving I/O throughput at the cost of extra host RAM (~one file size).
+    # Disabled by default; Arrow-native reads are preferable for many row groups.
     io_ranged_get: bool = False
-    # Bounds the per-file score matrix (`queries × rows`) for dense/sparse
-    # searches respectively — a big file (or large query set) can otherwise
-    # OOM the GPU; set this to score in row-batches instead of the whole file
-    # at once. None (default) = whole file (or, if every search of that
-    # vector_type has an active filter, the UNION of their surviving rows —
-    # see compute.py's `_union_keep`) in one matmul. Lives here (one value
-    # per vector_type, run-wide) rather than per-search: every search of a
-    # given vector_type ends up sharing one GPU pass over the corpus anyway
-    # (see compute.py), so a per-search value would just be resolved down to
-    # this same shared number regardless — this makes that explicit instead
-    # of implicit. `SearchSpec.rows` does NOT change that: the shared score
-    # matrix spans the vector_type's whole query-row union and each search
-    # slices its own rows out of it AFTER scoring, so what this bounds is
-    # still one matrix per vector_type, not one per search.
-    # A value below some search's own `k` is never raised —
-    # only warned about (that search just needs extra merge rounds to fill
-    # its own top-K, at no extra memory cost to anyone).
-    #
-    # When every search of a vector_type has an active filter, this is now
-    # the ONLY memory bound on that vector_type's shared pass: the union of
-    # several large, mostly-disjoint filters can be nearly as big as the
-    # whole file, transferred/scored in one shot if this is left at its
-    # None default — set it explicitly if you have several such filters and
-    # relied on each one's own (typically much smaller) surviving-row count
-    # bounding memory implicitly.
-    # `gt=0`: a batch size of 0 or negative isn't just useless, it's actively
-    # wrong — `range(0, n_rows, step)` with a non-positive `step` is EMPTY, so
-    # every file's batch loop would silently skip all rows, no exception, no
-    # partial results, just an empty top-K for every query. Reject it here at
-    # config-load time (the system boundary) rather than let it manifest as a
-    # silent all-empty run downstream.
-    dense_batch_size: int | None = Field(default=None, gt=0)
+    # Maximum rows scored per GPU batch for dense searches to limit memory usage.
+    # Shared across searches of this vector type. None processes the entire file
+    # (or union of filtered rows). Defaults to 8192 for efficient Triton top-K;
+    # larger batches may fall back to slower selection.
+    dense_batch_size: int | None = Field(default=8192, gt=0)
     sparse_batch_size: int | None = Field(default=None, gt=0)
     # Sparse scoring only. When the dense corpus operand exceeds the swap-memory
     # budget, chunk rows and stay on the faster, more reproducible dense GEMM path.
