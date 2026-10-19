@@ -26,6 +26,16 @@ from nova_bf.dates import is_epoch_format, normalize_date_fields, parse_scalar_e
 
 import os
 
+# The default pass-two mode (`ParamsConfig.two_pass_rescore`). Lives here, not
+# in `twopass`, so the config stays importable without torch/triton. `tiles`
+# since 2026-10-17 (validated on A10G: exact recall, every score within the
+# proven per-score tolerance); `slice` is the bit-identical-to-one-pass choice.
+TWO_PASS_RESCORE_DEFAULT = "tiles"
+# The default for `ParamsConfig.pipeline_pass_one` (and so for every run that
+# does not set it). On since 2026-10-17 (validated on A10G: output
+# byte-identical to unpipelined, late-file GPU time 1.39 -> 1.11 s/file).
+PIPELINE_PASS_ONE_DEFAULT = True
+
 _ENV_RE = re.compile(r"\$\{([^}]+)\}")
 
 
@@ -275,6 +285,19 @@ class ParamsConfig(BaseModel):
     # path when its runtime eligibility, safety, and crossover checks agree;
     # `off` always uses the ordinary one-pass fp32 path.
     two_pass: Literal["auto", "off"] = "auto"
+    # Second-pass rescoring: `slice` uses a verified-height cuBLAS GEMM,
+    # producing byte-identical one-pass scores. `tiles` (default) rescores
+    # only live query/tile pairs, reducing work but changing FP32 summation
+    # order and potentially near-tie rankings. Both prune safely.
+    # Override with NOVA_BF_TWOPASS_RESCORE.
+    two_pass_rescore: Literal["slice", "tiles"] = TWO_PASS_RESCORE_DEFAULT
+
+    # Launch dense pass one ahead on a side stream to overlap host bookkeeping.
+    # Decisions still use current thresholds. Adds one corpus slice and its
+    # pass-one outputs to GPU memory. `slice` mode remains byte-identical;
+    # `tiles` may differ if added memory pressure triggers a fallback.
+    # Override with NOVA_BF_PIPELINE_PASS_ONE (0 disables).
+    pipeline_pass_one: bool = PIPELINE_PASS_ONE_DEFAULT
     # Merge partials in row batches and stream results to disk to bound memory.
     # `None` auto-sizes for ~20M candidate slots; set explicitly to trade more
     # memory for larger batches and fewer parquet row groups. Merge warns when 

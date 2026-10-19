@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import pytest
 
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "slice_only: a two-pass test of slice-mode-only machinery (padded "
+        "GEMM heights, shape verification); skipped in the tiles-mode run")
+
 _MERGE_ENV = (
     "NOVA_BF_MERGE_FORCE", "NOVA_BF_MERGE_WINDOW",
     # Same property as the merge overrides: both are meant to be EXPORTED to

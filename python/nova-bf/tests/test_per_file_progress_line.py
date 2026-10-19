@@ -256,7 +256,9 @@ def test_the_twopass_line_reports_per_file_deltas(tmp_path, caplog, monkeypatch)
     from nova_bf import twopass
 
     # Fixture scale. None of these is a correctness parameter (see
-    # `tests/test_twopass_pipeline.py`); the run has 6 query rows.
+    # `tests/test_twopass_pipeline.py`); the run has 6 query rows. Slice mode
+    # pinned (the default is `tiles`): the knobs below open slice mode's gate.
+    monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", "slice")
     monkeypatch.setenv("NOVA_BF_TWOPASS_ON_CPU", "1")
     monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", "1.0")
     monkeypatch.setattr(twopass, "PAD_QUANTUM", 2)

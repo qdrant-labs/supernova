@@ -33,6 +33,9 @@ FORCED_KEY = b"nova_bf.merge_forced"
 # thresholds.py). A partial written with it is only exact alongside every other
 # rank of the same run, so a merge missing a rank cannot be forced.
 EXCHANGE_KEY = b"nova_bf.threshold_exchange"
+# Present only on results scored with tiles-mode pass two ("tiles"), or a
+# merge of partials some of which were ("mixed"). See `provenance`.
+RESCORE_KEY = b"nova_bf.two_pass_rescore"
 NUM_JOBS_KEY = b"nova_bf.num_jobs"
 JOB_RANK_KEY = b"nova_bf.job_rank"
 
@@ -113,6 +116,13 @@ def vector_dtype(schema: pa.Schema, column: str) -> str:
             break
     name = str(t)
     return _DTYPE_NAMES.get(name, name)
+
+
+def _rescore_configured(cfg: BruteForceConfig) -> str:
+    """The pass-two mode a compute run uses: `NOVA_BF_TWOPASS_RESCORE` if it
+    names a mode (as `twopass.rescore_mode` reads it), else the config."""
+    raw = os.environ.get("NOVA_BF_TWOPASS_RESCORE", "").strip().lower()
+    return raw if raw in ("slice", "tiles") else cfg.params.two_pass_rescore
 
 
 def config_identity(cfg: BruteForceConfig, spec: SearchSpec) -> str:
@@ -197,6 +207,7 @@ def provenance(
     forced: bool = False,
     inputs_forced: bool = False,
     threshold_exchange: str | bool = False,
+    two_pass_rescore: str | None = None,
 ) -> dict[bytes, bytes]:
     """How this ground truth was computed, for the parquet schema metadata.
 
@@ -253,6 +264,18 @@ def provenance(
         value = (dtypes or {}).get(key)
         if value:
             meta[f"nova_bf.{key}"] = value
+    # Tiles mode changes FP32 summation order, so scores may differ slightly
+    # from cuBLAS. Record this only for eligible dense two-pass searches.
+    # Slice mode leaves metadata unchanged. Exclude from `config_identity`
+    # since both modes produce mergeable FP32 ground truth.
+    # Merges inherit the mode ("tiles", "mixed", or None) from their partials.
+    if reducing:
+        if two_pass_rescore:
+            meta[RESCORE_KEY.decode()] = two_pass_rescore
+    elif (spec.vector_type == "dense" and spec.metric in ("cosine", "dot")
+          and cfg.params.two_pass == "auto"
+          and _rescore_configured(cfg) == "tiles"):
+        meta[RESCORE_KEY.decode()] = "tiles"
     out = {k.encode(): v.encode() for k, v in meta.items()}
     # Which tie-break rule decided the exact ties in these rows. Stamped HERE,
     # rather than where the table is built, because there are two builders — a

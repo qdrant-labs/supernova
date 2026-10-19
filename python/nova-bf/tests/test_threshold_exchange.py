@@ -578,19 +578,26 @@ def _mk_modes(cdir, qpath, out, exchange, tiebreak):
     )
 
 
-@pytest.mark.parametrize("twopass", [False, True])
+@pytest.mark.parametrize("twopass", [False, "slice", "tiles"])
 @pytest.mark.parametrize("tiebreak", ["ordinal", "id"])
 @pytest.mark.parametrize("nj", [2, 3])
 def test_metrics_tiebreaks_and_two_pass(tmp_path, monkeypatch, twopass, tiebreak, nj):
     """Cosine, euclidean (negative distances) and dot with a `rows` subset;
     both tie-break modes; the FP16 two-pass forced on (CPU) with dead rows
-    poisoned so a wrongly pruned row cannot pass unnoticed."""
+    poisoned so a wrongly pruned row cannot pass unnoticed -- in both pass-two
+    modes (tiles mode compared near-tie-aware: its scores may move an ULP)."""
     monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
     monkeypatch.setenv("NOVA_BF_POISON_DEAD_ROWS", "1")
     if twopass:
         monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", "1.0")
         monkeypatch.setenv("NOVA_BF_TWOPASS_ON_CPU", "1")
         monkeypatch.setenv("NOVA_BF_TWOPASS_FORCE_ENGAGE", "1")
+        monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", twopass)
+        if twopass == "tiles":
+            from nova_bf import twopass as _tp
+            monkeypatch.setenv("NOVA_BF_TWOPASS_TILE_THRESHOLD", "1.0")
+            monkeypatch.setattr(_tp, "CPU_TILE", 4)
+            monkeypatch.setattr(_tp, "TILE_CROSSOVER", 1.0)
     cdir, qpath = _dataset(tmp_path, n_files=9, rows=48, n_q=24, seed=5)
     s_out = tmp_path / "s"; s_out.mkdir()
     single = {n: pq.read_table(p).to_pydict()
@@ -600,7 +607,17 @@ def test_metrics_tiebreaks_and_two_pass(tmp_path, monkeypatch, twopass, tiebreak
     for r in range(nj):
         run_compute(cfg, num_jobs=nj, job_rank=r)
     merged = {n: pq.read_table(p).to_pydict() for n, p in run_merge(cfg).items()}
-    _assert_same(merged, single)
+    if twopass == "tiles":
+        from twopass_compare import assert_same_results, norm_product, tolerance
+        cols = ("query_id", "hit_ids", "hit_scores")
+        # The gamma_d bound at the dot search's B = max|q|max|c| (>= cosine's 1).
+        tol = tolerance(DIM, max(1.0, norm_product(cdir, qpath)))
+        for name in single:
+            assert_same_results({c: merged[name][c] for c in cols},
+                                {c: single[name][c] for c in cols},
+                                abs_tol=tol, label=name)
+    else:
+        _assert_same(merged, single)
     json.dumps(_manifests(str(out)))
 
 

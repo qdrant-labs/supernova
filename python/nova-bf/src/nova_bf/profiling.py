@@ -146,6 +146,23 @@ def parse_window():
     return lo, hi
 
 
+def _all_threads_config():
+    """Kineto config that records ops from EVERY thread, or `None`.
+
+    By default the profiler records only the thread that opened it. Work on
+    other threads, such as the dense staging helper's `bf_prefetch_stage` marks
+    and host copies in `compute._run_dense_prefetch`, would be missing from the
+    trace. Reader and decode threads appear too, which makes traces larger.
+    `profile_all_threads` is a private, version-dependent option. Older torch
+    builds without it profile only the opening thread, as before.
+    """
+    try:
+        from torch._C._profiler import _ExperimentalConfig
+        return _ExperimentalConfig(profile_all_threads=True)
+    except (ImportError, AttributeError, TypeError):
+        return None
+
+
 def start(n: int) -> None:
     """Open the window if file `n` (1-based) is its first file."""
     w = _PROF["window"]
@@ -157,7 +174,13 @@ def start(n: int) -> None:
     acts = [ProfilerActivity.CPU]
     if torch.cuda.is_available():
         acts.append(ProfilerActivity.CUDA)
-    _PROF["prof"] = profile(activities=acts, record_shapes=False, with_stack=False)
+    kw = {}
+    all_threads = _all_threads_config()
+    if all_threads is not None:
+        kw["experimental_config"] = all_threads
+    _PROF["prof"] = profile(
+        activities=acts, record_shapes=False, with_stack=False, **kw
+    )
     _PROF["prof"].__enter__()
     _PROF["active"] = True
     # `n` as well as the window: the window is what was REQUESTED, and a test

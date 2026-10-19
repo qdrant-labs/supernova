@@ -43,6 +43,7 @@ from nova_bf.results import (
     NUM_JOBS_KEY,
     RESERVED,
     EXCHANGE_KEY,
+    RESCORE_KEY,
     RUN_KEY,
     TIEBREAK_KEY,
     config_identity,
@@ -1958,6 +1959,12 @@ def _reduce(
     exchange_stamp: str | bool = (
         (_xids.pop() if len(_xids) == 1 else "mixed") if exchange_active else False
     )
+    # Tiles-mode provenance comes from the partials, never from this merge's
+    # own config or environment: "tiles" when every partial carries it,
+    # "mixed" when only some do.
+    _rescore = {(r.schema_arrow.metadata or {}).get(RESCORE_KEY) for r in readers}
+    rescore_stamp = (None if _rescore == {None}
+                     else "tiles" if _rescore == {b"tiles"} else "mixed")
     # Validate that all partials belong to the same complete compute run.
     run_sha = _validate_one_run(cfg, spec, partials, readers, forced, exchange_active)
     for f, r in zip(partials, readers):
@@ -2303,7 +2310,8 @@ def _reduce(
                 provenance(cfg, spec, carried_dtypes, run_sha=run_sha,
                            reducing=True, num_jobs=len(partials),
                            forced=forced, inputs_forced=inputs_forced,
-                           threshold_exchange=exchange_stamp)
+                           threshold_exchange=exchange_stamp,
+                           two_pass_rescore=rescore_stamp)
             )
             if writer is None:
                 writer = pq.ParquetWriter(sink, table.schema, compression="snappy")

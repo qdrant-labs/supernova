@@ -28,6 +28,7 @@ import pyarrow.parquet as pq
 
 from nova_bf import compute
 from nova_bf import twopass
+from twopass_compare import assert_same, tolerance
 from nova_bf.compute import run_compute
 from nova_bf.config import (
     BruteForceConfig,
@@ -46,7 +47,18 @@ DIM, K, NQ = 64, 5, 64
 BATCH = 64
 
 
+# Every fixture vector here is standard normal in DIM=64, written through
+# `_write`, which enforces this norm cap -- so `max|q| * max|c| <= NORM_MAX**2`
+# bounds the dot metric's `sum|q_i c_i|` (cosine's is 1), and tiles mode's
+# honest comparison tolerance is `tolerance(DIM, NORM_MAX**2)`.
+NORM_MAX = 13.0
+
+
 def _write(path, vectors, **columns):
+    assert float(np.linalg.norm(np.asarray(vectors, dtype=np.float64),
+                                axis=1).max(initial=0.0)) <= NORM_MAX, (
+        "a fixture vector exceeds NORM_MAX, so TILES_TOL no longer bounds "
+        "tiles mode's score differences")
     data = {"dense_embedding": pa.array(vectors.tolist(),
                                         type=pa.list_(pa.float32()))}
     data.update({k: pa.array(v) for k, v in columns.items()})
@@ -96,14 +108,49 @@ def _cfg(ds, out, metric="cosine", tiebreak="ordinal") -> BruteForceConfig:
     )
 
 
-@pytest.fixture(autouse=True)
-def _small_twopass(monkeypatch):
-    """Scale the two-pass down to fixture size.
+# The pass-two mode the current test runs in; see `_small_twopass`.
+MODE = "slice"
+
+
+TILES_TOL = tolerance(DIM, NORM_MAX ** 2)
+
+
+def _same(got, want, label=""):
+    """Byte identity in slice mode; near-tie-aware equality in tiles mode,
+    within the gamma_d bound on its summation-order difference (see
+    `twopass_compare`)."""
+    assert_same(MODE, got, want, label, abs_tol=TILES_TOL)
+
+
+@pytest.fixture(autouse=True, params=["slice", "tiles"])
+def _small_twopass(monkeypatch, request):
+    """Scale the two-pass down to fixture size, in each pass-two mode.
 
     `PAD_FLOOR` / `PAD_QUANTUM` are the GEMM heights that keep cuBLAS on one
     kernel; `MIN_QUERY_ROWS` is the height below which pass one cannot pay for
     itself. Neither is a correctness parameter.
+
+    Every test runs in both `params.two_pass_rescore` modes (set through
+    `NOVA_BF_TWOPASS_RESCORE`, which overrides the config) unless marked
+    `slice_only` -- for the padded-height machinery tiles mode never uses.
+    Tiles mode shrinks `CPU_TILE` to 16 so a 64-row fixture slice has four
+    tiles, and opens its own engage gate as `NOVA_BF_TWOPASS_THRESHOLD` opens
+    slice mode's.
     """
+    global MODE
+    MODE = request.param
+    if MODE == "tiles" and request.node.get_closest_marker("slice_only"):
+        pytest.skip("slice-mode machinery (padded heights / verification)")
+    if MODE == "tiles":
+        monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", "tiles")
+        monkeypatch.setenv("NOVA_BF_TWOPASS_TILE_THRESHOLD", "1.0")
+        monkeypatch.setattr(twopass, "CPU_TILE", 16)
+        # The per-slice crossover bail is opened like the engage gate, so
+        # every engaged slice exercises the tile path.
+        monkeypatch.setattr(twopass, "TILE_CROSSOVER", 1.0)
+    else:
+        # Pinned, not left to the default (`tiles` since 2026-10-17).
+        monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", "slice")
     monkeypatch.setattr(twopass, "PAD_QUANTUM", 8)
     monkeypatch.setattr(twopass, "PAD_FLOOR", 8)
     monkeypatch.setattr(twopass, "PAD_SMALL", ())
@@ -199,7 +246,7 @@ def test_results_are_identical_with_and_without_the_two_pass(
         f"was never exercised: {stats}"
     )
     for name in off:
-        assert on[name].equals(off[name]), f"{name} differs"
+        _same(on[name], off[name], f"{name} differs")
 
 
 def test_identical_with_dead_rows_poisoned(ds, tmp_path, monkeypatch):
@@ -212,9 +259,10 @@ def test_identical_with_dead_rows_poisoned(ds, tmp_path, monkeypatch):
     on, stats = _run(ds, tmp_path / "on", monkeypatch, twopass_on=True)
     assert stats["slices_twopass"] > 0
     for name in off:
-        assert on[name].equals(off[name]), f"{name} differs under poisoning"
+        _same(on[name], off[name], f"{name} differs under poisoning")
 
 
+@pytest.mark.slice_only
 def test_a_failed_shape_verification_disables_the_feature(
     ds, tmp_path, monkeypatch
 ):
@@ -233,7 +281,7 @@ def test_a_failed_shape_verification_disables_the_feature(
     ref, _ = _run(ds, tmp_path / "ref", monkeypatch, twopass_on=False)
     got = _tables(out)
     for name in ref:
-        assert got[name].equals(ref[name])
+        _same(got[name], ref[name])
 
 
 def _cfg_union(ds, out, k_sub, k_all):
@@ -319,9 +367,9 @@ def test_a_whole_matrix_member_unions_its_live_rows_instead_of_replacing_them(
         a = list(out.rglob(f"*_{name}_k*/rank000.parquet"))
         b = list(ref.rglob(f"*_{name}_k*/rank000.parquet"))
         assert len(a) == 1 and len(b) == 1, f"{name}: {a} {b}"
-        assert pq.read_table(a[0]).equals(pq.read_table(b[0])), (
+        _same(pq.read_table(a[0]), pq.read_table(b[0]), (
             f"{name} differs from the one-pass result — rows a sibling "
-            f"member needed were dropped from the shared live mask")
+            f"member needed were dropped from the shared live mask"))
 
 
 def _cfg_narrow(ds, out, k, batch):
@@ -377,11 +425,12 @@ def test_a_slice_narrower_than_k_scatters_its_shared_id_vector(
     a = list(out.rglob("*_all_k8/rank000.parquet"))
     b = list(ref.rglob("*_all_k8/rank000.parquet"))
     assert len(a) == 1 and len(b) == 1, f"{a} {b}"
-    assert pq.read_table(a[0]).equals(pq.read_table(b[0])), (
+    _same(pq.read_table(a[0]), pq.read_table(b[0]), (
         "a slice narrower than k produced different results under the "
-        "two-pass than under the one-pass path")
+        "two-pass than under the one-pass path"))
 
 
+@pytest.mark.slice_only
 def test_a_verification_that_never_completed_does_not_disable_the_feature(
     ds, tmp_path, monkeypatch, caplog
 ):
@@ -438,7 +487,7 @@ def test_a_verification_that_never_completed_does_not_disable_the_feature(
     ref, _ = _run(ds, tmp_path / "ref_unverified", monkeypatch, twopass_on=False)
     got = _tables(out)
     for name in ref:
-        assert got[name].equals(ref[name])
+        _same(got[name], ref[name])
 
 
 def test_the_query_cache_is_released_even_when_the_run_raises(
@@ -534,9 +583,9 @@ def test_a_bound_that_does_not_hold_disables_the_two_pass_before_it_prunes(
     ref, _ = _run(ds, tmp_path / "ref_bad_bound", monkeypatch, twopass_on=False)
     got = _tables(out)
     for name in ref:
-        assert got[name].equals(ref[name]), (
+        _same(got[name], ref[name], (
             f"{name}: falling back after a failed certification changed the "
-            f"results")
+            f"results"))
 
 
 def test_every_distinct_execution_configuration_is_certified_separately(
@@ -600,7 +649,7 @@ def test_every_distinct_execution_configuration_is_certified_separately(
         x = list(out.rglob(f"*_{name}_k{K}/rank000.parquet"))
         y = list(ref_out.rglob(f"*_{name}_k{K}/rank000.parquet"))
         assert len(x) == 1 and len(y) == 1
-        assert pq.read_table(x[0]).equals(pq.read_table(y[0])), name
+        _same(pq.read_table(x[0]), pq.read_table(y[0]), name)
 
 
 def test_a_dense_batch_can_never_have_two_eligible_score_groups(ds, tmp_path):
@@ -683,7 +732,7 @@ def test_certification_actually_consults_the_accumulator_guard(
     ref, _ = _run(ds, tmp_path / "not_ours_ref", monkeypatch, twopass_on=False)
     got = _tables(out)
     for name in ref:
-        assert got[name].equals(ref[name])
+        _same(got[name], ref[name])
 
 
 def test_the_cpu_path_is_not_refused_since_its_accumulation_is_also_ours(
@@ -779,7 +828,9 @@ def test_an_eligibility_refusal_is_distinguishable_in_the_manifest(
         "was eligible and simply never triggered")
 
 
-def test_a_pass_one_oom_does_not_fabricate_a_live_hint(ds, tmp_path, monkeypatch):
+@pytest.mark.parametrize("pipeline", ["0", "1"])
+def test_a_pass_one_oom_does_not_fabricate_a_live_hint(ds, tmp_path, monkeypatch,
+                                                       pipeline):
     """An all-live bound after a failed allocation is not a MEASUREMENT.
 
     `_TP_LIVE_HINT` is what the gate in `_twopass_groups` reads to decide the
@@ -790,41 +841,53 @@ def test_a_pass_one_oom_does_not_fabricate_a_live_hint(ds, tmp_path, monkeypatch
     that seeds the hint is already off by then, so the group cannot recover
     until the next one.
 
-    The oracle is "one fewer write than there were slices", NOT "no hint is
-    ever 1.0": a run's first slices are legitimately all-live, because the
-    top-K state is empty and every threshold is still -inf. The OOM is
-    injected well after that, so a real 1.0 cannot be confused with a
-    fabricated one.
+    The oracle is "no 1.0 written while the OOM'd slice is being decided",
+    NOT "no hint is ever 1.0": a run's first slices are legitimately
+    all-live, because the top-K state is empty and every threshold is still
+    -inf. The OOM is injected well after that, so a real 1.0 cannot be
+    confused with a fabricated one.
+
+    The OOM is keyed on the SLICE, at `approx_rowmax` -- the real allocation
+    failure path -- so it holds with pass-one pipelining on and off
+    (`pipeline`): pipelined, the slice's pass one is launched ahead through
+    `upper_bounds_begin` (not `upper_bounds`), runs out of memory there, and
+    fails again in the inline retry.
     """
     import torch
 
     from nova_bf import compute as compute_mod
 
-    real = twopass.upper_bounds
-    calls = []
+    monkeypatch.setenv("NOVA_BF_PIPELINE_PASS_ONE", pipeline)
     OOM_ON = 5                      # past the naturally all-live warm-up
 
-    def oom_on_the_fifth(Q, Cb, col_scale, row_scale, out_dtype, **kw):
-        calls.append(1)
-        if len(calls) == OOM_ON:
-            twopass._STATS["slices_pass_one_oom"] += 1
-            live = torch.full((int(Q.shape[0]),), float("inf"),
-                              dtype=torch.float32, device=Q.device)
-            # `with_parts` is what certification asks for; an all-live return
-            # has no pass one, so the parts are the refusal and a zero bound.
-            res = ((live, live, torch.zeros_like(live))
-                   if kw.get("with_parts") else live)
-            # `with_outcome` too. `_certify_two_pass` unpacks `(result,
-            # outcome)`, so a bare result raises ValueError *out of*
-            # `_twopass_prepare` and kills the run. This passed only by luck of
-            # ordering: of 23 upper_bounds calls exactly one asks for the
-            # outcome, and OOM_ON happens not to be it. Changing OOM_ON, adding
-            # a second score group, or anything that re-certifies mid-run would
-            # turn this into a ValueError that looks like a product bug.
-            if kw.get("with_outcome"):
-                return res, twopass.PassOneOutcome(twopass.PASS_ONE_OOM)
-            return res
-        return real(Q, Cb, col_scale, row_scale, out_dtype, **kw)
+    def key(Cb):
+        return tuple(float(v) for v in Cb[0, :8].float()) if Cb.shape[0] else None
+
+    seen = []                       # distinct slices to reach pass one, in order
+    state = {"pass_one": None, "deciding": None, "oom": None, "fired": 0}
+    real_ub = twopass._upper_bounds
+
+    def spy_ub(Q, Cb, *a, **kw):
+        k = state["pass_one"] = key(Cb)
+        if k not in seen:
+            seen.append(k)
+            if len(seen) == OOM_ON:
+                state["oom"] = k
+        return (yield from real_ub(Q, Cb, *a, **kw))
+
+    real_rowmax = twopass.approx_rowmax
+
+    def rowmax(*a, **kw):
+        if state["pass_one"] is not None and state["pass_one"] == state["oom"]:
+            state["fired"] += 1
+            raise twopass.PassOneUnavailable("CUDA out of memory (test)")
+        return real_rowmax(*a, **kw)
+
+    real_prepare = compute_mod._twopass_prepare
+
+    def prepare(tp_groups, sl, *a, **kw):
+        state["deciding"] = key(sl.Cb)
+        return real_prepare(tp_groups, sl, *a, **kw)
 
     class Recording(dict):
         """Tag each write with how many pass ones have run when it happens.
@@ -838,28 +901,41 @@ def test_a_pass_one_oom_does_not_fabricate_a_live_hint(ds, tmp_path, monkeypatch
         empty, so every threshold is still -inf.
 
         What identifies the fabrication exactly: a write of 1.0 made while
-        the OOM'd slice is the most recent pass one.
+        the OOM'd slice is being decided.
         """
 
         writes = []
 
         def __setitem__(self, k, v):
-            Recording.writes.append((v, len(calls)))
+            Recording.writes.append(
+                (v, state["oom"] is not None
+                 and state["deciding"] == state["oom"]))
             super().__setitem__(k, v)
 
     Recording.writes = []
-    monkeypatch.setattr(twopass, "upper_bounds", oom_on_the_fifth)
+    monkeypatch.setattr(twopass, "_upper_bounds", spy_ub)
+    monkeypatch.setattr(twopass, "approx_rowmax", rowmax)
+    monkeypatch.setattr(compute_mod, "_twopass_prepare", prepare)
     monkeypatch.setattr(compute_mod, "_TP_LIVE_HINT", Recording())
     out = tmp_path / "no_fabricated_hint"
     out.mkdir()
     twopass.reset()
     run_compute(_cfg(ds, out), num_jobs=1, job_rank=0)
 
-    assert len(calls) > OOM_ON, (
-        f"only {len(calls)} slices reached pass one, so the injected OOM "
+    assert len(seen) > OOM_ON, (
+        f"only {len(seen)} slices reached pass one, so the injected OOM "
         f"was never the non-warm-up case this test is about")
+    st = twopass.stats()
+    assert state["fired"] and st["slices_pass_one_oom"] == 1, (state, st)
+    if pipeline == "1":
+        # The OOM'd slice WAS launched ahead, and the launch's OOM is the one
+        # that had to be retried inline (and failed again there).
+        assert st["pipeline_used"] > 0 and st["pipeline_retried"] >= 1, st
+        assert state["fired"] >= 2, state
+    else:
+        assert st["pipeline_launched"] == 0 and state["fired"] == 1, (state, st)
     assert Recording.writes, "no hint was ever recorded"
-    fabricated = [v for v, n in Recording.writes if n == OOM_ON and v == 1.0]
+    fabricated = [v for v, oom in Recording.writes if oom and v == 1.0]
     assert not fabricated, (
         f"a live hint of 1.0 was written while the OOM'd slice was the most "
         f"recent pass one. Nothing measured it — pass one never ran — and "
@@ -873,6 +949,7 @@ def test_a_pass_one_oom_does_not_fabricate_a_live_hint(ds, tmp_path, monkeypatch
         "the two-pass never recovered after the pass-one OOM")
 
 
+@pytest.mark.slice_only
 def test_healthy_slices_clear_the_unchecked_streak_end_to_end(
     ds, tmp_path, monkeypatch
 ):
@@ -938,6 +1015,7 @@ def test_healthy_slices_clear_the_unchecked_streak_end_to_end(
         f"documented as CONSECUTIVE: {st['unavailable']!r}")
 
 
+@pytest.mark.slice_only
 def test_a_verification_that_never_completes_eventually_gives_up(
     ds, tmp_path, monkeypatch, caplog
 ):
@@ -969,7 +1047,7 @@ def test_a_verification_that_never_completes_eventually_gives_up(
     ref, _ = _run(ds, tmp_path / "ref_gives_up", monkeypatch, twopass_on=False)
     got = _tables(out)
     for name in ref:
-        assert got[name].equals(ref[name])
+        _same(got[name], ref[name])
 
 
 def test_a_disable_does_not_leak_into_the_next_run(ds, tmp_path, monkeypatch):
@@ -1028,6 +1106,7 @@ def test_disabled_by_env(ds, tmp_path, monkeypatch):
     assert twopass.stats()["slices_twopass"] == 0
 
 
+@pytest.mark.slice_only
 def test_a_mid_run_disable_reports_itself_and_does_not_kill_the_run(
     ds, tmp_path, monkeypatch, caplog
 ):
@@ -1340,10 +1419,10 @@ def test_a_nan_bound_keeps_its_row_live(ds, tmp_path, monkeypatch):
     assert st["slices_twopass"] > 0, (
         f"the two-pass never ran, so the predicate was never exercised: {st}")
     for name in ("all", "half"):
-        assert on[name].equals(off[name]), (
+        _same(on[name], off[name], (
             f"{name}: a query row whose bound is NaN was scored differently "
             f"with the two-pass on — the predicate is dropping it instead of "
-            f"keeping it live")
+            f"keeping it live"))
 
 
 def test_members_with_different_k_union_their_live_rows(ds, tmp_path, monkeypatch):
@@ -1407,10 +1486,10 @@ def test_members_with_different_k_union_their_live_rows(ds, tmp_path, monkeypatc
 
     for name, k in (("wide", 25), ("narrow", 2)):
         a, b = _one(out_on, name, k), _one(out_off, name, k)
-        assert a.equals(b), (
+        _same(a, b, (
             f"{name} (k={k}) differs between the two-pass and one-pass runs; "
             f"overlapping members with different k have different live masks, "
-            f"so the shared mask must be a union, not an assignment")
+            f"so the shared mask must be a union, not an assignment"))
 
 
 def test_the_prune_counter_does_not_move_with_the_two_pass(ds, tmp_path, monkeypatch):
@@ -1692,7 +1771,7 @@ def test_results_are_identical_under_both_tiebreak_modes(
     assert stats["slices_twopass"] > 0, "the two-pass never engaged"
     assert stats["rows_live"] < stats["rows_full"], "nothing was pruned"
     for name in off:
-        assert on[name].equals(off[name]), f"{name} differs under {tiebreak}"
+        _same(on[name], off[name], f"{name} differs under {tiebreak}")
 
 
 def test_a_group_with_no_live_rows_at_all_still_matches(tmp_path, monkeypatch):
@@ -1721,9 +1800,9 @@ def test_a_group_with_no_live_rows_at_all_still_matches(tmp_path, monkeypatch):
     on, stats = _run(ds2, tmp_path / "z_on", monkeypatch, twopass_on=True)
     assert stats["slices_twopass"] > 0
     for name in off:
-        assert on[name].equals(off[name]), (
+        _same(on[name], off[name], (
             f"{name} differs with dead rows poisoned — an uninitialised dead "
-            f"row leaked into a result")
+            f"row leaked into a result"))
 
 
 def test_the_pipeline_hands_the_guards_the_raw_corpus_norms(ds, tmp_path,
@@ -1807,9 +1886,11 @@ def test_the_decision_audit_grades_every_fp16_decision_a_run_makes(
     assert st["dead_audit_members"] > 0, f"the audit never ran: {st}"
     graded = (st["audit_correct_prune"] + st["dead_audit_violations"]
               + st["audit_correct_live"] + st["audit_wasted_live"])
-    assert graded == st["dead_audit_rows"], (
+    # Tiles mode decides, and so grades, (query, tile) pairs.
+    checked = st["dead_audit_tile_pairs" if MODE == "tiles" else "dead_audit_rows"]
+    assert graded == checked, (
         f"the four outcomes do not account for every decision: {graded} "
-        f"classified of {st['dead_audit_rows']} checked — {st}")
+        f"classified of {checked} checked — {st}")
     assert st["dead_audit_violations"] == 0, (
         f"the fp16 pass denied {st['dead_audit_violations']} rows that held a "
         f"candidate: results this run would have LOST — {st}")
@@ -1819,6 +1900,7 @@ def test_the_decision_audit_grades_every_fp16_decision_a_run_makes(
     assert st["audit_correct_live"] > 0, f"nothing was kept: {st}"
 
 
+@pytest.mark.slice_only
 def test_the_audit_grades_a_slice_whose_pass_one_was_discarded(
     ds, tmp_path, monkeypatch
 ):
@@ -1904,7 +1986,7 @@ def test_a_decision_audit_failure_recomputes_its_current_slice(
     )
     assert st["slices_discarded"] == 1
     for name in off:
-        assert on[name].equals(off[name]), name
+        _same(on[name], off[name], name)
 
 
 @pytest.fixture
@@ -2214,4 +2296,6 @@ def test_the_decision_audit_takes_no_scale_arguments():
     from nova_bf import twopass
 
     params = list(inspect.signature(twopass.audit_decisions).parameters)
-    assert params == ["Q", "Cb", "metric", "live", "thr", "q_norms"], params
+    # `tile_live` / `tile_width` are tiles mode's grading inputs, both read.
+    assert params == ["Q", "Cb", "metric", "live", "thr", "q_norms",
+                      "tile_live", "tile_width"], params

@@ -26,6 +26,7 @@ the slice is conservatively kept live and falls back to ordinary fp32 scoring.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -63,44 +64,16 @@ def is_certified(key: tuple) -> bool:
 
 # --- runtime hardware certification ------------------------------------------
 
-# Only GPU generations covered by the tensor-core accumulation model are
-# admitted. Unknown generations are refused rather than extrapolated.
-#
-# Runtime probes then check the actual device for behavior inconsistent with
-# the model; passing a finite probe cannot prove the model for every input.
-# Compute capabilities the two-pass is allowed to prune on.
-#
-# THE RULE: a capability appears here only if a probe has MEASURED its
-# accumulation model on real silicon and the result JSON is committed under
-# docs/brute-force/tc-probe/results/. Theorem 1 is conditional on (R5), and an
-# unmeasured generation is an assumption about hardware we have never run,
-# dressed up as support. Inheriting a row from a paper is not measurement --
-# the T4 settled that, measuring (8,1) where the literature says Turing is
-# (4,0).
-#
-# Removing an entry is SAFE, not a regression: `probe_device_generation`
-# refuses pass one for anything absent, and a refusal falls back to the
-# one-pass fp32 path, which produces identical ground truth without the
-# speedup. Adding an entry is the change that needs evidence.
-#
-# Dropped on 2026-09-18 for having no measurement behind them:
-#   (8, 7)  Ampere, the Jetson Orin part -- no such device has ever been probed
-#   (9, 0)  Hopper H100/H200 -- the published (16, 2) row is inherited from
-#           Khattak & Mikaitis and was never measured here. Not for want of
-#           trying: 3,816 provisioning attempts across p5.4xlarge, p5.48xlarge
-#           and p5e/p5en, over nine regions, every one refused with
-#           InsufficientInstanceCapacity. AWS had no Hopper to sell that day.
-#   (10, 0) Blackwell B200  -- inherited from Khattak & Mikaitis, never run
-#   (12, 0) Blackwell, consumer -- likewise
-# Re-add any of them together with its committed probe result, not before.
-# H200 counts for (9, 0): same sm_90, same matrix unit as H100.
+# Only GPU generations supported by the tensor-core accumulation model
+# are admitted. Runtime probes check for incompatible behavior but cannot
+# prove correctness for every input. Unknown generations fall back to
+# one-pass FP32 scoring rather than assuming hardware compatibility.
 _R5_GENERATIONS = {
-    # capability   name        measured on          evidence
-    (7, 0): "Volta",    # Tesla V100-SXM2-32GB  results/v100.json  (4,0)
-    (7, 5): "Turing",   # Tesla T4              results/t4.json    (8,1)
-    (8, 0): "Ampere",   # A100                  results/a100.json  (8,1)
-    (8, 6): "Ampere",   # A10G                  results/a10g.json  (8,1)
-    (8, 9): "Ada",      # L4                    results/l4.json    (8,1)
+    (7, 0): "Volta",
+    (7, 5): "Turing",
+    (8, 0): "Ampere",
+    (8, 6): "Ampere",
+    (8, 9): "Ada",
 }
 
 def probe_device_generation(device) -> str | None:
@@ -358,34 +331,16 @@ def scale_mismatch(scale, norms):
     Invalid norms are handled by the separate norm guards and are therefore
     excluded from the mismatch mask.
     """
-    import torch
-
-    # Scales and norms must correspond entry-for-entry; broadcasting would make
-    # the reciprocal check meaningless.
     if scale.shape != norms.shape:
         return (
-            torch.ones(norms.shape, dtype=torch.bool, device=norms.device),
+            scale_mismatch_mask(scale, norms),
             f"scale has shape {tuple(scale.shape)} against norms of shape "
             f"{tuple(norms.shape)}; scale and norm entries must correspond"
         )
 
-    # Flatten so scalar tensors and vectors share the same reporting path.
-    n = norms.reshape(-1).double()
-    s = scale.reshape(-1).double()
+    bad, lo, hi = _scale_mismatch_parts(scale, norms)
     scale = scale.reshape(-1)
     norms = norms.reshape(-1)
-
-    ok_norm = torch.isfinite(n) & (n > 0.0)
-
-    # Round the admissible interval outward.
-    lo = torch.nextafter((1.0 - _cf.U) / n, torch.zeros_like(n))
-    hi = torch.nextafter(
-        (1.0 + _cf.U) / n,
-        torch.full_like(n, float("inf")),
-    )
-
-    ok = torch.isfinite(s) & (s > 0.0) & (s >= lo) & (s <= hi)
-    bad = ok_norm & ~ok
 
     if not bool(bad.any()):
         return bad, None
@@ -397,6 +352,79 @@ def scale_mismatch(scale, norms):
         f"[{float(lo[i])!r}, {float(hi[i])!r}] for norm "
         f"{float(norms[i])!r}",
     )
+
+
+def _finite(x):
+    """Equivalent to `torch.isfinite` for floating tensors, using fewer
+    GPU kernels. Both NaN and infinity fail the comparison."""
+    return x.abs() < float("inf")
+
+# Cache scalar constants per (device, dtype, value) to avoid repeated
+# allocations and fill kernels in `torch.where`.
+# Safe without `record_stream` while all readers use the allocating stream.
+# Revisit if accessed from another stream.
+_CONSTS: dict = {}
+
+
+def _clear_device_caches() -> None:
+    """Drop the small per-device caches (`_CONSTS`, and those of `compute` /
+    `tile_rescore` if loaded -- looked up, not imported, to keep this module
+    free of import cycles)."""
+    import sys
+
+    _CONSTS.clear()
+    for mod, name in (("nova_bf.compute", "_TP_BOUNDS"),
+                      ("nova_bf.tile_rescore", "_QIDS")):
+        cache = getattr(sys.modules.get(mod), name, None)
+        if cache is not None:
+            cache.clear()
+
+
+def _const(value: float, like):
+    """`value` as a 0-d tensor of `like`'s dtype on `like`'s device, cached.
+    `torch.where(c, x, _const(v, x))` is `torch.where(c, x, v)`."""
+    import torch
+
+    key = (str(like.device), like.dtype, repr(float(value)))
+    got = _CONSTS.get(key)
+    if got is None:
+        got = _CONSTS[key] = torch.full((), value, dtype=like.dtype,
+                                        device=like.device)
+    return got
+
+
+def _scale_mismatch_parts(scale, norms):
+    """`(bad, lo, hi)` of `scale_mismatch` for equal shapes, flattened. Device
+    ops only, in binary64 -- no host read."""
+    import torch
+
+    # Flatten so scalar tensors and vectors share the same reporting path.
+    n = norms.reshape(-1).double()
+    s = scale.reshape(-1).double()
+
+    ok_norm = _finite(n) & (n > 0.0)
+
+    # Round the admissible interval outward.
+    lo = torch.nextafter((1.0 - _cf.U) / n, torch.zeros_like(n))
+    hi = torch.nextafter(
+        (1.0 + _cf.U) / n,
+        torch.full_like(n, float("inf")),
+    )
+
+    ok = _finite(s) & (s > 0.0) & (s >= lo) & (s <= hi)
+    return ok_norm & ~ok, lo, hi
+
+
+def scale_mismatch_mask(scale, norms):
+    """Return a device-side mismatch mask without host synchronization.
+    Shape mismatches mark all entries invalid."""
+    import torch
+
+    # Require matching shapes; broadcasting would invalidate the check.
+    if scale.shape != norms.shape:
+        return torch.ones(norms.shape, dtype=torch.bool, device=norms.device)
+    return _scale_mismatch_parts(scale, norms)[0]
+
 # --- continuous live-row audit ------------------------------------------------
 #
 # Live rows are scored exactly by pass two, so their exact slice maxima can be
@@ -427,7 +455,8 @@ def audit_rate() -> int:
             _AUDIT_RATE = 1
 
     return _AUDIT_RATE
-def audit_decisions(Q, Cb, metric, live, thr, q_norms=None) -> dict:
+def audit_decisions(Q, Cb, metric, live, thr, q_norms=None, tile_live=None,
+                    tile_width=None) -> dict:
     """Exactly score every row and grade the pass-one pruning decisions.
 
     A row should remain live when the exact slice maximum is at or above its
@@ -437,6 +466,11 @@ def audit_decisions(Q, Cb, metric, live, thr, q_norms=None) -> dict:
     This audit observes both kept and pruned rows, but costs the full-height
     exact GEMM that two-pass pruning is intended to avoid. It is therefore a
     verification tool rather than a production safety guard.
+
+    In tiles mode pass `tile_live` (`(n_tiles, n)` bool) and `tile_width`: the
+    decisions graded are then the (query, tile) ones -- a pair should be live
+    when its exact TILE maximum reaches the threshold -- in the same counters,
+    plus `dead_audit_tile_pairs`. `live` must still be its any-tile reduction.
     """
     import torch
 
@@ -466,7 +500,18 @@ def audit_decisions(Q, Cb, metric, live, thr, q_norms=None) -> dict:
     # therefore skips the audit rather than affecting the production result.
     try:
         exact = _scores(Q, Cb, metric, q_norms, scale_in_packer=False)
-        top = exact.amax(dim=1)
+        if tile_live is not None:
+            # Graded per pair: (n, n_tiles), thresholds broadcast per row.
+            top = tile_amax(exact, int(tile_width))
+            if tuple(tile_live.shape) != (int(top.shape[1]), n):
+                raise ValueError(
+                    f"two-pass decision audit: tile_live has shape "
+                    f"{tuple(tile_live.shape)}, expected "
+                    f"({int(top.shape[1])}, {n})")
+            live = tile_live.T
+            thr_v = thr_v[:, None]
+        else:
+            top = exact.amax(dim=1)
         del exact
     except Exception as exc:                       # noqa: BLE001
         if not is_oom(exc):
@@ -490,7 +535,11 @@ def audit_decisions(Q, Cb, metric, live, thr, q_norms=None) -> dict:
     wasted_live = int((ok & live & ~should_live).sum())
 
     _STATS["dead_audit_members"] += 1
-    _STATS["dead_audit_rows"] += int(ok.sum())
+    if tile_live is not None:
+        _STATS["dead_audit_rows"] += int(ok.any(dim=1).sum())
+        _STATS["dead_audit_tile_pairs"] += int(ok.sum())
+    else:
+        _STATS["dead_audit_rows"] += int(ok.sum())
     _STATS["audit_correct_prune"] += correct_prune
     _STATS["audit_correct_live"] += correct_live
     _STATS["audit_wasted_live"] += wasted_live
@@ -574,15 +623,15 @@ def audit_live_rows(scores, n_live: int, idx, upper, row_scale=None,
         top = top * row_scale.index_select(0, live_idx)
 
     ub = upper.index_select(0, live_idx)
-    ok = torch.isfinite(top) & torch.isfinite(ub)
+    ok = _finite(top) & _finite(ub)
     bad = ok & ~(ub >= top)
-    n_bad = int(bad.sum())
+    n_bad, n_ok, margin, eps_used = _audit_read(bad, ok, ub, top, eps_used)
 
-    _STATS["audit_rows"] += int(ok.sum())
+    _STATS["audit_rows"] += n_ok
 
     # Record the smallest remaining bound margin relative to `eps`.
-    if bool(ok.any()) and eps_used:
-        closest = float((ub - top)[ok].min()) / eps_used
+    if n_ok > 0 and eps_used:
+        closest = margin / eps_used
         prev = _STATS.get("audit_closest_margin")
         _STATS["audit_closest_margin"] = (
             closest if prev is None else min(prev, closest))
@@ -613,6 +662,100 @@ def audit_live_rows(scores, n_live: int, idx, upper, row_scale=None,
             )
 
     return n_bad
+
+def _audit_read(bad, ok, ub, top, eps_used, *extra):
+    """Everything an audit decides from on the host, in ONE device->host
+    transfer (it took five): `(n_bad, n_ok, margin, eps_used, *extra)`.
+
+    `margin` is `float((ub - top)[ok].min())` when any entry is `ok` (else
+    +inf, unused): an `ok` entry has finite `ub` and `top`, so `ub - top` is
+    never NaN and filling the others with +inf leaves the minimum -- one of
+    the `ok` values -- as it was, with no boolean index (a sync of its own).
+    `n_ok > 0` is `bool(ok.any())`. `eps_used` may be a 0-d device tensor
+    (`compute` defers that read to here) or a host float, returned as a
+    float. Counts and binary32 values are exact in binary64."""
+    import torch
+
+    xs = [bad.sum(), ok.sum()]
+    if ok.numel():
+        d = ub - top
+        xs.append(torch.where(ok, d, _const(float("inf"), d)).min())
+    eps_t = isinstance(eps_used, torch.Tensor)
+    if eps_t:
+        xs.append(eps_used)
+    xs.extend(extra)
+    vals = _read_scalars(*xs)
+    n_bad, n_ok = int(vals.pop(0)), int(vals.pop(0))
+    margin = vals.pop(0) if ok.numel() else float("inf")
+    if eps_t:
+        eps_used = vals.pop(0)
+    return (n_bad, n_ok, margin, eps_used, *(int(v) for v in vals))
+
+
+def audit_live_tiles(scores, idx, tile_upper, width: int, row_scale=None,
+                     eps_used=None) -> int:
+    """Verify tile bounds against exact scores for all live query/tile pairs.
+
+    Dead pairs are `-inf` and excluded from the audit. Updates the same
+    counters as `audit_live_rows`, plus `audit_tile_pairs`.
+    """
+    global _AUDIT_WARNED
+    import torch
+
+    n_live = int(idx.shape[0])
+    if n_live <= 0 or scores is None:
+        return 0
+    if scores.shape[0] != n_live:
+        raise ValueError(
+            f"two-pass tile audit: {scores.shape[0]} score rows for {n_live} "
+            f"live queries")
+    n_tiles = -(-int(scores.shape[1]) // width)
+    if tile_upper.shape[0] != n_tiles:
+        raise ValueError(
+            f"two-pass tile audit: {n_tiles} tiles of {width} in the scores, "
+            f"{tile_upper.shape[0]} in the bound")
+
+    _STATS["audit_slices"] += 1
+    top = tile_amax(scores, width)                       # (n_live, n_tiles)
+    if row_scale is not None:
+        top = top * row_scale.index_select(0, idx)[:, None]
+    ub = tile_upper.index_select(1, idx).T
+    ok = _finite(top) & _finite(ub)
+    bad = ok & ~(ub >= top)
+    n_bad, n_ok, margin, eps_used, n_rows_ok = _audit_read(
+        bad, ok, ub, top, eps_used, ok.any(dim=1).sum())
+
+    _STATS["audit_rows"] += n_rows_ok
+    _STATS["audit_tile_pairs"] += n_ok
+
+    if n_ok > 0 and eps_used:
+        closest = margin / eps_used
+        prev = _STATS.get("audit_closest_margin")
+        _STATS["audit_closest_margin"] = (
+            closest if prev is None else min(prev, closest))
+
+    if n_bad:
+        worst = float((top - ub)[bad].max())
+        _STATS["audit_violations"] += n_bad
+        _STATS["audit_worst"] = max(_STATS.get("audit_worst") or 0.0, worst)
+        disable(
+            f"the continuous audit found {n_bad} live (query, tile) pairs "
+            f"whose exact maximum exceeds their tile upper bound, by as much "
+            f"as {worst:.3e}"
+        )
+        if not _AUDIT_WARNED:
+            _AUDIT_WARNED = True
+            logger.error(
+                "two-pass AUDIT FAILURE: %d of %d live (query, tile) pairs on "
+                "this slice have an exact maximum ABOVE their tile upper "
+                "bound, by as much as %.3e. Live pairs are still scored "
+                "exactly so THESE results are correct, but a pair PRUNED "
+                "under the same bound may have been lost. Re-run with "
+                "NOVA_BF_TWOPASS=0 to get ground truth, and treat this run's "
+                "output as suspect.", n_bad, int(ok.sum()), worst,
+            )
+    return n_bad
+
 
 def exact_math_mode_flags(device) -> str | None:
     """Check that the exact CUDA path uses the arithmetic assumed by the bound.
@@ -831,6 +974,72 @@ def prunability_cut(qn, cn_min: float):
 
     return ~(torch.isfinite(qn) & (qn >= _cf.PRUNE_MIN_QNORM))
 
+
+# --- device-side guards -------------------------------------------------------
+
+# Evaluate guards on the GPU to avoid host synchronization before pass one.
+# Match host-side comparisons and precision, using float64 where required
+# by the proof. Refused slices receive +inf bounds, preventing pruning.
+# Guard results are read back together after the kernel is launched.
+
+# Refusal priority matches the original host-side checks.
+SLICE_REFUSALS = ("corpus norm", "corpus overflow", "corpus scale",
+                  "column scale", "all rows refused")
+
+# Device probe layout: refusal flags, sigma_max, and max N_c.
+# Read back in one D2H transfer for refusal reporting and the eps key.
+_PROBE_SIGMA = len(SLICE_REFUSALS)
+_PROBE_CN_MAX = _PROBE_SIGMA + 1
+
+
+def overflow_refused_t(d: int, n_max, fmt):
+    """Device twin of `not overflow_guard(d, norms, fmt)` given the reduced
+    `n_max = norms.max()` (a 0-d tensor): `_cf.overflow_ok`, in binary64."""
+    import torch
+
+    if fmt.u_t == 0.0:
+        return torch.zeros((), dtype=torch.bool, device=n_max.device)
+    m = n_max.double()
+    limit = fmt.omega_t * (1.0 - _cf.GUARD_MARGIN)
+    ok = (m == m) & (m > 0.0) & (m != float("inf")) & (_cf.kappa_bar(d) * m <= limit)
+    return ~ok
+
+
+def scale_range_refused_t(sigma_max):
+    """Device twin of `not norm_range_ok(sigma_max) and sigma_max != 1.0`."""
+    s = sigma_max.double()
+    return ~((s >= _cf.NORM_MIN) & (s <= _cf.NORM_MAX)) & (s != 1.0)
+
+
+def query_guard_halves(qn):
+    """The query-only halves of `product_guard_t` / `prunability_cut_t`, for
+    a query state: `(qn.double(), product rows, prunability rows)`. Fixed for
+    the state, so `_upper_bounds` computes them once per query matrix (cached
+    in `query_side`'s entry, dropped with it) instead of on every slice."""
+    return (qn.double(), ~(_finite(qn) & (qn > 0.0)),
+            ~(_finite(qn) & (qn >= _cf.PRUNE_MIN_QNORM)))
+
+
+def product_guard_t(qn, cn_max, halves=None):
+    """`product_guard(qn, float(cn_max))` with `cn_max` a 0-d device tensor.
+    `halves`: `query_guard_halves(qn)`, precomputed -- the same values."""
+    c = cn_max.double()
+    cn_ok = _finite(c) & (c > 0.0)
+    qn_d, q_rows, _ = query_guard_halves(qn) if halves is None else halves
+    prod = qn_d * c
+    rows = q_rows | ~(prod <= _cf.PROD_MAX)
+    return rows | ~cn_ok
+
+
+def prunability_cut_t(qn, cn_min, halves=None):
+    """`prunability_cut(qn, float(cn_min))` with `cn_min` a 0-d device tensor.
+    `halves`: `query_guard_halves(qn)`, precomputed -- the same values."""
+    m = cn_min.double()
+    cn_ok = _finite(m) & (m >= _cf.PRUNE_MIN_CNORM)
+    q_rows = (query_guard_halves(qn) if halves is None else halves)[2]
+    return q_rows | ~cn_ok
+
+
 # Exact live-row GEMMs are padded to candidate heights before execution.
 # `_verify_shape` still checks every height actually used against the full
 # query height, so these constants only choose which shapes are attempted.
@@ -855,11 +1064,37 @@ MIN_QUERY_ROWS = 8192
 # Maximum live fraction for using the two-pass path by default.
 DEFAULT_THRESHOLD = 0.50
 
+# --- pass-two rescoring granularity -------------------------------------------
+
+# `slice` rescores live queries with a verified-height cuBLAS GEMM,
+# producing byte-identical one-pass scores.
+# `tiles` (default) rescores only live query/tile pairs in FP32, safely
+# reducing work but potentially changing near-tie rankings due to
+# different summation order. Pruned pairs are filled with -inf.
+# Falls back to slice mode when tile rescoring is inefficient or unavailable.
+# Configured via `two_pass_rescore`; NOVA_BF_TWOPASS_RESCORE overrides it.
+RESCORE_MODES = ("slice", "tiles")
+_RESCORE: str | None = None
+_RESCORE_WARNED = False
+
+# Engage tiles mode when the live (query, tile) fraction is below this
+# threshold. Slice mode uses DEFAULT_THRESHOLD.
+DEFAULT_TILE_THRESHOLD = 0.20
+
+# Fall back to slice mode when tile rescoring becomes more expensive
+# than a padded GEMM. Both paths preserve correctness.
+TILE_CROSSOVER = 1.0 / 3.0
+
+# CPU tile width; CUDA uses the fused kernel's BLOCK_N.
+# Affects performance, not correctness.
+CPU_TILE = 128
+
 _UNAVAILABLE: str | None = None
 _DISABLED_REASON: str | None = None
 
 # Warn once for malformed runtime configuration values.
 _THRESHOLD_WARNED = False
+_TILE_THRESHOLD_WARNED = False
 _FORCE_ENGAGE_WARNED = False
 _FUSE_CONFIG_WARNED = False
 _ROWMAX_WARNED = False
@@ -869,6 +1104,9 @@ _ROWMAX_OFF = False
 
 # Whether the Triton row-max kernel successfully ran during this run.
 _ROWMAX_USED = False
+# How many launches used the row-max kernel; `_ROWMAX_USED` is "> 0", kept as
+# its own flag for the readers that predate the count (see `_take_back`).
+_ROWMAX_RUNS = 0
 
 _FUSE_OOM_WARNED = False
 _VERIFY_OOM_WARNED = False
@@ -1074,30 +1312,108 @@ def disable(reason: str) -> None:
         )
 
 
-def threshold() -> float:
-    global _THRESHOLD_WARNED
+def set_rescore_mode(mode: str | None) -> None:
+    """Record the configured pass-two mode for this run (`None` = default)."""
+    global _RESCORE
+    if mode is not None and mode not in RESCORE_MODES:
+        raise ValueError(
+            f"two-pass: rescore mode must be one of {RESCORE_MODES}, got "
+            f"{mode!r}")
+    _RESCORE = mode
 
-    raw = os.environ.get("NOVA_BF_TWOPASS_THRESHOLD")
+
+def rescore_mode() -> str:
+    """The pass-two mode in effect: env override, else config, else default."""
+    global _RESCORE_WARNED
+
+    raw = os.environ.get("NOVA_BF_TWOPASS_RESCORE")
+    if raw:
+        v = raw.strip().lower()
+        if v in RESCORE_MODES:
+            return v
+        if not _RESCORE_WARNED:
+            _RESCORE_WARNED = True
+            logger.warning("NOVA_BF_TWOPASS_RESCORE=%r is not one of %s; "
+                           "ignoring it", raw, RESCORE_MODES)
+    if _RESCORE is not None:
+        return _RESCORE
+    from nova_bf.config import TWO_PASS_RESCORE_DEFAULT
+
+    return TWO_PASS_RESCORE_DEFAULT
+
+
+def tiles_mode() -> bool:
+    return rescore_mode() == "tiles"
+
+
+# `params.pipeline_pass_one`, recorded per run by `run_compute`.
+_PIPELINE = None
+
+
+def set_pipeline_pass_one(on: bool | None) -> None:
+    """Record the configured pass-one pipelining for this run (`None` = default)."""
+    global _PIPELINE
+    _PIPELINE = None if on is None else bool(on)
+
+
+def pipeline_pass_one() -> bool:
+    """Whether to launch dense pass one a slice ahead.
+
+    NOVA_BF_PIPELINE_PASS_ONE overrides the configured value.
+    Results remain exact, but added memory pressure may change
+    tiles-mode fallback behavior and numerical reproducibility.
+    """
+    raw = os.environ.get("NOVA_BF_PIPELINE_PASS_ONE")
+    if raw is not None and raw.strip() != "":
+        v = raw.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(
+            f"NOVA_BF_PIPELINE_PASS_ONE must be a boolean (1/0, true/false), "
+            f"got {raw!r}")
+    if _PIPELINE is not None:
+        return _PIPELINE
+    from nova_bf.config import PIPELINE_PASS_ONE_DEFAULT
+
+    return PIPELINE_PASS_ONE_DEFAULT
+
+
+def threshold(mode: str | None = None) -> float:
+    """The engage cutoff on the live-fraction hint for `mode` (default: the
+    mode in effect). Slice mode compares a ROW fraction against
+    `NOVA_BF_TWOPASS_THRESHOLD` (default 0.5); tiles mode compares a TILE-pair
+    fraction against `NOVA_BF_TWOPASS_TILE_THRESHOLD` (default 0.2)."""
+    if (mode or rescore_mode()) == "tiles":
+        return _fraction_env("NOVA_BF_TWOPASS_TILE_THRESHOLD",
+                             DEFAULT_TILE_THRESHOLD)
+    return _fraction_env("NOVA_BF_TWOPASS_THRESHOLD", DEFAULT_THRESHOLD)
+
+
+def _fraction_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
     if not raw:
-        return DEFAULT_THRESHOLD
+        return default
 
     def _bad(why: str) -> float:
-        global _THRESHOLD_WARNED
-        if not _THRESHOLD_WARNED:
+        # Warn once per threshold, independently.
+        global _THRESHOLD_WARNED, _TILE_THRESHOLD_WARNED
+        if name == "NOVA_BF_TWOPASS_TILE_THRESHOLD":
+            if not _TILE_THRESHOLD_WARNED:
+                _TILE_THRESHOLD_WARNED = True
+                logger.warning("%s=%r %s; using %s", name, raw, why, default)
+        elif not _THRESHOLD_WARNED:
             _THRESHOLD_WARNED = True
-            logger.warning("NOVA_BF_TWOPASS_THRESHOLD=%r %s; using %s",
-                           raw, why, DEFAULT_THRESHOLD)
-        return DEFAULT_THRESHOLD
+            logger.warning("%s=%r %s; using %s", name, raw, why, default)
+        return default
 
     try:
         got = float(raw)
     except ValueError:
         return _bad("is not a number")
-    # A live FRACTION, so only [0, 1] is meaningful. `nan` compares false
-    # against everything, which would make `hint > thresh` never fire and run
-    # pass one on every slice however live it was; a negative value turns the
-    # two-pass off with no message at all. Both are configuration mistakes
-    # worth a line rather than a silent change of behaviour.
+    # Require a valid live fraction; NaN or out-of-range values could
+    # silently change when two-pass engages.
     if not (0.0 <= got <= 1.0):
         return _bad("is not a live fraction in [0, 1]")
     return got
@@ -1161,20 +1477,75 @@ _FUSE_SPACE = [
 
 
 def fused_off() -> str | None:
-    """Why the fused pass one is not in use, or `None` if it is."""
+    """Why the fused pass one is not in use, or `None` if it is.
+
+    Inside `deferred_fuse_disable()` a failure deferred there (`fuse_pending`)
+    also counts, so later launches do not re-run a kernel that just failed."""
     if os.environ.get("NOVA_BF_NO_FUSED_ROWMAX"):
         return "NOVA_BF_NO_FUSED_ROWMAX"
     if _gemm_rowmax is None:
         return f"triton unavailable ({_UNAVAILABLE})"
+    if _FUSE_OFF is None and _FUSE_DEFERRING and _FUSE_PENDING is not None:
+        return _FUSE_PENDING
     return _FUSE_OFF
+
+# Defer fused-kernel failures during pipelined pass one so they do not
+# affect earlier slices. Apply or discard the failure in phase B,
+# preserving unpipelined behavior.d -- or drops it
+# (`fuse_drop_pending`) when phase B discards it.
+_FUSE_DEFERRING = False
+_FUSE_PENDING: str | None = None
+
+
+@contextlib.contextmanager
+def deferred_fuse_disable():
+    """Defer `fuse_disable` for the duration (phase A of a pipelined slice)."""
+    global _FUSE_DEFERRING
+    prev, _FUSE_DEFERRING = _FUSE_DEFERRING, True
+    try:
+        yield
+    finally:
+        _FUSE_DEFERRING = prev
+
+
+def fuse_pending() -> str | None:
+    """A fused-kernel failure deferred by a launch and not yet applied/dropped."""
+    return _FUSE_PENDING
+
+
+def fuse_apply_pending(reason: str) -> None:
+    """Apply a deferred failure: the consumer reached the point where the
+    unpipelined run's own pass one would have hit it."""
+    global _FUSE_PENDING
+    if _FUSE_PENDING == reason:
+        _FUSE_PENDING = None
+    fuse_disable(reason)
+
+
+def fuse_drop_pending(reason: str) -> None:
+    """Forget a deferred failure whose launch nothing used. If the unpipelined
+    run would still reach that kernel, its inline pass one fails (and disables
+    the kernel) there itself."""
+    global _FUSE_PENDING
+    if _FUSE_PENDING == reason:
+        _FUSE_PENDING = None
+
 
 def fuse_disable(reason: str) -> None:
     """Disable the fused pass-one kernel for the rest of this run.
 
     `reset()` clears this state so the next run can attempt the fused path
-    again under its own device and workload conditions.
+    again under its own device and workload conditions. Inside
+    `deferred_fuse_disable()` the first reason is recorded instead (see
+    `_FUSE_PENDING`).
     """
-    global _FUSE_OFF
+    global _FUSE_OFF, _FUSE_PENDING
+    if _FUSE_DEFERRING and _FUSE_OFF is None:
+        if _FUSE_PENDING is None:
+            _FUSE_PENDING = reason
+            logger.debug("two-pass: fused pass-one failure deferred to the "
+                         "slice's decision: %s", reason)
+        return
     if _FUSE_OFF is None:
         _FUSE_OFF = reason
         logger.warning(
@@ -1258,12 +1629,17 @@ def fuse_available(Qh, Ch, cs) -> bool:
         return False
     return True
 
-def fused_rowmax(Qh, Ch, cs, config=None, probe=False):
+def fused_rowmax(Qh, Ch, cs, config=None, probe=False, with_tiles=False):
     """Compute pass-one row maxima without materializing the Gram matrix.
 
     Returns the float32 `(M,)` row maxima, or `None` when the fused kernel
     declines. `probe=True` prevents candidate-specific failures during
     autotuning from disabling the fused path for the run.
+
+    `with_tiles=True` returns `(row_max, part, BLOCK_N)` instead: `part` is
+    the kernel's own `(n_tiles, M)` buffer of per-(BLOCK_N-column tile, row)
+    maxima that the row max is reduced from -- returned, not recomputed, so
+    the kernel and its arithmetic are unchanged.
     """
     import torch
 
@@ -1316,9 +1692,10 @@ def fused_rowmax(Qh, Ch, cs, config=None, probe=False):
         # synchronization point where a deferred launch error may surface.
         # It is part of pass one, so it must share the allocation fallback
         # above rather than letting an OOM escape after the protected launch.
-        if n_tiles == 1:
-            return part[0]
-        return part.amax(dim=0)
+        row_max = part[0] if n_tiles == 1 else part.amax(dim=0)
+        if with_tiles:
+            return row_max, part, bn
+        return row_max
 
     except Exception as exc:
         if not probe:
@@ -1409,6 +1786,8 @@ _UNMEASURED_IS_NONE = frozenset((
     "last_refusal_reason",
     "audit_closest_margin", "probe_accum_worst_rel", "shortfall_worst_ratio",
     "rowmax_worst_ratio", "dead_audit_worst",
+    "tile_width", "tiles_fallback_reason", "tiles_kernel_decline_reason",
+    "tiles_reference_reason",
 ))
 
 _STATS = {
@@ -1445,9 +1824,13 @@ _STATS = {
     # and a classifier has to be right at every site. A string that steers behaviour is a
     # classifier, and a classifier has to be right at every site.
     "last_refusal_reason": None,
+    # Worst absolute pass-one maximum relative to Theorem 1's cap,
+    # including tile maxima. Values above 1 force rows live.
     "rowmax_worst_ratio": None,
     "probe_accum_worst_rel": None,
     "probe_accum_fitted": 0.0,
+    # Worst observed underestimation relative to the bound's leading margin,
+    # normalized by score scale. Values above 0.75 trigger a warning.
     "shortfall_worst_ratio": None,
     # How often the O(n_q) binary64 `eps` evaluation actually ran, against how
     # often a bucketed one was reused.
@@ -1494,10 +1877,65 @@ _STATS = {
 
     # Slices where pass one ran but padding removed any exact-GEMM savings.
     "slices_discarded": 0,
+
+    # Tiles-mode pass two; also counted in `slices_twopass`.
+    "slices_tiles": 0,                # slices rescored using tiles
+    "tile_pairs_full": 0,             # total (query, tile) pairs
+    "tile_pairs_live": 0,             # pairs rescored exactly
+    "tile_rows_rescored": 0,          # live pairs x tile width (upper bound)
+    "tiles_kernel": 0,                # Triton rescoring calls
+    "tiles_reference": 0,             # torch reference calls
+
+    # Tile rescoring fallbacks and most recent reason.
+    "tiles_fallbacks": 0,
+    "tiles_fallback_reason": None,
+    "tile_width": None,               # most recent pass-one tile width
+
+    # Tile-level bound and pruning audits.
+    "audit_tile_pairs": 0,
+    "dead_audit_tile_pairs": 0,
+
+    # Fallback to slice mode when tiles are inefficient or unsupported.
+    "tiles_crossover_bails": 0,
+    "tiles_kernel_declined": 0,
+    "tiles_kernel_decline_reason": None,
+    "tiles_reference_reason": None,   # why the CPU reference ran
+    "tiles_bound_oom": 0,             # tile-bound OOM; use coarser bounds
+
+    # Kernel validation against the reference.
+    "tiles_selfchecks": 0,
+    "tiles_selfcheck_failures": 0,
+
+    # Pass-one pipelining: launches are consumed or discarded exactly once.
+    # Retries are discarded launches rerun inline. Discarded launches that
+    # executed a kernel also contribute to `slices_discarded`.
+    "pipeline_launched": 0,
+    "pipeline_used": 0,
+    "pipeline_discarded": 0,
+    "pipeline_retried": 0,
 }
+
+# Bookings that wait for a device read nobody has made yet (a discarded
+# pipelined launch's verdict: `compute._tp_discard`). Settled at the next
+# point that has just synchronised anyway, and always before counters are
+# read (`stats`).
+_DEFERRED_BOOKINGS: list = []
+
+
+def defer_booking(fn) -> None:
+    """Run `fn()` (it may read the device) at the next `flush_bookings`."""
+    _DEFERRED_BOOKINGS.append(fn)
+
+
+def flush_bookings() -> None:
+    """Settle every deferred booking, in the order it was deferred."""
+    while _DEFERRED_BOOKINGS:
+        _DEFERRED_BOOKINGS.pop(0)()
+
 
 def stats() -> dict:
     """Return two-pass counters, audit settings, and runtime status."""
+    flush_bookings()
     out = dict(_STATS)
 
     # Record the configured live-row audit sampling rate.
@@ -1523,6 +1961,17 @@ def stats() -> dict:
     # Number of execution configurations that passed certification this run.
     out["certified_configs"] = len(_CERTIFIED_KEYS)
 
+    # Pass-two mode, and the engage gate it used: which fraction the hint is
+    # (row or tile pairs) and the cutoff it was compared against.
+    mode = rescore_mode()
+    out["rescore"] = mode
+    out["engage_fraction"] = "tile" if mode == "tiles" else "row"
+    out["engage_threshold"] = threshold(mode)
+
+    # The RESOLVED pass-one pipelining policy (env over config). It only had an
+    # effect if `pipeline_launched > 0`.
+    out["pipeline_pass_one"] = pipeline_pass_one()
+
     return out
 
 def reset_stats() -> None:
@@ -1531,6 +1980,10 @@ def reset_stats() -> None:
     for key in _STATS:
         # Preserve `None` for statistics where zero would imply a measurement.
         _STATS[key] = None if key in _UNMEASURED_IS_NONE else 0
+
+    # Bookings deferred until a verdict is read belong to the counters just
+    # cleared: settling them later would book the old ones into the new.
+    _DEFERRED_BOOKINGS.clear()
 
 
     # Clear verification status reported alongside the statistics.
@@ -1550,6 +2003,7 @@ def release() -> None:
     consumes the accumulated counters.
     """
     _QCACHE.clear()
+    _clear_device_caches()
 def reset() -> None:
     """Reset all state scoped to a single run.
 
@@ -1560,10 +2014,27 @@ def reset() -> None:
     global _THRESHOLD_WARNED, _FUSE_CONFIG_WARNED, _ROWMAX_WARNED
     global _UNCHECKED_WARNED, _ROWMAX_OFF, _FUSE_OOM_WARNED
     global _VERIFY_OOM_WARNED, _UNCHECKED_STREAK, _CERTIFIED
+    global _RESCORE, _RESCORE_WARNED, _TILE_THRESHOLD_WARNED
 
     _QCACHE.clear()
+    _clear_device_caches()
+    # A previous run's unsettled bookings belong to that run (it raised, or
+    # never read its counters): dropped, not booked into this one.
+    _DEFERRED_BOOKINGS.clear()
     reset_stats()
     _SHAPE_OK.clear()
+    # The configured pass-two mode is per run; `run_compute` sets it again.
+    _RESCORE = None
+    # So is the pass-one pipelining.
+    global _PIPELINE
+    _PIPELINE = None
+    _RESCORE_WARNED = False
+    try:
+        from nova_bf import tile_rescore as _tr
+
+        _tr.reset()
+    except ImportError:  # pragma: no cover - torch-free installs
+        pass
     _VERIFY_SKIPPED = False
     _DISABLED_REASON = None
     # Per-RUN, like every other warn-once flag here: soak_twopass.run() calls
@@ -1572,11 +2043,15 @@ def reset() -> None:
 
     # Retry fused execution on the next run; keep device autotuning results.
     _FUSE_OFF = None
+    global _FUSE_PENDING, _FUSE_DEFERRING
+    _FUSE_PENDING = None
+    _FUSE_DEFERRING = False
     _FUSE_LAUNCHES = 0
     _FUSE_KERNEL_INFO.clear()
 
     # Reset per-run warning state and cached configuration.
     _THRESHOLD_WARNED = False
+    _TILE_THRESHOLD_WARNED = False
     _FUSE_CONFIG_WARNED = False
     _ROWMAX_WARNED = False
     _ROWMAX_MAG_WARNED = False
@@ -1589,6 +2064,8 @@ def reset() -> None:
     _UNCHECKED_WARNED = False
     _ROWMAX_OFF = False
     _ROWMAX_USED = False
+    global _ROWMAX_RUNS
+    _ROWMAX_RUNS = 0
     _FUSE_OOM_WARNED = False
     _VERIFY_OOM_WARNED = False
     _UNCHECKED_STREAK = 0
@@ -1611,6 +2088,10 @@ def query_side(Q, row_scale=None) -> dict:
         # query tensors and scales immutable.
         return None if t is None else t._version
 
+    # Cache one entry per Q; changing `row_scale` replaces it.
+    # Pass one relies on cache hits to avoid repeated host synchronization.
+    # Mixed scales for the same Q are currently excluded from two-pass.
+    # Use (id(Q), id(row_scale)) if that changes.
     key = id(Q)
     got = _QCACHE.get(key)
     if (got is not None and got["Q"] is Q and got["row_scale"] is row_scale
@@ -1644,11 +2125,16 @@ def query_side(Q, row_scale=None) -> dict:
 # --- corpus side, per slice ---------------------------------------------------
 
 
-def corpus_side(Cb, col_scale, cn=None):
+def corpus_side(Cb, col_scale, cn=None, device_scalars=False):
     """Prepare the corpus-side inputs and scalars required by the bound.
 
     Returns `(C_h, sigma_max, cn_min, cn_max)`, where `sigma_max` is the
     largest column scale actually applied by pass one.
+
+    `device_scalars=True` (pass one's own path) returns the three scalars as
+    0-d binary32 DEVICE tensors -- the same reductions, not read back -- so
+    nothing here synchronises; `sigma_max` is then `None` when no column
+    scale is applied (it is exactly 1.0).
     """
     import torch
 
@@ -1668,6 +2154,12 @@ def corpus_side(Cb, col_scale, cn=None):
 
     if int(Cb.shape[0]) == 0:
         return Ch.contiguous(), 0.0, float("nan"), float("nan")
+
+    if device_scalars:
+        # The same reductions as below, left on the device. `max()` raises on
+        # an empty `col_scale` exactly as `float(col_scale.max())` did.
+        sig = None if col_scale is None else col_scale.max()
+        return Ch.contiguous(), sig, cn.min(), cn.max()
 
     if col_scale is None:
         # Dot product applies no corpus-side scaling.
@@ -1791,12 +2283,65 @@ def _pin_accumulation() -> None:
     import torch
 
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-def approx_rowmax(Qh, Ch, col_scale, out_dtype):
+
+def tile_amax(x, width: int):
+    """Per-tile maxima of a 2-D `(rows, n)` tensor: `(rows, ceil(n / width))`.
+
+    A partial last tile is padded with `-inf`, so it reduces over its real
+    columns only -- the same masking `_gemm_rowmax` applies to wrapped columns.
+    """
+    import torch
+
+    rows, n = int(x.shape[0]), int(x.shape[1])
+    n_tiles = -(-n // width)
+    pad = n_tiles * width - n
+    if pad:
+        x = torch.nn.functional.pad(x, (0, pad), value=float("-inf"))
+    return x.reshape(rows, n_tiles, width).amax(dim=2)
+
+
+def _tile_scaled(part, row_scale):
+    """Tile maxima in score units: `approx * row_scale`'s operation, per tile."""
+    return part * row_scale[None, :] if row_scale is not None else part
+
+
+def default_tile_width(device) -> int:
+    """Return the tile width when pass one has not produced tile maxima.
+
+    CUDA uses the last kernel width or configured fallback; CPU uses
+    CPU_TILE. Width affects decision granularity, not pruning safety.
+    """
+    if str(device).startswith("cuda"):
+        got = _STATS.get("tile_width")
+        if got:
+            return int(got)
+        ran = _FUSE_KERNEL_INFO.get("config")
+        if ran:
+            return int(ran[1])
+        raw = os.environ.get("NOVA_BF_FUSE_CONFIG")
+        if raw:
+            try:
+                cfg = tuple(int(x) for x in raw.split(","))
+                if _config_ok(cfg):
+                    return int(cfg[1])
+            except ValueError:
+                pass
+        return int(FUSE_CONFIG[1])
+    return int(CPU_TILE)
+
+
+def approx_rowmax(Qh, Ch, col_scale, out_dtype, with_tiles=False):
     """Compute the approximate scaled row maximum for pass one.
 
     Returns `(out, fused)`. When `fused` is true, the row max is taken directly
     from the float32 GEMM accumulator and no approximate Gram is materialized.
     Otherwise the Gram is materialized and reduced separately.
+
+    `with_tiles=True` returns `(out, fused, part, width)`, where `part` is the
+    `(n_tiles, n_q)` per-(tile of `width` corpus rows, query) maximum in the
+    same scaled units as `out` (whose row max it is). The fused path hands
+    back its kernel buffer with `width = BLOCK_N`; the unfused path reduces
+    the materialized product over `CPU_TILE`-wide tiles.
     """
     import torch
 
@@ -1809,9 +2354,11 @@ def approx_rowmax(Qh, Ch, col_scale, out_dtype):
     else:
         cs = col_scale.contiguous()
 
-    got = fused_rowmax(Qh, Ch, cs)
+    got = fused_rowmax(Qh, Ch, cs, with_tiles=with_tiles)
     if got is not None:
         _STATS["slices_fused"] += 1
+        if with_tiles:
+            return got[0], True, got[1], got[2]
         return got, True
     _STATS["slices_unfused"] += 1
 
@@ -1835,9 +2382,9 @@ def approx_rowmax(Qh, Ch, col_scale, out_dtype):
 
     n_q = int(g.shape[0])
     out = torch.empty(n_q, dtype=torch.float32, device=g.device)
-    global _ROWMAX_USED
+    global _ROWMAX_USED, _ROWMAX_RUNS
 
-    if (_rowmax_scaled is not None and not _ROWMAX_OFF
+    if (_rowmax_scaled is not None and not _ROWMAX_OFF and not with_tiles
             and g.is_cuda and g.is_contiguous()):
         try:
             block = min(2048, _triton.next_power_of_2(n_cols))
@@ -1850,6 +2397,7 @@ def approx_rowmax(Qh, Ch, col_scale, out_dtype):
 
             # Record success only after the kernel completes.
             _ROWMAX_USED = True
+            _ROWMAX_RUNS += 1
             return out, False
         except Exception as exc:  # noqa: BLE001 - fall through to the portable loop
             # OOM is transient; deterministic kernel failures disable this path.
@@ -1866,23 +2414,325 @@ def approx_rowmax(Qh, Ch, col_scale, out_dtype):
 
     # Portable chunked reduction limits the temporary scaled matrix size.
     chunk = max(1, (1 << 26) // max(1, n_cols))
+    width = int(CPU_TILE)
+    part = None
     try:
+        if with_tiles:
+            part = torch.empty((-(-n_cols // width), n_q), dtype=torch.float32,
+                               device=g.device)
         for r0 in range(0, n_q, chunk):
             blk = g[r0 : r0 + chunk].float() * cs[None, :]
             out[r0 : r0 + chunk] = blk.amax(dim=1)
+            if part is not None:
+                # The same scaled values the row max reads, so the row max is
+                # exactly the max over these tiles.
+                part[:, r0 : r0 + chunk] = tile_amax(blk, width).T
             del blk
     except Exception as exc:  # noqa: BLE001 - see above
         raise _as_pass_one_failure(exc, "the portable row-max copy") from exc
 
+    if with_tiles:
+        return out, False, part, width
     return out, False
 
 def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
-                 cn=None, corpus_exact_fp16=None, with_parts=False, with_outcome=False):
+                 cn=None, corpus_exact_fp16=None, with_parts=False, with_outcome=False,
+                 tiles=None):
     """Return a safe per-query upper bound on this corpus slice's best score.
 
-    Guard failures force affected rows live by returning `+inf`. An empty
-    corpus slice returns `-inf`. `corpus_exact_fp16` may provide a previously
-    established per-file format verdict; otherwise it is checked here.
+    Exactly `upper_bounds_finish(upper_bounds_begin(...))`; see `_upper_bounds`
+    for the contract. The split exists only so `compute` can launch a slice's
+    pass one before the previous slice's bookkeeping (`params.pipeline_pass_one`).
+    """
+    return upper_bounds_finish(upper_bounds_begin(
+        Q, Cb, col_scale, row_scale, out_dtype, metric, cn=cn,
+        corpus_exact_fp16=corpus_exact_fp16, with_parts=with_parts,
+        with_outcome=with_outcome, tiles=tiles, speculate=False))
+
+
+class PendingBound:
+    """A pass-one launch awaiting completion or discard.
+
+    Holds the suspended `_upper_bounds` generator after the row-max launch,
+    before guard readback and bound computation. Must be consumed exactly
+    once by `upper_bounds_finish` or `upper_bounds_discard`.
+
+    `event` synchronizes side-stream results with the consumer.
+    `probe` holds device-side guard results; `fused` and `delta` track
+    counter changes for rollback. `refusal` stores the resolved guard reason.
+    """
+
+    __slots__ = ("_gen", "_result", "event", "device", "probe", "fused",
+                 "verdict", "delta", "taken_back")
+
+    def __init__(self, gen, device):
+        self._gen = gen
+        self._result = None
+        self.event = None
+        self.device = device
+        self.probe = None
+        self.fused = None
+        self.verdict = [None, None]
+        self.delta = None
+        self.taken_back = False
+
+    @property
+    def refusal(self):
+        """The guard refusal reason, once read; None otherwise."""
+        return self.verdict[0]
+
+    @property
+    def launched(self) -> bool:
+        """Whether a row-max launch is pending (False: an early exit, whose
+        result is already final)."""
+        return self._gen is not None
+
+    def _join(self) -> None:
+        if self.event is not None:
+            import torch
+
+            # Device-side only: the consumer's stream waits for the side
+            # stream's launch. No host synchronization.
+            torch.cuda.current_stream(self.device).wait_event(self.event)
+            self.event = None
+
+
+class _Launch(typing.NamedTuple):
+    """What `_upper_bounds` yields at its launch/finish boundary."""
+
+    event: object      # side-stream completion event, or None
+    probe: object      # (len(SLICE_REFUSALS) + 2,) float64 device tensor
+    fused: object      # which counter approx_rowmax incremented (True:
+                       # slices_fused, False: slices_unfused); None: no launch
+    verdict: list      # [refusal reason or None, probe values once read]
+    delta: object      # `_launch_delta` of the launch, or None (no launch)
+
+
+def upper_bounds_begin(Q, Cb, col_scale, row_scale, out_dtype, metric,
+                       cn=None, corpus_exact_fp16=None, with_parts=False,
+                       with_outcome=False, tiles=None, stream=None,
+                       speculate=True):
+    """Run pass one through the row-max kernel launch, deferring bound computation.
+
+    Guards run on the device without host synchronization; pass
+    `corpus_exact_fp16` to avoid a readback. Host-side errors still raise
+    here. With `stream`, the kernel runs on a side stream after waiting
+    for the current stream. No thresholds are read.
+
+    `speculate=True` launches before resolving guards, rolling back work
+    on refusal. `False` checks guards first and skips refused launches.
+    """
+    verdict = [None, None]
+    gen = _upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
+                        cn=cn, corpus_exact_fp16=corpus_exact_fp16,
+                        with_parts=with_parts, with_outcome=with_outcome,
+                        tiles=tiles, stream=stream, speculate=speculate,
+                        _verdict=verdict)
+    pending = PendingBound(gen, Q.device)
+    pending.verdict = verdict
+    try:
+        got = next(gen)
+    except StopIteration as stop:
+        pending._gen = None
+        pending._result = stop.value
+        return pending
+    (pending.event, pending.probe, pending.fused, pending.verdict,
+     pending.delta) = got
+    return pending
+
+
+def resolve_refusal(pending: PendingBound):
+    """Read a pending launch's guard verdict without consuming it.
+
+    Synchronizes and returns the refusal reason or None. Used by phase B
+    to resolve deferred failures before finishing the bound.
+    """
+    if (pending.refusal is None and pending.probe is not None
+            and pending.verdict[1] is None):
+        # Kept, so the finish half reuses this read instead of repeating it.
+        pending.verdict[1] = _read_probe(pending.probe)
+        pending.verdict[0] = _probe_refusal(pending.verdict[1])
+    return pending.refusal
+
+
+def upper_bounds_finish(pending: PendingBound):
+    """The bound `upper_bounds` would have returned for this pending pass one."""
+    gen, pending._gen = pending._gen, None
+    if gen is None:
+        res, pending._result = pending._result, None
+        return res
+    pending._join()
+    try:
+        gen.send(None)
+    except StopIteration as stop:
+        return stop.value
+    raise RuntimeError("two-pass: _upper_bounds yielded more than once")
+
+
+def upper_bounds_discard(pending: PendingBound, resolve: bool = False):
+    """Discard a pending pass one without computing its bound. Idempotent.
+
+    Waits on the launch to ensure safe GPU buffer reuse.
+    `resolve=True` synchronizes and resolves guard refusals, rolling back
+    speculative side effects. Otherwise, resolution can be deferred via
+    `discard_resolved`.
+
+    Unresolved discards (e.g., exception cleanup) may retain speculative
+    kernel state.
+    """
+    gen, pending._gen = pending._gen, None
+    pending._result = None
+    if gen is None:
+        return pending.refusal
+    pending._join()
+    gen.close()
+    if resolve:
+        discard_resolved(pending)
+    return pending.refusal
+
+
+def discard_resolved(pending: PendingBound):
+    """The verdict of a DISCARDED launch, read now (a sync), with the launch's
+    non-`_STATS` side effects taken back if it was refused. Idempotent."""
+    resolve_refusal(pending)
+    if (pending.refusal is not None and pending.delta is not None
+            and not pending.taken_back):
+        pending.taken_back = True
+        _take_back(pending.delta, stats=False)
+    return pending.refusal
+
+
+def _read_scalars(*xs):
+    """0-d device scalars as host floats, in ONE device->host transfer."""
+    import torch
+
+    return torch.stack([x.reshape(()).to(torch.float64) for x in xs]).tolist()
+
+
+def _read_probe(probe, *extra):
+    """The probe (and any `extra` 0-d device scalars) as host floats, in ONE
+    device->host transfer. The only synchronisation of a pass one's guards."""
+    import torch
+
+    if extra:
+        probe = torch.cat([probe] + [e.reshape(1).to(probe.dtype)
+                                     for e in extra])
+    return probe.tolist()
+
+
+def _probe_refusal(vals) -> str | None:
+    """The first `SLICE_REFUSALS` entry that fired, in the host order."""
+    for reason, hit in zip(SLICE_REFUSALS, vals):
+        if hit != 0.0:
+            return reason
+    return None
+
+
+# Side effects restored when a speculative launch is guard-refused.
+# Counters are rolled back by per-launch deltas, preserving other launches.
+# Kernel state and warn-once flags are restored only when no later launch
+# depends on them. Logged warnings and autotuning state are not reverted.
+# Deferred fused-kernel failures are handled separately by phase B.
+_LAUNCH_FLAGS = ("_FUSE_OFF", "_FUSE_OOM_WARNED", "_ROWMAX_OFF",
+                 "_ROWMAX_WARNED")
+
+# Track launch order to avoid restoring flags used by later launches.
+# Such flags remain set to preserve fallback behavior, though a
+# data-specific failure may disable a kernel earlier than necessary.
+_LAUNCH_GEN = 0
+
+
+def _launch_mark():
+    global _LAUNCH_GEN
+    g = globals()
+    _LAUNCH_GEN += 1
+    return ({k: _STATS[k] for k in ("slices_fused", "slices_unfused")},
+            _FUSE_LAUNCHES, _ROWMAX_RUNS, {n: g[n] for n in _LAUNCH_FLAGS},
+            _LAUNCH_GEN)
+
+
+def _launch_delta(mark):
+    """What the launch since `mark` changed: counter deltas, and the flags it
+    flipped as `name: (before, after)`."""
+    g = globals()
+    stats0, fl0, rr0, flags0, gen = mark
+    return {
+        "gen": gen,
+        "stats": {k: _STATS[k] - v for k, v in stats0.items() if _STATS[k] != v},
+        "fuse_launches": _FUSE_LAUNCHES - fl0,
+        "rowmax_runs": _ROWMAX_RUNS - rr0,
+        "flags": {n: (v, g[n]) for n, v in flags0.items() if g[n] != v},
+    }
+
+
+def _take_back(delta, stats: bool = True) -> None:
+    """Undo a refused launch's side effects (see `_LAUNCH_FLAGS`). `stats=False`
+    leaves `_STATS` to the caller (a discarded pipelined launch whose counter
+    writes were never booked)."""
+    global _FUSE_LAUNCHES, _ROWMAX_RUNS, _ROWMAX_USED
+    g = globals()
+    if stats:
+        for k, v in delta["stats"].items():
+            _STATS[k] -= v
+    if delta["fuse_launches"]:
+        _FUSE_LAUNCHES -= delta["fuse_launches"]
+        if _FUSE_LAUNCHES <= 0:
+            _FUSE_LAUNCHES = 0
+            _FUSE_KERNEL_INFO.clear()
+    if delta["rowmax_runs"]:
+        _ROWMAX_RUNS -= delta["rowmax_runs"]
+        if _ROWMAX_RUNS <= 0:
+            _ROWMAX_RUNS = 0
+            _ROWMAX_USED = False
+    if _LAUNCH_GEN != delta["gen"]:
+        # A later launch already ran under these flags: see `_LAUNCH_GEN`.
+        return
+    for n, (before, after) in delta["flags"].items():
+        if g[n] == after:
+            g[n] = before
+
+
+def _query_refusals(qs, d, fmt_q, row_scale):
+    """Return query-side refusal mask and whether all rows are refused.
+
+    Checks norms, scaling, overflow, and prunability. Results are cached
+    per query state, avoiding repeated host synchronization across slices.
+    """
+    import torch
+
+    key = ("query_refusals", fmt_q.name, d)
+    got = qs.get(key)
+    if got is None:
+        bad = qs["bad"]
+        if row_scale is not None:
+            # A bad query scale forces only that query row live.
+            bad = bad | scale_mismatch_mask(row_scale, qs["qn"])
+        bad = bad | overflow_mask(d, qs["qn"], fmt_q)
+        qn = qs["qn"]
+        bad = bad | ~(torch.isfinite(qn) & (qn >= _cf.PRUNE_MIN_QNORM))
+        got = qs[key] = (bad, bool(bad.all()))
+    return got
+
+
+def _upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
+                  cn=None, corpus_exact_fp16=None, with_parts=False,
+                  with_outcome=False, tiles=None, stream=None,
+                  speculate=False, _verdict=None):
+    """Compute safe per-query upper bounds for a corpus slice.
+
+    Yields once after the row-max launch, allowing bound computation and
+    guard readback to finish later without synchronizing before launch.
+
+    Guard failures return +inf for affected rows; empty slices return -inf.
+    `corpus_exact_fp16` avoids repeating the per-file format check.
+
+    `tiles` receives per-tile bounds and width when available. Tile bounds
+    never exceed their per-query bounds; invalid values fall back to the
+    per-query bound. An empty dict means no tile maxima were computed.
+
+    Guards run on the device before launch, with refusals resolved afterward.
+    Speculative launches roll back kernel side effects on refusal;
+    non-speculative launches check the verdict before running the kernel.
     """
     import numpy as np
     import torch
@@ -1890,6 +2740,10 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
     n_q = int(Q.shape[0])
     d = int(Q.shape[1])
     dev = Q.device
+    # [guard refusal reason], shared with the PendingBound (`_verdict`) so a
+    # refusal reported BEFORE the yield (a failed speculative launch) is
+    # visible to phase B too.
+    verdict = [None, None] if _verdict is None else _verdict
 
     # The outcome travels OUT of this function rather than being reconstructed
     # from module globals by the caller. A one-element list because the helpers
@@ -1919,11 +2773,14 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
                                         "no outcome recorded"))
         return (res, _outcome[0])
 
-    def _fill(v, reason=None, kind=PASS_ONE_GUARD_REFUSED):
+    def _book(reason, kind):
         if reason:
             _STATS["slices_guard_refused"] += 1
             _STATS["last_refusal_reason"] = reason
         _outcome[0] = PassOneOutcome(kind, reason)
+
+    def _fill(v, reason=None, kind=PASS_ONE_GUARD_REFUSED):
+        _book(reason, kind)
         t = torch.full((n_q,), v, dtype=torch.float32, device=dev)
 
         # Certification needs the approximate value and bound separately.
@@ -1971,10 +2828,11 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
         )
 
     # These preparations allocate device memory too: in particular Qh is a
-    # run-cached half copy and Ch is a fresh half copy for every corpus slice.
-    # Keep them inside the same OOM-to-all-live boundary as the row-max GEMM.
-    # Otherwise a conversion OOM escapes before `approx_rowmax` gets its
-    # chance to translate it into the safe one-pass fallback.
+    # run-cached half copy and Ch is a fresh half copy for every corpus slice,
+    # and the guards below are small device tensors. Keep them inside the same
+    # OOM-to-all-live boundary as the row-max GEMM. Otherwise a conversion OOM
+    # escapes before `approx_rowmax` gets its chance to translate it into the
+    # safe one-pass fallback.
     try:
         qs = query_side(Q, row_scale)
         if cn is None:
@@ -1983,12 +2841,68 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
 
         # Select the conversion-error model from the actual corpus representation.
         if corpus_exact_fp16 is None:
+            # NOTE: reads the corpus back (a sync). Callers on the pipelined
+            # path pass the per-file verdict instead.
             corpus_exact_fp16 = float32_is_exactly_fp16(Cb)
         fmt_c = _cf.EXACT if corpus_exact_fp16 else _cf.FP16
         fmt_q = stored_format(Q)
 
-        # Corpus guards are slice-wide; query guards are per row.
-        Ch, sigma_max, cn_min, cn_max = corpus_side(Cb, col_scale, cn)
+        # Corpus guards are slice-wide; query guards are per row. The
+        # scalars stay on the device (no `float()`): see SLICE_REFUSALS.
+        Ch, sig_t, cn_min_t, cn_max_t = corpus_side(Cb, col_scale, cn,
+                                                    device_scalars=True)
+        # Widened ONCE
+        cn_max_t = cn_max_t.double()
+        if sig_t is not None:
+            sig_t = sig_t.double()
+
+        false = torch.zeros((), dtype=torch.bool, device=dev)
+        refused = [
+            # "corpus norm": every N_c within [NORM_MIN, NORM_MAX] (NaN fails).
+            norm_guard(cn).any(),
+            # "corpus overflow": kappa_bar(d) * max N_c <= Omega (1 - margin).
+            overflow_refused_t(d, cn_max_t, fmt_c),
+            # "corpus scale": sigma_max in range (or exactly 1).
+            false if sig_t is None else scale_range_refused_t(sig_t),
+        ]
+        # "column scale": each sigma within (1 +- u) / N_c of the SAME norms.
+        if col_scale is None:
+            refused.append(false)
+        elif col_scale.shape != cn.shape:
+            # Decided on the host, from shapes: no read.
+            refused.append(torch.ones((), dtype=torch.bool, device=dev))
+        else:
+            refused.append(scale_mismatch_mask(col_scale, cn).any())
+
+        bad, q_refuses_all = _query_refusals(qs, d, fmt_q, row_scale)
+        # A refusal the HOST already knows is certain -- from shapes, or from
+        # the cached query side -- launches nothing, as the guards-first code
+        # did; the device verdict still names the first reason that fired.
+        certain = q_refuses_all or (col_scale is not None
+                                    and col_scale.shape != cn.shape)
+        # The guards' query halves are fixed for the query state: computed
+        # once per query matrix, not per slice (`query_guard_halves`).
+        halves = qs.get("guard_halves")
+        if halves is None:
+            halves = qs["guard_halves"] = query_guard_halves(qs["qn"])
+        bad = bad | product_guard_t(qs["qn"], cn_max_t, halves)
+        bad = bad | prunability_cut_t(qs["qn"], cn_min_t, halves)
+        # "all rows refused": checked (and reported) only after the corpus
+        # guards, as before -- the reason is the FIRST that fired.
+        refused.append(bad.all())
+
+        flags = torch.stack(refused)
+        # THE FOLD: a slice-wide refusal marks every row, so the bound is
+        # `+inf` (prunes nothing) on the device, before anyone reads anything.
+        bad = bad | flags.any()
+
+        probe = torch.cat((
+            flags.to(torch.float64),
+            (torch.ones((), dtype=torch.float64, device=dev) if sig_t is None
+             else sig_t.double()).reshape(1),
+            cn_max_t.double().reshape(1),
+        ))
+        del refused, false, cn_min_t
     except Exception as exc:  # noqa: BLE001 - preserve non-allocation errors
         failure = _as_pass_one_failure(exc, "the pass-one input copies")
         if isinstance(failure, PassOneUnavailable):
@@ -1996,44 +2910,68 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
             return all_live(kind=PASS_ONE_OOM)
         raise failure
 
-    if bool(norm_guard(cn).any()):
-        return all_live("corpus norm")
-
-    if not overflow_guard(d, cn, fmt_c):
-        return all_live("corpus overflow")
-
-    if not _cf.norm_range_ok(sigma_max) and sigma_max != 1.0:
-        return all_live("corpus scale")
-
-    # Verify applied normalization scales against the computed norms.
-    if col_scale is not None:
-        bad_cols, why = scale_mismatch(col_scale, cn)
-        if why:
-            return all_live("column scale")
-
-    bad = qs["bad"]
-
-    if row_scale is not None:
-        bad_rows, why = scale_mismatch(row_scale, qs["qn"])
-        if why:
-            # A bad query scale forces only that query row live.
-            bad = bad | bad_rows
-
-    bad = bad | overflow_mask(d, qs["qn"], fmt_q)
-    bad = bad | product_guard(qs["qn"], cn_max)
-    bad = bad | prunability_cut(qs["qn"], cn_min)
-
-    if bool(bad.all()):
-        # Avoid pass one when every query row is already forced live.
-        return all_live("all rows refused")
-
-    try:
+    def _rowmax():
+        if tiles is not None:
+            return approx_rowmax(qs["Qh"], Ch, col_scale, out_dtype,
+                                 with_tiles=True)
         approx, fused = approx_rowmax(qs["Qh"], Ch, col_scale, out_dtype)
-        _outcome[0] = PassOneOutcome(
+        return approx, fused, None, None
+
+    def _refused(reason, delta):
+        """The guards-first report for a slice the verdict refused: take back
+        whatever a speculative launch changed (`delta`), book the refusal
+        exactly as before, and return `+inf` everywhere."""
+        if delta is not None:
+            _take_back(delta)
+        verdict[0] = reason
+        _book(reason, PASS_ONE_GUARD_REFUSED)
+        if approx is None:
+            t = torch.full((n_q,), float("inf"), dtype=torch.float32, device=dev)
+        else:
+            # The device fold -- every row `bad`, so `+inf` -- not a fresh
+            # constant: the fold is what makes a speculative launch safe.
+            t = torch.where(bad, torch.full_like(approx, float("inf")), approx)
+        return _wrap((t, t.clone(), torch.zeros_like(t)) if with_parts else t)
+
+    # Non-speculative runs read guard results before launch, avoiding wasted
+    # work on refused slices. Only pipelined phase A launches without readback.
+    pre_vals = None
+    approx = None
+    if not speculate and not certain:
+        pre_vals = verdict[1] = _read_probe(probe)
+        reason = _probe_refusal(pre_vals)
+        if reason is not None:
+            return _refused(reason, None)
+
+    event = None
+    mark = None if certain else _launch_mark()
+    try:
+        if certain:
+            # Host-known refusal: skip the kernel without synchronization.
+            # The reported reason may still be an earlier corpus guard.
+            fused, part, tile_w = None, None, None
+        elif stream is None or not str(dev).startswith("cuda"):
+            approx, fused, part, tile_w = _rowmax()
+        else:
+            approx, fused, part, tile_w, event = _rowmax_on(
+                stream, dev, _rowmax, (qs["Qh"], Ch, col_scale))
+        _outcome[0] = None if fused is None else PassOneOutcome(
             PASS_ONE_FUSED if fused
             else (PASS_ONE_CPU_WIDENED if not str(dev).startswith("cuda")
                   else PASS_ONE_UNFUSED_CUBLAS))
-    except PassOneUnavailable:
+    except Exception as exc:  # noqa: BLE001 - re-raised unless refused
+        if speculate:
+            # A speculative failure may belong to a guard-refused slice that would
+            # never have launched. Synchronize to resolve the verdict; ignore the
+            # failure if refused.
+            delta = _launch_delta(mark)
+            approx = None
+            verdict[1] = _read_probe(probe)
+            reason = _probe_refusal(verdict[1])
+            if reason is not None:
+                return _refused(reason, delta)
+        if not isinstance(exc, PassOneUnavailable):
+            raise
         # `slices_unfused` may ALREADY have been incremented by approx_rowmax
         # before the unfused GEMM raised, so a counter delta would read this as
         # "cuBLAS ran" and take the hard refusal. The outcome says what
@@ -2041,7 +2979,80 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
         _STATS["slices_pass_one_oom"] += 1
         return all_live(kind=PASS_ONE_OOM)
 
+    # Capture this launch's side effects so a later refusal can roll them back.
+    delta = None if mark is None else _launch_delta(mark)
     del Ch
+
+    # Launch/finish boundary: speculative execution has not synchronized yet.
+    yield _Launch(event, probe, fused, verdict, delta)
+
+    if pre_vals is None and verdict[1] is not None:
+        # Reuse the verdict if phase B already resolved it.
+        pre_vals = verdict[1]
+    try:
+        extras = []
+        if fused is None:
+            # No kernel launched; the guard verdict determines the outcome.
+            worst_t = None
+        else:
+            # Force non-finite approximate scores live.
+            approx = torch.where(_finite(approx), approx,
+                                _const(float("inf"), approx))
+            if row_scale is not None:
+                approx = approx * row_scale
+            worst_t = _rowmax_worst(approx, metric)
+            if worst_t is not None:
+                extras.append(worst_t)
+
+        # Compute scaled tile maxima and their magnitude cap.
+        # Tile OOMs are handled only after reaching this step.
+        t = t_abs = None
+        tile_oom = False
+        worst_tile_t = None
+        if part is not None:
+            try:
+                t = _tile_scaled(part, row_scale)
+                t_abs = t.abs()
+                t_abs = torch.where(t_abs < float("inf"), t_abs,
+                                    _const(0.0, t_abs)).amax(dim=0)
+                worst_tile_t = _rowmax_worst(t_abs, metric)
+            except Exception as exc:  # noqa: BLE001 - only an OOM is tolerated
+                if not is_oom(exc):
+                    raise
+                tile_oom = True
+                part = t = t_abs = None
+            if worst_tile_t is not None:
+                extras.append(worst_tile_t)
+
+        # Read guard results, eps inputs, and magnitude caps together.
+        if pre_vals is None:
+            vals = _read_probe(probe, *extras)
+            tail = vals[_PROBE_CN_MAX + 1:]
+        else:
+            vals = pre_vals
+            tail = _read_scalars(*extras) if extras else []
+    except Exception:
+        # Ignore speculative errors on guard-refused slices, which would
+        # never have executed this work. Otherwise propagate the error.
+        got = pre_vals
+        if got is None:
+            got = verdict[1] = _read_probe(probe)
+        reason = _probe_refusal(got)
+        if reason is not None:
+            approx = None
+            return _refused(reason, delta)
+        raise
+    worst = tail.pop(0) if worst_t is not None else None
+    worst_tile = tail.pop(0) if worst_tile_t is not None else None
+    del probe, worst_t, worst_tile_t, extras
+
+    reason = verdict[0] = _probe_refusal(vals)
+    if reason is None and fused is None:
+        # Unreachable: no launch means a certain refusal, which the verdict
+        # reports. Fail closed rather than bound with no kernel.
+        reason = verdict[0] = "all rows refused"
+    if reason is not None:
+        return _refused(reason, delta)
 
     # Only trusted accumulation paths may contribute pruning decisions.
     if not accumulator_is_ours(dev, fused):
@@ -2061,15 +3072,15 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
         # corpus rows when the real cause is a TF32/emulation flag.
         return all_live("exact math mode", kind=_outcome[0].kind)
 
-    # Any non-finite approximate result is conservatively forced live.
-    approx = torch.where(torch.isfinite(approx), approx,
-                         torch.full_like(approx, float("inf")))
-
     # Fused output is reduced directly from float32 accumulation; an unfused
     # non-float32 Gram requires the output-rounding term.
     half_out = (out_dtype is not torch.float32) and not fused
 
-    # Bucket slice-wide parameters upward so cached eps remains conservative.
+    # Round this slice's parameters upward for conservative eps caching.
+    # Each slice computes its own key from post-launch reductions, ensuring
+    # cached eps always bounds its values. Only eps values are reused, not keys.
+    sigma_max = 1.0 if col_scale is None else vals[_PROBE_SIGMA]
+    cn_max = vals[_PROBE_CN_MAX]
     sigma_key = _cf.ceil_pow2(sigma_max)
     cn_key = _cf.ceil_pow2(cn_max) if metric == "dot" else 0.0
     ekey = (sigma_key, cn_key, fmt_q.name, fmt_c.name, half_out, metric, d)
@@ -2082,13 +3093,17 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
     else:
         _STATS["eps_cache_hits"] += 1
 
-    eps = torch.as_tensor(np.ascontiguousarray(eps_np), dtype=torch.float32,
-                          device=dev)
+    # Cache the device copy of eps to avoid repeated blocking H2D transfers.
+    # Reuse only if the source array is unchanged and the tensor unmodified.
+    got = qs.setdefault("eps_dev", {}).get(ekey)
+    if got is not None and got[0] is eps_np and got[1]._version == got[2]:
+        eps = got[1]
+    else:
+        eps = torch.as_tensor(np.ascontiguousarray(eps_np),
+                              dtype=torch.float32, device=dev)
+        qs["eps_dev"][ekey] = (eps_np, eps, eps._version)
     if eps.ndim == 0:
         eps = eps.expand(n_q)
-
-    if row_scale is not None:
-        approx = approx * row_scale
 
     out = approx + eps
 
@@ -2096,9 +3111,41 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
     out = torch.where(bad, torch.full_like(out, float("inf")), out)
 
     # Reject rows whose approximate magnitude violates the bound's hypotheses.
-    over = _check_rowmax_magnitude(approx, d, fmt_q, fmt_c, half_out, metric)
+    over = _check_rowmax_magnitude(approx, d, fmt_q, fmt_c, half_out, metric,
+                                   worst=worst)
+
+    if tile_oom:
+        # Fall back to per-query bounds, which are safe for every tile.
+        _STATS["tiles_bound_oom"] += 1
+    elif part is not None:
+        # Check every tile's magnitude, including large negative maxima.
+        # Force entire rows live if any tile exceeds the bound's cap.
+        over_t = _check_rowmax_magnitude(t_abs, d, fmt_q, fmt_c, half_out,
+                                        metric, worst=worst_tile, what="tile")
+        if over_t is not None:
+            over = over_t if over is None else (over | over_t)
+    del t_abs
+
     if over is not None:
         out = torch.where(over, torch.full_like(out, float("inf")), out)
+
+    if part is not None:
+        # Same operations in the same order as `approx`/`out` above, applied to
+        # each tile maximum. Rounding is monotone, so a tile max <= the row max
+        # gives a tile bound <= the row bound, bit for bit.
+        try:
+            t = t + eps[None, :]
+            ok = _finite(part) & _finite(out)[None, :]
+            tiles["upper"] = torch.where(ok, t, out[None, :].expand_as(t))
+            tiles["width"] = int(tile_w)
+            _STATS["tile_width"] = int(tile_w)
+            del ok
+        except Exception as exc:  # noqa: BLE001 - only an OOM is tolerated
+            if not is_oom(exc):
+                raise
+            _STATS["tiles_bound_oom"] += 1
+            tiles.clear()
+        del part, t
 
     if with_parts:
         # `approx` is in the same scaled units as the exact score.
@@ -2106,21 +3153,77 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
 
     return _wrap(out)
 
+
+def _rowmax_on(stream, dev, rowmax, inputs):
+    """Launch `rowmax()` on side `stream`; return its outputs plus an event.
+
+    Cross-stream ownership, so the caching allocator never hands a block to
+    one stream while the other may still use it:
+    - `stream` first waits for the current stream, which produced `inputs`;
+    - `inputs` (current-stream allocations the kernel reads) are recorded on
+      `stream`, so freeing them waits for the kernel;
+    - the outputs (allocated on `stream`) are recorded on the current stream,
+      which is where they are consumed and freed. That consumer must wait on
+      the returned event before touching them -- `upper_bounds_finish` and
+      `upper_bounds_discard` both do.
+    """
+    import torch
+
+    current = torch.cuda.current_stream(dev)
+    stream.wait_stream(current)
+    for t in inputs:
+        if t is not None:
+            t.record_stream(stream)
+    with torch.cuda.stream(stream):
+        approx, fused, part, tile_w = rowmax()
+        event = torch.cuda.Event()
+        event.record(stream)
+    for t in (approx, part):
+        if t is not None:
+            t.record_stream(current)
+    return approx, fused, part, tile_w, event
+
+
 # Largest magnitude admitted for a scaled approximate cosine score.
 # Exceeding it means the pass-one result violates the bound's assumptions.
-def _check_rowmax_magnitude(approx, d, fmt_q, fmt_c, half_out, metric):
-    """Return a per-row mask of approximate scores above the admitted cap."""
+def _rowmax_worst(approx, metric):
+    """The largest finite `|approx|` as a 0-d DEVICE tensor (`-inf` when none
+    is finite), for `_check_rowmax_magnitude(worst=...)`: what it reads
+    with `float(finite.abs().max())`, left unread so the caller can batch the
+    transfer. `None` when there is nothing to check (dot, or no rows)."""
+    import torch
+
+    if metric != "cosine" or approx.numel() == 0:
+        return None
+    # `|x| < inf` is `isfinite(x)` (see `_finite`), sharing the one `abs`.
+    a = approx.abs()
+    return torch.where(a < float("inf"), a, _const(float("-inf"), a)).amax()
+
+
+_NOT_READ = object()
+
+
+def _check_rowmax_magnitude(approx, d, fmt_q, fmt_c, half_out, metric,
+                            worst=_NOT_READ, what="row"):
+    """Return a per-row mask of approximate scores above the admitted cap.
+
+    `worst`, if given, is `_rowmax_worst(approx, metric)` already read back
+    (a float, or None for nothing to check), so this reads nothing itself.
+    """
     global _ROWMAX_MAG_WARNED
     import torch
 
     if metric != "cosine":
         return None
 
-    finite = approx[torch.isfinite(approx)]
-    if finite.numel() == 0:
+    if worst is _NOT_READ:
+        finite = approx[torch.isfinite(approx)]
+        if finite.numel() == 0:
+            return None
+        worst = float(finite.abs().max())
+    elif worst is None or worst == float("-inf"):
+        # No rows, or no finite row max: nothing to cap, nothing to record.
         return None
-
-    worst = float(finite.abs().max())
     cap = (_cf.Lambda(d) * (1.0 + _cf.theta(d, _cf.C_HW_ENVELOPE))
            * (1.0 + fmt_q.u_t) * (1.0 + fmt_c.u_t)
            * ((1.0 + _cf.U16) if half_out else 1.0))
@@ -2131,13 +3234,15 @@ def _check_rowmax_magnitude(approx, d, fmt_q, fmt_c, half_out, metric):
     if worst > cap and not _ROWMAX_MAG_WARNED:
         _ROWMAX_MAG_WARNED = True
         logger.warning(
-            "two-pass: a first-pass row maximum of %.6g exceeds the %.6g that "
-            "Theorem 1 admits at d=%d. The affected rows will be forced live; "
-            "check the applied scales and `probe_scales`.",
-            worst, cap, d,
+            "two-pass: a first-pass %s maximum of magnitude %.6g exceeds the "
+            "%.6g that Theorem 1 admits at d=%d. The affected rows will be "
+            "forced live; check the applied scales and `probe_scales`.",
+            what, worst, cap, d,
         )
 
-    return torch.isfinite(approx) & (approx.abs() > cap)
+    # `|x| < inf` is `isfinite(x)` (see `_finite`), sharing the one `abs`.
+    a = approx.abs()
+    return (a < float("inf")) & (a > cap)
 
 _ROWMAX_MAG_WARNED = False
 

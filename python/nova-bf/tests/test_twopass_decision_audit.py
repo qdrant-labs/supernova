@@ -28,8 +28,11 @@ import torch
 from nova_bf import twopass
 
 
-@pytest.fixture(autouse=True)
-def _clean():
+@pytest.fixture(autouse=True, params=["slice", "tiles"])
+def _clean(request, monkeypatch):
+    # Both pass-two modes: the audits and the `_twopass_prepare` call sites
+    # below must behave the same whichever granularity decides liveness.
+    monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", request.param)
     twopass.reset()
     yield
     twopass.reset()
@@ -1106,3 +1109,206 @@ def test_a_generation_outside_the_allowlist_is_refused():
 
     assert why is not None, "an unmeasured generation was admitted"
     assert "B200" in why and "no accumulation model" in why, why
+
+
+# --- probe A's shortfall diagnostic ------------------------------------------
+#
+# `shortfall_worst_ratio` is the worst row's `exact max - first-pass max` as a
+# fraction of the margin the bound's leading term gives THAT row: C(d) for
+# cosine, C(d) * N_q * ceil_pow2(max N_c) for dot. Dividing a raw dot gap by
+# C(d) alone measured the norms, not the margin: "fell 12.97x C(d)" at d=128
+# on Gaussian vectors whose bound had plenty of slack.
+
+
+def _probe_a(metric, Q, C, shift=None):
+    """`_certify_two_pass` on (Q, C), recording pass one's `approx` and the
+    exact tops. `shift(approx, top)` may lower `approx` (keeping `upper`, so
+    the bound still holds) to plant a genuine shortfall."""
+    from nova_bf import compute as compute_mod
+
+    seen = {}
+    real_ub, real_sc = twopass.upper_bounds, compute_mod._scores
+
+    def ub(*a, **kw):
+        got = real_ub(*a, **kw)
+        (upper, approx, eps), outcome = got
+        if shift is not None:
+            approx = shift(approx)
+        seen["approx"] = approx
+        return (upper, approx, eps), outcome
+
+    def sc(*a, **kw):
+        out = real_sc(*a, **kw)
+        seen["top"] = out.max(dim=1).values
+        return out
+
+    if metric == "cosine":
+        args = (C.norm(dim=1).reciprocal(), Q.norm(dim=1).reciprocal(),
+                Q.norm(dim=1))
+    else:
+        args = (None, None, None)
+    twopass.upper_bounds, compute_mod._scores = ub, sc
+    try:
+        why = compute_mod._certify_two_pass(Q, C, metric, *args, torch.float32)
+    finally:
+        twopass.upper_bounds, compute_mod._scores = real_ub, real_sc
+    return why, seen
+
+
+def _c_d(C, d):
+    return twopass._cf.C_const(
+        d, twopass._cf.U16,
+        0.0 if twopass.float32_is_exactly_fp16(C) else twopass._cf.U16)
+
+
+def _gauss(n_q, n_c, d, scale, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    Q = torch.randn(n_q, d, generator=g) * scale
+    C = (torch.randn(n_c, d, generator=g) * scale).half().float()
+    return Q, C
+
+
+@pytest.mark.parametrize("scale", [1.0, 40.0])
+def test_a_dot_slice_with_ample_slack_does_not_warn(caplog, scale):
+    """Gaussian vectors at d=128 (norms ~11 and ~450): the raw gap over C(d)
+    is far past 0.75 -- the old, misleading number -- while the gap as a
+    fraction of each row's own margin is small, and nothing warns."""
+    import logging
+
+    d = 128
+    Q, C = _gauss(256, 512, d, scale)
+    with caplog.at_level(logging.WARNING, logger="nova_bf.compute"):
+        why, seen = _probe_a("dot", Q, C)
+    assert why is None, why
+    ratio = twopass.stats()["shortfall_worst_ratio"]
+    assert ratio is not None and 0.0 < ratio < 0.75, ratio
+    raw = float((seen["top"] - seen["approx"]).max()) / _c_d(C, d)
+    assert raw > 0.75, ("the fixture no longer shows the norm inflation the "
+                        f"scaled ratio exists to remove: raw {raw:.3f}")
+    # Exactly the documented formula: per row, gap / (N_q * ceil_pow2(max N_c)).
+    cn_key = twopass._cf.ceil_pow2(float(C.norm(dim=1).max()))
+    want = float(((seen["top"] - seen["approx"]).double()
+                  / (Q.norm(dim=1).double() * cn_key)).max()) / _c_d(C, d)
+    assert ratio == pytest.approx(want, rel=1e-12)
+    assert not [r for r in caplog.records if "below the exact" in r.message]
+
+
+def test_on_unit_cosine_vectors_the_ratio_is_the_raw_gap_over_c_d():
+    """Cosine is in unit-score units: the scale is 1, and the ratio is the
+    same number the probe always reported."""
+    d = 128
+    Q, C = _gauss(256, 512, d, 1.0, seed=1)
+    Q = Q / Q.norm(dim=1, keepdim=True)
+    C = (C / C.norm(dim=1, keepdim=True)).half().float()
+    why, seen = _probe_a("cosine", Q, C)
+    assert why is None, why
+    want = float((seen["top"] - seen["approx"]).max()) / _c_d(C, d)
+    assert twopass.stats()["shortfall_worst_ratio"] == want
+
+
+@pytest.mark.parametrize("metric", ["dot", "cosine"])
+def test_a_shortfall_that_uses_most_of_the_margin_still_warns(caplog, metric):
+    """A first pass 0.9 of the row's margin below its exact max (upper
+    untouched, so the bound still HOLDS): recorded, warned, not refused."""
+    import logging
+
+    d = 128
+    Q, C = _gauss(256, 512, d, 3.0, seed=2)
+    if metric == "cosine":
+        Q = Q / Q.norm(dim=1, keepdim=True)
+        C = (C / C.norm(dim=1, keepdim=True)).half().float()
+        row_scale = torch.ones(Q.shape[0], dtype=torch.float64)
+    else:
+        row_scale = (Q.norm(dim=1).double()
+                     * twopass._cf.ceil_pow2(float(C.norm(dim=1).max())))
+    margin = (0.9 * _c_d(C, d) * row_scale).float()
+
+    def shift(approx):
+        out = approx.clone()
+        out[7] = out[7] - margin[7]
+        return out
+
+    with caplog.at_level(logging.WARNING, logger="nova_bf.compute"):
+        why, _ = _probe_a(metric, Q, C, shift=shift)
+    assert why is None, why
+    ratio = twopass.stats()["shortfall_worst_ratio"]
+    assert ratio > 0.75, ratio
+    assert [r for r in caplog.records if "below the exact" in r.message]
+
+
+def test_the_dot_scale_reuses_the_bounds_own_query_norms(monkeypatch):
+    """`query_side`'s cached binary32 norms, the entry `upper_bounds` just
+    built: the diagnostic is a cache hit, not a second norm pass."""
+    Q, C = _gauss(64, 128, 128, 5.0)
+    built = []
+    real = twopass.query_side
+
+    def spy(Q_, row_scale=None):
+        before = twopass._QCACHE.get(id(Q_))
+        got = real(Q_, row_scale)
+        built.append(got is not before)
+        return got
+
+    monkeypatch.setattr(twopass, "query_side", spy)
+    why, _ = _probe_a("dot", Q, C)
+    assert why is None, why
+    assert built and built[-1] is False, built
+    assert torch.equal(twopass._QCACHE[id(Q)]["qn"], Q.float().norm(dim=1))
+
+
+def test_an_oom_in_the_shortfall_diagnostic_still_certifies(monkeypatch):
+    """The bound held; failing to MEASURE its slack is not a verdict and must
+    not raise out of certification."""
+    Q, C = _gauss(64, 128, 128, 5.0)
+    done = [False]
+    real_ub, real_qs = twopass.upper_bounds, twopass.query_side
+
+    def ub(*a, **kw):
+        got = real_ub(*a, **kw)
+        done[0] = True
+        return got
+
+    def qs(*a, **kw):
+        if done[0]:
+            raise RuntimeError("CUDA out of memory (simulated)")
+        return real_qs(*a, **kw)
+
+    monkeypatch.setattr(twopass, "upper_bounds", ub)
+    monkeypatch.setattr(twopass, "query_side", qs)
+    from nova_bf import compute as compute_mod
+
+    why = compute_mod._certify_two_pass(Q, C, "dot", None, None, None,
+                                        torch.float32)
+    assert why is None, why
+    assert twopass.stats()["shortfall_worst_ratio"] is None
+
+
+def test_an_oom_computing_c_d_still_certifies(monkeypatch):
+    """`C(d)`'s storage probe allocates too: inside the same guard."""
+    Q, C = _gauss(64, 128, 128, 5.0)
+    done = [False]
+    real_ub, real_fp16 = twopass.upper_bounds, twopass.float32_is_exactly_fp16
+
+    def ub(*a, **kw):
+        got = real_ub(*a, **kw)
+        done[0] = True
+        return got
+
+    def fp16(*a, **kw):
+        if done[0]:
+            raise RuntimeError("CUDA out of memory (simulated)")
+        return real_fp16(*a, **kw)
+
+    monkeypatch.setattr(twopass, "upper_bounds", ub)
+    monkeypatch.setattr(twopass, "float32_is_exactly_fp16", fp16)
+    from nova_bf import compute as compute_mod
+
+    for metric in ("dot", "cosine"):
+        twopass.reset()
+        done[0] = False
+        args = ((None, None, None) if metric == "dot" else
+                (C.norm(dim=1).reciprocal(), Q.norm(dim=1).reciprocal(),
+                 Q.norm(dim=1)))
+        why = compute_mod._certify_two_pass(Q, C, metric, *args, torch.float32)
+        assert why is None, (metric, why)
+        assert twopass.stats()["shortfall_worst_ratio"] is None

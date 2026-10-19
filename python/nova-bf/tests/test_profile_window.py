@@ -199,3 +199,35 @@ def test_the_marks_actually_appear_in_the_trace(tmp_path, monkeypatch):
     # On this (unbuffered) path the two marks wrap the same statements, so they
     # come in pairs. The other paths use their own names and need a GPU.
     assert marked["bf_transfer"] == marked["bf_slice"], marked
+
+
+def test_marks_from_another_thread_appear_in_the_trace(tmp_path, monkeypatch):
+    """The dense staging helper marks and copies on its own thread. Kineto
+    records only the opening thread unless told otherwise, which would drop
+    `bf_prefetch_stage` (and its copies) from every trace."""
+    import gzip
+    import json as _json
+    import threading
+
+    import torch
+
+    if profiling._all_threads_config() is None:
+        pytest.skip("this torch cannot profile all threads")
+    out = tmp_path / "prof"
+    monkeypatch.setenv("NOVA_BF_PROFILE_FILES", "1:1")
+    monkeypatch.setenv("NOVA_BF_PROFILE_OUT", str(out))
+    profiling.configure()
+    profiling.start(1)
+    try:
+        def helper():
+            with profiling.slice_mark("bf_prefetch_stage"):
+                torch.ones(64).copy_(torch.zeros(64))
+
+        t = threading.Thread(target=helper)
+        t.start()
+        t.join()
+    finally:
+        profiling.stop(1)
+    with gzip.open(out / "C_trace.json.gz", "rt") as fh:
+        names = {e.get("name") for e in _json.load(fh)["traceEvents"]}
+    assert "bf_prefetch_stage" in names

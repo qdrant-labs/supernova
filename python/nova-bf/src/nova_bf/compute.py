@@ -997,58 +997,128 @@ class DenseCorpusBatch:
         Keeping publication in `transfer` preserves the instrumentation seam:
         a transfer observer sees the slice immediately before scoring even
         though its data movement started one slice earlier.
+
+        The two halves can run on different threads (see `_run_dense_prefetch`).
+        `prepare_prefetch` runs on the GPU-feeding thread. `stage_prefetch` runs
+        on the feeding thread or on the staging helper.
         """
+        self.stage_prefetch(self.prepare_prefetch(r0, r1, device))
+
+    def prepare_prefetch(self, r0: int, r1: int, device: str) -> "_DensePrefetchPlan":
+        """Allocate one slice's device memory on the CALLING thread.
+
+        Called on the GPU-feeding thread, before the previous slice is scored,
+        so device allocations happen in the same order as inline staging.
+        An out-of-memory error then raises here, before that slice's
+        temporaries exist, instead of on the helper at an arbitrary point
+        during scoring. The fp32 widen target is allocated here too.
+
+        Also resolves an unindexed `cuda` device to this thread's current
+        device. The helper thread does not share this thread's device context.
+        """
+        import torch
+
         key = (r0, r1)
         if key in self._prefetched:
             raise RuntimeError(f"dense slice {key} was prefetched twice")
-        self._prefetched[key] = self._transfer_pinned(r0, r1, device)
-
-    def _transfer_pinned(self, r0: int, r1: int, device: str):
-        """Stage one slice through the fixed two-slot pinned-memory ring."""
-        import torch
-
         rows = r1 - r0
         if rows > self._pinned_rows:
             raise RuntimeError(
                 f"dense transfer slice has {rows} rows, above its configured "
                 f"pinned staging capacity {self._pinned_rows}"
             )
-        if self._ring is None:
-            dtype = torch.from_numpy(self.arr[:1]).dtype
-            self._ring = [
-                torch.empty(
-                    (self._pinned_rows, self.arr.shape[1]),
-                    dtype=dtype,
-                    pin_memory=True,
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        with torch.cuda.device(dev):
+            if self._ring is None:
+                dtype = torch.from_numpy(self.arr[:1]).dtype
+                self._ring = [
+                    torch.empty(
+                        (self._pinned_rows, self.arr.shape[1]),
+                        dtype=dtype,
+                        pin_memory=True,
+                    )
+                    for _ in range(self._RING_SIZE)
+                ]
+                self._ring_ready = [None] * self._RING_SIZE
+            if self._copy_stream is None:
+                # Per device, not per batch: see `_device_streams`.
+                self._copy_stream = _dense_copy_stream(dev)
+            # Allocated on the copy stream, matching inline `host.to(device)`.
+            # Only the copy stream uses `dst`. `out` is handed to compute,
+            # which records its stream on it in `wait_on`.
+            with torch.cuda.stream(self._copy_stream):
+                shape = (rows, self.arr.shape[1])
+                dst = torch.empty(shape, dtype=self._ring[0].dtype, device=dev)
+                out = (
+                    dst if dst.dtype is torch.float32
+                    else torch.empty(shape, dtype=torch.float32, device=dev)
                 )
-                for _ in range(self._RING_SIZE)
-            ]
-            self._ring_ready = [None] * self._RING_SIZE
-        if self._copy_stream is None:
-            self._copy_stream = torch.cuda.Stream(device=torch.device(device))
+        return _DensePrefetchPlan(r0, r1, dev, dst, out)
 
-        slot = self._ring_i % self._RING_SIZE
-        self._ring_i += 1
-        # The previous DMA must stop reading this host buffer before it is
-        # refilled. Two slots bound reuse; this event makes reuse safe.
-        previous = self._ring_ready[slot]
-        if previous is not None:
-            previous.synchronize()
-        host = self._ring[slot][:rows]
-        host.copy_(torch.from_numpy(self.arr[r0:r1]))
+    def stage_prefetch(self, plan: "_DensePrefetchPlan") -> None:
+        """Fill a prepared slice: host copy into the ring, then enqueue the H2D.
 
-        with torch.cuda.stream(self._copy_stream):
-            Cb = host.to(device, non_blocking=True)
-            # Widen on the copy stream before publishing readiness. Widening
-            # on the compute stream could race the fp16 H2D operation.
-            if Cb.dtype is not torch.float32:
-                Cb = Cb.to(torch.float32)
-            ready = torch.cuda.Event()
-            ready.record(self._copy_stream)
-        self._ring_ready[slot] = ready
+        Allocates no device memory. Safe on the staging helper thread because
+        the caller never has two stagings in flight. It waits for each one
+        before the matching `transfer` and before submitting the next. So the
+        ring cursor, `_ring_ready` and the transfer counters have one writer at
+        a time, and the future's completion orders those writes before the
+        feeding thread reads them. `_prefetched` is the exception: this thread
+        inserts key i+1 while the feeding thread may pop key i. Those are
+        different keys, and single dict operations are atomic under the GIL.
+        """
+        self._prefetched[(plan.r0, plan.r1)] = self._stage(plan)
+
+    def _transfer_pinned(self, r0: int, r1: int, device: str):
+        """Stage one slice through the fixed two-slot pinned-memory ring."""
+        return self._stage(self.prepare_prefetch(r0, r1, device))
+
+    def _stage(self, plan: "_DensePrefetchPlan"):
+        import torch
+
+        # Helper threads start on the default device.
+        with torch.cuda.device(plan.device):
+            rows = plan.r1 - plan.r0
+            slot = self._ring_i % self._RING_SIZE
+            self._ring_i += 1
+            
+            # Wait for the slot's previous DMA before reusing its buffer.
+            previous = self._ring_ready[slot]
+            if previous is not None:
+                previous.synchronize()
+            host = self._ring[slot][:rows]
+            host.copy_(torch.from_numpy(self.arr[plan.r0:plan.r1]))
+
+            with torch.cuda.stream(self._copy_stream):
+                plan.dst.copy_(host, non_blocking=True)
+                
+                # Widen after H2D on the same stream to avoid races.
+                if plan.out is not plan.dst:
+                    plan.out.copy_(plan.dst)
+                ready = torch.cuda.Event()
+                ready.record(self._copy_stream)
+            self._ring_ready[slot] = ready
         _DENSE_TRANSFER_STATS["pinned_slices"] += 1
         _DENSE_TRANSFER_STATS["copy_stream_slices"] += 1
+        Cb = plan.out
+        
+        # Release plan references; the allocator tracks dst's stream use.
+        plan.dst = plan.out = None
         return Cb, ready
+
+
+@dataclass
+class _DensePrefetchPlan:
+    """Device memory for one prefetched dense slice, allocated by
+    `DenseCorpusBatch.prepare_prefetch` on the GPU-feeding thread."""
+
+    r0: int
+    r1: int
+    device: object  # torch.device, always indexed for CUDA
+    dst: object     # stored-dtype H2D destination
+    out: object     # float32 slice handed to scoring (`dst` when already fp32)
 
 
 @dataclass
@@ -1260,7 +1330,30 @@ _DENSE_TRANSFER_STATS = {
     "mode": 2,
     "pinned_slices": 0,
     "copy_stream_slices": 0,
+    "prefetch_inline": False,
 }
+
+
+def _dense_prefetch_inline() -> bool:
+    """Whether mode-2 staging runs inline on the GPU-feeding thread.
+
+    Off by default: the next slice's host copy into pinned memory runs on one
+    helper thread so it overlaps the current slice's GPU work (see
+    `_run_dense_prefetch`). `NOVA_BF_PREFETCH_INLINE=1` (or true/yes/on)
+    restores the previous inline staging. Results are identical either way;
+    only scheduling changes.
+    """
+    raw = os.environ.get("NOVA_BF_PREFETCH_INLINE")
+    if raw is None:
+        return False
+    v = raw.strip().lower()
+    if v in ("", "0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(
+        f"NOVA_BF_PREFETCH_INLINE must be a boolean (1/0, true/false), got {raw!r}"
+    )
 
 
 def _dense_transfer_mode() -> int:
@@ -1294,7 +1387,10 @@ def _reset_prune_instrumentation() -> None:
         "mode": _dense_transfer_mode(),
         "pinned_slices": 0,
         "copy_stream_slices": 0,
+        "prefetch_inline": _dense_prefetch_inline(),
     })
+    # A helper left by a caller outside `run_compute` must not carry into this run.
+    _close_dense_staging()
 
 
 # Track how many query/slice rows survive pruning, overall and per search.
@@ -2485,12 +2581,15 @@ def _reset_certify_outcome() -> None:
 
 
 def _reset_twopass_hints() -> None:
-    global _TP_OUT_DTYPE, _TP_TF32_WARNED
+    global _TP_OUT_DTYPE, _TP_TF32_WARNED, _TILES_FALLBACK_WARNED
+    global _TILES_DECLINE_WARNED
 
     _TP_LIVE_HINT.clear()
     _ROW_SCALE.clear()
     # Warn-once state is per run, not per process.
     _TP_TF32_WARNED = False
+    _TILES_FALLBACK_WARNED = False
+    _TILES_DECLINE_WARNED = False
 
     # Re-probe the output dtype for each run so an earlier GPU/device state
     # cannot pin the bound used by later runs.
@@ -2651,13 +2750,34 @@ def _certify_two_pass(Q, Cb, metric, col_scale, row_scale, q_norms,
             f"bound would call live rows dead"
         )
 
-    # Record how much of the closed-form margin the observed pass-one error uses.
-    C_d = twopass._cf.C_const(
-        d, twopass._cf.U16,
-        0.0 if twopass.float32_is_exactly_fp16(Cb) else twopass._cf.U16)
-    ok_rows = needs_bound & torch.isfinite(top) & torch.isfinite(approx)
-    if bool(ok_rows.any()) and C_d > 0.0:
-        shortfall = float((top - approx)[ok_rows].max()) / C_d
+    # Measure the worst observed error relative to the bound's leading term.
+    # Cosine uses unit scale; dot normalizes by N_q * ceil_pow2(max N_c)
+    # (Theorems 1/1'), making the ratio dimensionless for both metrics.
+    # This is diagnostic only: OOM skips measurement, not certification.
+    try:
+        # `float32_is_exactly_fp16` allocates (a half and a float copy).
+        C_d = twopass._cf.C_const(
+            d, twopass._cf.U16,
+            0.0 if twopass.float32_is_exactly_fp16(Cb) else twopass._cf.U16)
+        gap = (top - approx).double()
+        ok_rows = needs_bound & torch.isfinite(top) & torch.isfinite(approx)
+        if metric == "dot":
+            # Match the query norms and corpus scale used by the bound.
+            qn = twopass.query_side(Q, row_scale)["qn"]
+            cn_key = twopass._cf.ceil_pow2(float(Cb.float().norm(dim=1).max()))
+            scale = qn.double() * cn_key
+            ok_rows = ok_rows & torch.isfinite(scale) & (scale > 0.0)
+            gap = gap / scale
+        measured = bool(ok_rows.any()) and C_d > 0.0
+        if measured:
+            shortfall = float(gap[ok_rows].max()) / C_d
+    except Exception as exc:                       # noqa: BLE001
+        if not _is_oom(exc):
+            raise
+        logger.info("two-pass: probe A's shortfall measurement could not "
+                    "allocate; skipped (the bound held on every row).")
+        measured = False
+    if measured:
         twopass._STATS["shortfall_worst_ratio"] = max(
             twopass._STATS.get("shortfall_worst_ratio") or 0.0, shortfall)
         if shortfall > 0.75:
@@ -2665,12 +2785,16 @@ def _certify_two_pass(Q, Cb, metric, col_scale, row_scale, q_norms,
             # property. It is a signal that the real error has little of the
             # margin the model predicts, i.e. that a term may be missing.
             logger.warning(
-                "two-pass: the first pass fell %.2fx C(d) below the exact "
-                "maximum on this slice (d=%d, C=%.4e). The bound HELD on every "
-                "row, but Sec.9.3 red-flags anything above 0.75 — the worst "
-                "previously recorded was 0.42. Check the accumulation probe "
-                "and the storage formats before trusting this configuration.",
-                shortfall, d, C_d,
+                "two-pass: the first pass fell %.2f of the bound's margin "
+                "(C(d); for dot, C(d) x N_q x ceil_pow2(max N_c)) below the "
+                "exact maximum on this slice (metric=%s, d=%d, C=%.4e). The bound HELD on "
+                "every row, but Sec.9.3 red-flags anything above 0.75 — the "
+                "worst previously recorded was 0.42, a COSINE figure; a dot "
+                "ratio is if anything diluted (max N_c is rounded up to a "
+                "power of two, and rows whose best match has a smaller norm "
+                "use less of it). Check the accumulation probe and the "
+                "storage formats before trusting this configuration.",
+                shortfall, metric, d, C_d,
             )
         else:
             logger.info(
@@ -2834,24 +2958,297 @@ _TP_UNSET = object()
 _TP_OUT_DTYPE = _TP_UNSET
 
 
-def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
-                     audit_members=None):
-    """Build two-pass plans for eligible score matrices in this slice.
+def _tp_cert_key(g, sl, device) -> tuple:
+    """The execution configuration a slice's pass one is certified for."""
+    Q = g["Q"]
+    return (g["key"], int(Q.shape[0]), int(sl.Cb.shape[0]),
+            int(Q.shape[1]), str(device), str(_tp_out_dtype()),
+            bool(sl.exact_fp16))
 
-    Uses the approximate upper bound to identify live query rows, verifies a
-    bit-identical padded GEMM height, and computes exact scores only for those
-    rows. Groups that cannot safely or profitably use two-pass fall back to
-    ordinary full-height scoring.
+
+class _PassOneLaunch:
+    """A pass-one score group launched ahead by `_twopass_launch`.
+
+    Counter changes are deferred to phase B (`deltas` for increments,
+    `marks` for before/after values). Device-side guard refusals are
+    handled separately by `upper_bounds_finish` or `_tp_discard`.
+
+    Phase B books counters when consuming the launch, or discards them
+    otherwise. Discarded launches that ran a kernel retain their
+    `slices_fused` / `slices_unfused` increment and add `slices_discarded`.
+
+    `error` stores launch exceptions. `fuse_seen` records the fused-kernel
+    state at launch; `fuse_failure` records failures deferred by this launch.
+    Errors or stale fused-kernel state (`fuse_stale`) trigger an inline retry
+    to preserve unpipelined behavior.
+    """
+
+    __slots__ = ("pending", "cert_key", "tile_info", "deltas", "marks",
+                 "error", "fuse_seen", "fuse_failure", "refusal")
+
+    # The pass-one kinds: a kernel ran (fused, or cuBLAS / CPU widened).
+    _RAN = ("slices_fused", "slices_unfused")
+
+    def __init__(self, cert_key, tile_info):
+        self.pending = None
+        self.cert_key = cert_key
+        self.tile_info = tile_info
+        self.deltas = {}
+        self.marks = {}
+        self.error = None
+        self.fuse_seen = None
+        self.fuse_failure = None
+        # The guard refusal reason, once phase B read the launch's verdict
+        # (consumed or discarded); None while unread or when none fired.
+        self.refusal = None
+
+    @property
+    def fuse_stale(self) -> bool:
+        """Whether the fused kernel's state differs from the one the launch
+        ran under: a later inline pass one disabled it (the launch may have
+        used a kernel the unpipelined run no longer had), or an earlier
+        launch's deferred failure was dropped (the launch skipped a kernel
+        the unpipelined run would still try)."""
+        return twopass.fused_off() != self.fuse_seen
+
+    @property
+    def po_delta(self) -> int:
+        return sum(self.deltas.get(k, 0) for k in self._RAN)
+
+    @property
+    def oom_delta(self) -> int:
+        return self.deltas.get("slices_pass_one_oom", 0)
+
+    @property
+    def ran_kernel(self) -> bool:
+        """Whether the launch produced a pass-one result from a kernel."""
+        return bool(self.po_delta and not self.oom_delta
+                    and self.error is None)
+
+    def unbook(self, before: dict) -> None:
+        """Take back every counter write since `before` (a `_STATS` copy)."""
+        st = twopass._STATS
+        for key, was in before.items():
+            now = st.get(key)
+            if now == was:
+                continue
+            if (isinstance(now, int) and isinstance(was, int)
+                    and not isinstance(now, bool)):
+                self.deltas[key] = now - was
+                st[key] = was
+            else:
+                self.marks[key] = (was, now)
+                st[key] = was
+
+    def book(self, keys=None) -> None:
+        """Book the held writes (all of them, or only `keys`). Once."""
+        st = twopass._STATS
+        for key, d in list(self.deltas.items()):
+            if keys is None or key in keys:
+                st[key] += d
+                del self.deltas[key]
+        for key, (_, now) in list(self.marks.items()):
+            if keys is None or key in keys:
+                st[key] = now
+                del self.marks[key]
+
+
+# Cache one distinct pass-one and H2D stream pair per device.
+# CUDA streams come from a round-robin pool, so streams created at different
+# times can alias, silently serializing pass one and H2D. Create them together
+# and retry collisions to preserve overlap.
+# Keep the same priority to avoid changing GPU scheduling behavior.
+_DEVICE_STREAMS: dict = {}
+
+def _device_streams(dev):
+    """`(pass_one_stream, copy_stream)` for CUDA device `dev` (indexed)."""
+    import torch
+
+    got = _DEVICE_STREAMS.get(dev.index)
+    if got is None:
+        side = torch.cuda.Stream(device=dev)
+        copy = torch.cuda.Stream(device=dev)
+        # Bounded by the pool size: a round-robin pool cannot return the same
+        # stream twice in a row unless it has a single entry.
+        for _ in range(64):
+            handle = getattr(copy, "cuda_stream", None)
+            if handle is None or handle != getattr(side, "cuda_stream", None):
+                break
+            copy = torch.cuda.Stream(device=dev)
+        got = _DEVICE_STREAMS[dev.index] = (side, copy)
+    return got
+
+
+def _indexed_cuda(device):
+    import torch
+
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    return dev
+
+
+def _pass_one_stream(device):
+    """The side stream pipelined pass ones launch on; `None` off CUDA."""
+    if not str(device).startswith("cuda"):
+        return None
+    return _device_streams(_indexed_cuda(device))[0]
+
+
+def _dense_copy_stream(device):
+    """The stream dense H2D staging (`DenseCorpusBatch`) copies on."""
+    return _device_streams(_indexed_cuda(device))[1]
+
+
+def _twopass_launch(tp_groups, sl, device, step):
+    """Phase A: speculatively launch pass one without making decisions.
+
+    Launch certified groups using possibly stale live-fraction hints.
+    Guards and conversions run on the current stream; the fused kernel runs
+    on the side stream. No thresholds are read or decisions changed.
+    """
+
+    if not (tp_groups and sl.n_rows == step and twopass.enabled()):
+        return None
+    stream = _pass_one_stream(device)
+    tiles = twopass.tiles_mode()
+    thresh = twopass.threshold()
+    force = twopass.force_engage()
+    no_certify = bool(os.environ.get("NOVA_BF_TWOPASS_NO_CERTIFY"))
+    st = twopass._STATS
+    out = {}
+    for score_key, g in tp_groups.items():
+        hint = _TP_LIVE_HINT.get(g["key"])
+        if hint is None and force:
+            hint = 0.0
+        if hint is None or hint > thresh:
+            continue
+        cert_key = _tp_cert_key(g, sl, device)
+        if not (no_certify or twopass.is_certified(cert_key)):
+            continue
+        rec = _PassOneLaunch(cert_key, {} if tiles else None)
+        before = dict(st)
+        with twopass.deferred_fuse_disable():
+            rec.fuse_seen = twopass.fused_off()
+            deferred = twopass.fuse_pending()
+            try:
+                metric = g["metric"]
+                col_scale = (sl.col_norms().reciprocal() if metric == "cosine"
+                             else None)
+                rec.pending = twopass.upper_bounds_begin(
+                    g["Q"], sl.Cb, col_scale, g["row_scale"], _tp_out_dtype(),
+                    metric=metric, cn=sl.col_norms_raw(),
+                    corpus_exact_fp16=sl.exact_fp16, with_parts=True,
+                    tiles=rec.tile_info, stream=stream)
+            except Exception as exc:  # noqa: BLE001 - deferred to phase B
+                rec.error = exc
+            if deferred is None:
+                rec.fuse_failure = twopass.fuse_pending()
+
+        # Defer counter updates to phase B to match inline execution.
+        rec.unbook(before)
+        st["pipeline_launched"] += 1
+        out[score_key] = rec
+    return out or None
+
+
+def _tp_discard(rec, retried: bool = False, count: bool = True) -> None:
+    """Discard an unused phase-A launch. Idempotent.
+
+    Drop speculative counters and deferred fused-kernel failures to match
+    unpipelined execution. If a kernel ran without being retried, retain
+    its fused/unfused count and add `slices_discarded`.
+
+    Device-side guard refusals are excluded from these counts. Since this
+    path does not synchronize, defer resolving the guard verdict until
+    the next synchronization or stats read.
+
+    `count=False` releases resources without updating counters.
+    """
+    pending, rec.pending = rec.pending, None
+    settle = None
+    if pending is not None:
+        twopass.upper_bounds_discard(pending)
+        if count and rec.cert_key is not None and rec.ran_kernel:
+            ran = {k: rec.deltas[k] for k in _PassOneLaunch._RAN
+                   if rec.deltas.get(k)}
+
+            def settle(rec=rec, pending=pending, ran=ran, retried=retried):
+                refused = twopass.discard_resolved(pending)
+                rec.refusal = refused
+                if refused is None and not retried:
+                    # A kernel ran and nothing will use it: the counter
+                    # identity's `slices_discarded` side.
+                    st_ = twopass._STATS
+                    for k, v in ran.items():
+                        st_[k] += v
+                    st_["slices_discarded"] += 1
+    if rec.fuse_failure is not None:
+        twopass.fuse_drop_pending(rec.fuse_failure)
+        rec.fuse_failure = None
+    if not count or rec.cert_key is None:
+        return
+    rec.cert_key = None          # booked once, however often it is released
+    st = twopass._STATS
+    st["pipeline_discarded"] += 1
+    if retried:
+        st["pipeline_retried"] += 1
+    if settle is not None:
+        twopass.defer_booking(settle)
+    rec.deltas.clear()
+    rec.marks.clear()
+
+
+def _tp_discard_all(launched, count: bool = True) -> None:
+    if not launched:
+        return
+    for rec in list(launched.values()):
+        _tp_discard(rec, count=count)
+    launched.clear()
+
+
+def _tp_discard_all_quietly(launched) -> None:
+    """The unwind release (`count=False`): every launch is released even if
+    one release raises, and a failure is only logged -- it must never replace
+    the exception already unwinding. `Exception` only: a KeyboardInterrupt
+    here must escape."""
+    if not launched:
+        return
+    for rec in list(launched.values()):
+        try:
+            _tp_discard(rec, count=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("pass-one release failed during unwind: %r", exc)
+    launched.clear()
+
+
+def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
+                     audit_members=None, launched=None):
+    """Build two-pass plans, falling back to full scoring when needed.
+
+    Use approximate bounds to select live rows, verify the padded GEMM
+    height, and compute exact scores only for surviving rows.
+
+    `launched` contains speculative pass ones from phase A. All decisions
+    use current state, as in unpipelined execution; eligible launches
+    replace only the inline `upper_bounds` call. Entries remain in the
+    mapping, and the caller discards any left unused.
     """
     import torch
 
     plans = {}
     # Apply stats only if the whole group loop succeeds.
     notes = []          
+    # Tiles mode decides liveness per (query, tile) and hints a TILE-pair
+    # fraction, so it has its own engage cutoff (see `twopass.threshold`).
+    tiles = twopass.tiles_mode()
     thresh = twopass.threshold()
     force = twopass.force_engage()
 
     for score_key, g in tp_groups.items():
+        # Left in `launched` once consumed (consumption is idempotent), so an
+        # exception anywhere below still has the caller release it.
+        pre = launched.get(score_key) if launched else None
         hint = _TP_LIVE_HINT.get(g["key"])
         if hint is None and force:
             # Verification runs engage before the hint exists; see
@@ -2859,20 +3256,36 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
             hint = 0.0
         if hint is None or hint > thresh:
             twopass._STATS["slices_plain"] += 1
+            if pre is not None:
+                # Launched on the hint one slice earlier; the current one
+                # says plain, so this slice is scored exactly as unpipelined.
+                _tp_discard(pre)
             # One-pass scoring seeds/updates the live-fraction hint.
             continue
         Q = g["Q"]
         n_full = int(Q.shape[0])
         metric = g["metric"]
-        col_scale = sl.col_norms().reciprocal() if metric == "cosine" else None
 
         # Certify each execution configuration before allowing it to prune.
-        cert_key = (g["key"], int(Q.shape[0]), int(sl.Cb.shape[0]),
-                    int(Q.shape[1]), str(device), str(_tp_out_dtype()),
-                    bool(sl.exact_fp16))
+        cert_key = _tp_cert_key(g, sl, device)
         budget_key = _certify_budget_key(g["key"], Q, device, _tp_out_dtype())
-        if not twopass.is_certified(cert_key) and not os.environ.get(
-                "NOVA_BF_TWOPASS_NO_CERTIFY"):
+        certified = twopass.is_certified(cert_key) or bool(
+            os.environ.get("NOVA_BF_TWOPASS_NO_CERTIFY"))
+        if pre is not None and (pre.error is not None or pre.oom_delta
+                                or pre.fuse_stale or pre.cert_key != cert_key
+                                or not certified):
+            # A launch that failed, could not allocate (the pipelined run
+            # holds one more slice on the device) or ran under a fused-kernel
+            # state that has changed since is retried inline, where the
+            # unpipelined run would have run it: the same result, or the
+            # same exception at the same point.
+            _tp_discard(pre, retried=(pre.error is not None
+                                      or bool(pre.oom_delta)
+                                      or pre.fuse_stale))
+            pre = None
+        col_scale = (sl.col_norms().reciprocal()
+                     if metric == "cosine" and pre is None else None)
+        if not certified:
             why = _certify_two_pass(
                 Q, sl.Cb, metric, col_scale, g["row_scale"], g["q_norms"],
                 _tp_out_dtype())
@@ -2935,41 +3348,118 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
         oom_before = twopass._STATS["slices_pass_one_oom"]
         po_before = (twopass._STATS["slices_fused"]
                      + twopass._STATS["slices_unfused"])
-        upper, _approx_dbg, _eps_dbg = twopass.upper_bounds(
-            Q, sl.Cb, col_scale, g["row_scale"], _tp_out_dtype(),
-            metric=metric, cn=sl.col_norms_raw(),
-            corpus_exact_fp16=sl.exact_fp16, with_parts=True)
-        # Largest epsilon gives a conservative audit margin ratio.
-        eps_for_audit = float(_eps_dbg.max()) if _eps_dbg.numel() else 0.0
+        if pre is not None:
+            # Apply deferred failures at the equivalent inline execution point.
+            if pre.fuse_failure is not None:
+                # Only apply the failure if the guards allowed the kernel to run.
+                # Resolving the verdict synchronizes, but only on this rare path.
+                reason, pre.fuse_failure = pre.fuse_failure, None
+                if twopass.resolve_refusal(pre.pending) is not None:
+                    twopass.fuse_drop_pending(reason)
+                else:
+                    twopass.fuse_apply_pending(reason)
+            pre.book()
+            tile_info = pre.tile_info
+            pending, pre.pending = pre.pending, None
+            with profiling.slice_mark("bf_pass_one_finish"):
+                upper, _approx_dbg, _eps_dbg = twopass.upper_bounds_finish(
+                    pending)
+            pre.refusal = pending.refusal
+            twopass._STATS["pipeline_used"] += 1
+            pre.cert_key = None
+        else:
+            tile_info = {} if tiles else None
+            upper, _approx_dbg, _eps_dbg = twopass.upper_bounds(
+                Q, sl.Cb, col_scale, g["row_scale"], _tp_out_dtype(),
+                metric=metric, cn=sl.col_norms_raw(),
+                corpus_exact_fp16=sl.exact_fp16, with_parts=True,
+                tiles=tile_info)
+        # Largest epsilon gives a conservative audit margin ratio. Left on the
+        # device: only an audit reads it, inside its own batched transfer.
+        eps_for_audit = _eps_dbg.max() if _eps_dbg.numel() else 0.0
         del _approx_dbg, _eps_dbg
         ran_pass_one = (twopass._STATS["slices_fused"]
                         + twopass._STATS["slices_unfused"]) > po_before
         
-        # Union live rows across every member sharing this score matrix.
-        live = torch.zeros(n_full, dtype=torch.bool, device=device)
-        bnds = []
-        dead_probe = []
-        for m in g["members"]:
-            qsel = spec_qsel[m]
-            thr_s = unpack_score(spec_thr[m])
-            want = n_full if qsel is None else (qsel.stop - qsel.start)
+        # Resolve deferred discard counters after `ran_pass_one` so it only
+        # reflects this slice. May synchronize to read pending guard verdicts.
+        twopass.flush_bookings()
+        
+        # Tiles mode: per-(tile, query) bounds. Absent (a guard or empty exit
+        # computed no tile maxima) means every tile takes the query's bound,
+        # which bounds every tile of the slice.
+        tile_w = 0
+        if tiles:
+            tile_w = int(tile_info.get("width")
+                         or twopass.default_tile_width(device))
 
-            # Require the exact 1-D threshold shape; numel() alone can broadcast.
-            if thr_s.ndim != 1 or int(thr_s.shape[0]) != want:
-                raise RuntimeError(
-                    f"two-pass: member {m}'s threshold has shape "
-                    f"{tuple(thr_s.shape)}, expected ({want},) to match its "
-                    f"query span — any other shape would broadcast and "
-                    f"silently mark the wrong rows dead"
-                )
-            if qsel is None:
-                live |= ~(upper < thr_s)
-                bnds.extend((0, n_full))
-                dead_probe.append((m, slice(0, n_full), upper < thr_s, thr_s))
+        def _union(tiled):
+            """Union the members' liveness: per (tile, query) when `tiled`,
+            per query otherwise. Returns (live, tile_up, tile_live, bnds,
+            dead_probe); `live` is per query either way."""
+            tile_up = tile_live = None
+            if tiled:
+                n_tiles = -(-int(sl.Cb.shape[0]) // tile_w)
+                tile_up = tile_info.get("upper")
+                if tile_up is None:
+                    tile_up = upper[None, :].expand(n_tiles, n_full)
+                tile_live = _tile_mask(n_tiles, n_full, device)
             else:
-                live[qsel] |= ~(upper[qsel] < thr_s)
-                bnds.extend((qsel.start, qsel.stop))
-                dead_probe.append((m, qsel, upper[qsel] < thr_s, thr_s))
+                # (Tiled, `live` is derived from `tile_live` below.)
+                live = torch.zeros(n_full, dtype=torch.bool, device=device)
+            bnds = []
+            dead_probe = []
+            for m in g["members"]:
+                qsel = spec_qsel[m]
+                thr_s = unpack_score(spec_thr[m])
+                want = n_full if qsel is None else (qsel.stop - qsel.start)
+
+                # Require the exact 1-D threshold shape; numel() alone can
+                # broadcast.
+                if thr_s.ndim != 1 or int(thr_s.shape[0]) != want:
+                    raise RuntimeError(
+                        f"two-pass: member {m}'s threshold has shape "
+                        f"{tuple(thr_s.shape)}, expected ({want},) to match "
+                        f"its query span — any other shape would broadcast "
+                        f"and silently mark the wrong rows dead"
+                    )
+                rng = slice(0, n_full) if qsel is None else qsel
+                bnds.extend((rng.start, rng.stop))
+                if tiled:
+                    # The same strict rule, per (tile, query): a pair is dead
+                    # only when its tile bound is below the member's
+                    # threshold. Unioned across members exactly as rows are.
+                    t_live = ~(tile_up[:, rng] < thr_s[None, :])
+                    tile_live[:, rng] |= t_live
+                    # Computed here, inside the OOM fallback below, even
+                    # though only the dead audit reads it.
+                    dead_probe.append((m, rng, ~t_live.any(dim=0), thr_s,
+                                       t_live))
+                elif qsel is None:
+                    dead = upper < thr_s
+                    live |= ~dead
+                    dead_probe.append((m, rng, dead, thr_s, None))
+                else:
+                    dead = upper[qsel] < thr_s
+                    live[qsel] |= ~dead
+                    dead_probe.append((m, rng, dead, thr_s, None))
+            if tiled:
+                # A query is live when ANY of its tiles is: every row-level
+                # consumer below (hint, spans, audits, counters) reads this.
+                live = tile_live.any(dim=0)
+            return live, tile_up, tile_live, bnds, dead_probe
+
+        use_tiles = tiles
+        try:
+            live, tile_up, tile_live, bnds, dead_probe = _union(use_tiles)
+        except Exception as exc:  # noqa: BLE001 - only an OOM is tolerated
+            if not (use_tiles and twopass.is_oom(exc)):
+                raise
+            # The tile masks could not be allocated: decide this slice per
+            # query, which is exactly as safe, and give it the slice path.
+            twopass._STATS["tiles_bound_oom"] += 1
+            use_tiles = False
+            live, tile_up, tile_live, bnds, dead_probe = _union(False)
 
         # Optional exact audit of prune/keep decisions.
         _dr = twopass.dead_audit_rate()
@@ -2977,14 +3467,16 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
             twopass._STATS["dead_audit_offered"] += 1
         if _dr and ((twopass._STATS["dead_audit_offered"] - 1) % _dr == 0):
             twopass._STATS["dead_audit_sampled"] += 1
-            for _m, _rng, _dead, _thr in dead_probe:
+            for _m, _rng, _dead, _thr, _tlive in dead_probe:
                 if audit_members is not None and _m not in audit_members:
                     # Filtered members would distort live/wasted-live grading.
                     twopass._STATS["dead_audit_skipped_filtered"] += 1
                     continue
                 twopass.audit_decisions(
                     Q[_rng], sl.Cb, metric, ~_dead, _thr,
-                    None if g["q_norms"] is None else g["q_norms"][_rng])
+                    None if g["q_norms"] is None else g["q_norms"][_rng],
+                    **({} if _tlive is None
+                       else {"tile_live": _tlive, "tile_width": tile_w}))
                 if not twopass.enabled():
                     break
 
@@ -2995,25 +3487,48 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
                     twopass._STATS["slices_discarded"] += 1
                 return {}
 
-        idx = live.nonzero(as_tuple=True)[0]
-        n_live = int(idx.numel())
+        # Fetch all host-side counts in one D2H transfer; build live indices
+        # afterward without another synchronization.
+        spans, n_live, n_pairs = _tp_live_counts(
+            live, bnds, tile_live if use_tiles else None)
         pass_one_oom = twopass._STATS["slices_pass_one_oom"] > oom_before
-        if not pass_one_oom:
-            _TP_LIVE_HINT[g["key"]] = n_live / max(1, n_full)
-        
-        M = twopass.pad_height(n_live, n_full)
-        if M >= n_full:
-            # No useful query-row reduction remains.
-            twopass._STATS["slices_plain"] += 1
-            if ran_pass_one:
-                twopass._STATS["slices_discarded"] += 1
-            continue
+        tile_note = None
+        if use_tiles:
+            n_pairs_full = int(tile_live.numel())
+            if not pass_one_oom:
+                _TP_LIVE_HINT[g["key"]] = n_pairs / max(1, n_pairs_full)
+            if n_pairs > twopass.TILE_CROSSOVER * n_pairs_full:
+                # Slice-mode GEMM is cheaper beyond the tile crossover.
+                twopass._STATS["tiles_crossover_bails"] += 1
+                use_tiles = False
+            elif not ran_pass_one:
+                # No kernel ran, so tile rescoring would violate the counter
+                # identity (fused + unfused == twopass + discarded).
+                # Fall back to slice mode, which handles the all-live case.
+                use_tiles = False
+            else:
+                tile_note = (n_pairs, n_pairs_full, tile_w)
+        elif tiles:
+            if not pass_one_oom:
+                # The row-level decision stood in for the tile one (OOM);
+                # the hint stays a fraction, now an over-estimate.
+                _TP_LIVE_HINT[g["key"]] = n_live / max(1, n_full)
+        else:
+            if not pass_one_oom:
+                _TP_LIVE_HINT[g["key"]] = n_live / max(1, n_full)
 
-        # Every host-side number this plan needs, in one device->host round
-        # trip: the member spans within the sorted live index.
-        spans = torch.searchsorted(
-            idx, torch.tensor(bnds, dtype=idx.dtype, device=device)
-        ).tolist()
+        if not use_tiles:
+            M = twopass.pad_height(n_live, n_full)
+            if M >= n_full:
+                # No useful query-row reduction remains.
+                twopass._STATS["slices_plain"] += 1
+                if ran_pass_one:
+                    twopass._STATS["slices_discarded"] += 1
+                continue
+
+        # `live.nonzero(as_tuple=True)[0]`, the sorted live rows, at the size
+        # just read: the same tensor, but no size read of its own.
+        idx = _tp_live_index(live, n_live, n_full)
 
         span, dst, height = {}, {}, {}
         for i, m in enumerate(g["members"]):
@@ -3023,8 +3538,37 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
         if n_live == 0:
             # Every row was safely pruned; no exact GEMM is needed.
             plans[score_key] = _TwoPassPlan(None, span, dst, height, 0, n_full)
-            notes.append((0, n_full, 0))
+            notes.append((0, n_full, 0, tile_note))
             continue
+
+        if use_tiles:
+            buf = _tp_rescore_tiles(g, sl, metric, idx, tile_live, tile_w)
+            if buf is not None:
+                rate = twopass.audit_rate()
+                if rate and (twopass._STATS["slices_twopass"] % rate == 0):
+                    twopass.audit_live_tiles(
+                        buf, idx, tile_up,  tile_w,
+                        g["row_scale"] if g["scale_in_packer"] else None,
+                        eps_used=eps_for_audit)
+                del upper, tile_up, tile_live
+                for m in g["members"]:
+                    lo, hi = span[m]
+                    base = 0 if spec_qsel[m] is None else spec_qsel[m].start
+                    dst[m] = idx[lo:hi] - base
+                plans[score_key] = _TwoPassPlan(buf, span, dst, height,
+                                                n_live, n_full)
+                notes.append((n_live, n_full, n_live, tile_note))
+                continue
+            # The tile re-score declined (CUDA without the kernel) or failed:
+            # this slice takes the slice-mode pass two below, with the same
+            # (exactly as safe) row-level live set.
+            M = twopass.pad_height(n_live, n_full)
+            if M >= n_full:
+                twopass._STATS["slices_plain"] += 1
+                if ran_pass_one:
+                    twopass._STATS["slices_discarded"] += 1
+                continue
+        del tile_up, tile_live
 
         # Verify, once per distinct shape, that an M-row GEMM agrees
         # bit-for-bit with the full-height one.
@@ -3104,15 +3648,95 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
             base = 0 if spec_qsel[m] is None else spec_qsel[m].start
             dst[m] = idx[lo:hi] - base
         plans[score_key] = _TwoPassPlan(scores, span, dst, height, n_live, n_full)
-        notes.append((n_live, n_full, M))
+        notes.append((n_live, n_full, M, None))
 
     # Count only two-pass plans whose results are actually returned.
     for note in notes:
         _tp_note(*note)
     return plans
 
+# Cache fixed member bounds per (bounds, device) to avoid repeated
+# pageable H2D copies that block the host.
+# No `record_stream` needed while all readers use the allocating stream.
+# Revisit if bounds are ever accessed from another stream.
+_TP_BOUNDS: dict = {}
 
-def _tp_note(n_live: int, n_full: int, M: int) -> None:
+
+def _tp_bounds_tensor(bnds, device):
+    """`torch.tensor(bnds, dtype=int64, device=device)`, cached. Read-only:
+    callers only index with it."""
+    import torch
+
+    key = (tuple(int(b) for b in bnds), str(device))
+    got = _TP_BOUNDS.get(key)
+    if got is None:
+        if len(_TP_BOUNDS) >= 64:
+            _TP_BOUNDS.clear()
+        got = _TP_BOUNDS[key] = torch.tensor(key[0], dtype=torch.int64,
+                                             device=device)
+    return got
+
+
+def _tp_live_counts(live, bnds, tile_live=None):
+    """Return member spans, live rows, and live pairs in one D2H transfer.
+
+    Prefix sums give each member's offsets into the sorted live indices,
+    avoiding a separate `nonzero` synchronization. `n_pairs` is None
+    when `tile_live` is absent.
+    """
+    import torch
+
+    prefix = torch.nn.functional.pad(
+        torch.cumsum(live, 0, dtype=torch.int64), (1, 0))
+    parts = [prefix.index_select(0, _tp_bounds_tensor(bnds, live.device)),
+             prefix[-1:]]
+    if tile_live is not None:
+        parts.append(tile_live.sum(dtype=torch.int64).reshape(1))
+    got = torch.cat(parts).tolist()
+    n_pairs = int(got[-1]) if tile_live is not None else None
+    return got[:len(bnds)], int(got[len(bnds)]), n_pairs
+
+
+_NONZERO_STATIC_OFF: set = set()     # device types without the kernel
+
+
+def _tp_live_index(live, n_live: int, n_full: int):
+    """Build live-row indices using a previously counted `n_live`.
+
+    `live` must remain unchanged since counting. Allocate one extra slot
+    to detect undercounts without host synchronization. Overcounts leave
+    out-of-range padding, causing gathers to fail rather than silently
+    selecting wrong rows.
+
+    CUDA violations trigger device asserts; ROCm may compile these out.
+    If `nonzero_static` is unavailable, fall back to `nonzero` and check
+    the length on the host.
+    """
+    import torch
+
+    dev = live.device.type
+    if (dev not in _NONZERO_STATIC_OFF and hasattr(torch, "nonzero_static")
+            and hasattr(torch, "_assert_async")):
+        try:
+            out = torch.nonzero_static(live, size=n_live + 1,
+                                       fill_value=n_full)
+            # The extra slot must be padding: else live rows were dropped.
+            # (A failed assert raises RuntimeError, never caught here.)
+            torch._assert_async(out[-1, 0] == n_full)
+        except NotImplementedError:
+            _NONZERO_STATIC_OFF.add(dev)
+        else:
+            # Rows of a contiguous (n_live + 1, 1): contiguous, int64.
+            return out[:n_live, 0]
+    idx = live.nonzero(as_tuple=True)[0]
+    if int(idx.numel()) != n_live:
+        raise RuntimeError(
+            f"two-pass: {int(idx.numel())} live rows, but {n_live} were "
+            f"counted from the same mask; it changed between the two reads")
+    return idx
+
+
+def _tp_note(n_live: int, n_full: int, M: int, tile=None) -> None:
     st = twopass._STATS
     st["slices_twopass"] += 1
     st["rows_full"] += n_full
@@ -3122,6 +3746,116 @@ def _tp_note(n_live: int, n_full: int, M: int) -> None:
     # An all-pruned slice uses two-pass but launches no exact GEMM.
     if M:
         st["gemms"] += 1
+
+    if tile is not None:
+        # Tiles mode: `M` is the live-query count (no padding), and the work
+        # is the live pairs, each `tile_w` scores (fewer in a partial tile).
+        n_pairs, n_pairs_full, tile_w = tile
+        st["slices_tiles"] += 1
+        st["tile_pairs_live"] += n_pairs
+        st["tile_pairs_full"] += n_pairs_full
+        st["tile_rows_rescored"] += n_pairs * tile_w
+
+
+_TILES_FALLBACK_WARNED = False
+_TILES_DECLINE_WARNED = False
+
+
+def _tile_mask(n_tiles: int, n_full: int, device):
+    """The (n_tiles, n_full) live-pair mask; a seam for the OOM tests."""
+    import torch
+
+    return torch.zeros((n_tiles, n_full), dtype=torch.bool, device=device)
+
+
+def _tiles_reference_allowed(device) -> bool:
+    """Allow the torch reference on CPU; on GPU, slice mode is at least
+    as efficient and uses verified GEMM padding."""
+    return not str(device).startswith("cuda")
+
+
+def _tp_probe_tiles(scores, qsel, thr_packed, cos_scale, cscale, width: int):
+    """Measure per-tile liveness from exact, unfiltered slice scores.
+
+    Apply the same scaling as `pack`, then compare each tile's maximum
+    against its threshold. Like the row probe, omitting `eps` can only
+    underestimate liveness. Returns a (rows, n_tiles) mask.
+    """
+    import torch
+
+    x = scores if qsel is None else scores[qsel]
+    thr = unpack_score(thr_packed)
+    n_m, n_cols = int(x.shape[0]), int(x.shape[1])
+    out = torch.empty((n_m, -(-n_cols // width)), dtype=torch.bool,
+                      device=x.device)
+    chunk = max(1, (1 << 26) // max(1, n_cols))
+    for r0 in range(0, n_m, chunk):
+        blk = x[r0 : r0 + chunk]
+        if cscale is not None:
+            blk = blk / cscale[None, :]
+        if cos_scale is not None:
+            blk = blk / cos_scale[r0 : r0 + chunk, None]
+        out[r0 : r0 + chunk] = ~(
+            twopass.tile_amax(blk, width) < thr[r0 : r0 + chunk, None])
+    return out
+
+
+def _tp_rescore_tiles(g, sl, metric, idx, tile_live, tile_w):
+    """Rescore live (query, tile) pairs into a `-inf`-initialized buffer.
+
+    Return `None` to fall back to slice-mode scoring. Cosine normalization
+    matches `_scores`, with query scaling deferred to the packer when needed.
+    """
+    from nova_bf import tile_rescore
+
+    global _TILES_FALLBACK_WARNED, _TILES_DECLINE_WARNED
+    st = twopass._STATS
+    cn = qn = None
+    if metric == "cosine":
+        cn = sl.col_norms()
+        if not g["scale_in_packer"]:
+            qn = g["q_norms"]
+    why = tile_rescore.decline_reason(g["Q"], sl.Cb, tile_live, tile_w, cn, qn)
+    if why is not None:
+        if not _tiles_reference_allowed(sl.Cb.device):
+            # On a GPU the torch reference is the slice GEMM without slice
+            # mode's verified padding -- never better than the slice path.
+            st["tiles_kernel_declined"] += 1
+            st["tiles_kernel_decline_reason"] = why
+            if not _TILES_DECLINE_WARNED:
+                _TILES_DECLINE_WARNED = True
+                logger.warning(
+                    "two-pass: tiles mode cannot use its kernel here (%s); "
+                    "those slices take the slice-mode pass two. Results are "
+                    "unaffected. See tiles_kernel_declined for the count.",
+                    why)
+            return None
+        st["tiles_reference_reason"] = why
+    try:
+        buf, used_kernel = tile_rescore.rescore(
+            g["Q"], sl.Cb, idx, tile_live, tile_w, cn=cn, qn=qn)
+    except Exception as exc:  # noqa: BLE001 - any failure: the slice path
+        if isinstance(exc, tile_rescore.KernelMismatch):
+            st["tiles_selfcheck_failures"] += 1
+        st["tiles_fallbacks"] += 1
+        st["tiles_fallback_reason"] = f"{type(exc).__name__}: {exc}"
+        if twopass.is_oom(exc):
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001 - best effort only
+                pass
+        if not _TILES_FALLBACK_WARNED:
+            _TILES_FALLBACK_WARNED = True
+            logger.warning(
+                "two-pass: the tile re-score failed (%s: %s); this slice "
+                "takes the slice-mode pass two. Results are unaffected. See "
+                "tiles_fallbacks for the count.", type(exc).__name__, exc)
+        return None
+    st["tiles_kernel" if used_kernel else "tiles_reference"] += 1
+    st["tiles_selfchecks"] = tile_rescore.usage()["selfchecks"]
+    return buf
 
 
 def _tp_scatter_part(part_key, part_enc, live, dst, height: int):
@@ -3157,39 +3891,229 @@ def _tp_scatter_part(part_key, part_enc, live, dst, height: int):
     return full_key, full_enc, full_live
 
 
+# One run-scoped staging helper for `_run_dense_prefetch`. It is created on
+# first use and joined by `_close_dense_staging`, which `run_compute` calls in
+# its `finally` and again at run start. A thread per file would rebuild its
+# OpenMP team for every file.
+_DENSE_STAGING: dict = {"pool": None}
+_DENSE_STAGING_LOCK = Lock()
+
+
+def _dense_staging_pool() -> ThreadPoolExecutor:
+    with _DENSE_STAGING_LOCK:
+        pool = _DENSE_STAGING["pool"]
+        if pool is None:
+            pool = _DENSE_STAGING["pool"] = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="nova-bf-stage"
+            )
+        return pool
+
+
+def _close_dense_staging() -> None:
+    """Join the staging helper, if any. Idempotent. The next use makes a new one."""
+    with _DENSE_STAGING_LOCK:
+        pool, _DENSE_STAGING["pool"] = _DENSE_STAGING["pool"], None
+    if pool is not None:
+        pool.shutdown(wait=True)
+
+
 def _run_dense_prefetch(batch, ranges, device, process_slice) -> None:
-    """Transfer each dense slice through the observable seam one slice ahead."""
+    """Prefetch dense slices one ahead without blocking GPU computation.
+
+    Device allocation stays on the main thread to preserve OOM ordering.
+    A helper thread copies into pinned memory and enqueues H2D, overlapping
+    staging with the current slice's GPU work.
+
+    Only one staging task runs at a time. Ring reuse waits for DMA completion,
+    and consumers wait on the prefetched slice's ready event. The device
+    backlog remains two scored slices plus one prefetched slice.
+
+    Helper exceptions propagate through `result()`, and cleanup waits for
+    outstanding staging. `NOVA_BF_PREFETCH_INLINE=1` restores inline staging.
+
+    Profiling uses `bf_prefetch` for main-thread work and
+    `bf_prefetch_stage` for helper-thread staging.
+    """
     import torch
 
     compute_stream = torch.cuda.current_stream(torch.device(device))
     inflight_compute: deque = deque()
-    with profiling.slice_mark("bf_prefetch"):
-        batch.prefetch(*ranges[0], device)
-    for index, (r0, r1) in enumerate(ranges):
-        # Enqueue i+1 before compute for i. Its H2D runs on the batch's copy
-        # stream while the compute stream consumes the current device tensor.
-        if index + 1 < len(ranges):
-            with profiling.slice_mark("bf_prefetch"):
-                batch.prefetch(*ranges[index + 1], device)
-        with profiling.slice_mark("bf_ring_slice"):
-            # Publish through the same seam as the pageable path immediately
-            # before scoring. GPU tests and profiling hooks observe this call.
-            sl = batch.transfer(r0, r1, device)
-            sl.wait_on(compute_stream)
-            process_slice(r0, r1, sl)
-        # DMA completion only permits host-buffer reuse. Device allocations
-        # recorded on the compute stream remain live until scoring finishes.
-        # Bound that backlog to two scored slices plus one prefetched slice.
-        done = torch.cuda.Event()
-        done.record(compute_stream)
-        inflight_compute.append(done)
-        if len(inflight_compute) > 1:
+    helper = None if _dense_prefetch_inline() else _dense_staging_pool()
+    pending = None
+
+    def stage(plan) -> None:
+        with profiling.slice_mark("bf_prefetch_stage"):
+            batch.stage_prefetch(plan)
+
+    try:
+        # Nothing is queued yet for slice 0 to overlap with, so stage it inline.
+        with profiling.slice_mark("bf_prefetch"):
+            batch.prefetch(*ranges[0], device)
+        for index, (r0, r1) in enumerate(ranges):
+            if pending is not None:
+                # Slice `index` was staged during the previous slice. Wait for
+                # it before transferring it or preparing the next staging.
+                with profiling.slice_mark("bf_prefetch"):
+                    future, pending = pending, None
+                    future.result()
+            # Enqueue i+1 before compute for i. Its H2D runs on the batch's copy
+            # stream while the compute stream consumes the current device tensor.
+            if index + 1 < len(ranges):
+                with profiling.slice_mark("bf_prefetch"):
+                    if helper is None:
+                        batch.prefetch(*ranges[index + 1], device)
+                    else:
+                        plan = batch.prepare_prefetch(*ranges[index + 1], device)
+                        pending = helper.submit(stage, plan)
+                        del plan
+            with profiling.slice_mark("bf_ring_slice"):
+                # Publish through the same seam as the pageable path immediately
+                # before scoring. GPU tests and profiling hooks observe this call.
+                sl = batch.transfer(r0, r1, device)
+                sl.wait_on(compute_stream)
+                process_slice(r0, r1, sl)
+            # DMA completion allows host-buffer reuse, not device-buffer reuse.
+            # Limit in-flight compute to two slices plus one prefetched slice.
+            done = torch.cuda.Event()
+            done.record(compute_stream)
+            inflight_compute.append(done)
+            if len(inflight_compute) > 1:
+                with profiling.slice_mark("bf_backpressure"):
+                    inflight_compute.popleft().synchronize()
+        # Do not carry a remaining slice's backlog into each subsequent batch.
+        for done in inflight_compute:
             with profiling.slice_mark("bf_backpressure"):
-                inflight_compute.popleft().synchronize()
-    # Do not carry a remaining slice's backlog into each subsequent batch.
-    for done in inflight_compute:
-        with profiling.slice_mark("bf_backpressure"):
-            done.synchronize()
+                done.synchronize()
+    finally:
+        # Reached with `pending` set only when this thread is already raising.
+        # Wait so the staging cannot touch the batch after return. Its own
+        # error is only logged, so it never replaces the exception in flight.
+        # Catch `Exception` only: a second KeyboardInterrupt here must escape.
+        if pending is not None:
+            try:
+                pending.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("dense staging failed during unwind: %r", exc)
+
+
+def _run_dense_pipelined(batch, ranges, device, launch, process_slice) -> None:
+    """Run slices with pass one launched one slice ahead, without prefetching.
+
+    Transfer and launch slice N+1 before processing N. Phase B runs
+    sequentially, so each slice sees updated thresholds. At most two
+    slices reside on the device.
+
+    Supports CPU and CUDA pageable/single-slice paths. `bf_slice` covers
+    transfer, launch, and processing; `bf_transfer` marks each transfer.
+    """
+    nxt = None
+    cur_launch = None
+    try:
+        with profiling.slice_mark("bf_transfer"):
+            sl = batch.transfer(*ranges[0], device)
+        cur_launch = launch(sl)
+        for index, (r0, r1) in enumerate(ranges):
+            with profiling.slice_mark("bf_slice"):
+                if index + 1 < len(ranges):
+                    with profiling.slice_mark("bf_transfer"):
+                        sl_next = batch.transfer(*ranges[index + 1], device)
+                    nxt = (sl_next, launch(sl_next))
+                    del sl_next
+                launched, cur_launch = cur_launch, None
+                process_slice(r0, r1, sl, launched)
+                del launched
+            if nxt is not None:
+                (sl, cur_launch), nxt = nxt, None
+    finally:
+        # Only on an exception: release launches nothing will consume. Each
+        # release is attempted even if another fails, and a failure is only
+        # logged, so it never replaces the exception in flight.
+        _tp_discard_all_quietly(cur_launch)
+        if nxt is not None:
+            _tp_discard_all_quietly(nxt[1])
+
+
+def _run_dense_prefetch_pipelined(batch, ranges, device, launch,
+                                  process_slice) -> None:
+    """Prefetch slices and launch pass one a slice ahead.
+
+    Launch pass one for N+1 before processing N, while staging N+2.
+    Phase B remains sequential, ensuring each slice sees updated thresholds.
+
+    Preserves prefetch synchronization and allocation ordering. Up to four
+    corpus slices may reside on the device: two scored, one with pass one
+    queued, and one prefetched. Pass-one outputs for N and N+1 add to memory
+    usage. Backpressure remains unchanged.
+    """
+    import torch
+
+    compute_stream = torch.cuda.current_stream(torch.device(device))
+    inflight_compute: deque = deque()
+    helper = None if _dense_prefetch_inline() else _dense_staging_pool()
+    pending = None
+    cur = nxt = None
+
+    def stage(plan) -> None:
+        with profiling.slice_mark("bf_prefetch_stage"):
+            batch.stage_prefetch(plan)
+
+    def submit(index: int) -> None:
+        nonlocal pending
+        with profiling.slice_mark("bf_prefetch"):
+            if helper is None:
+                batch.prefetch(*ranges[index], device)
+            else:
+                plan = batch.prepare_prefetch(*ranges[index], device)
+                pending = helper.submit(stage, plan)
+                del plan
+
+    def publish(index: int):
+        nonlocal pending
+        if pending is not None:
+            with profiling.slice_mark("bf_prefetch"):
+                future, pending = pending, None
+                future.result()
+        with profiling.slice_mark("bf_ring_publish"):
+            sl = batch.transfer(*ranges[index], device)
+            sl.wait_on(compute_stream)
+        return sl, launch(sl)
+
+    try:
+        with profiling.slice_mark("bf_prefetch"):
+            batch.prefetch(*ranges[0], device)
+        cur = publish(0)
+        if len(ranges) > 1:
+            submit(1)
+        for index, (r0, r1) in enumerate(ranges):
+            if index + 1 < len(ranges):
+                nxt = publish(index + 1)
+                if index + 2 < len(ranges):
+                    submit(index + 2)
+            with profiling.slice_mark("bf_ring_slice"):
+                (sl, launched), cur = cur, None
+                process_slice(r0, r1, sl, launched)
+                del sl, launched
+            done = torch.cuda.Event()
+            done.record(compute_stream)
+            inflight_compute.append(done)
+            if len(inflight_compute) > 1:
+                with profiling.slice_mark("bf_backpressure"):
+                    inflight_compute.popleft().synchronize()
+            cur, nxt = nxt, None
+        for done in inflight_compute:
+            with profiling.slice_mark("bf_backpressure"):
+                done.synchronize()
+    finally:
+        # Only on an exception: release launches nothing will consume, then
+        # wait for an outstanding staging, exactly as `_run_dense_prefetch`.
+        for item in (cur, nxt):
+            if item is not None:
+                _tp_discard_all_quietly(item[1])
+        if pending is not None:
+            try:
+                pending.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("dense staging failed during unwind: %r", exc)
 
 
 def _mv_full_threshold(Q, thr_packed, qsel):
@@ -3537,7 +4461,28 @@ def _process_batch_group(
         for m in member_idxs:
             _flush_pending(m)
 
-    def process_slice(r0: int, r1: int, sl) -> None:
+    def process_slice(r0: int, r1: int, sl, launched=None) -> None:
+        """Score and fold a slice, making all threshold-dependent decisions.
+
+        `launched` holds this slice's speculative pass-one work. Any unused
+        launches are discarded before returning.
+        """
+        try:
+            _process_slice(r0, r1, sl, launched)
+        finally:
+            if launched:
+                # On failure, release GPU resources without booking counters.
+                # Cleanup errors are logged without masking the original.
+                _tp_discard_all_quietly(launched)
+
+    def launch_pass_one(sl):
+        """Phase A of a pipelined slice (see `_twopass_launch`)."""
+        if not tp_groups:
+            return None
+        with profiling.slice_mark("bf_pass_one_launch"):
+            return _twopass_launch(tp_groups, sl, device, step)
+
+    def _process_slice(r0: int, r1: int, sl, launched) -> None:
         if orig_rows is None:
             # No CPU round-trip: build the row-index tensor directly on
             # device
@@ -3570,12 +4515,16 @@ def _process_batch_group(
         if tp_groups and sl.n_rows == step:
             unfiltered = {m for m in range(len(specs))
                           if _is_unfiltered(specs[m].filter)}
-            tp_plan = _twopass_prepare(
-                tp_groups, sl, _ThrView(_thr), spec_qsel, device,
-                audit_members=unfiltered,
-            )
+            with profiling.slice_mark("bf_twopass_decide"):
+                tp_plan = _twopass_prepare(
+                    tp_groups, sl, _ThrView(_thr), spec_qsel, device,
+                    audit_members=unfiltered, launched=launched,
+                )
             if not twopass.enabled():
                 tp_groups.clear()
+        # Launches no decision used: groups an early return skipped, or a
+        # two-pass disabled since they were issued. Booked, then released.
+        _tp_discard_all(launched)
         probe = tp_probe[0] and not tp_plan
         probe_live: dict[tuple, list] = {}
         # One prune-rate measurement per SLICE, summed over its members.
@@ -3726,7 +4675,17 @@ def _process_batch_group(
             if live is not None:
                 _live_stats_add(m, live, live.shape[0])
                 if probe and score_key in tp_groups:
-                    probe_live.setdefault(score_key, []).append((m, live))
+                    if twopass.tiles_mode():
+                        # Tiles mode hints a TILE-pair fraction, so the probe
+                        # measures one, from this member's unfiltered scores.
+                        live_m = _tp_probe_tiles(
+                            scores, qsel, _thr(m),
+                            spec_cos_scale[m],
+                            sl.col_norms() if fuse_cn else None,
+                            twopass.default_tile_width(device))
+                    else:
+                        live_m = live
+                    probe_live.setdefault(score_key, []).append((m, live_m))
             pending[m].append((part_key, part_enc, live))
             pending_cols[m] += part_key.shape[1]
             if pending_cols[m] >= s.k:
@@ -3744,7 +4703,19 @@ def _process_batch_group(
                 if g is None:
                     continue
                 n_full = int(g["Q"].shape[0])
-                
+                if lives and lives[0][1].ndim == 2:
+                    # Tiles mode: (rows, n_tiles) per member, unioned the same way.
+                    n_tiles = int(lives[0][1].shape[1])
+                    union = torch.zeros((n_full, n_tiles), dtype=torch.bool,
+                                        device=device)
+                    for mi, lv in lives:
+                        qsel = spec_qsel[mi]
+                        union[slice(None) if qsel is None else qsel] |= lv
+                    _TP_LIVE_HINT[g["key"]] = (
+                        int(union.sum(dtype=torch.int64).item())
+                        / max(1, n_full * n_tiles))
+                    continue
+
                 union = torch.zeros(n_full, dtype=torch.bool, device=device)
                 for mi, lv in lives:
                     qsel = spec_qsel[mi]
@@ -3809,6 +4780,11 @@ def _process_batch_group(
             _flush_all_pending()
             return time.perf_counter() - t0
 
+    # Pipeline pass one only for eligible dense two-pass groups.
+    # Keep launches within each file to preserve threshold exchange and state.
+    pipeline = (bool(tp_groups) and isinstance(batch, DenseCorpusBatch)
+                and twopass.pipeline_pass_one())
+
     dense_transfer_mode = _dense_transfer_mode()
     use_dense_prefetch = (
         dense_transfer_mode == 2
@@ -3822,7 +4798,17 @@ def _process_batch_group(
         # different cached pinned block for every survivor count.
         batch.configure_transfer(step, dense_transfer_mode)
 
-        _run_dense_prefetch(batch, ranges, device, process_slice)
+        if pipeline:
+            _run_dense_prefetch_pipelined(batch, ranges, device,
+                                          launch_pass_one, process_slice)
+        else:
+            _run_dense_prefetch(batch, ranges, device, process_slice)
+        _flush_all_pending()
+        return time.perf_counter() - t0
+
+    if pipeline:
+        _run_dense_pipelined(batch, ranges, device, launch_pass_one,
+                             process_slice)
         _flush_all_pending()
         return time.perf_counter() - t0
 
@@ -4638,6 +5624,9 @@ def run_compute(
     # Same for the kernel launch counters, which live in the kernel modules.
     _reset_sparse_branches()
     _reset_prune_instrumentation()
+    # After the reset, which returns the mode to "unconfigured".
+    twopass.set_rescore_mode(cfg.params.two_pass_rescore)
+    twopass.set_pipeline_pass_one(cfg.params.pipeline_pass_one)
     # Local imports: both modules are imported function-locally throughout this
     # file (triton is optional), and `topk_triton` is otherwise reached only via
     # `tiebreak`.
@@ -5913,7 +6902,8 @@ def run_compute(
         # `twopass.stats()` is cumulative for the whole run, and the per-file
         # line reports DELTAS, so the previous reading has to be carried the
         # same way `prev_gpu` is.
-        prev_tp = {"slices_twopass": 0, "slices_plain": 0, "rows_full": 0,
+        prev_tp = {"tile_pairs_full": 0, "tile_pairs_live": 0,
+                   "slices_twopass": 0, "slices_plain": 0, "rows_full": 0,
                    "rows_live": 0, "rows_padded": 0}
         with tqdm(total=len(mine), unit="file", dynamic_ncols=True, desc="bf") as bar:
             for want_gidx, _f in mine:
@@ -6052,8 +7042,12 @@ def run_compute(
                          + tp["slices_plain"] - prev_tp["slices_plain"]),
                         (tp["rows_live"] - prev_tp["rows_live"]) / d_full,
                         (tp["rows_padded"] - prev_tp["rows_padded"]) / d_full,
-                        "" if tp["unavailable"] is None
-                        else f" DISABLED: {tp['unavailable']}",
+                        ("" if not tp["tile_pairs_full"] - prev_tp["tile_pairs_full"]
+                         else " tiles=%.4f" % (
+                             (tp["tile_pairs_live"] - prev_tp["tile_pairs_live"])
+                             / (tp["tile_pairs_full"] - prev_tp["tile_pairs_full"])))
+                        + ("" if tp["unavailable"] is None
+                           else f" DISABLED: {tp['unavailable']}"),
                     )
                 prev_tp = {k: tp[k] for k in prev_tp}
 
@@ -6112,7 +7106,11 @@ def run_compute(
             filter_pool.shutdown()
         finally:
             # Release run-local two-pass device caches, including on failure.
-            twopass.release()
+            try:
+                twopass.release()
+            finally:
+                # Join the run-scoped dense staging helper on every exit path.
+                _close_dense_staging()
 
     wall = time.perf_counter() - wall0
     gb = bytes_seen / 1e9
@@ -6540,8 +7538,15 @@ def run_compute(
         "multivector_batch_size": mv_batch_size,
         "multivector_query_block": mv_query_block,
         # Dense H2D policy and actual use: 0 is pageable, 2 uses pinned memory
-        # with one-slice copy-stream overlap.
+        # with one-slice copy-stream overlap. `prefetch_inline` records
+        # NOVA_BF_PREFETCH_INLINE: mode-2 staging on the GPU-feeding thread
+        # (true) or on its helper thread (false, the default). Like `mode`, it
+        # is the resolved POLICY. It only had an effect if the pinned path ran,
+        # i.e. `pinned_slices > 0`. A CPU or pageable run records it unused.
         "dense_transfer": dense_transfer_usage(),
+        # RESOLVED pass-one pipelining (NOVA_BF_PIPELINE_PASS_ONE over the
+        # config); `kernels.twopass.pipeline_*` says what it actually did.
+        "pipeline_pass_one": twopass.pipeline_pass_one(),
         # The configured bool stays under `threshold_exchange`; what the
         # exchange actually did is here.
         "threshold_exchange_stats": thr_exchange_stats,

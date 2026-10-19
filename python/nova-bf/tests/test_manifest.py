@@ -190,6 +190,7 @@ def test_scan_failure_before_id_coordinator_starts(ds, tmp_path, monkeypatch):
 
 def test_single_node_manifest_describes_the_run(ds, tmp_path, monkeypatch):
     monkeypatch.delenv("NOVA_BF_PINNED", raising=False)
+    monkeypatch.delenv("NOVA_BF_PREFETCH_INLINE", raising=False)
     out = tmp_path / "single"
     out.mkdir()
     cfg = _cfg(ds, out)
@@ -207,6 +208,7 @@ def test_single_node_manifest_describes_the_run(ds, tmp_path, monkeypatch):
         "mode": 2,
         "pinned_slices": 0,
         "copy_stream_slices": 0,
+        "prefetch_inline": False,
     }
     assert doc["sharding"] == {
         "num_jobs": None, "job_rank": None,

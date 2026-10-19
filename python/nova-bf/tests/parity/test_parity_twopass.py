@@ -7,6 +7,13 @@ same real candidate whichever path runs it agrees with itself perfectly. So
 the two-pass is also held here, against the naive oracle and, where a server
 is up, against live Qdrant.
 
+The Qdrant half covers every forced two-pass case: each `PROBES` search and the
+row-subsetted run, in all four (mode, pipelining) combinations. Nothing in
+them needs skipping — all are dense `cosine`/`dot` under filters Qdrant
+evaluates natively. The euclidean and gathered-subset tests are held to the
+naive oracle only: they assert the two-pass did NOT run, so their answers are
+the one-pass path the matrix suite already holds to Qdrant.
+
 Reaching the path at fixture scale takes three knobs, none of them a
 correctness parameter:
 
@@ -66,7 +73,7 @@ import pytest
 from nova_bf import twopass
 
 from . import cases as cases_mod
-from . import compare
+from . import compare, qdrant_ref
 from .devices import parity_devices
 from .runner import build_config, pinned_device, read_results, spec
 
@@ -110,9 +117,39 @@ def _filter_of(case, ds):
     return _filter_from_dict(ds, case.filter_dict)
 
 
-@pytest.fixture
-def forced(monkeypatch):
-    """Scale the two-pass to fixture size and turn it on for CPU."""
+def _force(monkeypatch, mode, pipeline):
+    """Scale the two-pass to fixture size and turn it on for CPU, in pass-two
+    mode `mode` (`params.two_pass_rescore`) with pass-one pipelining
+    (`params.pipeline_pass_one`) on or off. Tiles mode shrinks `CPU_TILE` to 4
+    so an 8-row slice has two tiles; on CUDA the width is the fused kernel's
+    BLOCK_N, so there an 8-row slice is one partial tile."""
+    from nova_bf import compute as _compute
+
+    _MODE["m"] = mode
+    _MODE["pipeline"] = pipeline
+    # Pinned BOTH ways, not left to the default: when the default flips on,
+    # the off arm must still be the unpipelined path, not a second copy of
+    # the pipelined one.
+    monkeypatch.setenv("NOVA_BF_PIPELINE_PASS_ONE", "1" if pipeline else "0")
+    # Per-slice record of what `_tp_note` books. The aggregate counters cannot
+    # tell tile-granular pruning from row pruning in tile units (a slice's
+    # tile count varies with its height), so `_assert_it_pruned` reads these.
+    real_note = _compute._tp_note
+
+    def _spy(n_live, n_full, M, tile=None):
+        _NOTES.append((n_live, n_full, M, tile))
+        return real_note(n_live, n_full, M, tile)
+
+    monkeypatch.setattr(_compute, "_tp_note", _spy)
+    if mode == "tiles":
+        monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", "tiles")
+        monkeypatch.setenv("NOVA_BF_TWOPASS_TILE_THRESHOLD", "1.0")
+        monkeypatch.setattr(twopass, "CPU_TILE", 4)
+        # Open the per-slice crossover bail too, as the gate above is opened.
+        monkeypatch.setattr(twopass, "TILE_CROSSOVER", 1.0)
+    else:
+        # Pinned, not left to the default (`tiles` since 2026-10-17).
+        monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", "slice")
     monkeypatch.setattr(twopass, "PAD_QUANTUM", 2)
     monkeypatch.setattr(twopass, "PAD_FLOOR", 2)
     monkeypatch.setattr(twopass, "PAD_SMALL", ())
@@ -121,13 +158,28 @@ def forced(monkeypatch):
     monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", "1.0")
     # The guard the byte-identity claims rest on.
     monkeypatch.delenv("NOVA_BF_TWOPASS_NO_VERIFY", raising=False)
+
+
+# Every two-pass case runs in all four (mode, pipelining) combinations.
+FORCED = [("slice", False), ("tiles", False), ("slice", True), ("tiles", True)]
+FORCED_IDS = ["slice", "tiles", "slice-pipelined", "tiles-pipelined"]
+
+
+@pytest.fixture(params=FORCED, ids=FORCED_IDS)
+def forced(monkeypatch, request):
+    _force(monkeypatch, *request.param)
     twopass.reset()
     yield
     twopass.reset()
 
 
+_MODE = {"m": "slice", "pipeline": False}
+_NOTES: list = []
+
+
 def _run(ds, specs, *, tag, device, params=None):
     _CURRENT_DEVICE["d"] = str(device or "")
+    del _NOTES[:]
     p = {"dense_batch_size": BATCH}
     p.update(params or {})
     cfg = build_config(ds, specs, out_tag=f"{tag}_{device or 'auto'}", params=p)
@@ -216,6 +268,16 @@ def _assert_it_pruned(label):
     # (the fused path reads the float32 accumulator, so it legitimately drops
     # the 2**-11 * T output term) — and on a CPU box `slices_fused` is 0 in
     # every run, so the production kernel was untested by this file entirely.
+    if _MODE["m"] == "tiles":
+        _assert_tiles_pruned(label, st)
+    else:
+        # Slice mode must not have wandered into the tile re-score.
+        assert st["rescore"] == "slice" and st["slices_tiles"] == 0 \
+            and st["tile_pairs_full"] == 0, (
+                f"{label}: slice mode re-scored tiles: {st}")
+        assert all(n[3] is None for n in _NOTES), (
+            f"{label}: slice mode booked a tiles slice: {_NOTES}")
+    _assert_pipelining(label, st)
     if device_is_cuda():
         assert st["slices_fused"] > 0, (
             f"{label}: pass one never took the fused kernel on CUDA, so this "
@@ -225,6 +287,71 @@ def _assert_it_pruned(label):
         assert st["gemms"] > 0, (
             f"{label}: the two-pass disabled itself without ever running a "
             f"narrowed GEMM, so nothing was exercised: {st}")
+
+
+def _assert_tiles_pruned(label, st):
+    """Tiles mode re-scored tiles, and pruned at TILE granularity.
+
+    `tile_pairs_live < tile_pairs_full` alone is not that claim: dropping a
+    whole dead row drops all its pairs too, so a tile decision that degenerated
+    into the row decision (every live row keeps every tile) still satisfies it.
+    What only a real tile decision does is drop a dead tile of a LIVE row:
+    fewer live pairs than `n_live * n_tiles` in some slice.
+    """
+    assert st["rescore"] == "tiles", f"{label}: tiles mode did not resolve: {st}"
+    # A run whose every slice fell back to slice mode (a tile re-score error,
+    # a crossover bail, a declined kernel) would pass every check above and
+    # say nothing about tiles; at fixture size none of those is expected, so
+    # it fails rather than being excused.
+    assert st["slices_tiles"] > 0, (
+        f"{label}: tiles mode never re-scored a tile — every slice fell back "
+        f"to slice mode: {st}")
+    assert st["tile_pairs_live"] < st["tile_pairs_full"], (
+        f"{label}: tiles mode pruned no (query, tile) pair: {st}")
+    tiled = [n for n in _NOTES if n[3] is not None]
+    assert len(tiled) == st["slices_tiles"], (label, tiled, st)
+    if not device_is_cuda():
+        assert st["tiles_fallbacks"] == 0 and st["tile_width"] == twopass.CPU_TILE, (
+            f"{label}: the CPU tile re-score fell back or ran at the wrong "
+            f"width (want {twopass.CPU_TILE}): {st}")
+    # (n_pairs, n_pairs_full, tile_w) per slice; n_pairs_full = n_full * tiles.
+    multi = [(n_live, n_pairs, n_pairs_full // n_full)
+             for n_live, n_full, _, (n_pairs, n_pairs_full, _w) in tiled
+             if n_full and n_pairs_full // n_full > 1]
+    if device_is_cuda() and not multi:
+        # On CUDA the width is the fused kernel's BLOCK_N, which is at least
+        # `BATCH`, so every slice is ONE tile and the tile decision IS the row
+        # decision. The granularity claim is the CPU run's (CPU_TILE = 4).
+        return
+    assert multi, (
+        f"{label}: no tiles slice had more than one tile, so the tile "
+        f"decision could not differ from the row one: {tiled}")
+    assert any(n_pairs < n_live * tiles for n_live, n_pairs, tiles in multi), (
+        f"{label}: every live row kept every tile — tiles mode pruned only "
+        f"whole rows, never a tile of a live row: {multi}")
+
+
+def _assert_pipelining(label, st):
+    """Pass-one pipelining ran iff this combination turned it on.
+
+    Results are byte-identical either way by design, so the answers cannot
+    show which path ran; a pipeline-on case that never launched ahead would be
+    a second copy of the off case. Every launch is consumed exactly once.
+    """
+    keys = ("pipeline_launched", "pipeline_used", "pipeline_discarded",
+            "pipeline_retried")
+    if not _MODE["pipeline"]:
+        assert st["pipeline_pass_one"] is False and not any(st[k] for k in keys), (
+            f"{label}: pipelining is off but launched ahead: {st}")
+        return
+    assert st["pipeline_pass_one"] is True, f"{label}: pipelining did not resolve on: {st}"
+    assert st["pipeline_launched"] > 0 and st["pipeline_used"] > 0, (
+        f"{label}: pipelining is on but no pass one was launched ahead and "
+        f"used ({ {k: st[k] for k in keys} }), so this case ran unpipelined")
+    assert st["pipeline_launched"] == st["pipeline_used"] + st["pipeline_discarded"], (
+        f"{label}: a pipelined launch was consumed zero or two times: "
+        f"{ {k: st[k] for k in keys} }")
+    assert st["pipeline_retried"] <= st["pipeline_discarded"], (label, st)
 
 
 @pytest.mark.parametrize("case", PROBES, ids=PROBE_IDS)
@@ -243,6 +370,35 @@ def test_the_two_pass_agrees_with_the_oracle(case, ds_wide, oracle_wide, device,
         compare.assert_scores_agree(
             got[qi], want[qi], metric=case.metric,
             label=f"[{device}] two-pass {case.id} q{qi}")
+
+
+@pytest.mark.qdrant
+@pytest.mark.parametrize("case", PROBES, ids=PROBE_IDS)
+def test_the_two_pass_agrees_with_qdrant(case, ds_wide, client, collection,
+                                         device, forced):
+    """The same forced run, against the engine the ground truth grades.
+
+    The naive oracle and Qdrant fail differently on purpose (see conftest), and
+    a wrongly-pruned row is exactly the kind of error only ONE of them might
+    share: the naive oracle is this suite's own arithmetic. Every probe is a
+    dense `cosine`/`dot` search under a filter Qdrant evaluates natively, so
+    none is skipped here. `collection` is built from `ds`, whose documents
+    `ds_wide` shares (only the query side differs), as the mask-height suite
+    also relies on.
+
+    A separate nova-bf run rather than reusing the naive test's: with no
+    server, that test must still run, and it cannot if it asks for `client`.
+    """
+    got = _run(ds_wide, [_at_k(case)], tag=f"tpq_{case.name}", device=device)[case.name]
+    _assert_it_pruned(f"[{device}] {case.id} vs qdrant")
+    want = qdrant_ref.topk(client, collection, ds_wide, vector_type=case.vector_type,
+                           metric=case.metric, k=K, filt=_filter_of(case, ds_wide))
+    assert set(want) == set(range(len(ds_wide.queries)))
+    for qi in range(len(ds_wide.queries)):
+        compare.assert_scores_agree(
+            got[qi], want[qi], metric=case.metric,
+            label=f"[{device}] two-pass {_MODE['m']} "
+                  f"pipeline={_MODE['pipeline']} {case.id} q{qi} vs qdrant")
 
 
 @pytest.mark.parametrize("case", PROBES, ids=PROBE_IDS)
@@ -265,10 +421,76 @@ def test_the_two_pass_is_hit_identical_to_the_one_pass(case, ds_wide, device,
     one = _run(ds_wide, [_at_k(case)], tag=f"tp1_{case.name}", device=device)[case.name]
     assert twopass.stats()["slices_twopass"] == 0, "the control arm used the two-pass"
 
+    from twopass_compare import norm_product, tolerance
+    from .corpus import DIM
+
+    tiles_tol = tolerance(DIM, 1.0 if case.metric == "cosine" else max(
+        1.0, norm_product(ds_wide.corpus_dir, ds_wide.queries_path)))
     for qi in range(len(ds_wide.queries)):
+        if _MODE["m"] == "tiles":
+            # Tiles mode sums in a different order: the same hits up to
+            # near-ties within the gamma_d bound (`twopass_compare`), never
+            # the same-bits claim.
+            compare.assert_scores_agree(
+                two[qi], one[qi], metric=case.metric, tol=tiles_tol,
+                label=f"[{device}] tiles {case.id} q{qi}")
+            continue
         assert two[qi] == one[qi], (
             f"[{device}] {case.id} q{qi}: the two-pass changed the result\n"
             f"  two-pass: {two[qi][:5]}\n  one-pass: {one[qi][:5]}")
+
+
+@pytest.fixture(params=["slice", "tiles"])
+def forced_mode(monkeypatch, request):
+    """`forced` without the pipelining axis, for a test that runs both arms."""
+    _force(monkeypatch, request.param, False)
+    twopass.reset()
+    yield request.param
+    twopass.reset()
+
+
+@pytest.mark.parametrize("case", PROBES, ids=PROBE_IDS)
+def test_pipelining_leaves_the_result_table_byte_identical(
+        case, ds_wide, oracle_wide, device, forced_mode, monkeypatch):
+    """Pass-one pipelining is a scheduling change only: the same table.
+
+    Each arm also matching the oracle (above) would allow two DIFFERENT right
+    answers — a near-tie broken the other way — and the claim the default flip
+    rests on is stronger: phase B re-takes every decision on up-to-date state,
+    so the pipelined run prunes, scores and folds exactly what the unpipelined
+    one does. So the written tables are compared whole, value bits included.
+    """
+    import pyarrow.parquet as pq
+
+    tables = {}
+    for pipe in (False, True):
+        _MODE["pipeline"] = pipe
+        monkeypatch.setenv("NOVA_BF_PIPELINE_PASS_ONE", "1" if pipe else "0")
+        _CURRENT_DEVICE["d"] = str(device or "")
+        del _NOTES[:]
+        cfg = build_config(
+            ds_wide, [_at_k(case)], params={"dense_batch_size": BATCH},
+            out_tag=f"tpp{int(pipe)}_{forced_mode}_{case.name}_{device}")
+        with pinned_device(device):
+            paths = run_compute(cfg)
+        _assert_it_pruned(f"[{device}] {forced_mode} pipeline={pipe} {case.id}")
+        tables[pipe] = pq.read_table(paths[case.name])
+
+    off, on = tables[False], tables[True]
+    assert off.num_rows == len(ds_wide.queries)
+    # `equals` compares values exactly (float bits, list order); file-level
+    # metadata is left out, since the resolved config is not the answer.
+    assert on.equals(off, check_metadata=False), (
+        f"[{device}] {forced_mode} {case.id}: pipelining changed the result "
+        f"table\n  on:  {on.slice(0, 3).to_pydict()}\n"
+        f"  off: {off.slice(0, 3).to_pydict()}")
+    want = oracle_wide.topk(vector_type=case.vector_type, metric=case.metric,
+                            k=K, filt=_filter_of(case, ds_wide))
+    got = read_results({case.name: paths[case.name]})[case.name]
+    for qi in range(len(ds_wide.queries)):
+        compare.assert_scores_agree(
+            got[qi], want[qi], metric=case.metric,
+            label=f"[{device}] pipelined {forced_mode} {case.id} q{qi}")
 
 
 def test_a_row_subsetted_search_keeps_its_own_live_rows(ds_wide, oracle_wide,
@@ -286,6 +508,36 @@ def test_a_row_subsetted_search_keeps_its_own_live_rows(ds_wide, oracle_wide,
     column alternates even/odd, which resolves to a gathered index tensor and
     is refused (see the test below).
     """
+    specs, members = _subset_specs(ds_wide)
+    got = _run(ds_wide, specs, tag="tp_subset", device=device)
+    _assert_it_pruned(f"[{device}] row-subsetted")
+
+    want = oracle_wide.topk(vector_type="dense", metric="cosine", k=K, filt=None)
+    _assert_subset_agrees(got, want, members, label=f"[{device}] two-pass subset")
+
+
+@pytest.mark.qdrant
+def test_a_row_subsetted_search_agrees_with_qdrant(ds_wide, client, collection,
+                                                   device, forced):
+    """The test above, against live Qdrant. Qdrant has no notion of a row
+    subset — each query is searched on its own — so every member is held to the
+    same unfiltered per-query answer, which is exactly the claim: a member's
+    result must not depend on which other rows shared its score matrix."""
+    specs, members = _subset_specs(ds_wide)
+    got = _run(ds_wide, specs, tag="tpq_subset", device=device)
+    _assert_it_pruned(f"[{device}] row-subsetted vs qdrant")
+
+    want = qdrant_ref.topk(client, collection, ds_wide, vector_type="dense",
+                           metric="cosine", k=K, filt=None)
+    _assert_subset_agrees(
+        got, want, members,
+        label=f"[{device}] two-pass {_MODE['m']} pipeline={_MODE['pipeline']} "
+              f"subset vs qdrant")
+
+
+def _subset_specs(ds_wide):
+    """`front` / `back` contiguous `qid` blocks plus an unsubsetted sibling,
+    and the query rows each member must cover."""
     n_q = len(ds_wide.queries)
     half = n_q // 2
     # BOTH halves, and the second one is the point. `dst[m] = idx[lo:hi] - base`
@@ -304,24 +556,21 @@ def test_a_row_subsetted_search_keeps_its_own_live_rows(ds_wide, oracle_wide,
              rows={"column": "qid", "isin": back}),
         spec("all", vector_type="dense", metric="cosine", k=K),
     ]
-    got = _run(ds_wide, specs, tag="tp_subset", device=device)
-    _assert_it_pruned(f"[{device}] row-subsetted")
+    return specs, (("front", range(half)), ("back", range(half, n_q)),
+                   ("all", range(n_q)))
 
-    want = oracle_wide.topk(vector_type="dense", metric="cosine", k=K, filt=None)
+
+def _assert_subset_agrees(got, want, members, *, label):
     # Results are keyed by the ORIGINAL query index, so the key set is itself
     # the base assertion for the `back` member.
-    for name, rows in (("front", range(half)), ("back", range(half, n_q))):
+    for name, rows in members:
         assert set(got[name]) == set(rows), (
-            f"[{device}] the {name} selector covered {sorted(got[name])}, "
+            f"{label}: the {name} selector covered {sorted(got[name])}, "
             f"expected {sorted(rows)}")
         for qi in rows:
             compare.assert_scores_agree(
                 got[name][qi], want[qi], metric="cosine",
-                label=f"[{device}] two-pass subset {name} q{qi}")
-    for qi in range(len(ds_wide.queries)):
-        compare.assert_scores_agree(
-            got["all"][qi], want[qi], metric="cosine",
-            label=f"[{device}] two-pass subset all q{qi}")
+                label=f"{label} {name} q{qi}")
 
 
 def test_a_gathered_row_subset_is_refused_not_mishandled(ds_wide, oracle_wide,

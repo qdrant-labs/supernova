@@ -216,6 +216,13 @@ def kernel_usage(
     tp["padded_fraction"] = (
         round(tp["rows_padded"] / tp["rows_full"], 6) if tp["rows_full"] else None
     )
+    # Tiles mode (`rescore == "tiles"`): the (query, tile) pairs re-scored out
+    # of those its slices spanned -- the fraction its engage gate reads.
+    tp["tile_live_fraction"] = (
+        round(tp["tile_pairs_live"] / tp["tile_pairs_full"], 6)
+        if tp["tile_pairs_full"] else None
+    )
+    tp["tile_rescore_kernel"] = _tile_rescore_usage()
     # THE COUNTER IDENTITY, checked on the real run rather than only in tests.
     # Recorded, never raised: a manifest that fails to write costs a rank its
     # provenance, which is worse than an inconsistent counter.
@@ -249,6 +256,14 @@ def kernel_usage(
         "twopass": tp,
         "fused_rowmax_kernel": twopass.fuse_usage(),
     }
+
+
+def _tile_rescore_usage() -> dict:
+    """The tiles-mode pass-two kernel: launches and why it is unavailable."""
+    from nova_bf import tile_rescore
+
+    return {"permitted": not os.environ.get("NOVA_BF_NO_TILE_KERNEL"),
+            **tile_rescore.usage()}
 
 
 def code_versions() -> dict:

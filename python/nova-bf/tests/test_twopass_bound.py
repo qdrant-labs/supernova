@@ -1137,6 +1137,9 @@ def test_a_nonsense_threshold_falls_back_to_the_default(monkeypatch, raw):
     """A live FRACTION, so only [0, 1] means anything. `nan` compares false
     against everything and would run pass one on every slice however live it
     was; a negative value disabled the two-pass with no message."""
+    # `NOVA_BF_TWOPASS_THRESHOLD` is slice mode's cutoff; pinned, since the
+    # default mode is `tiles`.
+    monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", "slice")
     monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", raw)
     monkeypatch.setattr(twopass, "_THRESHOLD_WARNED", False)
     assert twopass.threshold() == twopass.DEFAULT_THRESHOLD
@@ -1145,6 +1148,7 @@ def test_a_nonsense_threshold_falls_back_to_the_default(monkeypatch, raw):
 @pytest.mark.parametrize("raw,want", [("0.0", 0.0), ("0.5", 0.5), ("1.0", 1.0),
                                       ("1", 1.0)])
 def test_a_valid_threshold_is_honoured(monkeypatch, raw, want):
+    monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", "slice")
     monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", raw)
     assert twopass.threshold() == want
 
@@ -1430,6 +1434,12 @@ def test_a_slice_every_row_refuses_never_runs_pass_one_at_all():
     it, a slice of near-zero-norm corpus vectors pays a full pass-one GEMM
     whose every answer is then overwritten with `+inf` — which is exactly the
     shape the prunability cut exists to avoid.
+
+    Since the per-slice guards are decided on the device (no read before the
+    launch), only the QUERY-side form of this skip survives: it is cached
+    with the query side and known on the host without a read. A slice refused
+    by its CORPUS data now runs the (speculative) kernel and takes its
+    counters back -- see test_twopass_sync_free.py.
     """
     twopass.reset()
     Q = torch.nn.functional.normalize(torch.randn(16, DIM), dim=1) * 1e-4

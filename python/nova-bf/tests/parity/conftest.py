@@ -203,6 +203,10 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         config._nova_bf_qdrant_required_but_absent = True
     if _QDRANT.get("graded"):
         tr.write_sep("=", "Qdrant oracle: RAN", green=True)
+        # Per file, so a run can be checked for WHICH suites reached the
+        # engine, not just that one of them did.
+        for mod, n in sorted(_QDRANT.get("compared", {}).items()):
+            tr.write_line(f"  {mod}: {n} Qdrant-backed test(s) passed")
         return
     if _QDRANT.get("reachable"):
         # Connected but never loaded a collection: the oracle did not grade.
@@ -232,6 +236,24 @@ def collection(client, ds):
     _QDRANT["graded"] = True
     yield name
     client.delete_collection(name)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Tally, per file, the tests that passed WITH a Qdrant collection in hand.
+
+    `graded` says only that a collection was loaded; this says which suites
+    then actually compared against it. Keyed on the fixture rather than on a
+    call in each test, so a new Qdrant-backed test is counted without having to
+    remember to report itself.
+    """
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.when == "call" and rep.passed and (
+            {"collection", "mv_collection"} & set(getattr(item, "fixturenames", ()))):
+        tally = _QDRANT.setdefault("compared", {})
+        mod = item.nodeid.split("::", 1)[0].rsplit("/", 1)[-1]
+        tally[mod] = tally.get(mod, 0) + 1
 
 
 @pytest.hookimpl(trylast=True)
