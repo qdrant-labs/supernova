@@ -101,6 +101,273 @@ def _copy_range(dst: np.ndarray, buf) -> None:
     np.copyto(dst, np.frombuffer(buf, dtype=np.uint8))
 
 
+# Optional native dense read path (NOVA_BF_NATIVE_DENSE=1).
+# Rust fetches dense chunks via concurrent ranged GETs and decodes directly
+# into (n, dim), avoiding intermediate Arrow buffers and copies.
+# Preserves bitwise equivalence with dense_to_2d; unsupported layouts
+# fall back to PyArrow.
+# Tuning: NOVA_BF_NATIVE_CONC=128, NOVA_BF_NATIVE_PART_MIB=16,
+# NOVA_BF_NATIVE_CHUNKS=8 (defaults).
+_NATIVE: dict = {"pid": None, "clients": {}, "warned": set(), "orphans": []}
+_NATIVE_LOCK = threading.Lock()
+
+
+def _reset_native_lock_in_child() -> None:
+    # Reset synchronization after fork to prevent inherited lock deadlocks
+    # and clear in-flight state from threads that no longer exist.
+    global _NATIVE_LOCK, _INFLIGHT_CV
+    _NATIVE_LOCK = threading.Lock()
+    _INFLIGHT_CV = threading.Condition()
+    _INFLIGHT["n"] = 0
+
+
+os.register_at_fork(after_in_child=_reset_native_lock_in_child)
+
+# Track native calls to prevent Python 3.13 shutdown crashes.
+# At exit, block new calls and wait for active Rust reads to finish.
+_INFLIGHT = {"n": 0, "closing": False}
+_INFLIGHT_CV = threading.Condition()
+
+
+def _native_enter() -> bool:
+    with _INFLIGHT_CV:
+        if _INFLIGHT["closing"]:
+            return False
+        _INFLIGHT["n"] += 1
+        return True
+
+
+def _native_exit() -> None:
+    with _INFLIGHT_CV:
+        _INFLIGHT["n"] -= 1
+        _INFLIGHT_CV.notify_all()
+
+
+def _drain_native_at_exit(timeout_s: float = 60.0) -> None:
+    with _INFLIGHT_CV:
+        _INFLIGHT["closing"] = True
+    # Cancel in-flight calls (S3 parts stop at once; a local pread finishes
+    # its current part), then wait for them to come back out of Rust.
+    if _NATIVE["pid"] == os.getpid():
+        for client in list(_NATIVE["clients"].values()):
+            try:
+                client.cancel()
+            except Exception:
+                pass
+    with _INFLIGHT_CV:
+        _INFLIGHT_CV.wait_for(lambda: _INFLIGHT["n"] == 0, timeout=timeout_s)
+
+
+import atexit  # noqa: E402
+
+atexit.register(_drain_native_at_exit)
+
+# Use PyArrow for custom S3 endpoints unsupported by the native client.
+_ENDPOINT_ENV = ("AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT")
+
+
+def native_fetch_enabled() -> bool:
+    """NOVA_BF_NATIVE_FETCH=1: download (not decode) the pyarrow-read
+    columns through the native transport -- see Store.read_columns_fetched."""
+    return os.environ.get("NOVA_BF_NATIVE_FETCH", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Fetch padding, range coalescing, and tail-read limits.
+_FETCH_PAD = 4096
+_FETCH_COALESCE = 8 << 10  # Match PyArrow's pre_buffer hole limit.
+_FETCH_TAIL = 1 << 20
+
+# Bounded cache of recently fetched column data.
+import collections as _collections  # noqa: E402
+
+_FETCH_KEEPALIVE: _collections.deque = _collections.deque(maxlen=4)
+
+
+def _fetch_image(client, url: str, size: int, pin):
+    """Fetch the Parquet footer into a sparse file-sized buffer.
+
+    Returns (image, have_from), or None if footer validation fails.
+    """
+    if size < 12:
+        return None
+    image = _zeroed_image(size)
+    if os.environ.get("NOVA_BF_NATIVE_FETCH_CANARY"):
+        image.fill(0xA5)  # tests: make any read of an unfetched byte loud
+    tail = min(size, _FETCH_TAIL)
+    client.read_ranges_into(url, image, [(size - tail, tail, size - tail)], if_match=pin)
+    if bytes(image[size - 4:]) != b"PAR1":
+        return None
+    flen = int.from_bytes(bytes(image[size - 8:size - 4]), "little")
+    if flen + 8 > size:
+        return None
+    have_from = size - tail
+    if flen + 8 > tail:
+        start = size - 8 - flen
+        client.read_ranges_into(url, image, [(start, size - tail - start, start)], if_match=pin)
+        have_from = start
+    return image, have_from
+
+
+def _zeroed_image(size: int) -> np.ndarray:
+    """Create a zero-initialized, writable uint8 array with lazy allocation.
+
+    Uses anonymous mmap for large arrays to avoid allocating untouched pages
+    and disables huge pages to minimize memory residency.
+    """
+    import mmap
+
+    if size < (1 << 20):
+        return np.zeros(size, dtype=np.uint8)
+    m = mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    if hasattr(mmap, "MADV_NOHUGEPAGE"):
+        m.madvise(mmap.MADV_NOHUGEPAGE)
+    return np.frombuffer(m, dtype=np.uint8)
+
+
+def _release_image(image: np.ndarray, table: pa.Table) -> None:
+    """Release decoded image pages unless Arrow buffers still reference them."""
+    import mmap
+
+    base = image.ctypes.data
+    end = base + image.nbytes
+    for col in table.columns:
+        for chunk in col.chunks:
+            stack = [chunk]
+            while stack:
+                arr = stack.pop()
+                for b in arr.buffers():
+                    if b is not None and b.size and base <= b.address < end:
+                        return
+                stack.extend(getattr(arr, "children", None) or [])
+                dct = getattr(arr, "dictionary", None)
+                if dct is not None:
+                    stack.append(dct)
+    m = image.base
+    m = getattr(m, "obj", m)  # np.frombuffer(mmap) -> memoryview -> mmap
+    if isinstance(m, mmap.mmap) and hasattr(mmap, "MADV_DONTNEED"):
+        m.madvise(mmap.MADV_DONTNEED)
+
+
+def _leaf_count(t: pa.DataType) -> int:
+    if isinstance(t, pa.BaseExtensionType):  # incl. C++ canonical (uuid, json, opaque)
+        return _leaf_count(t.storage_type)
+    if pa.types.is_struct(t):
+        return sum(_leaf_count(t.field(i).type) for i in range(t.num_fields))
+    if pa.types.is_map(t):
+        return _leaf_count(t.key_type) + _leaf_count(t.item_type)
+    if (pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t)
+            or pa.types.is_list_view(t) or pa.types.is_large_list_view(t)):
+        return _leaf_count(t.value_type)
+    return 1
+
+
+def _column_ranges(image: np.ndarray, size: int, columns: list[str], have_from: int | None = None):
+    """Compute merged Parquet column fetch ranges, excluding the fetched footer.
+
+    Returns None for unsupported or ambiguous metadata to trigger PyArrow fallback.
+    """
+    end = size if have_from is None else have_from
+    try:
+        pf = pq.ParquetFile(pa.BufferReader(pa.py_buffer(image)))
+        md, arrow = pf.metadata, pf.schema_arrow
+        names = arrow.names
+        counts = [_leaf_count(f.type) for f in arrow]
+        if sum(counts) != md.num_columns or len(set(names)) != len(names):
+            return None
+        want = set(columns)
+        if not want <= set(names):
+            return None
+        leaves, j = [], 0
+        for name, c in zip(names, counts):
+            if name in want:
+                leaves.extend(range(j, j + c))
+            j += c
+        spans = []
+        for i in range(md.num_row_groups):
+            rg = md.row_group(i)
+            if rg.num_columns != md.num_columns:
+                return None
+            for leaf in leaves:
+                cc = rg.column(leaf)
+                start = cc.data_page_offset
+                dpo = cc.dictionary_page_offset
+                if cc.has_dictionary_page and dpo is not None and 0 < dpo < start:
+                    start = dpo
+                length = cc.total_compressed_size
+                if start is None or length is None or start < 0 or length < 0 or start + length > size:
+                    return None
+                s0, e0 = start, min(end, start + length + _FETCH_PAD)
+                if s0 < e0:
+                    spans.append((s0, e0))
+    except Exception:
+        return None
+    if not spans:
+        return []
+    spans.sort()
+    merged = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s <= merged[-1][1] + _FETCH_COALESCE:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e - s, s) for s, e in merged]
+
+
+def native_dense_enabled() -> bool:
+    return os.environ.get("NOVA_BF_NATIVE_DENSE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        v = int(raw) if raw else default
+        if v < 1:
+            raise ValueError(v)
+        return v
+    except ValueError:
+        _warn_once(f"env:{name}:{raw}", "%s=%r is not a positive integer; using %d",
+                   name, raw, default)
+        return default
+
+
+def _warn_once(key: str, msg: str, *args) -> None:
+    with _NATIVE_LOCK:
+        if key in _NATIVE["warned"]:
+            return
+        _NATIVE["warned"].add(key)
+    logger.warning(msg, *args)
+
+
+def _native_client(region: str | None):
+    """Return a process-local Rust fetch client for the given region.
+
+    Creates clients lazily and reinitializes them after fork.
+    Returns None if rust_fetch is unavailable.
+    """
+    try:
+        import rust_fetch
+    except ImportError as e:
+        _warn_once("import", "NOVA_BF_NATIVE_DENSE is set but rust_fetch is not "
+                   "importable (%s); reading dense columns with pyarrow", e)
+        return None
+    with _NATIVE_LOCK:
+        if _NATIVE["pid"] != os.getpid():
+            # A client inherited across fork() cannot be used in the child
+            # (its runtime threads don't exist there; rust_fetch refuses and
+            # leaks it on drop). Build fresh ones for this process.
+            _NATIVE["orphans"].append(_NATIVE["clients"])
+            _NATIVE["pid"], _NATIVE["clients"] = os.getpid(), {}
+        client = _NATIVE["clients"].get(region)
+        if client is None:
+            client = rust_fetch.Client(
+                region=region,
+                concurrency=_env_int("NOVA_BF_NATIVE_CONC", 128),
+                part_size=_env_int("NOVA_BF_NATIVE_PART_MIB", 16) << 20,
+            )
+            _NATIVE["clients"][region] = client
+        return client
+
+
 def _is_s3(uri: str) -> bool:
     return uri.startswith("s3://")
 
@@ -119,12 +386,26 @@ class Store:
                  ranged_get_concurrency: int | None = None):
         self.uri = uri
         self.is_s3 = _is_s3(uri)
-        # Optional parallel ranged reads for large files
         self.ranged_get = ranged_get
-        # Per-file concurrency; callers reading multiple files should divide
-        # this to bound total concurrent GETs.
+
+        # Per-file GET concurrency; account for parallel file reads.
         self.ranged_get_concurrency = ranged_get_concurrency or _RANGED_GET_CONCURRENCY
         self.fs, self.root = _fs_and_path(uri)
+
+        # Enable native reads only for supported local/S3 configurations.
+        # Match PyArrow's resolved S3 region.
+        self._native_ok, self._native_region = False, None
+        self._native_failed = False
+        if self.is_s3:
+            from urllib.parse import parse_qs, urlsplit
+
+            q = parse_qs(urlsplit(uri).query)
+            self._native_ok = set(q) <= {"region"} and not any(
+                os.environ.get(k) for k in _ENDPOINT_ENV)
+            self._native_region = getattr(self.fs, "region", None) or (
+                q["region"][-1] if "region" in q else None)
+        elif "://" not in uri or uri.startswith("file://"):
+            self._native_ok = True
 
     def _loader_key(self, read_path: str) -> str:
         # The loader's id `filename` is the object key (s3, no bucket) or the
@@ -197,6 +478,184 @@ class Store:
         # Faster for files with many row groups; use io_ranged_get for few row groups.
         return pq.read_table(read_path, filesystem=self.fs, columns=columns,
                              pre_buffer=True, use_threads=True)
+
+    def read_dense(self, read_path: str, column: str,
+                   size: int | None = None) -> np.ndarray | None:
+        r = self.read_dense_versioned(read_path, column)
+        return None if r is None else r[0]
+
+    def same_version(self, read_path: str, etag: str | None) -> bool:
+        """Check whether the object still matches the given EntityTag to prevent stale reads.
+
+        Returns True if no ETag is provided, or False if verification fails.
+        """
+        if etag is None:
+            return True
+        if not _native_enter():
+            return False  # shutting down: let pyarrow re-read, never call in
+        try:
+            client = _native_client(self._native_region)
+            if client is None:
+                return False
+            url = f"s3://{read_path}" if self.is_s3 else read_path
+            try:
+                return client.head(url)[1] == etag
+            except Exception:
+                return False
+        finally:
+            _native_exit()
+
+    def read_dense_versioned(self, read_path: str, column: str):
+        """Read a dense column as a contiguous array using the native reader.
+
+        Returns (array, ETag), or None to fall back to PyArrow.
+        Preserves bitwise equivalence; transport errors propagate.
+        """
+        if self._native_failed:
+            return None
+        if not (self._native_ok and native_dense_enabled()):
+            if native_dense_enabled() and not self._native_ok:
+                _warn_once(f"store:{self.uri}", "NOVA_BF_NATIVE_DENSE: %s is not a "
+                        "plain s3:// or local root, or an AWS_ENDPOINT_URL* override "
+                        "is set; reading with pyarrow", self.uri)
+            return None
+        client = _native_client(self._native_region)
+        if client is None:
+            return None
+        import rust_fetch
+
+        url = f"s3://{read_path}" if self.is_s3 else read_path
+
+        # Defer special fields and Hive-partitioned paths to PyArrow
+        # to preserve dataset API semantics.
+        if column.startswith("__") or any(
+                "=" in seg for seg in read_path.split("/")[:-1]):
+            return None
+        if not _native_enter():
+            return None  # Interpreter shutting down.
+        try:
+            return self._read_dense_native(client, rust_fetch, read_path, url, column)
+        finally:
+            _native_exit()
+
+    def _read_dense_native(self, client, rust_fetch, read_path, url, column):
+        try:
+            # Recheck object size and validate PyArrow schema compatibility.
+            plan = client.dense_plan(url, column, None)
+            try:
+                typ = pq.read_schema(read_path, filesystem=self.fs).field(column).type
+            except Exception as e:
+                raise rust_fetch.UnsupportedLayout(f"pyarrow cannot read the schema: {e}") from e
+
+            plain = (
+                (pa.types.is_list(typ) or pa.types.is_large_list(typ)
+                or (pa.types.is_fixed_size_list(typ)
+                    and (plan.n_rows == 0 or typ.list_size == plan.dim)))
+                and not isinstance(typ, pa.ExtensionType)
+                and typ.value_type == pa.from_numpy_dtype(np.dtype(plan.dtype))
+            )
+            if not plain:
+                raise rust_fetch.UnsupportedLayout(f"pyarrow reads {column!r} as {typ}")
+            if plan.n_rows == 0:
+                return np.zeros((0, 0), dtype=np.float32), plan.etag
+
+            out = np.empty((plan.n_rows, plan.dim), dtype=plan.dtype)
+            client.read_dense_into(plan, out.reshape(-1).view(np.uint8),
+                                _env_int("NOVA_BF_NATIVE_CHUNKS", 8))
+            return out, plan.etag
+
+        except (ValueError, MemoryError, rust_fetch.CorruptParquet) as e:
+            # Fall back for unsupported layouts, invalid sizes, or corrupt data.
+            kind = type(e).__name__
+            _warn_once(f"fallback:{kind}:{str(e).replace(url, '')}", "native dense read "
+                    "of %s fell back to pyarrow: %s: %s (further files with this "
+                    "reason are not logged)", read_path, kind, e)
+            return None
+
+        except FileNotFoundError:
+            return None  # Let PyArrow report missing files.
+
+        except OSError as e:
+            if _INFLIGHT["closing"]:
+                return None
+
+            # Disable native reads after transport failure; use PyArrow thereafter.
+            self._native_failed = True
+            logger.warning("native dense transport failed on %s (%s); using pyarrow "
+                        "for the rest of this run on %s", read_path, e, self.uri)
+            return None
+
+    def read_columns_fetched(self, read_path: str, columns: list[str],
+                         etag: str | None = None):
+        """Fetch selected Parquet columns natively and decode with PyArrow.
+
+        Returns (table, ETag), or None to fall back to standard reads.
+        Uses version-pinned ranged GETs and lazily allocated buffers.
+        """
+        if self._native_failed or not (self._native_ok and native_fetch_enabled()):
+            return None
+
+        # Preserve PyArrow dataset semantics for special fields and partitions.
+        if any(c.startswith("__") for c in columns) or any(
+                "=" in seg for seg in read_path.split("/")[:-1]):
+            return None
+        client = _native_client(self._native_region)
+        if client is None:
+            return None
+        import rust_fetch
+
+        url = f"s3://{read_path}" if self.is_s3 else read_path
+        if not _native_enter():
+            return None
+        try:
+            try:
+                size, now = client.head(url)
+                if etag is not None and now != etag:
+                    return None
+                pin = now
+                got = _fetch_image(client, url, size, pin)
+                if got is None:
+                    return None
+                image, have_from = got
+
+                # Fetch requested column chunks after reading the footer.
+                ranges = _column_ranges(image, size, columns, have_from)
+                if ranges is None:
+                    return None
+                if ranges:
+                    client.read_ranges_into(url, image, ranges, if_match=pin)
+
+            except (ValueError, MemoryError, rust_fetch.CorruptParquet) as e:
+                kind = type(e).__name__
+                _warn_once(f"fetch:{kind}:{str(e).replace(url, '')}", "native fetch of %s "
+                        "fell back to pyarrow: %s: %s", read_path, kind, e)
+                return None
+            except FileNotFoundError:
+                return None
+            except OSError as e:
+                if _INFLIGHT["closing"]:
+                    return None
+                if "object changed" in str(e):
+                    return None
+                self._native_failed = True
+                logger.warning("native fetch transport failed on %s (%s); using pyarrow "
+                            "for the rest of this run on %s", read_path, e, self.uri)
+                return None
+
+            buf = pa.py_buffer(image)
+            try:
+                table = pq.read_table(pa.BufferReader(buf), columns=columns, use_threads=True)
+            except Exception:
+                return None
+            finally:
+                # Retain buffers to avoid destruction on Arrow threads during shutdown.
+                _FETCH_KEEPALIVE.append(buf)
+
+            # Reclaim image pages when decoded data no longer references them.
+            _release_image(image, table)
+            return table, pin
+        finally:
+            _native_exit()
 
     def _ranged_download(self, read_path: str, size: int):
         """Download a file using concurrent byte-range reads on S3 or POSIX.

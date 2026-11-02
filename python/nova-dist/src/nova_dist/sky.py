@@ -193,6 +193,9 @@ DEFAULTS: dict[str, dict] = {
             f"nova-bf[compute] @ git+{_REPO}@master#subdirectory=python/nova-bf",
             with_specs=(
                 f"nova-textscan @ git+{_REPO}@master#subdirectory=crates/nova-textscan",
+                # Native S3/dense reader; only used when NOVA_BF_NATIVE_DENSE /
+                # NOVA_BF_NATIVE_FETCH is set, pyarrow otherwise.
+                f"rust_fetch @ git+{_REPO}@master#subdirectory=python/nova-bf/rust_io",
             ),
         ),
     },

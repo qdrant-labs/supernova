@@ -65,7 +65,10 @@ from nova_bf.filters import (
 )
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
 from nova_bf.ids import make_point_id
-from nova_bf.io import ParquetFile, Store, dense_to_2d, multivector_to_ragged, sparse_to_coo_parts
+from nova_bf.io import (
+    ParquetFile, Store, dense_to_2d, multivector_to_ragged, native_dense_enabled, native_fetch_enabled,
+    sparse_to_coo_parts,
+)
 from nova_bf.results import (
     build_result_table,
     config_identity,
@@ -6398,6 +6401,24 @@ def run_compute(
     if tiebreak == "id" and mine:
         t_ord = time.perf_counter()
 
+        id_fetch = native_fetch_enabled()
+
+        def _read_id_column(f):
+            # Native download of just the id column's chunks when
+            # NOVA_BF_NATIVE_FETCH is on (pyarrow still decodes them; see
+            # Store.read_columns_fetched); otherwise -- or on any fallback --
+            # pyarrow's own projected read.
+            if id_fetch:
+                got = cstore.read_columns_fetched(f.read_path, [id_col])
+                if got is not None:
+                    return got[0][id_col]
+            return cstore.read_columns(
+                f.read_path, [id_col],
+                # `None` = the store's setting; `False` projects the column
+                # instead of buying the whole file. See ID_PASS_RANGED_GET.
+                ranged=None if ID_PASS_RANGED_GET else False,
+            )[id_col]
+
         def _rank_ids() -> None:
             try:
                 # `map` preserves file order, including duplicate-id tie order.
@@ -6415,15 +6436,7 @@ def run_compute(
                         with id_rank_lock:
                             if id_rank_cancel.is_set():
                                 return
-                            futures.append(pool.submit(
-                                lambda f=f: cstore.read_columns(
-                                    f.read_path, [id_col],
-                                    # `None` = the store's setting; `False`
-                                    # projects the column instead of buying the
-                                    # whole file. See ID_PASS_RANGED_GET.
-                                    ranged=None if ID_PASS_RANGED_GET else False,
-                                )[id_col]
-                            ))
+                            futures.append(pool.submit(_read_id_column, f))
                     # Resolve in file order, preserving the old `map`
                     # guarantee. A failed scan cancels all queued reads.
                     id_arrays = []
@@ -6503,6 +6516,25 @@ def run_compute(
     # Optional read-phase profiling, grouped by column shape/type so timings remain 
     # meaningful across corpora with different column names.
     read_timing = profiling.read_timing_on()
+    # Native dense read path (NOVA_BF_NATIVE_DENSE=1; see io.py). Read timing
+    # keeps the pyarrow path: it exists to profile THAT path's stages.
+    # Only when the dense column plays no other role (id / filter / another
+    # vector type would need it from the pyarrow table too).
+    use_native_dense = (
+        "dense" in vts_needed and native_dense_enabled() and not read_timing
+        and read_cols.count(dense_col) == 1
+        and dense_col not in ([id_col] if id_col else []) + filter_cols
+        and dense_col not in (
+            ([sparse_col] if "sparse" in vts_needed else [])
+            + ([multivector_col] if "multivector" in vts_needed else []))
+    )
+    if use_native_dense:
+        logger.info("dense corpus column %r: native read path (NOVA_BF_NATIVE_DENSE)", dense_col)
+    # Native DOWNLOAD (pyarrow still decodes) for the columns pyarrow reads
+    # (NOVA_BF_NATIVE_FETCH; see Store.read_columns_fetched).
+    use_native_fetch = native_fetch_enabled() and not read_timing
+    if use_native_fetch:
+        logger.info("corpus columns read by pyarrow: native download (NOVA_BF_NATIVE_FETCH)")
     read_col_groups = {
         "dense": [dense_col] if "dense" in vts_needed else [],
         "sparse": [sparse_col] if "sparse" in vts_needed else [],
@@ -6571,15 +6603,61 @@ def run_compute(
                     t0 = time.perf_counter()
                     # Optional per-file read timing
                     rt: dict | None = None
+                    # Native dense path (opt-in, see io.py): the dense column
+                    # arrives already decoded; pyarrow reads only the OTHER
+                    # columns (projected -- never a whole-file ranged GET,
+                    # which would re-buy the dense bytes). None = fall back.
+                    native = (
+                        cstore.read_dense_versioned(f.read_path, dense_col)
+                        if use_native_dense else None
+                    )
+                    native_dense, native_etag = native if native is not None else (None, None)
                     if read_timing:
                         table, rt = profiling.fetch_and_decode(
                             cstore, f.read_path, read_cols, read_col_groups)
+                    elif native_dense is not None:
+                        rest_cols = [c for c in read_cols if c != dense_col]
+                        table = None
+                        fetch_pinned = False
+                        if rest_cols:
+                            # Native download pinned to the SAME version as the
+                            # dense read (None if that version is gone).
+                            fetched = (cstore.read_columns_fetched(f.read_path, rest_cols,
+                                                                   etag=native_etag)
+                                       if use_native_fetch else None)
+                            if fetched is not None:
+                                table, fetch_pinned = fetched[0], True
+                            else:
+                                table = cstore.read_columns(f.read_path, rest_cols, ranged=False)
+                            # Never keep a second reference to the table: the
+                            # reader drops it before compaction (peak memory).
+                            fetched = None
+                        if (table is not None and not fetch_pinned
+                                and not cstore.same_version(f.read_path, native_etag)):
+                            # Rewritten between the two reads: never pair one
+                            # version's ids/filters with another's vectors.
+                            # Read everything again in ONE pyarrow read.
+                            logger.warning("%s changed during the read; re-reading it with "
+                                           "pyarrow", f.key)
+                            native_dense = None
+                            table = cstore.read_columns(f.read_path, read_cols)
+                        if (table is not None and native_dense is not None
+                                and len(table) != native_dense.shape[0]):
+                            raise ValueError(
+                                f"{f.key}: native dense read gave {native_dense.shape[0]} "
+                                f"rows but the other columns have {len(table)}"
+                            )
                     else:
-                        table = cstore.read_columns(f.read_path, read_cols)
-                
+                        fetched = (cstore.read_columns_fetched(f.read_path, read_cols)
+                                   if use_native_fetch else None)
+                        table = (fetched[0] if fetched is not None
+                                 else cstore.read_columns(f.read_path, read_cols))
+                        fetched = None  # see above: no second reference to the table
+
                     # Normalize declared datetime columns before any filter reads them.
                     ts = time.perf_counter()
-                    table = convert_table_date_columns(table, corpus_date_fmts)
+                    if table is not None:
+                        table = convert_table_date_columns(table, corpus_date_fmts)
                     if rt is not None:
                         rt["dates"] = time.perf_counter() - ts
 
@@ -6587,7 +6665,9 @@ def run_compute(
                     arrs: dict[str, object] = {}
                     ts = time.perf_counter()
                     if "dense" in vts_needed:
-                        arrs["dense"] = dense_to_2d(table[dense_col])
+                        arrs["dense"] = (native_dense if native_dense is not None
+                                         else dense_to_2d(table[dense_col]))
+                    native_dense = None
                     if rt is not None:
                         # Recorded only when the stage RAN
                         if "dense" in vts_needed:
@@ -6629,7 +6709,9 @@ def run_compute(
                         rt["ids"] = time.perf_counter() - ts
 
                     # Keep only filter columns; vector/ID data is already retained elsewhere.
-                    n_rows_file = len(table)
+                    # `table` is None only on the native path with no other
+                    # columns to read (no ids, filters or other vector types).
+                    n_rows_file = len(table) if table is not None else int(arrs["dense"].shape[0])
                     ts = time.perf_counter()
                     if filter_cols:
                         table = table.select(filter_cols)

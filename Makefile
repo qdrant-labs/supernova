@@ -6,7 +6,7 @@
 #   make load     the `nova load` Rust binary
 #   make storm    the `nova storm` Rust binary
 #   make inspect  the `nova inspect` Rust binary (count vectors + parquet schema)
-#   make bf       the `nova bf` Python tool (brute-force ground truth; torch)
+#   make bf       the `nova bf` Python tool (brute-force ground truth; torch + native readers)
 #   make dist     the `nova dist` orchestrator (SkyPilot; controller-side only)
 #   make sweep    the `nova sweep` parameter-sweep orchestrator (controller-side only)
 #   make docs     serve the docs locally (zensical)
@@ -58,8 +58,12 @@ inspect:
 
 # `nova bf` — Python brute-force ground truth. `[compute]` pulls torch (GPU);
 # drop the extra for a controller that only runs `nova bf merge`.
+# Two native companions are built from source (needs cargo): nova-textscan
+# (match_text scan) and rust_fetch (python/nova-bf/rust_io: the native S3/dense
+# reader behind NOVA_BF_NATIVE_DENSE / NOVA_BF_NATIVE_FETCH). Both are optional
+# at runtime -- nova-bf falls back to pyarrow / Python when they are missing.
 bf:
-	uv pip install -e 'python/nova-bf[compute]' ./crates/nova-textscan
+	uv pip install -e 'python/nova-bf[compute]' ./crates/nova-textscan ./python/nova-bf/rust_io
 
 # `nova dist` — SkyPilot orchestrator. Controller-side only (your laptop / a
 # dispatch box); workers never need it. Still part of `make all` (pulls in
@@ -80,10 +84,17 @@ docs:
 docs-build:
 	uvx zensical build
 
+# rust_io is a standalone crate (own [workspace]), so the root `cargo test`
+# does not reach it; --no-default-features skips the pyo3 bindings, which need
+# libpython at link time. Its Python tests run in nova-bf's env (S3 cases skip
+# unless RUST_FETCH_TEST_S3_ENDPOINT points at a minio).
+NOVA_BF_NATIVE := --with $(CURDIR)/crates/nova-textscan --with $(CURDIR)/python/nova-bf/rust_io
 test:
 	cargo test
+	cargo test --manifest-path python/nova-bf/rust_io/Cargo.toml --no-default-features
 	uv run --directory python/nova-embed --extra dev pytest -q || true
-	uv run --directory python/nova-bf --extra dev --with $(CURDIR)/crates/nova-textscan pytest -q
+	uv run --directory python/nova-bf --extra dev $(NOVA_BF_NATIVE) pytest -q
+	uv run --directory python/nova-bf --extra dev $(NOVA_BF_NATIVE) pytest -q rust_io/tests
 	uv run --directory python/nova-sweep --extra dev pytest -q || true
 
 # nova-bf three-way parity: nova-bf vs a plain-Python reference vs a live
@@ -97,4 +108,5 @@ parity:
 
 clean:
 	cargo clean
+	cargo clean --manifest-path python/nova-bf/rust_io/Cargo.toml
 	rm -rf site dist python/*/dist

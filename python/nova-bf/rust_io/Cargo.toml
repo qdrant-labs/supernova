@@ -1,0 +1,41 @@
+[package]
+name = "rust_fetch"
+version = "0.1.0"
+edition = "2021"
+description = "High-throughput native S3 (and file://) range downloader for Python: GIL-free, writes straight into a caller-provided buffer"
+publish = false
+
+# Standalone: NOT a member of the supernova Cargo workspace.
+[workspace]
+
+[lib]
+name = "rust_fetch"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["python"]
+# The Python bindings. `cargo test --no-default-features` builds/tests the
+# pure-Rust core without needing libpython at link time.
+python = ["dep:pyo3"]
+
+[dependencies]
+object_store = { version = "0.12.4", features = ["aws", "tls-webpki-roots"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+futures = "0.3"
+bytes = "1"
+url = "2"
+thiserror = "2"
+parquet = { version = "59.2", default-features = false }
+snap = "1.1"
+zstd = "0.13"
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode"] }
+flate2 = "1.1"
+pyo3 = { version = "0.23.5", features = ["extension-module", "abi3-py311"], optional = true }
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

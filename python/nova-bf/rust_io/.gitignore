@@ -1,0 +1,5 @@
+target/
+dist/
+__pycache__/
+# editable installs (make bf) build the extension in place
+*.so
