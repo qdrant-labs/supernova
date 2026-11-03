@@ -101,13 +101,55 @@ def _copy_range(dst: np.ndarray, buf) -> None:
     np.copyto(dst, np.frombuffer(buf, dtype=np.uint8))
 
 
-# Optional native dense read path (NOVA_BF_NATIVE_DENSE=1).
-# Rust fetches dense chunks via concurrent ranged GETs and decodes directly
-# into (n, dim), avoiding intermediate Arrow buffers and copies.
+# rust_fetch I/O, on by default (`params.rust_fetch_dense` / `_columns`).
+# Dense: Rust fetches dense chunks via concurrent ranged GETs and decodes
+# directly into (n, dim), avoiding intermediate Arrow buffers and copies.
 # Preserves bitwise equivalence with dense_to_2d; unsupported layouts
-# fall back to PyArrow.
-# Tuning: NOVA_BF_NATIVE_CONC=128, NOVA_BF_NATIVE_PART_MIB=16,
-# NOVA_BF_NATIVE_CHUNKS=8 (defaults).
+# fall back to PyArrow. Columns: see Store.read_columns_fetched.
+# Settings come from `configure_rust_fetch` (called by compute with the run's
+# `params`); NOVA_BF_RUST_FETCH_DENSE / _COLUMNS / _CONC / _PART_MIB / _CHUNKS
+# override them per run.
+_NATIVE_DEFAULTS = {"dense": True, "columns": True, "concurrency": 128,
+                    "part_mib": 16, "chunks": 8}
+_NATIVE_CFG = dict(_NATIVE_DEFAULTS)
+
+
+def configure_rust_fetch(dense: bool | None = None, columns: bool | None = None,
+                         concurrency: int | None = None, part_mib: int | None = None,
+                         chunks: int | None = None) -> None:
+    """Set the run's rust_fetch settings (None = built-in default).
+    NOVA_BF_RUST_FETCH_* environment variables still take precedence."""
+    given = {"dense": dense, "columns": columns, "concurrency": concurrency,
+             "part_mib": part_mib, "chunks": chunks}
+    for k, v in given.items():
+        _NATIVE_CFG[k] = _NATIVE_DEFAULTS[k] if v is None else v
+
+
+_NATIVE_ENV = {"dense": "NOVA_BF_RUST_FETCH_DENSE", "columns": "NOVA_BF_RUST_FETCH_COLUMNS",
+               "concurrency": "NOVA_BF_RUST_FETCH_CONC", "part_mib": "NOVA_BF_RUST_FETCH_PART_MIB",
+               "chunks": "NOVA_BF_RUST_FETCH_CHUNKS"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be a boolean (1/0, true/false), got {raw!r}")
+
+
+def rust_fetch_settings() -> dict:
+    """The RESOLVED rust_fetch settings (environment over configuration)."""
+    out = {}
+    for k, v in _NATIVE_CFG.items():
+        env = _NATIVE_ENV[k]
+        out[k] = _env_bool(env, v) if isinstance(v, bool) else _env_int(env, v)
+    return out
+
+
 _NATIVE: dict = {"pid": None, "clients": {}, "warned": set(), "orphans": []}
 _NATIVE_LOCK = threading.Lock()
 
@@ -166,10 +208,11 @@ atexit.register(_drain_native_at_exit)
 _ENDPOINT_ENV = ("AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT")
 
 
-def native_fetch_enabled() -> bool:
-    """NOVA_BF_NATIVE_FETCH=1: download (not decode) the pyarrow-read
-    columns through the native transport -- see Store.read_columns_fetched."""
-    return os.environ.get("NOVA_BF_NATIVE_FETCH", "").strip().lower() in ("1", "true", "yes", "on")
+def rust_fetch_columns_enabled() -> bool:
+    """Download (not decode) the pyarrow-read columns through the native
+    transport -- see Store.read_columns_fetched. `params.rust_fetch_columns`,
+    overridden by NOVA_BF_RUST_FETCH_COLUMNS."""
+    return _env_bool("NOVA_BF_RUST_FETCH_COLUMNS", _NATIVE_CFG["columns"])
 
 
 # Fetch padding, range coalescing, and tail-read limits.
@@ -191,7 +234,7 @@ def _fetch_image(client, url: str, size: int, pin):
     if size < 12:
         return None
     image = _zeroed_image(size)
-    if os.environ.get("NOVA_BF_NATIVE_FETCH_CANARY"):
+    if os.environ.get("NOVA_BF_RUST_FETCH_CANARY"):
         image.fill(0xA5)  # tests: make any read of an unfetched byte loud
     tail = min(size, _FETCH_TAIL)
     client.read_ranges_into(url, image, [(size - tail, tail, size - tail)], if_match=pin)
@@ -282,23 +325,26 @@ def _column_ranges(image: np.ndarray, size: int, columns: list[str], have_from: 
             if name in want:
                 leaves.extend(range(j, j + c))
             j += c
+        # Chunk offsets come from rust_fetch, NOT pyarrow's RowGroupMetaData
+        # .column(): on some malformed size statistics that accessor lets a
+        # C++ exception reach std::terminate and aborts the whole process
+        # (the plain pyarrow read raises a clean error on the same file).
+        # chunk_spans refuses those footers, so we decline instead.
+        import rust_fetch
+
+        flen = int.from_bytes(bytes(image[size - 8:size - 4]), "little")
+        if flen <= 0 or flen > size - 12:
+            return None
+        footer = bytes(image[size - 8 - flen:size - 8])
         spans = []
-        for i in range(md.num_row_groups):
-            rg = md.row_group(i)
-            if rg.num_columns != md.num_columns:
+        for start, dpo, length in rust_fetch.chunk_spans(footer, leaves):
+            if dpo is not None and 0 < dpo < start:
+                start = dpo
+            if start < 0 or length < 0 or start + length > size:
                 return None
-            for leaf in leaves:
-                cc = rg.column(leaf)
-                start = cc.data_page_offset
-                dpo = cc.dictionary_page_offset
-                if cc.has_dictionary_page and dpo is not None and 0 < dpo < start:
-                    start = dpo
-                length = cc.total_compressed_size
-                if start is None or length is None or start < 0 or length < 0 or start + length > size:
-                    return None
-                s0, e0 = start, min(end, start + length + _FETCH_PAD)
-                if s0 < e0:
-                    spans.append((s0, e0))
+            s0, e0 = start, min(end, start + length + _FETCH_PAD)
+            if s0 < e0:
+                spans.append((s0, e0))
     except Exception:
         return None
     if not spans:
@@ -313,8 +359,9 @@ def _column_ranges(image: np.ndarray, size: int, columns: list[str], have_from: 
     return [(s, e - s, s) for s, e in merged]
 
 
-def native_dense_enabled() -> bool:
-    return os.environ.get("NOVA_BF_NATIVE_DENSE", "").strip().lower() in ("1", "true", "yes", "on")
+def rust_fetch_dense_enabled() -> bool:
+    """`params.rust_fetch_dense`, overridden by NOVA_BF_RUST_FETCH_DENSE."""
+    return _env_bool("NOVA_BF_RUST_FETCH_DENSE", _NATIVE_CFG["dense"])
 
 
 def _env_int(name: str, default: int) -> int:
@@ -347,8 +394,9 @@ def _native_client(region: str | None):
     try:
         import rust_fetch
     except ImportError as e:
-        _warn_once("import", "NOVA_BF_NATIVE_DENSE is set but rust_fetch is not "
-                   "importable (%s); reading dense columns with pyarrow", e)
+        _warn_once("import", "native I/O is on but rust_fetch is not importable "
+                   "(%s); reading with pyarrow. Install python/nova-bf/rust_io "
+                   "(`make bf`) or set params.rust_fetch_dense/rust_fetch_columns: false", e)
         return None
     with _NATIVE_LOCK:
         if _NATIVE["pid"] != os.getpid():
@@ -357,14 +405,15 @@ def _native_client(region: str | None):
             # leaks it on drop). Build fresh ones for this process.
             _NATIVE["orphans"].append(_NATIVE["clients"])
             _NATIVE["pid"], _NATIVE["clients"] = os.getpid(), {}
-        client = _NATIVE["clients"].get(region)
+        conc = _env_int("NOVA_BF_RUST_FETCH_CONC", _NATIVE_CFG["concurrency"])
+        part = _env_int("NOVA_BF_RUST_FETCH_PART_MIB", _NATIVE_CFG["part_mib"]) << 20
+        # Keyed by the tuning too: a later run in this process with other
+        # settings must not reuse a client built with the old ones.
+        key = (region, conc, part)
+        client = _NATIVE["clients"].get(key)
         if client is None:
-            client = rust_fetch.Client(
-                region=region,
-                concurrency=_env_int("NOVA_BF_NATIVE_CONC", 128),
-                part_size=_env_int("NOVA_BF_NATIVE_PART_MIB", 16) << 20,
-            )
-            _NATIVE["clients"][region] = client
+            client = rust_fetch.Client(region=region, concurrency=conc, part_size=part)
+            _NATIVE["clients"][key] = client
         return client
 
 
@@ -513,9 +562,9 @@ class Store:
         """
         if self._native_failed:
             return None
-        if not (self._native_ok and native_dense_enabled()):
-            if native_dense_enabled() and not self._native_ok:
-                _warn_once(f"store:{self.uri}", "NOVA_BF_NATIVE_DENSE: %s is not a "
+        if not (self._native_ok and rust_fetch_dense_enabled()):
+            if rust_fetch_dense_enabled() and not self._native_ok:
+                _warn_once(f"store:{self.uri}", "native dense read: %s is not a "
                         "plain s3:// or local root, or an AWS_ENDPOINT_URL* override "
                         "is set; reading with pyarrow", self.uri)
             return None
@@ -543,13 +592,21 @@ class Store:
             # Recheck object size and validate PyArrow schema compatibility.
             plan = client.dense_plan(url, column, None)
             try:
-                typ = pq.read_schema(read_path, filesystem=self.fs).field(column).type
+                schema = pq.read_schema(read_path, filesystem=self.fs)
+                typ = schema.field(column).type
             except Exception as e:
                 raise rust_fetch.UnsupportedLayout(f"pyarrow cannot read the schema: {e}") from e
+            # pyarrow's dataset read (the fallback) refuses ANY duplicated
+            # top-level name, even one that is not read -- refuse too.
+            if len(set(schema.names)) != len(schema.names):
+                raise rust_fetch.UnsupportedLayout("duplicate top-level field names")
 
             plain = (
                 (pa.types.is_list(typ) or pa.types.is_large_list(typ)
                 or (pa.types.is_fixed_size_list(typ)
+                    # A 0-row file has no dim to compare, but pyarrow still
+                    # refuses a negative ARROW:schema list size on read.
+                    and typ.list_size >= 0
                     and (plan.n_rows == 0 or typ.list_size == plan.dim)))
                 and not isinstance(typ, pa.ExtensionType)
                 and typ.value_type == pa.from_numpy_dtype(np.dtype(plan.dtype))
@@ -561,7 +618,7 @@ class Store:
 
             out = np.empty((plan.n_rows, plan.dim), dtype=plan.dtype)
             client.read_dense_into(plan, out.reshape(-1).view(np.uint8),
-                                _env_int("NOVA_BF_NATIVE_CHUNKS", 8))
+                                _env_int("NOVA_BF_RUST_FETCH_CHUNKS", _NATIVE_CFG["chunks"]))
             return out, plan.etag
 
         except (ValueError, MemoryError, rust_fetch.CorruptParquet) as e:
@@ -592,7 +649,7 @@ class Store:
         Returns (table, ETag), or None to fall back to standard reads.
         Uses version-pinned ranged GETs and lazily allocated buffers.
         """
-        if self._native_failed or not (self._native_ok and native_fetch_enabled()):
+        if self._native_failed or not (self._native_ok and rust_fetch_columns_enabled()):
             return None
 
         # Preserve PyArrow dataset semantics for special fields and partitions.

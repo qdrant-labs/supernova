@@ -3,6 +3,8 @@ from typing import Any
 
 __version__: str
 
+def chunk_spans(footer: bytes, leaves: Sequence[int]) -> list[tuple[int, int | None, int]]: ...
+
 class Client:
     def __init__(
         self,

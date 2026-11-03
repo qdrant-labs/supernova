@@ -506,8 +506,23 @@ impl Client {
     }
 }
 
+/// chunk_spans(footer, leaves) -> [(data_page_offset, dictionary_page_offset | None, total_compressed_size)]
+///
+/// Column-chunk byte layout of leaf columns `leaves` in every row group
+/// (row-group major), from the raw thrift footer bytes (without length and
+/// magic). Raises UnsupportedLayout / CorruptParquet for any footer the
+/// dense planner or pyarrow's ColumnChunkMetaData would refuse -- including
+/// the malformed size statistics on which pyarrow's
+/// `RowGroupMetaData.column()` aborts the process instead of raising.
+#[pyfunction]
+fn chunk_spans(py: Python<'_>, footer: &[u8], leaves: Vec<usize>) -> PyResult<Vec<(i64, Option<i64>, i64)>> {
+    let footer = footer.to_vec();
+    py.allow_threads(move || dense::chunk_spans(&footer, &leaves)).map_err(dense_to_py)
+}
+
 #[pymodule]
 fn _rust_fetch(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(chunk_spans, m)?)?;
     m.add_class::<Client>()?;
     m.add_class::<DensePlan>()?;
     m.add("UnsupportedLayout", m.py().get_type::<UnsupportedLayout>())?;

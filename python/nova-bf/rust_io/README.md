@@ -26,18 +26,27 @@ column at 6–8 GB/s, GIL-free.
 
 ## How nova-bf uses it
 
-Both paths are opt-in and fall back to pyarrow on any doubt:
+Both paths are on by default and fall back to pyarrow on any doubt. They are
+set in the config's `params:` block; the env var overrides it for one run
+(`=0` turns a path off, `=1` on):
 
-| Env var | Effect |
-|---|---|
-| `NOVA_BF_NATIVE_DENSE=1` | The dense corpus column is downloaded and decoded in Rust. |
-| `NOVA_BF_NATIVE_FETCH=1` | The other corpus columns (sparse, ids, filter/date fields) and the `tiebreak='id'` id pass are *downloaded* in Rust (footer + needed column chunks only); pyarrow still decodes them. |
+| `params` key (default) | Env override | Effect |
+|---|---|---|
+| `rust_fetch_dense` (true) | `NOVA_BF_RUST_FETCH_DENSE` | The dense corpus column is downloaded and decoded in Rust. |
+| `rust_fetch_columns` (true) | `NOVA_BF_RUST_FETCH_COLUMNS` | The other corpus columns (sparse, ids, filter/date fields) and the `tiebreak='id'` id pass are *downloaded* in Rust (footer + needed column chunks only); pyarrow still decodes them. |
+| `rust_fetch_concurrency` (128) | `NOVA_BF_RUST_FETCH_CONC` | Ranged GETs in flight per process, shared by all files. |
+| `rust_fetch_part_mib` (16) | `NOVA_BF_RUST_FETCH_PART_MIB` | Bytes per ranged GET. |
+| `rust_fetch_chunks` (8) | `NOVA_BF_RUST_FETCH_CHUNKS` | Row groups fetched/decoded at once per file. |
+
+If `rust_fetch` is not installed, nova-bf logs one warning and reads with
+pyarrow. The resolved settings are recorded in the run record under
+`rust_fetch`.
 
 What still goes through pyarrow: listing the corpus, loading the query file,
 writing partials and manifests, `nova-bf merge`, the per-file schema check, and
 every fallback.
 
-Outputs with the flags on are byte-identical to runs without them; see
+Outputs with these on are byte-identical to runs with them off; see
 `python/nova-bf/tests/test_native_dense.py`.
 
 ## API sketch

@@ -184,6 +184,21 @@ class ParamsConfig(BaseModel):
     # improving I/O throughput at the cost of extra host RAM (~one file size).
     # Disabled by default; Arrow-native reads are preferable for many row groups.
     io_ranged_get: bool = False
+    # Rust-based corpus I/O (enabled by default).
+    # Falls back to pyarrow for unsupported files or configurations.
+    #   dense: Downloads and decodes dense vectors directly into a (rows, dim) array.
+    #   columns: Downloads other columns in Rust; pyarrow handles decoding.
+    # Overrides: NOVA_BF_RUST_FETCH_DENSE / NOVA_BF_RUST_FETCH_COLUMNS (1/0).
+    rust_fetch_dense: bool = True
+    rust_fetch_columns: bool = True
+    # Rust download settings:
+    #   concurrency: Maximum simultaneous ranged GETs per process.
+    #   part_mib: Size of each GET in MiB.
+    #   chunks: Row groups processed together per file.
+    # Overrides: NOVA_BF_RUST_FETCH_CONC / _PART_MIB / _CHUNKS.
+    rust_fetch_concurrency: int = Field(default=128, ge=1, strict=True)
+    rust_fetch_part_mib: int = Field(default=16, ge=1, strict=True)
+    rust_fetch_chunks: int = Field(default=8, ge=1, strict=True)
     # Maximum rows scored per GPU batch for dense searches to limit memory usage.
     # Shared across searches of this vector type. None processes the entire file
     # (or union of filtered rows). Defaults to 8192 for efficient Triton top-K;

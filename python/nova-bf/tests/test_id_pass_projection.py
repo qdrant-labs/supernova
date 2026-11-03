@@ -51,10 +51,10 @@ ID_COL = "sid"
 @pytest.fixture(autouse=True)
 def _pyarrow_read_path(monkeypatch):
     """These tests classify Store.read_columns calls; the native dense path
-    (NOVA_BF_NATIVE_DENSE) adds a projected id-column read of its own that
+    (NOVA_BF_RUST_FETCH_DENSE) adds a projected id-column read of its own that
     looks exactly like an id-pass read. Pin the pyarrow path."""
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
-    monkeypatch.delenv("NOVA_BF_NATIVE_FETCH", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
 
 @pytest.fixture
 def corpus_and_queries(tmp_path):

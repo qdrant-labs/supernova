@@ -1,4 +1,5 @@
-"""Native dense read path (NOVA_BF_NATIVE_DENSE=1, `Store.read_dense`).
+"""rust_fetch dense read path (on by default; `params.rust_fetch_dense`,
+NOVA_BF_RUST_FETCH_DENSE overrides; `Store.read_dense`).
 
 Contract: when it returns an array, the bytes equal `dense_to_2d` on the
 pyarrow read; when it can't reproduce that exactly, it returns None and the
@@ -36,7 +37,7 @@ from nova_bf.io import Store, dense_to_2d
 
 @pytest.fixture
 def native_on(monkeypatch):
-    monkeypatch.setenv("NOVA_BF_NATIVE_DENSE", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
 
 
 def _dense_col(v, kind="list"):
@@ -70,11 +71,68 @@ def test_read_dense_matches_dense_to_2d(tmp_path, native_on, np_type, kind, comp
     assert got.flags.c_contiguous
 
 
-def test_off_by_default(tmp_path, monkeypatch):
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
+@pytest.fixture
+def fresh_rust_fetch_cfg(monkeypatch):
+    """Built-in defaults, no env overrides, restored afterwards."""
+    for k in ("DENSE", "COLUMNS", "CONC", "PART_MIB", "CHUNKS"):
+        monkeypatch.delenv(f"NOVA_BF_RUST_FETCH_{k}", raising=False)
+    monkeypatch.setattr(nio, "_NATIVE_CFG", dict(nio._NATIVE_DEFAULTS))
+
+
+def _one_file(tmp_path):
     p = tmp_path / "f.parquet"
     pq.write_table(pa.table({"dense_embedding": _dense_col(np.ones((3, 2), np.float32))}), str(p))
+    return p
+
+
+def test_on_by_default(tmp_path, fresh_rust_fetch_cfg):
+    p = _one_file(tmp_path)
+    assert nio.rust_fetch_dense_enabled() and nio.rust_fetch_columns_enabled()
+    assert Store(str(tmp_path)).read_dense(str(p), "dense_embedding") is not None
+
+
+def test_env_zero_disables(tmp_path, fresh_rust_fetch_cfg, monkeypatch):
+    p = _one_file(tmp_path)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
     assert Store(str(tmp_path)).read_dense(str(p), "dense_embedding") is None
+
+
+def test_config_disables_and_env_overrides_config(tmp_path, fresh_rust_fetch_cfg, monkeypatch):
+    p = _one_file(tmp_path)
+    nio.configure_rust_fetch(dense=False, columns=False, concurrency=7)
+    assert Store(str(tmp_path)).read_dense(str(p), "dense_embedding") is None
+    assert not nio.rust_fetch_columns_enabled()
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_CONC", "9")
+    assert Store(str(tmp_path)).read_dense(str(p), "dense_embedding") is not None
+    got = nio.rust_fetch_settings()
+    assert got["dense"] is True and got["columns"] is False and got["concurrency"] == 9
+
+
+def test_bad_env_bool_is_an_error(fresh_rust_fetch_cfg, monkeypatch):
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "maybe")
+    with pytest.raises(ValueError, match="NOVA_BF_RUST_FETCH_COLUMNS"):
+        nio.rust_fetch_columns_enabled()
+
+
+def test_params_config_turns_it_off_for_a_run(tmp_path, fresh_rust_fetch_cfg, monkeypatch):
+    """`params.rust_fetch_dense: false` alone (no env) keeps the run on pyarrow."""
+    cdir, qpath = _corpus(tmp_path, np.float32)
+    calls = []
+    real = Store.read_dense_versioned
+
+    def spy(self, *a, **k):
+        r = real(self, *a, **k)
+        calls.append(r is not None)
+        return r
+
+    monkeypatch.setattr(Store, "read_dense_versioned", spy)
+    off = _run(cdir, qpath, tmp_path / "off", SEARCHES["dense_only"],
+               rust_fetch_dense=False, rust_fetch_columns=False)
+    assert calls == []
+    on = _run(cdir, qpath, tmp_path / "on", SEARCHES["dense_only"])
+    assert calls and all(calls), calls
+    assert off and off == on
 
 
 @pytest.mark.parametrize("rows,typ", [
@@ -201,18 +259,18 @@ SEARCHES = {
 @pytest.mark.parametrize("id_column", ["sid", None])
 def test_run_outputs_identical_flag_on_vs_off(tmp_path, monkeypatch, np_type, which, id_column):
     cdir, qpath = _corpus(tmp_path, np_type)
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
     off = _run(cdir, qpath, tmp_path / "off", SEARCHES[which], id_column)
-    monkeypatch.setenv("NOVA_BF_NATIVE_DENSE", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
     on = _run(cdir, qpath, tmp_path / "on", SEARCHES[which], id_column)
     assert off and off == on
 
 
 def test_run_with_one_fallback_file_is_identical(tmp_path, monkeypatch):
     cdir, qpath = _corpus(tmp_path, np.float32, ragged_file=True)
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
     off = _run(cdir, qpath, tmp_path / "off", SEARCHES["dense_filtered"])
-    monkeypatch.setenv("NOVA_BF_NATIVE_DENSE", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
     on = _run(cdir, qpath, tmp_path / "on", SEARCHES["dense_filtered"])
     assert off and off == on
 
@@ -221,7 +279,7 @@ def test_native_path_is_actually_taken(tmp_path, monkeypatch):
     """Guard against the equality tests passing because the flag silently
     did nothing."""
     cdir, qpath = _corpus(tmp_path, np.float32)
-    monkeypatch.setenv("NOVA_BF_NATIVE_DENSE", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
     calls = []
     real = Store.read_dense_versioned
 
@@ -291,7 +349,7 @@ def test_object_rewritten_mid_read_falls_back(tmp_path, native_on, monkeypatch):
 @pytest.mark.parametrize("role", ["id", "filter"])
 def test_dense_column_with_another_role_uses_pyarrow(tmp_path, monkeypatch, role):
     cdir, qpath = _corpus(tmp_path, np.float32)
-    monkeypatch.setenv("NOVA_BF_NATIVE_DENSE", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
     calls = []
     monkeypatch.setattr(Store, "read_dense_versioned", lambda self, *a, **k: calls.append(1))
     searches = [SearchSpec(name="d", k=3, metric="dot")]
@@ -318,7 +376,7 @@ def test_interpreter_exit_with_daemon_readers_mid_call_does_not_abort(tmp_path):
     code = textwrap.dedent(f"""
         import os, sys, threading, time
         sys.path.insert(0, {src!r})
-        os.environ["NOVA_BF_NATIVE_DENSE"] = "1"
+        os.environ["NOVA_BF_RUST_FETCH_DENSE"] = "1"
         from nova_bf.io import Store
         st = Store({str(tmp_path)!r}); p = {str(tmp_path / "f.parquet")!r}
         def loop():
@@ -336,7 +394,7 @@ def test_interpreter_exit_with_daemon_readers_mid_call_does_not_abort(tmp_path):
 def test_file_rewritten_between_native_and_side_column_reads_is_reread(tmp_path, monkeypatch):
     """Ids must never be paired with vectors from another file version."""
     cdir, qpath = _corpus(tmp_path, np.float32)
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
     files = sorted(cdir.glob("*.parquet"))
     target = files[0]
     # Version B: same rows/ids, different vectors.
@@ -358,7 +416,7 @@ def test_file_rewritten_between_native_and_side_column_reads_is_reread(tmp_path,
     for p in files:
         pq.write_table(tb if p == target else pq.read_table(str(p)), str(ec / p.name), row_group_size=16)
     expected = _run(ec, qpath, tmp_path / "off", SEARCHES["dense_filtered"])
-    monkeypatch.setenv("NOVA_BF_NATIVE_DENSE", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
     monkeypatch.setattr(Store, "read_dense_versioned", rewrite_after)
     got = _run(cdir, qpath, tmp_path / "on", SEARCHES["dense_filtered"])
     assert got == expected
@@ -374,7 +432,7 @@ def test_drain_cancels_inflight_native_calls(tmp_path):
     code = textwrap.dedent(f"""
         import os, sys, threading, time
         sys.path.insert(0, {src!r})
-        os.environ["NOVA_BF_NATIVE_DENSE"] = "1"
+        os.environ["NOVA_BF_RUST_FETCH_DENSE"] = "1"
         import nova_bf.io as nio
         # A stalled 'S3' endpoint: accepts, never answers.
         import socket
@@ -443,15 +501,15 @@ def test_equals_sign_in_the_file_name_is_not_a_partition(tmp_path, native_on):
     assert Store(str(tmp_path)).read_dense(str(p), "e") is not None
 
 
-# --- native DOWNLOAD of pyarrow-decoded columns (NOVA_BF_NATIVE_FETCH) -------
+# --- native DOWNLOAD of pyarrow-decoded columns (NOVA_BF_RUST_FETCH_COLUMNS) -------
 
 
 @pytest.fixture
 def fetch_on(monkeypatch):
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "1")
     # Fill unfetched bytes with garbage: any read outside the fetched ranges
     # then breaks equality (or decoding) instead of silently reading zeros.
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH_CANARY", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_CANARY", "1")
     # Small test files would otherwise arrive whole in the speculative tail
     # read; shrink it and stop coalescing so the projected ranges are what
     # actually gets exercised (gaps between them stay canary garbage).
@@ -545,15 +603,15 @@ def test_fetch_falls_back_when_pinned_version_is_gone(tmp_path, fetch_on):
 @pytest.mark.parametrize("which", list(SEARCHES))
 def test_run_outputs_identical_with_native_fetch(tmp_path, monkeypatch, which, dense_flag):
     cdir, qpath = _corpus(tmp_path, np.float16)
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
-    monkeypatch.delenv("NOVA_BF_NATIVE_FETCH", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
     off = _run(cdir, qpath, tmp_path / "off", SEARCHES[which])
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH", "1")
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH_CANARY", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_CANARY", "1")
     monkeypatch.setattr(nio, "_FETCH_TAIL", 64)
     monkeypatch.setattr(nio, "_FETCH_COALESCE", 0)
     if dense_flag:
-        monkeypatch.setenv("NOVA_BF_NATIVE_DENSE", "1")
+        monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
     calls = []
     real = Store.read_columns_fetched
 
@@ -574,15 +632,15 @@ def test_id_pass_uses_native_fetch_and_outputs_match(tmp_path, monkeypatch, dens
     native download (one call per corpus file) and nothing changes."""
     cdir, qpath = _corpus(tmp_path, np.float32)
     n_files = len(list(cdir.glob("*.parquet")))
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
-    monkeypatch.delenv("NOVA_BF_NATIVE_FETCH", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
     off = _run(cdir, qpath, tmp_path / "off", SEARCHES["dense_filtered"], tiebreak="id")
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH", "1")
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH_CANARY", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_CANARY", "1")
     monkeypatch.setattr(nio, "_FETCH_TAIL", 64)
     monkeypatch.setattr(nio, "_FETCH_COALESCE", 0)
     if dense_flag:
-        monkeypatch.setenv("NOVA_BF_NATIVE_DENSE", "1")
+        monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "1")
     id_calls = []
     real = Store.read_columns_fetched
 
@@ -600,10 +658,10 @@ def test_id_pass_uses_native_fetch_and_outputs_match(tmp_path, monkeypatch, dens
 
 def test_id_pass_falls_back_to_pyarrow_when_fetch_declines(tmp_path, monkeypatch):
     cdir, qpath = _corpus(tmp_path, np.float32)
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
-    monkeypatch.delenv("NOVA_BF_NATIVE_FETCH", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
     off = _run(cdir, qpath, tmp_path / "off", SEARCHES["dense_only"], tiebreak="id")
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "1")
     monkeypatch.setattr(Store, "read_columns_fetched", lambda self, *a, **k: None)
     on = _run(cdir, qpath, tmp_path / "on", SEARCHES["dense_only"], tiebreak="id")
     assert off and off == on
@@ -647,7 +705,7 @@ def test_missing_column_defers_without_downloading_the_file(tmp_path, fetch_on, 
 def test_a_short_range_fails_loudly_instead_of_reading_stale_memory(tmp_path, monkeypatch):
     """No canary here (production): unfetched bytes must still never decode
     as data -- e.g. a previous file's bytes left in recycled heap memory."""
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "1")
     monkeypatch.setattr(nio, "_FETCH_TAIL", 64)
     monkeypatch.setattr(nio, "_FETCH_COALESCE", 0)
     rng = np.random.default_rng(5)
@@ -670,7 +728,7 @@ def test_narrow_fetch_keeps_only_fetched_pages_resident(tmp_path, monkeypatch):
     returned once pyarrow has decoded (only the keepalive object remains)."""
     import gc
 
-    monkeypatch.setenv("NOVA_BF_NATIVE_FETCH", "1")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "1")
     n, dim = 24000, 256
     rng = np.random.default_rng(0)
     vec = pa.FixedSizeListArray.from_arrays(pa.array(rng.standard_normal(n * dim).astype(np.float32)), dim)

@@ -66,7 +66,8 @@ from nova_bf.filters import (
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
 from nova_bf.ids import make_point_id
 from nova_bf.io import (
-    ParquetFile, Store, dense_to_2d, multivector_to_ragged, native_dense_enabled, native_fetch_enabled,
+    ParquetFile, Store, configure_rust_fetch, dense_to_2d, multivector_to_ragged, rust_fetch_dense_enabled,
+    rust_fetch_columns_enabled, rust_fetch_settings,
     sparse_to_coo_parts,
 )
 from nova_bf.results import (
@@ -5630,6 +5631,10 @@ def run_compute(
     # After the reset, which returns the mode to "unconfigured".
     twopass.set_rescore_mode(cfg.params.two_pass_rescore)
     twopass.set_pipeline_pass_one(cfg.params.pipeline_pass_one)
+    configure_rust_fetch(
+        dense=cfg.params.rust_fetch_dense, columns=cfg.params.rust_fetch_columns,
+        concurrency=cfg.params.rust_fetch_concurrency,
+        part_mib=cfg.params.rust_fetch_part_mib, chunks=cfg.params.rust_fetch_chunks)
     # Local imports: both modules are imported function-locally throughout this
     # file (triton is optional), and `topk_triton` is otherwise reached only via
     # `tiebreak`.
@@ -6401,11 +6406,11 @@ def run_compute(
     if tiebreak == "id" and mine:
         t_ord = time.perf_counter()
 
-        id_fetch = native_fetch_enabled()
+        id_fetch = rust_fetch_columns_enabled()
 
         def _read_id_column(f):
             # Native download of just the id column's chunks when
-            # NOVA_BF_NATIVE_FETCH is on (pyarrow still decodes them; see
+            # params.rust_fetch_columns is on (pyarrow still decodes them; see
             # Store.read_columns_fetched); otherwise -- or on any fallback --
             # pyarrow's own projected read.
             if id_fetch:
@@ -6516,12 +6521,12 @@ def run_compute(
     # Optional read-phase profiling, grouped by column shape/type so timings remain 
     # meaningful across corpora with different column names.
     read_timing = profiling.read_timing_on()
-    # Native dense read path (NOVA_BF_NATIVE_DENSE=1; see io.py). Read timing
+    # rust_fetch dense read path (params.rust_fetch_dense; see io.py). Read timing
     # keeps the pyarrow path: it exists to profile THAT path's stages.
     # Only when the dense column plays no other role (id / filter / another
     # vector type would need it from the pyarrow table too).
     use_native_dense = (
-        "dense" in vts_needed and native_dense_enabled() and not read_timing
+        "dense" in vts_needed and rust_fetch_dense_enabled() and not read_timing
         and read_cols.count(dense_col) == 1
         and dense_col not in ([id_col] if id_col else []) + filter_cols
         and dense_col not in (
@@ -6529,12 +6534,12 @@ def run_compute(
             + ([multivector_col] if "multivector" in vts_needed else []))
     )
     if use_native_dense:
-        logger.info("dense corpus column %r: native read path (NOVA_BF_NATIVE_DENSE)", dense_col)
+        logger.info("dense corpus column %r: rust_fetch read path (params.rust_fetch_dense)", dense_col)
     # Native DOWNLOAD (pyarrow still decodes) for the columns pyarrow reads
-    # (NOVA_BF_NATIVE_FETCH; see Store.read_columns_fetched).
-    use_native_fetch = native_fetch_enabled() and not read_timing
+    # (params.rust_fetch_columns; see Store.read_columns_fetched).
+    use_native_fetch = rust_fetch_columns_enabled() and not read_timing
     if use_native_fetch:
-        logger.info("corpus columns read by pyarrow: native download (NOVA_BF_NATIVE_FETCH)")
+        logger.info("corpus columns read by pyarrow: rust_fetch download (params.rust_fetch_columns)")
     read_col_groups = {
         "dense": [dense_col] if "dense" in vts_needed else [],
         "sparse": [sparse_col] if "sparse" in vts_needed else [],
@@ -7629,6 +7634,9 @@ def run_compute(
         # RESOLVED pass-one pipelining (NOVA_BF_PIPELINE_PASS_ONE over the
         # config); `kernels.twopass.pipeline_*` says what it actually did.
         "pipeline_pass_one": twopass.pipeline_pass_one(),
+        # RESOLVED native I/O settings (NOVA_BF_RUST_FETCH_* over the config).
+        # Per-file fallbacks to pyarrow are logged, not counted here.
+        "rust_fetch": rust_fetch_settings(),
         # The configured bool stays under `threshold_exchange`; what the
         # exchange actually did is here.
         "threshold_exchange_stats": thr_exchange_stats,

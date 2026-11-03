@@ -1,9 +1,9 @@
 """Native, GIL-free S3 / local range downloader that writes into caller buffers,
 plus a dense-vector parquet fast path (`Client.dense_plan` / `read_dense`)."""
 
-from ._rust_fetch import Client, CorruptParquet, DensePlan, UnsupportedLayout, __version__
+from ._rust_fetch import Client, CorruptParquet, DensePlan, UnsupportedLayout, __version__, chunk_spans
 
-__all__ = ["Client", "CorruptParquet", "DensePlan", "UnsupportedLayout", "__version__", "read_dense"]
+__all__ = ["Client", "CorruptParquet", "DensePlan", "UnsupportedLayout", "__version__", "chunk_spans", "read_dense"]
 
 
 def read_dense(client, url, column, size=None, chunks_in_flight=8, out=None):

@@ -1038,8 +1038,8 @@ def test_shared_io_and_decode_once_per_file_not_per_spec(ds, monkeypatch):
     each make exactly one additional call apiece (there's only one query
     file), accounted for explicitly below."""
     # Instruments the pyarrow read path (Store.read_columns): pin it.
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
-    monkeypatch.delenv("NOVA_BF_NATIVE_FETCH", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
     calls = {"read_columns": 0, "dense_to_2d": 0, "sparse_to_coo_parts": 0}
 
     orig_read = Store.read_columns

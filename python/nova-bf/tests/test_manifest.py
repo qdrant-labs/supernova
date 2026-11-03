@@ -172,8 +172,8 @@ def test_scan_failure_before_id_coordinator_starts(ds, tmp_path, monkeypatch):
         return original_read(store, path, columns, *args, **kwargs)
 
     # Injects its scan failure through Store.read_columns: pin the pyarrow path.
-    monkeypatch.delenv("NOVA_BF_NATIVE_DENSE", raising=False)
-    monkeypatch.delenv("NOVA_BF_NATIVE_FETCH", raising=False)
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
     monkeypatch.setattr(compute, "Thread", thread)
     monkeypatch.setattr(compute.Store, "read_columns", read)
     cfg = _cfg(ds, tmp_path)

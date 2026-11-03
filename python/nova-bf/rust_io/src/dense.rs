@@ -363,7 +363,64 @@ pub async fn plan_dense(f: &Fetcher, url: &str, column: &str, size: Option<u64>,
     Ok(plan)
 }
 
-/// Pure footer -> plan (no I/O; unit-testable).
+/// Extract column chunk offsets and sizes from a raw Parquet footer without I/O.
+/// Returns (data_page_offset, dictionary_page_offset, total_compressed_size)
+/// for each requested leaf in each row group, ordered by row group.
+/// Validates the footer before pyarrow access, avoiding crashes on malformed metadata.
+pub fn chunk_spans(footer: &[u8], leaves: &[usize]) -> DResult<Vec<(i64, Option<i64>, i64)>> {
+    check_footer_thrift(footer)?;
+    let md = ParquetMetaDataReader::decode_metadata(footer)
+        .map_err(|e| DenseError::Corrupt(format!("footer: {e}")))?;
+    let schema = md.file_metadata().schema_descr();
+    let ncols = schema.num_columns();
+    if let Some(&bad) = leaves.iter().find(|&&l| l >= ncols) {
+        return unsupported(format!("leaf {bad} out of range ({ncols} columns)"));
+    }
+    let mut out = Vec::with_capacity(md.num_row_groups() * leaves.len());
+    for rg in md.row_groups() {
+        if rg.num_columns() != ncols {
+            return unsupported("row group column count differs from the schema");
+        }
+        // A row group claiming more rows than a chunk holds values makes
+        // pyarrow size its reads from the bogus count (the fetch fuzz saw a
+        // 2^32-row claim balloon a BufferReader decode to 7.6 GB); the dense
+        // planner refuses it for the same reason.
+        if rg.num_rows() < 0 {
+            return corrupt("negative row count in footer");
+        }
+        // pyarrow validates every chunk's size statistics when it builds
+        // ColumnChunkMetaData; mirror plan_from_footer's checks.
+        for (j, cc) in rg.columns().iter().enumerate() {
+            let d = schema.column(j);
+            if cc.num_values() < rg.num_rows() {
+                return unsupported(format!(
+                    "column chunk with {} values in a row group of {} rows",
+                    cc.num_values(),
+                    rg.num_rows()
+                ));
+            }
+            if cc.unencoded_byte_array_data_bytes().is_some() && d.physical_type() != PhysicalType::BYTE_ARRAY {
+                return unsupported("unencoded_byte_array_data_bytes on a non-BYTE_ARRAY column");
+            }
+            for (h, max, what) in [
+                (cc.definition_level_histogram(), d.max_def_level(), "definition"),
+                (cc.repetition_level_histogram(), d.max_rep_level(), "repetition"),
+            ] {
+                if let Some(h) = h {
+                    if h.len() != 0 && h.len() != max as usize + 1 {
+                        return unsupported(format!("{what} level histogram of {} for max level {max}", h.len()));
+                    }
+                }
+            }
+        }
+        for &l in leaves {
+            let cc = rg.column(l);
+            out.push((cc.data_page_offset(), cc.dictionary_page_offset(), cc.compressed_size()));
+        }
+    }
+    Ok(out)
+}
+
 pub fn plan_from_footer(footer: &[u8], column: &str, file_size: u64) -> DResult<DensePlan> {
     check_footer_thrift(footer)?;
     let md = ParquetMetaDataReader::decode_metadata(footer)
@@ -373,13 +430,19 @@ pub fn plan_from_footer(footer: &[u8], column: &str, file_size: u64) -> DResult<
     // Accept only Parquet schemas PyArrow interprets as flat primitive lists;
     // reject nested, ambiguous, or incompatible layouts.
     let root = schema.root_schema();
-    let mut named = root.get_fields().iter().filter(|t| t.name() == column);
-    let top = named
-        .next()
-        .ok_or_else(|| DenseError::Unsupported(format!("no top-level column {column:?}")))?;
-    if named.next().is_some() {
-        return unsupported(format!("two top-level fields named {column:?}"));
+    // pyarrow's dataset read (what nova-bf's pyarrow path uses) refuses a
+    // file with ANY duplicated top-level name, not just the requested one.
+    {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(t) = root.get_fields().iter().find(|t| !seen.insert(t.name())) {
+            return unsupported(format!("duplicate top-level field {:?}", t.name()));
+        }
     }
+    let top = root
+        .get_fields()
+        .iter()
+        .find(|t| t.name() == column)
+        .ok_or_else(|| DenseError::Unsupported(format!("no top-level column {column:?}")))?;
     let not_list = || unsupported::<()>(format!("column {column:?} is not a flat list of floats"));
     let rep_of = |t: &parquet::schema::types::Type| {
         let i = t.get_basic_info();
@@ -644,6 +707,9 @@ fn check_footer_thrift(footer: &[u8]) -> DResult<()> {
         types: Vec<Option<i64>>,
         /// ColumnMetaData.type of every column chunk, in footer order.
         chunk_types: Vec<Option<i64>>,
+        /// Byte lengths of each chunk's Statistics min/max values (fields
+        /// max=1, min=2, max_value=5, min_value=6), aligned with chunk_types.
+        stat_lens: Vec<Vec<u64>>,
     }
     /// i16/i32 varints: pyarrow's thrift truncates the raw varint to 32 bits
     /// BEFORE zigzag, parquet-rs zigzags 64 bits then truncates -- they
@@ -669,6 +735,7 @@ fn check_footer_thrift(footer: &[u8]) -> DResult<()> {
         }
         if path.as_slice() == [4, 1, 3] {
             w.chunk_types.push(None);
+            w.stat_lens.push(Vec::new());
         }
         let mut last = 0i16;
         let mut seen = FieldSet::default();
@@ -696,6 +763,19 @@ fn check_footer_thrift(footer: &[u8]) -> DResult<()> {
             if path.as_slice() == [4, 1, 3] && id == 1 && ty == 5 {
                 let v = small_int(t)?;
                 *w.chunk_types.last_mut().unwrap() = Some(v);
+                continue;
+            }
+            // ColumnMetaData.statistics(12) min/max values: pyarrow decodes
+            // them on read and refuses a wrong-sized fixed-width value.
+            if path.as_slice() == [4, 1, 3, 12] && matches!(id, 1 | 2 | 5 | 6) && ty == 8 {
+                let n = t.uvarint()?;
+                if n > MAX_FOOTER_BINARY {
+                    return unsupported(format!("footer binary of {n} bytes"));
+                }
+                t.skip_bytes(n)?;
+                if let Some(v) = w.stat_lens.last_mut() {
+                    v.push(n);
+                }
                 continue;
             }
             path.push(id);
@@ -759,8 +839,25 @@ fn check_footer_thrift(footer: &[u8]) -> DResult<()> {
         }
     }
     let mut t = Thrift { b: footer, pos: 0 };
-    let mut w = W { children: Vec::new(), types: Vec::new(), chunk_types: Vec::new() };
+    let mut w = W { children: Vec::new(), types: Vec::new(), chunk_types: Vec::new(), stat_lens: Vec::new() };
     walk_struct(&mut t, &mut w, 0, &mut Vec::new())?;
+    // pyarrow decodes column statistics when it reads a file and refuses one
+    // whose fixed-width min/max has the wrong size ("Unexpected end of
+    // stream"); the decoder never looks at them, so refuse too (any column).
+    for (ct, lens) in w.chunk_types.iter().zip(&w.stat_lens) {
+        let width = match ct {
+            Some(0) => Some(1), // BOOLEAN (one PLAIN byte)
+            Some(1) | Some(4) => Some(4), // INT32, FLOAT
+            Some(2) | Some(5) => Some(8), // INT64, DOUBLE
+            Some(3) => Some(12),          // INT96
+            _ => None,                    // BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY: variable here
+        };
+        if let Some(wd) = width {
+            if let Some(n) = lens.iter().find(|&&n| n != wd) {
+                return unsupported(format!("column statistic of {n} bytes for a {wd}-byte type"));
+            }
+        }
+    }
     // pyarrow refuses a column chunk whose ColumnMetaData.type differs from
     // its schema leaf's physical type (for any column); parquet-rs ignores
     // the chunk's own field. Leaves = elements without children, in order.
