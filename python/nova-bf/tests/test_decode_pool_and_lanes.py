@@ -186,24 +186,42 @@ def _partial(qids, widths):
 
 
 def test_the_decision_reads_past_the_first_slice(tmp_path):
-    """`dense` is a MINIMUM over rows, so a prefix cannot decide it.
-
-    A partial whose LATER rows are short must not be called dense: lane state
-    for a filtered-shaped search pays a materialise per fold for a fast path
-    that then never runs.
+    """The id WIDTH must be fixed across every row, so a prefix cannot decide
+    it: a partial whose LATER ids are a different width cannot use lanes.
 
     The fixture spans TWO CHUNKS on purpose. The slice bound is
     `2_000_000 // k` rows, so at a test-sized k any modest fixture fits in one
-    slice and a head-only scan would still see every row -- which is how the
-    test this replaces passed against the very bug it named. Two chunks force
-    the loop to continue past its first piece whatever the bound resolves to.
+    slice and a head-only scan would still see every row -- which is how an
+    earlier version of this test passed against the very bug it named. Two
+    chunks force the loop to continue past its first piece whatever the bound
+    resolves to.
     """
-    dense = _partial([f"a{i}" for i in range(64)], [K] * 64)
-    short = _partial([f"b{i}" for i in range(64)], [K] * 63 + [1])
-    tbl = pa.concat_tables([dense, short])
+    head = _partial([f"a{i}" for i in range(64)], [K] * 64)
+    late = build_result_table(
+        [f"b{i}" for i in range(64)], {},
+        [[f"<urn:uuid:{i:08x}-{j:05x}>" for j in range(K)] for i in range(64)],
+        [[1.0 - j * 0.01 for j in range(K)] for _ in range(64)])
+    tbl = pa.concat_tables([head, late])
     assert len(tbl.column("hit_ids").chunks) == 2, "fixture is not multi-chunk"
     cfg = _cfg(str(tmp_path))
     assert merge_mod._decide_lanes(tbl, cfg.searches[0]) is False
+
+
+def test_short_rows_still_enable_lanes(tmp_path):
+    """Row LENGTH no longer matters: the device fold takes ragged rows
+    (trimmed partials, queries with fewer than k hits), so a fixed-width
+    partial with short or empty rows keeps its state in lanes."""
+    dense = _partial([f"a{i}" for i in range(64)], [K] * 64)
+    short = _partial([f"b{i}" for i in range(64)], [K] * 60 + [1, 0, 2, 0])
+    tbl = pa.concat_tables([dense, short])
+    cfg = _cfg(str(tmp_path))
+    assert merge_mod._decide_lanes(tbl, cfg.searches[0]) is True
+
+
+def test_a_partial_with_no_hits_keeps_arrow(tmp_path):
+    """No ids at all means no width to pack; stay on Arrow."""
+    tbl = _partial([f"q{i}" for i in range(16)], [0] * 16)
+    assert merge_mod._decide_lanes(tbl, _cfg(str(tmp_path)).searches[0]) is False
 
 
 def test_the_density_scan_stays_bounded_by_k(tmp_path, monkeypatch):

@@ -1061,19 +1061,19 @@ def test_the_device_fold_matches_the_host_fold_exactly(
     # is all the device path needs.
     monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
 
-    # PROVE the device path ran. It DECLINES (returns None) on ragged rows or
-    # variable-width ids, and a decline routes the batch to the host path --
+    # PROVE the device path ran. It DECLINES (returns None) on variable-width
+    # ids or an all-empty batch, and a decline routes the batch to the host path --
     # so without this spy both sides of the comparison could be the same code
     # and the test would pass while proving nothing.
     took = []
-    real = merge_mod._dense_device_fold
-    monkeypatch.setattr(merge_mod, "_dense_device_fold",
+    real = merge_mod._device_fold
+    monkeypatch.setattr(merge_mod, "_device_fold",
                         lambda *a, **kw: (lambda r: (took.append(r is not None), r)[1])(real(*a, **kw)))
     dev_ids, dev_sc, dev_tie = merge_mod._topk_merge(scores, ids, None, k)
     assert took == [True], f"the device fold did not run: {took}"
 
     # Force the host path for the same inputs by refusing the dense fold.
-    monkeypatch.setattr(merge_mod, "_dense_device_fold", lambda *a, **kw: None)
+    monkeypatch.setattr(merge_mod, "_device_fold", lambda *a, **kw: None)
     host_ids, host_sc, host_tie = merge_mod._topk_merge(scores, ids, None, k)
 
     assert dev_ids.to_pylist() == host_ids.to_pylist(), "winning ids differ"
@@ -1081,23 +1081,461 @@ def test_the_device_fold_matches_the_host_fold_exactly(
     assert dev_tie is None and host_tie is None
 
 
-def test_the_device_fold_declines_rows_shorter_than_k(monkeypatch):
-    """Ragged rows have no dense grid, so the fast path must DECLINE, not
-    guess. Returning None routes the batch to the general path; raising, or
-    silently reshaping, would corrupt the output for every sparse/filtered
-    search."""
-    torch = pytest.importorskip("torch")
+def _spy_device_fold(monkeypatch):
+    """Record whether each `_device_fold` call took the batch."""
+    took = []
+    real = merge_mod._device_fold
+
+    def spy(*a, **kw):
+        r = real(*a, **kw)
+        took.append(r is not None)
+        return r
+
+    monkeypatch.setattr(merge_mod, "_device_fold", spy)
+    return took
+
+
+def _ragged_input(rng, b, k, tag, *, empty_frac=0.2, ties=False, pool=None):
+    """One partial with ragged rows: 0..k hits per row, some rows empty."""
+    lens = rng.integers(0, k + 1, size=b).astype(np.int32)
+    lens[rng.random(b) < empty_frac] = 0
+    tot = int(lens.sum())
+    off = pa.array(np.concatenate([[0], np.cumsum(lens)]).astype(np.int32))
+    if ties:
+        sc = rng.choice(np.array([0.25, 0.5, 0.75], np.float32), size=tot)
+    else:
+        sc = rng.random(tot).astype(np.float32)
+    # Each row's hits sorted descending, as compute writes them.
+    sc = np.concatenate([np.sort(sc[o:o + n])[::-1] for o, n in
+                         zip(np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)]
+                        or [np.empty(0, np.float32)]).astype(np.float32)
+    if pool is not None:
+        ids = [pool[i] for i in rng.integers(0, len(pool), size=tot)]
+    else:
+        ids = [f"<urn:uuid:{tag:04x}{i:04x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(tot)]
+    return (pa.ListArray.from_arrays(off, pa.array(sc, pa.float32())),
+            pa.ListArray.from_arrays(off, pa.array(ids, pa.large_string())))
+
+
+def _cuda_ok():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# The device fold on the CPU everywhere, and on a real GPU where there is one.
+FOLD_DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not _cuda_ok(), reason="needs CUDA"))]
+
+
+@pytest.mark.parametrize("fold_dev", FOLD_DEVICES)
+@pytest.mark.parametrize("seed", range(12))
+@pytest.mark.parametrize("ties,dups", [(False, False), (True, False), (True, True)])
+def test_the_device_fold_takes_ragged_rows_and_matches_numpy(
+        monkeypatch, seed, ties, dups, fold_dev):
+    """Short rows (trimmed partials, queries with < k hits) take the device
+    fold and give exactly the NumPy fold's answer: same ids, same scores, same
+    order, same per-row counts -- including heavy exact ties and ids that
+    repeat across and within inputs, where only the tie order decides."""
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(1000 + seed + 100 * (2 * ties + dups))
+    b = int(rng.integers(1, 40))
+    k = int(rng.integers(1, 12))
+    n = int(rng.integers(2, 7))     # >= 2 inputs, so rows can exceed k
+    pool = ([f"<urn:uuid:{i:08x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(7)]
+            if dups else None)
+    ins = [_ragged_input(rng, b, k, w, ties=ties, pool=pool) for w in range(n)]
+    if sum(len(s.flatten()) for s, _ in ins) == 0:
+        pytest.skip("drew an all-empty batch")
+    scores, ids = [s for s, _ in ins], [i for _, i in ins]
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", fold_dev)
+    took = _spy_device_fold(monkeypatch)
+    d_ids, d_sc, _ = merge_mod._topk_merge(scores, ids, None, k)
+    assert took == [True], "the device fold declined ragged rows"
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    h_ids, h_sc, _ = merge_mod._topk_merge(scores, ids, None, k)
+    assert d_sc.to_pylist() == h_sc.to_pylist()
+    assert d_ids.to_pylist() == h_ids.to_pylist()
+
+
+@pytest.mark.parametrize("fold_dev", FOLD_DEVICES)
+@pytest.mark.parametrize("widths,k", [((3, 5, 0, 2), 5), ((4, 4), 4), ((1,), 3), ((6, 6, 6), 6)])
+def test_uniform_width_inputs_take_the_reshape_layout_and_match_numpy(
+        monkeypatch, widths, k, fold_dev):
+    """Every row of an input holding the same count (full-width partials, or
+    any constant width) builds the grid by reshape + concatenation instead of
+    a scatter. Same answer as NumPy, including widths that differ per input,
+    an all-empty input in the middle, and widths below and at k."""
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(sum(widths) * 31 + k)
+    b = 17
+    ins = []
+    for w, width in enumerate(widths):
+        lens = np.full(b, width, dtype=np.int32)
+        off = pa.array(np.concatenate([[0], np.cumsum(lens)]).astype(np.int32))
+        tot = int(lens.sum())
+        sc = rng.choice(np.array([0.1, 0.2, 0.3], np.float32), size=tot)
+        ins.append((pa.ListArray.from_arrays(off, pa.array(sc, pa.float32())),
+                    pa.ListArray.from_arrays(off, pa.array(
+                        [f"<urn:uuid:{w:04x}{i:04x}-aaaa-bbbb-cccc-{i:012x}>"
+                         for i in range(tot)], pa.large_string()))))
+    scores, ids = [s for s, _ in ins], [i for _, i in ins]
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", fold_dev)
+    took = _spy_device_fold(monkeypatch)
+    d_ids, d_sc, _ = merge_mod._topk_merge(scores, ids, None, k)
+    assert took == [True]
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    h_ids, h_sc, _ = merge_mod._topk_merge(scores, ids, None, k)
+    assert d_sc.to_pylist() == h_sc.to_pylist()
+    assert d_ids.to_pylist() == h_ids.to_pylist()
+
+
+def _with_ties(rng, sc, *, dup_frac=0.0):
+    """A `hit_tie` column for `sc`: compute's file*1e8 + row layout, with an
+    optional share of values repeated (only ever equal within a test, but the
+    fold must still resolve them exactly as the host does)."""
+    n = len(sc.flatten())
+    tie = rng.integers(0, 50, n) * 100_000_000 + rng.integers(0, 10_000_000, n)
+    if dup_frac and n:
+        m = rng.random(n) < dup_frac
+        tie[m] = tie[rng.integers(0, n, int(m.sum()))] if n else tie[m]
+    return pa.ListArray.from_arrays(sc.offsets, pa.array(tie.astype(np.int64), pa.int64()))
+
+
+def _var_width_ids(sc, tag):
+    """IDs of differing byte widths: no lanes, so ties-mode gathers Arrow."""
+    n = len(sc.flatten())
+    return pa.ListArray.from_arrays(sc.offsets, pa.array(
+        [f"d{tag}-{i}" for i in range(n)], pa.large_string()))
+
+
+@pytest.mark.parametrize("fold_dev", FOLD_DEVICES)
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("ids_kind", ["fixed", "variable"])
+@pytest.mark.parametrize("ties,dup_frac", [(False, 0.0), (True, 0.0), (True, 0.3)])
+def test_the_device_fold_takes_hit_tie_and_matches_numpy(
+        monkeypatch, seed, ids_kind, ties, dup_frac, fold_dev):
+    """`tiebreak: ordinal`: the device fold ranks the `hit_tie` VALUES and
+    gives exactly the NumPy fold's ids, scores, ties, order and counts --
+    ragged rows, heavy score ties, repeated tie values, and ids of any width
+    (fixed-width or not: ties do not need the ids to pack)."""
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(5000 + seed + 97 * (2 * ties + (dup_frac > 0)))
+    b = int(rng.integers(1, 40))
+    k = int(rng.integers(1, 12))
+    n = int(rng.integers(2, 7))
+    ins = [_ragged_input(rng, b, k, w, ties=ties) for w in range(n)]
+    if sum(len(s.flatten()) for s, _ in ins) == 0:
+        pytest.skip("drew an all-empty batch")
+    scores = [s for s, _ in ins]
+    ids = ([i for _, i in ins] if ids_kind == "fixed"
+           else [_var_width_ids(s, w) for w, s in enumerate(scores)])
+    tl = [_with_ties(rng, s, dup_frac=dup_frac) for s in scores]
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", fold_dev)
+    took = _spy_device_fold(monkeypatch)
+    d_ids, d_sc, d_tie = merge_mod._topk_merge(scores, ids, tl, k)
+    assert took == [True], "the device fold declined a hit_tie batch"
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    h_ids, h_sc, h_tie = merge_mod._topk_merge(scores, ids, tl, k)
+    assert d_sc.to_pylist() == h_sc.to_pylist()
+    assert d_ids.to_pylist() == h_ids.to_pylist()
+    assert d_tie.to_pylist() == h_tie.to_pylist()
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_host_torch_tie_path_still_matches_numpy(monkeypatch, seed):
+    """With ties on the device fold, nothing else exercises the host-grid
+    torch path for `hit_tie` (`_fold_torch`, ties ranked by `_rank_dense`) --
+    which still runs whenever the device fold declines. Force it."""
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(700 + seed)
+    b, k, n = int(rng.integers(1, 30)), int(rng.integers(1, 9)), int(rng.integers(2, 5))
+    ins = [_ragged_input(rng, b, k, w, ties=True) for w in range(n)]
+    scores, ids = [s for s, _ in ins], [i for _, i in ins]
+    tl = [_with_ties(rng, s, dup_frac=0.3) for s in scores]
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    monkeypatch.setattr(merge_mod, "_device_fold", lambda *a, **kw: None)
+    merge_mod._reset_fold_used()
+    t_ids, t_sc, t_tie = merge_mod._topk_merge(scores, ids, tl, k)
+    assert merge_mod._FOLD_USED == {"torch:cpu"}, merge_mod._FOLD_USED
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    h_ids, h_sc, h_tie = merge_mod._topk_merge(scores, ids, tl, k)
+    assert t_sc.to_pylist() == h_sc.to_pylist()
+    assert t_ids.to_pylist() == h_ids.to_pylist()
+    assert t_tie.to_pylist() == h_tie.to_pylist()
+
+
+def test_an_oom_assembling_device_winners_falls_back_to_the_host(monkeypatch):
+    """The winners' lane gather in `_assemble` runs on the device; an OOM
+    there must take the host path (inputs are untouched), not abort."""
+    pytest.importorskip("torch")
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    rng = np.random.default_rng(3)
     b, k = 12, 5
-    lengths = np.full(b, k, dtype=np.int32)
-    lengths[3] = k - 2                              # one short row
-    off = pa.array(np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32))
-    total = int(lengths.sum())
-    sc = pa.ListArray.from_arrays(
-        off, pa.array(np.arange(total, dtype=np.float32), pa.float32()))
-    ids = pa.ListArray.from_arrays(
-        off, pa.array([f"<urn:uuid:{i:08x}-a-b-c-{i:012x}>" for i in range(total)],
-                      pa.large_string()))
-    assert merge_mod._dense_device_fold([sc], [ids], k, torch.device("cpu")) is None
+    ins = [_ragged_input(rng, b, k, w) for w in range(3)]
+    tl = [_with_ties(rng, s) for s, _ in ins]
+    real = merge_mod._assemble
+    calls = []
+
+    def flaky(*a, **kw):
+        calls.append(kw.get("lanes_win") is not None or kw.get("lanes_fallback") is not None)
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(merge_mod, "_assemble", flaky)
+    merge_mod._reset_fold_used()
+    got = merge_mod._topk_merge([s for s, _ in ins], [i for _, i in ins], tl, k,
+                                lanes_mode=True)
+    assert len(calls) == 2, "the host path did not run after the OOM"
+    assert merge_mod._DEVICE_FOLDS[0] == 0, "a failed device fold was counted"
+    monkeypatch.setattr(merge_mod, "_assemble", real)
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    want = merge_mod._topk_merge([s for s, _ in ins], [i for _, i in ins], tl, k)
+    assert merge_mod._as_ids_array(got[0]).to_pylist() == want[0].to_pylist()
+    assert got[1].to_pylist() == want[1].to_pylist()
+    assert got[2].to_pylist() == want[2].to_pylist()
+
+
+def test_a_tie_grid_too_wide_to_rank_declines(monkeypatch):
+    """`_rank_dense` packs ranks into 32 bits over the PADDED grid; a ragged
+    batch whose grid exceeds that must decline, not raise (NumPy can still
+    do it). Simulated by shrinking the limit check's arithmetic input."""
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(4)
+    sc, ids = _ragged_input(rng, 6, 4, 0, empty_frac=0.0)
+    tl = [_with_ties(rng, sc)]
+    real_stack = np.stack
+
+    def wide_stack(arrs, *a, **kw):
+        out = real_stack(arrs, *a, **kw)
+        return out * 0 + 0x7FFFFFFF if out.ndim == 2 and out.dtype == np.int64 else out
+
+    monkeypatch.setattr(merge_mod.np, "stack", wide_stack)
+    assert merge_mod._device_fold([sc], [ids], 4, torch.device("cpu"), tie_lists=tl) is None
+
+
+def test_hit_tie_fold_matches_a_naive_reference(monkeypatch):
+    """Independent of both folds: per row, sort by (score desc, tie asc)."""
+    pytest.importorskip("torch")
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    rng = np.random.default_rng(91)
+    b, k = 30, 6
+    ins = [_ragged_input(rng, b, k, w, ties=True) for w in range(4)]
+    tl = [_with_ties(rng, s) for s, _ in ins]
+    took = _spy_device_fold(monkeypatch)
+    out_ids, out_sc, out_tie = merge_mod._topk_merge(
+        [s for s, _ in ins], [i for _, i in ins], tl, k)
+    assert took == [True]
+    for r in range(b):
+        cand = []
+        for (s, i), t in zip(ins, tl):
+            cand += list(zip(s[r].as_py(), t[r].as_py(), i[r].as_py()))
+        cand.sort(key=lambda c: (-c[0], c[1]))
+        want = cand[:k]
+        assert out_sc[r].as_py() == [c[0] for c in want], r
+        assert out_tie[r].as_py() == [c[1] for c in want], r
+        assert out_ids[r].as_py() == [c[2] for c in want], r
+
+
+@pytest.mark.parametrize("fold_dev", FOLD_DEVICES)
+def test_a_hit_tie_lane_state_keeps_the_device_fold(monkeypatch, fold_dev):
+    """The ordinal `_reduce` shape: lanes on, the seed fold STARTS the lane
+    state (`want_lanes`), later folds carry it with ragged groups, and the
+    winning ties travel with their ids. Equals the NumPy chain."""
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(57)
+    b, k = 25, 8
+    groups = []
+    for g in range(5):
+        grp = [_ragged_input(rng, b, k // 3, 10 * g + w) for w in range(3)]
+        groups.append([(s, i, _with_ties(rng, s)) for s, i in grp])
+
+    def chain(lanes_mode):
+        state = None
+        lazy = []
+        for grp in groups:
+            scs, idss, tis = (list(x) for x in zip(*grp))
+            if state is not None:
+                lazy.append(isinstance(state[0], merge_mod._LazyIds))
+                scs, idss, tis = [state[1]] + scs, [state[0]] + idss, [state[2]] + tis
+            state = merge_mod._topk_merge(scs, idss, tis, k, lanes_mode=lanes_mode)
+        return state, lazy
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", fold_dev)
+    took = _spy_device_fold(monkeypatch)
+    d, lazy = chain(True)
+    assert took and all(took), f"a fold declined: {took}"
+    assert lazy and all(lazy), f"the state did not stay in lanes: {lazy}"
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    h, _ = chain(False)
+    assert merge_mod._as_ids_array(d[0]).to_pylist() == h[0].to_pylist()
+    assert d[1].to_pylist() == h[1].to_pylist()
+    assert d[2].to_pylist() == h[2].to_pylist()
+
+
+def test_a_lane_state_meeting_variable_width_ids_declines_with_ties(monkeypatch):
+    """A lane state can only fold with ids of its own width; a partial whose
+    ids are not one fixed width must send the batch to the host path (which
+    materialises the state), not mix representations."""
+    pytest.importorskip("torch")
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    rng = np.random.default_rng(12)
+    b, k = 10, 4
+    s0, i0 = _dense_pair(rng, b, k, 0)
+    t0 = _with_ties(rng, s0)
+    st = merge_mod._topk_merge([s0], [i0], [t0], k, lanes_mode=True)
+    assert isinstance(st[0], merge_mod._LazyIds)
+    s1, _ = _ragged_input(rng, b, k, 1)
+    i1, t1 = _var_width_ids(s1, 1), _with_ties(rng, s1)
+    took = _spy_device_fold(monkeypatch)
+    d = merge_mod._topk_merge([st[1], s1], [st[0], i1], [st[2], t1], k, lanes_mode=True)
+    assert took == [False]
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    h = merge_mod._topk_merge([s0, s1], [i0, i1], [t0, t1], k)
+    assert merge_mod._as_ids_array(d[0]).to_pylist() == h[0].to_pylist()
+    assert d[1].to_pylist() == h[1].to_pylist()
+    assert d[2].to_pylist() == h[2].to_pylist()
+
+
+def test_the_device_fold_matches_a_naive_reference_on_ragged_rows(monkeypatch):
+    """An independent check that does not share code with either fold: per
+    row, sort every candidate by (score desc, id asc) and keep k."""
+    pytest.importorskip("torch")
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    rng = np.random.default_rng(77)
+    b, k = 30, 6
+    ins = [_ragged_input(rng, b, k, w, ties=True) for w in range(4)]
+    took = _spy_device_fold(monkeypatch)
+    out_ids, out_sc, _ = merge_mod._topk_merge(
+        [s for s, _ in ins], [i for _, i in ins], None, k)
+    assert took == [True]
+    for r in range(b):
+        cand = []
+        for s, i in ins:
+            cand += list(zip(s[r].as_py(), i[r].as_py()))
+        cand.sort(key=lambda t: (-t[0], t[1]))
+        want = cand[:k]
+        assert out_sc[r].as_py() == [c[0] for c in want], r
+        assert out_ids[r].as_py() == [c[1] for c in want], r
+
+
+@pytest.mark.parametrize("fold_dev", FOLD_DEVICES)
+def test_a_ragged_lane_state_keeps_the_device_fold(monkeypatch, fold_dev):
+    """The `_reduce` shape with trimmed partials (lanes are on whenever the ids
+    are fixed width): a lane state whose rows are SHORT (an earlier fold of
+    short partials), plus a group of short Arrow partials. Every fold must take the device path, and the chain must equal
+    the NumPy fold of the same chain."""
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(31)
+    b, k = 25, 8
+    groups = [[_ragged_input(rng, b, k // 3, 10 * g + w) for w in range(3)]
+              for g in range(5)]
+
+    ragged_states = []
+
+    def chain(lanes_mode):
+        state = None
+        for grp in groups:
+            scs = [s for s, _ in grp]
+            idss = [i for _, i in grp]
+            if state is not None:
+                if isinstance(state[0], merge_mod._LazyIds):
+                    ragged_states.append(state[0].dense_k is None)
+                scs, idss = [state[1]] + scs, [state[0]] + idss
+            state = merge_mod._topk_merge(scs, idss, None, k, lanes_mode=lanes_mode)
+        return state
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", fold_dev)
+    took = _spy_device_fold(monkeypatch)
+    d = chain(True)
+    assert took and all(took), f"a fold declined: {took}"
+    assert isinstance(d[0], merge_mod._LazyIds)
+    assert sum(ragged_states) >= 2, (
+        f"fixture should fold ragged lane states: {ragged_states}")
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    h = chain(False)
+    assert merge_mod._as_ids_array(d[0]).to_pylist() == h[0].to_pylist()
+    assert d[1].to_pylist() == h[1].to_pylist()
+
+
+def test_the_device_fold_takes_an_empty_arrow_input_beside_a_lane_state(monkeypatch):
+    """A partial whose rows are ALL empty (a trimmed rank that contributed
+    nothing to this batch) has no id width of its own; it must not make the
+    device fold decline, nor shift any other input's ids."""
+    pytest.importorskip("torch")
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    rng = np.random.default_rng(8)
+    b, k = 10, 4
+    s0, i0 = _dense_pair(rng, b, k, 0)
+    lazy_ids, lazy_sc, _ = merge_mod._topk_merge([s0], [i0], None, k, lanes_mode=True)
+    off0 = pa.array(np.zeros(b + 1, dtype=np.int32))
+    s_empty = pa.ListArray.from_arrays(off0, pa.array([], pa.float32()))
+    i_empty = pa.ListArray.from_arrays(off0, pa.array([], pa.large_string()))
+    s2, i2 = _ragged_input(rng, b, k, 2)
+
+    took = _spy_device_fold(monkeypatch)
+    d = merge_mod._topk_merge([lazy_sc, s_empty, s2], [lazy_ids, i_empty, i2],
+                              None, k, lanes_mode=True)
+    assert took == [True]
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    h = merge_mod._topk_merge([s0, s_empty, s2], [i0, i_empty, i2], None, k)
+    assert merge_mod._as_ids_array(d[0]).to_pylist() == h[0].to_pylist()
+    assert d[1].to_pylist() == h[1].to_pylist()
+
+
+def test_the_device_fold_declines_an_all_empty_batch(monkeypatch):
+    """No candidates at all: nothing to rank, so decline and let the host
+    path return the empty rows."""
+    torch = pytest.importorskip("torch")
+    b, k = 6, 3
+    off0 = pa.array(np.zeros(b + 1, dtype=np.int32))
+    sc = pa.ListArray.from_arrays(off0, pa.array([], pa.float32()))
+    ids = pa.ListArray.from_arrays(off0, pa.array([], pa.large_string()))
+    assert merge_mod._device_fold([sc, sc], [ids, ids], k,
+                                        torch.device("cpu")) is None
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    out_ids, out_sc, _ = merge_mod._topk_merge([sc, sc], [ids, ids], None, k)
+    assert out_ids.to_pylist() == [[]] * b and out_sc.to_pylist() == [[]] * b
+
+
+def test_an_empty_input_of_another_string_type_does_not_crash_the_device_fold(monkeypatch):
+    """An all-empty `string` input beside `large_string` ones: it adds no ids,
+    so the winners' gather must leave it out rather than chunk two string
+    types together (ArrowTypeError). The old dense-only path declined this."""
+    pytest.importorskip("torch")
+    F = pa.list_(pa.float32())
+    s1 = pa.array([[0.9, 0.1], [0.5]], F)
+    i1 = pa.array([["aa", "bb"], ["cc"]], pa.list_(pa.large_string()))
+    s2 = pa.array([[], []], F)
+    i2 = pa.array([[], []], pa.list_(pa.string()))
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    took = _spy_device_fold(monkeypatch)
+    ids, sc, _ = merge_mod._topk_merge([s1, s2], [i1, i2], None, 2)
+    assert took == [True]
+    assert ids.to_pylist() == [["aa", "bb"], ["cc"]]
+    assert sc.to_pylist() == [[pytest.approx(0.9), pytest.approx(0.1)], [0.5]]
+
+
+def test_the_device_fold_declines_more_candidates_than_its_ordinals_hold(monkeypatch):
+    """Past the 32-bit ordinal (and int32 permutation) range the device fold
+    must hand the batch to the host path, not wrap."""
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(2)
+    sc, ids = _ragged_input(rng, 8, 4, 0, empty_frac=0.0)
+    n = len(sc.flatten())
+    monkeypatch.setattr(merge_mod, "_DEVICE_FOLD_MAX_CANDIDATES", n - 1)
+    assert merge_mod._device_fold([sc], [ids], 4, torch.device("cpu")) is None
+    monkeypatch.setattr(merge_mod, "_DEVICE_FOLD_MAX_CANDIDATES", n)
+    assert merge_mod._device_fold([sc], [ids], 4, torch.device("cpu")) is not None
 
 
 def test_the_device_fold_declines_variable_width_ids(monkeypatch):
@@ -1109,13 +1547,13 @@ def test_the_device_fold_declines_variable_width_ids(monkeypatch):
         off, pa.array(np.arange(b * k, dtype=np.float32), pa.float32()))
     ids = pa.ListArray.from_arrays(
         off, pa.array([f"id{i}" for i in range(b * k)], pa.large_string()))
-    assert merge_mod._dense_device_fold([sc], [ids], k, torch.device("cpu")) is None
+    assert merge_mod._device_fold([sc], [ids], k, torch.device("cpu")) is None
 
 
 @pytest.mark.parametrize("special,where,why", [
-    (float("-inf"), 3,  "-inf is how the general path marks PADDING, but a real "
-                        "score can be -inf too; the device path has no padding "
-                        "so it must not treat it as absent"),
+    (float("-inf"), 3,  "-inf is how both paths mark PADDING, and a real "
+                        "score can be -inf too; both must drop it the same way "
+                        "(the valid mask keeps only scores > -inf)"),
     (float("inf"),  5,  "+inf is a VALID hit and must survive the valid mask"),
     (float("nan"),  7,  "NaN must sort BELOW every real candidate, matching the "
                         "NumPy semantics `_fold_packed` forces with SENTINEL_KEY"),
@@ -1139,13 +1577,13 @@ def test_the_device_fold_handles_special_scores_like_the_host(
 
     monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
     took = []
-    real = merge_mod._dense_device_fold
-    monkeypatch.setattr(merge_mod, "_dense_device_fold",
+    real = merge_mod._device_fold
+    monkeypatch.setattr(merge_mod, "_device_fold",
                         lambda *a, **kw: (lambda r: (took.append(r is not None), r)[1])(real(*a, **kw)))
     d_ids, d_sc, _ = merge_mod._topk_merge(scores, ids, None, k)
     assert took == [True], "device fold did not run"
 
-    monkeypatch.setattr(merge_mod, "_dense_device_fold", lambda *a, **kw: None)
+    monkeypatch.setattr(merge_mod, "_device_fold", lambda *a, **kw: None)
     h_ids, h_sc, _ = merge_mod._topk_merge(scores, ids, None, k)
 
     dv, hv = d_sc.to_pylist(), h_sc.to_pylist()
@@ -1177,7 +1615,7 @@ def test_the_device_fold_agrees_when_ids_repeat_inside_one_input(monkeypatch):
 
     monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
     d = merge_mod._topk_merge([s_arr, s_arr], [i_arr, i_arr], None, k)
-    monkeypatch.setattr(merge_mod, "_dense_device_fold", lambda *a, **kw: None)
+    monkeypatch.setattr(merge_mod, "_device_fold", lambda *a, **kw: None)
     h = merge_mod._topk_merge([s_arr, s_arr], [i_arr, i_arr], None, k)
     assert d[0].to_pylist() == h[0].to_pylist()
     assert d[1].to_pylist() == h[1].to_pylist()
@@ -1226,8 +1664,8 @@ def test_the_device_fold_still_runs_once_the_state_carries_lanes(monkeypatch):
     assert isinstance(lazy_ids, merge_mod._LazyIds), "seed must produce lazy state"
 
     took = []
-    real = merge_mod._dense_device_fold
-    monkeypatch.setattr(merge_mod, "_dense_device_fold",
+    real = merge_mod._device_fold
+    monkeypatch.setattr(merge_mod, "_device_fold",
                         lambda *a, **kw: (lambda r: (took.append(r is not None), r)[1])(real(*a, **kw)))
     s1, i1 = _dense_pair(rng, b, k, 1)
     merge_mod._topk_merge([lazy_sc, s1], [lazy_ids, i1], None, k, lanes_mode=True)
@@ -1240,7 +1678,8 @@ def test_lazy_state_survives_a_batch_that_declines_the_device_fold(monkeypatch):
     """The state carries LANES; the general path speaks Arrow. A batch that
     declines must convert, not crash.
 
-    The device fold declines whenever any row is shorter than k, and real
+    The device fold used to decline whenever a row was shorter than k (it now
+    declines on variable-width ids; this test forces the decline), and real
     partials contain queries that matched fewer than k documents. Caught only
     on real data — every synthetic fixture had full rows, so the whole local
     suite passed while the production merge died with
@@ -1264,6 +1703,15 @@ def test_lazy_state_survives_a_batch_that_declines_the_device_fold(monkeypatch):
     i1 = pa.ListArray.from_arrays(off2, pa.array(
         [f"<urn:uuid:ffff{i:04x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(tot)],
         pa.large_string()))
+
+    # Ragged rows no longer decline, so force the decline this test is about.
+    monkeypatch.setattr(merge_mod, "_device_fold", lambda *a, **kw: None)
+    out_ids, out_sc, _ = merge_mod._topk_merge(
+        [lazy_sc, s1], [lazy_ids, i1], None, k, lanes_mode=True)
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    ref_ids, ref_sc, _ = merge_mod._topk_merge([s0, s1], [i0, i1], None, k)
+    assert merge_mod._as_ids_array(out_ids).to_pylist() == ref_ids.to_pylist()
+    assert out_sc.to_pylist() == ref_sc.to_pylist()
 
 
 def _ragged_lists(lens, k, seed=0):
@@ -1374,16 +1822,15 @@ def test_a_manifest_that_vanishes_mid_delete_is_not_reported_as_a_failure(
 # Round 3: the probe, the failed-write cleanup, and manifest coverage.
 # ---------------------------------------------------------------------------
 
-def test_the_density_probe_sees_every_row_not_just_the_first_batch(
+def test_the_lanes_probe_sees_every_row_not_just_the_first_batch(
         tmp_path, monkeypatch, caplog):
-    """`dense` is a MINIMUM over rows, so a partial prefix cannot decide it.
+    """The fixed-width check is over EVERY row, so a partial prefix cannot
+    decide it: rows 0..8999 with one id width and 500 later rows with another
+    must keep the state on Arrow (lane state would pay a materialise per fold
+    for a device fold that then declines every batch).
 
-    Probing only the first batch was strictly optimistic: rows 0..1499 full-k
-    with 1500+ short probed `dense=True`, turning `lanes_mode` on for exactly
-    the filtered-search shape the density gate was added to keep it off. That
-    costs a materialise() and a _lazy_from_arrow() per fold -- ~235 MB each way
-    at the real shape -- for a fast path that then never runs. Perf, not
-    correctness, but it silently undoes the gate.
+    (This used to be a DENSITY probe: lanes needed full-k rows. The device
+    fold now takes ragged rows, so only the id width gates lanes.)
     """
     monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")   # the probe needs a device
     root = tmp_path / "out"
@@ -1391,34 +1838,91 @@ def test_the_density_probe_sees_every_row_not_just_the_first_batch(
     pdir = root / partial_dir(cfg, cfg.searches[0])
     pdir.mkdir(parents=True)
 
-    # NOTE (2026-09-16): the prefetch this was written against is gone --
-    # `lanes_mode` now comes from the first partial the reduce fetches, via
-    # `_decide_lanes`. "Batches" are now SLICES, and the sizing below still
-    # works: `probe_rows` is `max(256, min(8192, 2_000_000 // k))` = 8192 at
-    # k=4, so 9500 rows split [8192, 1308] and the 500 short rows (9000..9499)
-    # sit entirely in the SECOND slice. DO NOT SHRINK `n_full` below 8192 --
-    # at 2000 rows this becomes one slice, a head-only scan reaches the same
+    # `probe_rows` is `max(256, min(8192, 2_000_000 // k))` = 8192 at k=4, so
+    # 9500 rows split [8192, 1308] and the 500 odd-width rows (9000..9499) sit
+    # entirely in the SECOND slice. DO NOT SHRINK `n_head` below 8192 -- at
+    # 2000 rows this becomes one slice, a head-only scan reaches the same
     # answer, and the test silently stops guarding the thing it is named for.
-    # This is the only END-TO-END cover for that property (a real `run_merge`
-    # over real files); the unit-level version, with a multi-chunk fixture that
-    # does not depend on the sizing, is in tests/test_decode_pool_and_lanes.py.
-    n_full, n_short = 9000, 500
-    qids = [f"q{i}" for i in range(n_full + n_short)]
-    ids, scores = [], []
-    for i, q in enumerate(qids):
-        width = K if i < n_full else 1
-        ids.append([f"<urn:uuid:{i:08x}-{j:04x}>" for j in range(width)])
-        scores.append([1.0 - j * 0.01 for j in range(width)])
+    # The unit-level version, with a multi-chunk fixture that does not depend
+    # on the sizing, is in tests/test_decode_pool_and_lanes.py.
+    n_head, n_late = 9000, 500
+    qids = [f"q{i}" for i in range(n_head + n_late)]
     for p in range(2):
+        ids, scores = [], []
+        for i in range(len(qids)):
+            fmt = "{:08x}-{:04x}{}" if i < n_head else "{:08x}-{:05x}{}"
+            ids.append([f"<urn:uuid:{fmt.format(i, j, p)}>" for j in range(K)])
+            scores.append([1.0 - j * 0.01 - p * 0.001 for j in range(K)])
         pq.write_table(build_result_table(qids, {}, ids, scores),
                        str(pdir / f"rank{p:03d}.parquet"))
 
     with caplog.at_level("INFO"):
         merge_mod.run_merge(cfg)
     log = caplog.text
-    assert "partial rows are not all k=" in log, (
-        "the probe called a partial dense whose later rows are short")
+    assert "not one fixed width" in log, (
+        "the probe called a partial fixed-width whose later ids are not")
     assert "merge state ids: arrow" in log, log[-2000:]
+
+
+@pytest.mark.parametrize("with_tie", [False, True])
+def test_a_ragged_run_merge_takes_the_device_fold_every_time(
+        tmp_path, monkeypatch, caplog, with_tie):
+    """End to end: partials whose rows are short and uneven (the shape a
+    trimmed or filtered search writes) keep lanes on and take the device
+    fold on EVERY fold call, and the result equals the NumPy merge's --
+    with ties by id, and with ties from a `hit_tie` column (ordinal)."""
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    rng = np.random.default_rng(23)
+    n_q, n_parts = 300, 5
+
+    def write(root):
+        cfg = _cfg(str(root))
+        pdir = root / partial_dir(cfg, cfg.searches[0])
+        pdir.mkdir(parents=True)
+        r = np.random.default_rng(23)
+        qids = [f"q{i}" for i in range(n_q)]
+        for p in range(n_parts):
+            ids, scores, ties = [], [], []
+            for i in range(n_q):
+                w = int(r.integers(0, K + 1))
+                sc = np.sort(r.choice([0.1, 0.2, 0.3, 0.4, 0.5], size=w))[::-1]
+                scores.append([float(x) for x in sc])
+                ids.append([f"<urn:uuid:{p:02x}{i:06x}-{j:04x}>" for j in range(w)])
+                ties.append([int(x) for x in r.integers(0, 10**9, size=w)])
+            pq.write_table(build_result_table(qids, {}, ids, scores,
+                                              hit_tie=ties if with_tie else None),
+                           str(pdir / f"rank{p:03d}.parquet"))
+        return cfg
+
+    def merged(root):
+        from nova_bf import manifest as run_manifest
+
+        cfg = write(root)
+        paths = merge_mod.run_merge(cfg)
+        name = cfg.searches[0].name
+        tbl = pq.read_table(paths[name])
+        man = [json.loads((root / run_manifest.manifest_name(
+            cfg, "merge", search=name)).read_text())]
+        return tbl, man
+
+    with caplog.at_level("INFO"):
+        dev_tbl, dev_man = merged(tmp_path / "dev")
+    assert "merge state ids: device lanes" in caplog.text, caplog.text[-2000:]
+    entries = [e for m in dev_man for e in m.get("searches", [])]
+    assert entries, dev_man
+    for e in entries:
+        assert e["merge_fold_calls"] > 0
+        assert e["merge_fold_device_calls"] == e["merge_fold_calls"], e
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    host_tbl, host_man = merged(tmp_path / "host")
+    for e in (e for m in host_man for e in m.get("searches", [])):
+        assert e["merge_fold_device_calls"] == 0, e
+    # The merged output carries no `hit_tie` (it is a merge-time key only).
+    for col in ("query_id", "hit_ids", "hit_scores"):
+        assert dev_tbl.column(col).to_pylist() == host_tbl.column(col).to_pylist(), col
+    for e in entries:
+        assert e["tiebreak_source"] == ("hit_tie" if with_tie else "hit_ids"), e
 
 
 @pytest.mark.parametrize("scheme", ["local", "s3"])

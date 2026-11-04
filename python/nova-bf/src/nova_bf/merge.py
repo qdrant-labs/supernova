@@ -1,13 +1,9 @@
-"""Merge per-rank top-K partials into global per-query top-K results.
+"""Merge disjoint per-rank partials into global per-query top-K results.
 
-Each partial covers a disjoint corpus slice and contains row-aligned results
-for the same queries. Partials are folded incrementally into a running top-K,
-with query IDs checked for alignment as they arrive.
-
-The reduce is partial-major and bounds the number of partials in flight to
-overlap I/O with folding while limiting memory use. `_topk_merge` uses the
-shared `(score, tiebreak)` ordering, so fold order does not affect the result.
-Query payload columns are retained from the first partial.
+Validates query alignment and incrementally merges results using consistent
+score/tiebreak ordering. Batches trimmed partials to reduce merge overhead,
+bounds in-flight data for memory efficiency, and preserves query metadata
+from the first partial.
 """
 
 
@@ -113,47 +109,41 @@ def _unclamp_decode_threads(cfg: BruteForceConfig) -> None:
     )
 
 def _decide_lanes(tbl, spec) -> bool:
-    """Choose the ID representation from an already-decoded partial."""
+    """Choose the ID representation from an already-decoded partial.
+
+    Lanes need fixed-width string IDs; row lengths do not matter (the device
+    fold takes ragged rows: trimmed partials, queries with fewer than k hits).
+    """
     from nova_bf.tiebreak import _NO_GPU_ORDINALS, _fixed_width
 
     try:
         # Bound each probe: a 100k-query partial may be a single Arrow chunk,
         # and `_fixed_width` uses `np.diff`, which allocates an int64 array.
         probe_rows = max(256, min(8192, 2_000_000 // max(1, spec.k)))
-        min_len, n_seen, W = None, 0, None
+        n_hits, W = 0, None
 
         for col in _sliced(tbl.column("hit_ids"), probe_rows):
-            if len(col) == 0:
+            flat = col.flatten()
+            if len(flat) == 0:
                 continue
-
-            lens = col.value_lengths().to_numpy(zero_copy_only=False)
-            n_seen += len(lens)
-            bmin = int(lens.min())
-            min_len = bmin if min_len is None else min(min_len, bmin)
-
-            if min_len < spec.k:
-                break  # Not dense; device fold cannot apply.
+            n_hits += len(flat)
 
             # `_fixed_width` inspects offsets only; character data is untouched.
-            bw = _fixed_width([col.flatten()])
+            bw = _fixed_width([flat])
             if bw is None or (W is not None and bw != W):
                 W = None
                 break
             W = bw
 
-        # Device fold requires full-k rows and fixed-width IDs.
-        dense = n_seen > 0 and min_len == spec.k
-        if not dense:
+        if n_hits and W is None:
             logger.info(
-                "search=%r: partial rows are not all k=%d hits (min %d), so "
-                "the device fold cannot apply; keeping ids on Arrow",
+                "search=%r: hit ids are not one fixed width, so the device "
+                "fold cannot rank them; keeping ids on Arrow",
                 spec.name,
-                spec.k,
-                min_len if min_len is not None else 0,
             )
 
         return (
-            dense
+            n_hits > 0
             and W is not None
             and not os.environ.get(_NO_GPU_ORDINALS)
         )
@@ -229,14 +219,14 @@ def _merge_window(cfg, n_partials: int) -> int:
     return n
 
 _TARGET_CANDIDATE_SLOTS = 20_000_000
+# Limit buffered partials per merge batch to bound memory usage.
+_MAX_PENDING_PARTIALS = 64
 
 def _resolve_batch_rows(explicit: int | None, n_rows: int, k: int) -> int:
-    """Choose batch rows from the target number of candidate slots.
+    """Choose batch size assuming at most 2k candidate slots per row.
 
-    `2 * k`, NOT `n_partials * k`: a fold holds the running state plus ONE
-    partial, so the candidate grid is `B x 2k` however many partials the merge
-    has. That is why the partial count is not a parameter here -- it only ever
-    appeared in the warning text below.
+    Each fold combines up to k running and k pending candidates,
+    independent of the number of partials.
     """
     per_row = max(1, 2 * k)
     ceiling = max(1, min(_TARGET_CANDIDATE_SLOTS // per_row, n_rows))
@@ -259,8 +249,6 @@ def _resolve_batch_rows(explicit: int | None, n_rows: int, k: int) -> int:
         )
 
     return want
-
-
 
 def _id_tie_grid(
     scatter: list,
@@ -315,8 +303,14 @@ _FOLD_ENV = "NOVA_BF_MERGE_FOLD"
 _FOLD_USED: set[str] = set()
 
 
+# Folds the device fast path (`_device_fold`) took in the current reduce;
+# `_FOLD_USED` names the device but not which torch path ran.
+_DEVICE_FOLDS = [0]
+
+
 def _reset_fold_used() -> None:
     _FOLD_USED.clear()
+    _DEVICE_FOLDS[0] = 0
 
 
 def _lane_rankable(scatter: list) -> bool:
@@ -718,11 +712,16 @@ def _validate_fold_inputs(score_lists, id_lists, tie_lists, k: int) -> None:
             )
 
 
-def _dense_device_fold(score_lists, id_lists, k, device):
-    """Fast fold for dense, fixed-width IDs without a host candidate grid.
+# `_gpu_perm_from_lanes` indexes with int32 and `pack` keeps a 32-bit ordinal.
+_DEVICE_FOLD_MAX_CANDIDATES = np.iinfo(np.int32).max
 
-    Returns None when the batch does not qualify. `sel` and `scatter` are
-    returned only when every input still uses Arrow IDs.
+
+def _device_fold(score_lists, id_lists, k, device, tie_lists=None, want_lanes=False):
+    """Merge ragged candidate lists on the device without a host grid.
+
+    Packs candidates by row, preserving input order and excluding padding.
+    Supports ID-based or explicit ordinal tie-breaking, consistent with
+    the host merge. Returns None for unsupported layouts or sizes.
     """
     import torch
 
@@ -733,24 +732,25 @@ def _dense_device_fold(score_lists, id_lists, k, device):
         _gpu_perm_from_lanes,
     )
 
-    # This path bypasses build_ordinals, so honor its GPU-ranking kill switch.
-    if os.environ.get(_NO_GPU_ORDINALS):
+    want_tie = tie_lists is not None
+
+    # Respect the GPU ID-ranking disable flag when ties are ID-based.
+    if not want_tie and os.environ.get(_NO_GPU_ORDINALS):
         return None
 
     n_inputs = len(score_lists)
     b = len(score_lists[0])
-    width = n_inputs * k
 
-    flat_scores, lane_parts, arrow_ids = [], [], []
+    lengths, flat_scores, lane_parts, arrow_ids = [], [], [], []
     for sl, il in zip(score_lists, id_lists):
-        lengths = sl.value_lengths().to_numpy(zero_copy_only=False)
-        if len(lengths) != b or lengths.min() != k or lengths.max() != k:
+        lens = sl.value_lengths().to_numpy(zero_copy_only=False).astype(np.int64)
+        if len(lens) != b:
             return None
-
+        lengths.append(lens)
         flat_scores.append(sl.flatten())
 
         if isinstance(il, _LazyIds):
-            if il.dense_k != k or il.lanes is None:
+            if il.lanes is None:
                 return None
             lane_parts.append(il.lanes)
             arrow_ids.append(None)
@@ -758,87 +758,187 @@ def _dense_device_fold(score_lists, id_lists, k, device):
             lane_parts.append(None)
             arrow_ids.append(il.flatten())
 
-    # Every input must use the same fixed ID width.
-    widths = {il.W for il in id_lists if isinstance(il, _LazyIds)}
-    present = [ids for ids in arrow_ids if ids is not None]
-    if present:
-        W = _fixed_width(present)
-        if W is None:
-            return None
-        widths.add(W)
-
-    if len(widths) != 1:
+    totals = [int(x.sum()) for x in lengths]
+    total = sum(totals)
+    if total == 0:
+        # Nothing to rank; the host path returns the empty rows.
+        return None
+    if total > _DEVICE_FOLD_MAX_CANDIDATES:
+        # `_gpu_perm_from_lanes` indexes with int32 and `pack` keeps a 32-bit
+        # ordinal; the host path ranks (or refuses) this batch loudly.
         return None
 
-    W = widths.pop()
-    nlanes = (W + 7) // 8
+    # Require consistent fixed-width string IDs for GPU ranking or lane states.
+    # With explicit ties, other ID types can be gathered through Arrow.
+    widths = {il.W for il in id_lists if isinstance(il, _LazyIds)}
+    present = [ids for ids in arrow_ids if ids is not None]
+    strings = all(pa.types.is_string(a.type) or pa.types.is_large_string(a.type)
+                for a in present)
+    nonempty = [a for a in present if len(a)]
+    W_arrow = _fixed_width(nonempty) if (strings and nonempty) else None
+    if W_arrow is not None:
+        widths.add(W_arrow)
+    packable = strings and (W_arrow is not None or not nonempty) and len(widths) == 1
+    has_lazy = any(lp is not None for lp in lane_parts)
+    if not packable and (not want_tie or has_lazy):
+        return None
+    use_lanes = packable and (not want_tie or has_lazy or want_lanes)
+    if use_lanes:
+        W = widths.pop()
+        nlanes = (W + 7) // 8
+    else:
+        W = nlanes = None
 
-    scores = torch.cat(
-        [
-            torch.from_numpy(
-                np.ascontiguousarray(a.to_numpy(zero_copy_only=False))
-            ).to(device).view(b, k)
-            for a in flat_scores
-        ],
-        dim=1,
-    )
+    # Per (input, row) segment, in the input-major flat order of the
+    # concatenated scores, ties, lanes and Arrow IDs below: its length, its
+    # first grid column (row r of input w starts at sum(lengths[:w, r])), and
+    # its first flat index.
+    lens_np = np.stack(lengths)                                    # (n, b)
+    width = int(lens_np.sum(axis=0).max())
+    if want_tie and b * width > 0xFFFFFFFF:
+        # `_rank_dense` ranks the whole padded grid into a 32-bit field; let
+        # the host path handle (or refuse) a batch that wide.
+        return None
+    col0_np = np.cumsum(lens_np, axis=0) - lens_np
+    flat_len = lens_np.reshape(-1)
+    seg_np = (np.cumsum(flat_len) - flat_len).reshape(n_inputs, b)
 
-    lanes = torch.cat(
-        [
-            lp if lp is not None
-            else _lanes_on_device([ids], W, b * k, device)
-            for lp, ids in zip(lane_parts, arrow_ids)
-        ],
-        dim=0,
-    )
+    len_t = torch.from_numpy(lens_np).to(device)
+    col0_t = torch.from_numpy(col0_np).to(device)
+    seg_t = torch.from_numpy(seg_np).to(device)
 
-    total = n_inputs * b * k
-    perm = torch.from_numpy(_gpu_perm_from_lanes(lanes)).to(device)
+    # Uniform rows (every row of input w holds the same count, e.g. full-width
+    # partials): the packed grid is just the inputs side by side, so build it
+    # by reshape + concatenation instead of a scatter. Same cells, same values.
+    uniform = bool((lens_np == lens_np[:, :1]).all())
+    widths_w = [int(x[0]) for x in lens_np]
 
-    ordinals = torch.empty(total, dtype=torch.int64, device=device)
-    ordinals[perm.long()] = torch.arange(
-        total, dtype=torch.int64, device=device
-    )
-    del perm
+    if uniform:
+        pos = None
+    else:
+        # Grid cell (row * width + column) of every candidate.
+        row_base = torch.arange(b, dtype=torch.int64, device=device) * width
+        pos = torch.repeat_interleave(
+            (row_base.unsqueeze(0) + col0_t - seg_t).reshape(-1),
+            len_t.reshape(-1),
+            output_size=total,
+        )
+        pos += torch.arange(total, dtype=torch.int64, device=device)
+        del row_base
 
-    # Map input-major ordinals into the row-major candidate grid.
-    tie = (
-        ordinals.view(n_inputs, b, k)
-        .permute(1, 0, 2)
-        .reshape(b, width)
-    )
-    del ordinals
+    def _grid(flat, fill):
+        """Lay `flat` (input-major, one value per candidate) out in the grid."""
+        if uniform:
+            return torch.cat(
+                [p.view(b, w_) for p, w_ in zip(torch.split(flat, totals), widths_w)],
+                dim=1,
+            )
+        g = torch.full((b * width,), fill, dtype=flat.dtype, device=device)
+        g[pos] = flat
+        return g.view(b, width)
 
-    top_idx = _fold_packed(scores, tie, k)
+    def _flat(arrays, dtype):
+        # Upload each input, then concatenate ON the device: a host-side cat
+        # first is an extra full copy of every candidate (measured ~50 ms per
+        # fold at 10k x k=1000 x 2 inputs on an A10G host).
+        return torch.cat(
+            [
+                torch.from_numpy(
+                    np.ascontiguousarray(a.to_numpy(zero_copy_only=False), dtype=dtype)
+                ).to(device)
+                for a in arrays
+            ]
+        )
+
+    flat_s = _flat(flat_scores, np.float32)
+    scores = _grid(flat_s, float("-inf"))
+    del flat_s
+
+    lanes = None
+    if use_lanes:
+        lanes = torch.cat(
+            [
+                (
+                    lp.to(device)
+                    if lp is not None
+                    else _lanes_on_device([ids], W, len(ids), device)
+                )
+                for lp, ids, n in zip(lane_parts, arrow_ids, totals)
+                if n
+            ],
+            dim=0,
+        )
+        if lanes.shape != (total, nlanes):
+            raise RuntimeError(
+                f"device fold built {tuple(lanes.shape)} id lanes for {total} "
+                f"candidates of width {W}; a lane state does not match its row "
+                "counts"
+            )
+
+    raw_tie = None
+    if want_tie:
+        flat_t = _flat([tl.flatten() for tl in tie_lists], np.int64)
+        raw_tie = _grid(flat_t, np.iinfo(np.int64).max)
+        del flat_t
+        # The host torch path's ranking, over the same row-major grid.
+        tie = _rank_dense(raw_tie)
+    else:
+        perm = torch.from_numpy(_gpu_perm_from_lanes(lanes)).to(device)
+        ordinals = torch.empty(total, dtype=torch.int64, device=device)
+        ordinals[perm.long()] = torch.arange(
+            total, dtype=torch.int64, device=device
+        )
+        del perm
+        tie = _grid(ordinals, 0)
+        del ordinals
+    del pos
+
+    top_idx = _fold_packed(scores, tie, k)                         # (b, kk)
     del tie
+    kk = top_idx.shape[1]
 
     top_scores = scores.gather(1, top_idx)
     del scores
+    top_tie = raw_tie.gather(1, top_idx) if want_tie else None
+    del raw_tie
 
-    # Keep winning ID lanes on-device for the next fold.
-    lanes_win = (
-        lanes.view(n_inputs, b, k, nlanes)
-        .permute(1, 0, 2, 3)
-        .reshape(b, width, nlanes)
-        .gather(1, top_idx.unsqueeze(-1).expand(b, k, nlanes))
-        .reshape(b * k, nlanes)
-    )
+    # Winning cell -> candidate index (input-major flat order), from the
+    # segment table rather than a per-cell grid; -1 for padding.
+    sel_t = torch.full_like(top_idx, -1)
+    for w in range(n_inputs):
+        if not totals[w]:
+            continue
+        c0 = col0_t[w].unsqueeze(1)
+        inside = (top_idx >= c0) & (top_idx < c0 + len_t[w].unsqueeze(1))
+        sel_t = torch.where(inside, seg_t[w].unsqueeze(1) + (top_idx - c0), sel_t)
+        del inside
+    del top_idx
+
+    # Keep winning ID lanes on-device for the next fold. Padding cells (-1)
+    # take lane 0 here and are dropped by `_assemble`'s valid mask.
+    lanes_win = None
+    if use_lanes:
+        lanes_win = lanes.index_select(0, sel_t.clamp(min=0).reshape(-1))
+        lanes_win = lanes_win.reshape(b * kk, nlanes)
     del lanes
 
     # Arrow gathering is only needed when every input still has Arrow IDs.
+    # `sel` indexes the concatenation of the inputs' ids in input order; an
+    # empty input adds nothing to it, so it is left out (it may even be a
+    # different string type, which `_take_ids` cannot chunk together).
     if all(ids is not None for ids in arrow_ids):
-        src = (
-            torch.arange(total, dtype=torch.int64, device=device)
-            .view(n_inputs, b, k)
-            .permute(1, 0, 2)
-            .reshape(b, width)
-        )
-        sel = src.gather(1, top_idx).cpu().numpy()
-        scatter = [(None, None, ids) for ids in arrow_ids]
+        sel = sel_t.cpu().numpy()
+        scatter = [(None, None, ids) for ids in arrow_ids if len(ids)]
     else:
         sel, scatter = None, None
 
-    return top_scores.cpu().numpy(), sel, scatter, (lanes_win, W)
+    return (
+        top_scores.cpu().numpy(),
+        sel,
+        scatter,
+        (lanes_win, W) if use_lanes else None,
+        top_tie.cpu().numpy() if want_tie else None,
+    )
 
 
 def _topk_merge(
@@ -859,14 +959,15 @@ def _topk_merge(
     b = len(score_lists[0])
     width = n_inputs * k
 
-    # Dense fixed-width IDs can avoid building the host candidate grid.
+    # The device fold avoids building the host candidate grid.
     fast = None
     dev = None
-    if tie_lists is None and b:
+    if b:
         dev = _fold_device()
         if dev is not None:
             try:
-                fast = _dense_device_fold(score_lists, id_lists, k, dev)
+                fast = _device_fold(score_lists, id_lists, k, dev,
+                                    tie_lists=tie_lists, want_lanes=lanes_mode)
             except Exception as exc:  # noqa: BLE001
                 if not _is_oom(exc):
                     raise
@@ -887,28 +988,61 @@ def _topk_merge(
                         pass
 
     if fast is not None:
-        _FOLD_USED.add(f"torch:{dev.type}")
-
-        top_s, sel_all, scatter, lanes_w = fast
+        top_s, sel_all, scatter, lanes_w, top_tie = fast
         valid = top_s > -np.inf
 
-        return _assemble(
-            top_s,
-            sel_all,
-            valid,
-            scatter,
-            b,
-            None,
-            None,
-            lanes_win=lanes_w if lanes_mode else None,
-            # Materialize lanes now if no Arrow IDs remain.
-            lanes_fallback=(
-                None if lanes_mode or scatter is not None else lanes_w
-            ),
-        )
+        # `lanes_w` is None when the IDs were not packed (ties with Arrow IDs
+        # that are not one fixed width); `scatter` then gathers them.
+        try:
+            out = _assemble(
+                top_s,
+                sel_all,
+                valid,
+                scatter,
+                b,
+                top_tie,
+                tie_lists is not None,
+                lanes_win=lanes_w if lanes_mode else None,
+                # Materialize lanes now if no Arrow IDs remain.
+                lanes_fallback=(
+                    None if lanes_mode or scatter is not None else lanes_w
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The winners' lane gather runs on the device too. The inputs are
+            # untouched, so an OOM here can still take the host path below.
+            if not _is_oom(exc):
+                raise
+            logger.warning(
+                "assembling the device fold's winners on %s ran out of memory "
+                "(%s); falling back to the host path",
+                dev,
+                exc,
+            )
+            del fast, lanes_w
+            if dev.type == "cuda":
+                try:
+                    import torch
+
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            _FOLD_USED.add(f"torch:{dev.type}")
+            _DEVICE_FOLDS[0] += 1
+            return out
 
     # The general path requires Arrow IDs.
     id_lists = [_as_ids_array(x) for x in id_lists]
+
+    # Pack candidates by row, preserving input order and minimizing padding.
+    all_lengths = [
+        sl.value_lengths().to_numpy(zero_copy_only=False).astype(np.int64)
+        for sl in score_lists
+    ]
+    row_total = np.sum(all_lengths, axis=0) if all_lengths else np.zeros(b, np.int64)
+    width = max(1, int(row_total.max(initial=0)))
+    filled = np.zeros(b, dtype=np.int64)
 
     scores = np.full((b, width), -np.inf, dtype=np.float32)
     src = np.full((b, width), -1, dtype=np.int64)
@@ -929,11 +1063,7 @@ def _topk_merge(
 
     # Input structure was validated above.
     for w, (sl, il) in enumerate(zip(score_lists, id_lists)):
-        lengths = (
-            sl.value_lengths()
-            .to_numpy(zero_copy_only=False)
-            .astype(np.int64)
-        )
+        lengths = all_lengths[w]
         total = int(lengths.sum())
 
         if total == 0:
@@ -948,7 +1078,8 @@ def _topk_merge(
         np.cumsum(lengths[:-1], out=starts[1:])
         within = np.arange(total) - np.repeat(starts, lengths)
 
-        col = w * k + within
+        col = np.repeat(filled, lengths) + within
+        filled += lengths
         scores[row_idx, col] = flat_s
 
         # `src` indexes the concatenated ID arrays stored in `scatter`.
@@ -1122,7 +1253,7 @@ def _assemble(
             else lanes_fallback
         )
 
-        # Row-major both sides: `lanes` is (b*k, nlanes) over (b, k), the same
+        # Row-major both sides: `lanes` is (b*kk, nlanes) over (b, kk), the same
         # order `top_s[valid]` yields. Reorder either and ids attach to the
         # wrong scores, silently.
         keep = valid.ravel()
@@ -2034,6 +2165,23 @@ def _reduce(
      # Reference query IDs used to verify row alignment as partials arrive.
     qref: list[pa.Array | None] = [None] * n_batches
 
+    # Partials received but not yet folded, per batch, their per-row entry
+    # counts (always < k per row once a fold has run; see `_fold`) and their
+    # files (named when a fold of the group fails). Each is a compact copy of
+    # its batch's rows. What outlives the window permits is bounded by k
+    # pending entries per query -- one full-width partial's hit data -- PLUS
+    # the per-partial overhead (list offsets, Arrow objects) of at most
+    # `_MAX_PENDING_PARTIALS` partials per batch: a filtered search with
+    # mostly-empty rows would otherwise keep every partial of the run
+    # pending. That is ADDITIONAL to the old peak (state + in-flight
+    # partials) with trimmed partials: measured +18% Arrow pool at 20k x
+    # k=200 (RSS was lower, the packed grid being narrower); at 100k x
+    # k=1000 with 32-char ids it can reach a few GB.
+    pend: list[list] = [[] for _ in range(n_batches)]
+    pend_len: list[np.ndarray | None] = [None] * n_batches
+    pend_src: list[list[str]] = [[] for _ in range(n_batches)]
+    fold_stats = {"calls": 0, "inputs": 0, "max_inputs": 0}
+
     def _col(sl: pa.Table, name: str):
         """Return `name` as one contiguous Arrow Array."""
         ca = sl.column(name).combine_chunks()
@@ -2041,7 +2189,7 @@ def _reduce(
         # `combine_chunks()` may still return a one-chunk ChunkedArray.
         return ca.chunk(0) if isinstance(ca, pa.ChunkedArray) else ca
 
-    def _fold(idx: int, sl: pa.Table, keep_head: bool) -> None:
+    def _fold(idx: int, sl: pa.Table, keep_head: bool, src: str) -> None:
         if keep_head and head[idx] is None:
             # Copy retained query/payload columns so this slice does not pin the 
             # partial's full backing table.
@@ -2059,45 +2207,72 @@ def _reduce(
                 "across partials. Re-run `bf compute` so every rank writes the "
                 "same queries in the same order."
             )
-        cur = state[idx]
         sc, ids = _col(sl, "hit_scores"), _col(sl, "hit_ids")
         ti = _col(sl, "hit_tie") if want_tie else None
-        if cur is None:
-            # Seed through the same fold so single- and multi-partial merges have 
-            # identical normalization and tie semantics.
-            ids0, sc0, ti0 = _topk_merge([sc], [ids], [ti] if want_tie else None,
-                                         k, lanes_mode=lanes_mode)
-            state[idx] = (ids0, sc0, ti0)
+        # Validate partials before buffering; each row must contain at most k entries.
+        _validate_fold_inputs([sc], [ids], [ti] if want_tie else None, k)
+        lens = sc.value_lengths().to_numpy(zero_copy_only=False).astype(np.int64)
+
+        # Flush before pending candidates exceed k per row, keeping folds <= 2k.
+        if pend[idx] and (pend_len[idx] + lens > k).any():
+            _flush(idx)
+
+        # Buffer the current batch independently of the source partial.
+        pend[idx].append((sc, ids, ti))
+        pend_src[idx].append(src)
+        pend_len[idx] = lens if pend_len[idx] is None else pend_len[idx] + lens
+
+        # Flush when any row reaches k entries or the partial-count limit.
+        if (pend_len[idx].max(initial=0) >= k
+                or len(pend[idx]) >= _MAX_PENDING_PARTIALS):
+            _flush(idx)
+
+    def _flush(idx: int) -> None:
+        """Fold the running state and every pending partial of batch `idx`."""
+        group, srcs = pend[idx], pend_src[idx]
+        pend[idx], pend_src[idx] = [], []
+        pend_len[idx] = None
+        if not group:
             return
-        c_ids, c_sc, c_ti = cur
-        # `lanes_mode` is fixed for the search (see `_reduce`), so the state
-        # keeps the same id representation on every fold: the next fold ranks
-        # it without re-packing and without an Arrow `Take`, and the strings
-        # are built once, at write time.
-        ids2, sc2, ti2 = _topk_merge(
-            [c_sc, sc], [c_ids, ids],
-            [c_ti, ti] if want_tie else None, k, lanes_mode=lanes_mode,
-        )
-        state[idx] = (ids2, sc2, ti2)
+        scs = [g[0] for g in group]
+        idss = [g[1] for g in group]
+        tis = [g[2] for g in group]
+        cur = state[idx]
+        if cur is not None:
+            # Merge existing state first to preserve arrival-order tie-breaking.
+            c_ids, c_sc, c_ti = cur
+            scs, idss, tis = [c_sc] + scs, [c_ids] + idss, [c_ti] + tis
+
+        # Use the same fold path and ID representation for every batch.
+        try:
+            state[idx] = _topk_merge(scs, idss, tis if want_tie else None, k,
+                                    lanes_mode=lanes_mode)
+        except BaseException as exc:
+            # Identify all partials involved in a failed fold.
+            exc.add_note(
+                f"while folding batch {idx}: "
+                f"{'the running state and ' if cur is not None else ''}{len(srcs)} "
+                f"pending partial(s): {', '.join(srcs)}")
+            raise
+        fold_stats["calls"] += 1
+        fold_stats["inputs"] += len(scs)
+        fold_stats["max_inputs"] = max(fold_stats["max_inputs"], len(scs))
 
     ranged = bool(cfg.params.merge_ranged_reads)
     window_n = _merge_window(cfg, len(partials))
     # Keep one ID representation for the running state throughout the search.
-    lanes_eligible = not want_tie and _fold_device() is not None
+    lanes_eligible = _fold_device() is not None
     lanes_mode = False
     lanes_decided = not lanes_eligible
     if not lanes_eligible:
         logger.info("merge state ids: arrow")
 
     inputs_forced = _inputs_forced(readers)
-    # Divide ranged-read concurrency across in-flight partials. The pool is a
-    # budget, not a ceiling: a window wider than the pool still gives each
-    # reader at least one GET, so `merge_window: 64` really does run 64.
+    # Divide ranged GET concurrency across in-flight partials (minimum one per file).
     per_file = max(1, _RANGED_GET_POOL // max(1, window_n))
     src = Store(out.uri, ranged_get=ranged, ranged_get_concurrency=per_file)
-    # Give the first partial extra concurrency because folding cannot begin
-    # until it has arrived. The constraint is GETs per file, not bandwidth.
-    # Invalid overrides fall back to the default pool size.
+
+    # Allow additional GET concurrency for the first partial to reduce startup latency.
     raw_first = os.environ.get("NOVA_BF_FIRST_GETS", "").strip()
     try:
         first_gets = int(raw_first) if raw_first else _RANGED_GET_POOL
@@ -2187,13 +2362,16 @@ def _reduce(
                 for bi in range(n_batches):
                     sl = tbl.slice(bi * batch_rows, batch_rows)
                     if sl.num_rows:
-                        _fold(bi, sl, keep_head=(i == 0))
+                        _fold(bi, sl, keep_head=(i == 0), src=partials[i].read_path)
                 t_fold += time.perf_counter() - _t
             except BaseException as exc:     # noqa: BLE001 - re-raised below
                 errors.append(exc)
                 fold_errors.append(exc)
                 failed = True
                 abort.set()
+                # If a multi-partial fold failed, the note above names every
+                # partial in it; this one only triggered that fold.
+                exc.add_note(f"while folding partial {partials[i].read_path}")
                 # Preserve traceback text, then release frame-held Arrow buffers.
                 exc.add_note("".join(traceback.format_exception(
                     type(exc), exc, exc.__traceback__)).rstrip())
@@ -2248,6 +2426,25 @@ def _reduce(
                 logger.error("search=%r: additional merge failure: %r",
                              spec.name, extra)
         raise primary
+
+    # Every partial has arrived; fold whatever is still pending. No reader is
+    # left (all drained and joined), so a failure here propagates -- reported
+    # like a mid-stream fold failure (traceback text kept as a note, frames
+    # released so they do not pin `state`/`pend` Arrow buffers).
+    _t = time.perf_counter()
+    try:
+        for bi in range(n_batches):
+            _flush(bi)
+    except BaseException as exc:             # noqa: BLE001 - re-raised
+        exc.add_note("".join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__)).rstrip())
+        exc.add_note(f"search={spec.name!r}: while folding the pending partials "
+                     "at the end of the reduce")
+        exc.__traceback__ = None
+        pend[:] = [[] for _ in range(n_batches)]
+        state[:] = [None] * n_batches
+        raise
+    t_fold += time.perf_counter() - _t
 
     # All partials are folded; write each query batch and release its state
     t_write0 = time.perf_counter()
@@ -2419,15 +2616,18 @@ def _reduce(
     logger.info(
         "merge-bench search=%r partials=%d queries=%d k=%d gb=%.2f "
         "reduce_s=%.1f io_wait_s=%.1f fold_s=%.1f write_s=%.1f other_s=%.1f "
-        "fold=%s read_mbps=%.0f",
+        "fold=%s fold_calls=%d fold_device=%d fold_inputs_max=%d read_mbps=%.0f",
         spec.name, len(partials), n_rows, k, _gb,
         t_reduce, t_io, t_fold, t_write, t_other,
         # `_FOLD_USED`, not `_fold_device()`. The latter reports the device
         # that was AVAILABLE; `_topk_merge` then declines it and falls back to
-        # NumPy whenever the ids are not fixed-width lane-rankable, so the
-        # field said `cuda` in precisely the case it exists to detect -- "the
-        # kernel is slow" versus "there was no kernel".
+        # NumPy for `tiebreak: id` whenever the ids are not fixed-width
+        # lane-rankable, so the field said `cuda` in precisely the case it
+        # exists to detect -- "the kernel is slow" versus "there was no
+        # kernel". `fold_device` counts the folds the device fast path took
+        # (`fold` says `torch:<dev>` for it and for the host-grid torch path).
         ",".join(sorted(_FOLD_USED)) or "none",
+        fold_stats["calls"], _DEVICE_FOLDS[0], fold_stats["max_inputs"],
         (_gb * 1000 / t_reduce) if t_reduce else 0.0,
     )
     logger.info("search=%r wrote %s (%d queries)", spec.name, path, n_rows)
@@ -2445,6 +2645,15 @@ def _reduce(
         "tiebreak_source": "hit_tie" if want_tie else "hit_ids",
         "run_sha": run_sha,
         "merge_fold": sorted(_FOLD_USED),
+        # How the partials were grouped: `_topk_merge` calls over all batches,
+        # and the most inputs (state + pending partials) any one call folded.
+        # Full-width partials give calls = partials x batches, max_inputs = 2.
+        "merge_fold_calls": fold_stats["calls"],
+        # Of those, how many the device fast path took (the rest built a host
+        # candidate grid, then ranked it on `merge_fold`'s backend).
+        "merge_fold_device_calls": _DEVICE_FOLDS[0],
+        "merge_fold_max_inputs": fold_stats["max_inputs"],
+        "merge_fold_inputs": fold_stats["inputs"],
         # The decode width this reduce actually used.
         "cpu_thread_count": pa.cpu_count(),
         "queries_short_of_k": short_count,

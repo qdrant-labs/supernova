@@ -181,6 +181,41 @@ def _resolve_rank(num_jobs: int | None, job_rank: int | None) -> int | None:
     return job_rank
 
 
+# Messages of a device fault raised as a plain RuntimeError (torch before
+# `torch.AcceleratorError` existed, ~2.8; torch is unpinned).
+_DEVICE_FAULT_MARKERS = ("device-side assert", "illegal memory access",
+                         "illegal instruction", "misaligned address",
+                         "unspecified launch failure", "Triton Error [CUDA]",
+                         "cuDNN error", "CUDNN_STATUS_EXECUTION_FAILED")
+# Allocation failures are recoverable (the degrade case) whatever type they
+# arrive as: on torch >= 2.8 a failed cudaMalloc / pinned-host allocation
+# outside the caching allocator is a `torch.AcceleratorError` too.
+_ALLOC_FAILURE_MARKERS = ("out of memory", "alloc_failed")
+
+
+def _is_device_fault(exc: BaseException) -> bool:
+    """A sticky CUDA/device fault (`torch.AcceleratorError`, or a plain
+    RuntimeError saying "CUDA error: ..." / naming a device fault on an
+    older torch) -- never `torch.OutOfMemoryError`, which subclasses
+    RuntimeError but is a recoverable allocation failure."""
+    import torch
+
+    oom = getattr(torch, "OutOfMemoryError", None)
+    if oom is not None and isinstance(exc, oom):
+        return False
+    msg = str(exc)
+    # Before the AcceleratorError check: an allocation failure raised as one
+    # is still recoverable.
+    if any(m in msg.lower() for m in _ALLOC_FAILURE_MARKERS):
+        return False
+    accel = getattr(torch, "AcceleratorError", None)
+    if accel is not None and isinstance(exc, accel):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    return msg.lstrip().startswith("CUDA error") or any(m in msg for m in _DEVICE_FAULT_MARKERS)
+
+
 def _to_query_array(values: list) -> np.ndarray:
     """A per-query filter column's values -> a numpy array. Plain scalars
     (equality/range/text values) get numpy's own dtype inference (float64
@@ -2360,6 +2395,20 @@ def _merge_topk(top_key, top_enc, parts: list[tuple], k: int, thr=None):
     top_enc.index_copy_(0, rows, new_enc)
     thr.index_copy_(0, rows, new_key.min(dim=1).values)
     return top_key, top_enc
+
+
+def _trim_mask(keys, ext_key):
+    """Identify final top-k entries safely removable before merging.
+
+    Drops candidates strictly below the applied external threshold,
+    preserving ties and rows containing NaN or +inf scores.
+    The merge validates the threshold to ensure correctness.
+    """
+    import torch
+
+    sc = unpack_score(keys)
+    odd = (torch.isnan(sc) | (sc == float("inf"))).any(dim=1, keepdim=True)
+    return (keys < ext_key.unsqueeze(1)) & ~odd
 
 
 def _sample_mean_doc_tokens(store: Store, mine: list, column: str) -> float:
@@ -5972,6 +6021,33 @@ def run_compute(
     # `applied_threshold` column for the merge to verify against.
     spec_thr_applied: list = [None] * len(specs)
 
+    _run_scope_memo: list[str] = []
+
+    def _run_scope_id() -> str:
+        """sha256 scoping the threshold exchange's `_thresholds/<id>/` under
+        `output.path`. Covers every search's run identity (config, corpus
+        fingerprint, num_jobs, max_files, tiebreak), the query CONTENT, the
+        corpus listing with sizes, and this package's code hash, so files left
+        by any other run (or other code) on the same output path are never
+        read as this run's. Identical on every rank of one run; computed once."""
+        if not _run_scope_memo:
+            import hashlib as _hashlib
+            h = _hashlib.sha256("\n".join(sorted(
+                run_identity(config_identity(cfg, s_), corpus_fp["sha256"],
+                             num_jobs, max_files, cfg.params.tiebreak)
+                for s_ in specs
+            )).encode())
+            for vt in sorted(Q_np_by_vt):
+                h.update(vt.encode())
+                _thresholds.hash_array(h, Q_np_by_vt[vt])
+            if mv_q_offsets is not None:
+                _thresholds.hash_array(h, np.asarray(mv_q_offsets))
+            for f_ in all_files:
+                h.update(f"{f_.key}:{f_.size}\n".encode())
+            h.update(_thresholds.code_hash().encode())
+            _run_scope_memo.append(h.hexdigest())
+        return _run_scope_memo[0]
+
     def _start_threshold_exchange() -> None:
         """Constructed right before the scan's try/finally so that a failure
         in the remaining setup cannot leak its threads."""
@@ -5979,10 +6055,11 @@ def run_compute(
         if not cfg.params.threshold_exchange:
             return
         if not num_jobs or num_jobs < 2:
+            # The default config has it on, so a lone worker is the normal
+            # case here, not a misconfiguration: note it, don't warn.
             thr_exchange_stats["reason"] = "single-worker run"
-            logger.warning(
-                "params.threshold_exchange is set but this is a single-worker run "
-                "(no --num-jobs); nothing to exchange, continuing without it"
+            logger.info(
+                "threshold exchange off: single-worker run (no peers to exchange with)"
             )
         elif os.environ.get("NOVA_BF_NO_PRUNE"):
             thr_exchange_stats["reason"] = "NOVA_BF_NO_PRUNE"
@@ -5992,22 +6069,7 @@ def run_compute(
             )
         else:
             # Scope the exchange to THIS run
-            import hashlib as _hashlib
-            h = _hashlib.sha256("\n".join(sorted(
-                run_identity(config_identity(cfg, s_), corpus_fp["sha256"],
-                             num_jobs, max_files, cfg.params.tiebreak)
-                for s_ in specs
-            )).encode())
-
-            for vt in sorted(Q_np_by_vt):
-                h.update(vt.encode())
-                _thresholds.hash_array(h, Q_np_by_vt[vt])
-            if mv_q_offsets is not None:
-                _thresholds.hash_array(h, np.asarray(mv_q_offsets))
-            for f_ in all_files:
-                h.update(f"{f_.key}:{f_.size}\n".encode())
-            h.update(_thresholds.code_hash().encode())
-            exchange_id = h.hexdigest()
+            exchange_id = _run_scope_id()
             try:
                 thr_exchange = _thresholds.ThresholdExchange(
                     Store(cfg.output.path), exchange_id, job_rank, num_jobs,
@@ -6015,6 +6077,7 @@ def run_compute(
                                      _thresholds.publish_width(specs[m].k, num_jobs))
                      for m in range(len(specs))},
                     refresh_s=cfg.params.threshold_exchange_refresh_s,
+                    fetch_concurrency=cfg.params.threshold_exchange_fetch_concurrency,
                 )
             except Exception as exc:  # noqa: BLE001 — degrade to no exchange
                 thr_exchange = None
@@ -6026,13 +6089,24 @@ def run_compute(
                 return
             thr_exchange.stats["configured"] = True
             thr_exchange_stats = thr_exchange.stats
+            # Compute-thread wall time in the exchange hooks (see `_thr_timed`).
+            thr_exchange.stats.update({
+                "apply_calls": 0, "apply_seconds_total": 0.0, "apply_seconds_max": 0.0,
+                "publish_calls": 0, "publish_seconds_total": 0.0, "publish_seconds_max": 0.0,
+                # Hook calls that raised and were skipped (see `_thr_guarded`).
+                "apply_failures": 0, "publish_failures": 0,
+            })
             logger.info(
-                "threshold exchange ON: rank %d/%d publishes per-query thresholds "
-                "under %s/%s and prunes against the max over peers (refresh every "
-                "%.1fs; code hash %s — workers with a different one form a separate "
-                "exchange group)",
-                job_rank, num_jobs, cfg.output.path, thr_exchange.subdir,
-                cfg.params.threshold_exchange_refresh_s, _thresholds.code_hash()[:12],
+                "threshold exchange ON: rank %d/%d publishes its top-m scores per "
+                "query (m = publish width: %s) under %s/%s and prunes against the "
+                "k-th best of its own top-m ∪ every peer's (refresh every %.1fs, up "
+                "to %d concurrent GETs; code hash %s — workers with a different one "
+                "form a separate exchange group)",
+                job_rank, num_jobs,
+                ", ".join(f"{n}={w}" for n, w in thr_exchange.stats["publish_width"].items()),
+                cfg.output.path, thr_exchange.subdir,
+                cfg.params.threshold_exchange_refresh_s, thr_exchange.fetch_concurrency,
+                _thresholds.code_hash()[:12],
             )
             # A worker starting after its peers inherits their thresholds for
             # its very first file, not just from the second file on (-1 =
@@ -6082,13 +6156,59 @@ def run_compute(
             out.append(torch.topk(sc, w, dim=1, sorted=True).values if w < sc.shape[1] else sc)
         return out
 
+    def _thr_timed(key: str, fn, *args) -> None:
+        """Track exchange hook wall time, calls, and maximum duration.
+
+        CUDA timings include implicit synchronization but exclude asynchronous
+        work not yet completed when the hook returns.
+        """
+        t0 = time.perf_counter()
+        try:
+            fn(*args)
+        finally:
+            if thr_exchange is not None:
+                dt = time.perf_counter() - t0
+                st = thr_exchange.stats
+                st[f"{key}_calls"] = st.get(f"{key}_calls", 0) + 1
+                st[f"{key}_seconds_total"] = round(st.get(f"{key}_seconds_total", 0.0) + dt, 6)
+                st[f"{key}_seconds_max"] = round(max(st.get(f"{key}_seconds_max", 0.0), dt), 6)
+
+    def _thr_guarded(key: str, fn, *args) -> None:
+        """Run an exchange hook, counting and logging recoverable failures.
+
+        Retains the last valid pruning thresholds on failure.
+        Propagates CUDA device faults.
+        """
+        try:
+            _thr_timed(key, fn, *args)
+        except Exception as exc:  # noqa: BLE001 — see above; re-raised if not ours
+            if _is_device_fault(exc):
+                raise
+            st = thr_exchange.stats
+            st[f"{key}_failures"] = st.get(f"{key}_failures", 0) + 1
+            if st[f"{key}_failures"] == 1:
+                logger.warning(
+                    "threshold exchange: %s step failed (%s: %s); skipping it, this "
+                    "rank prunes against its last valid thresholds. Further failures "
+                    "are counted in threshold_exchange_stats.%s_failures, not logged.",
+                    key, type(exc).__name__, exc, key, exc_info=True,
+                )
+
     def _apply_external_thresholds(file_idx: int | None = None) -> None:
+        if thr_exchange is not None:
+            _thr_guarded("apply", _apply_external_thresholds_impl, file_idx)
+
+    def _publish_thresholds() -> None:
+        if thr_exchange is not None:
+            _thr_guarded("publish", _publish_thresholds_impl)
+
+    def _apply_external_thresholds_impl(file_idx: int | None = None) -> None:
         """Recompute the external bound from the peers' latest lists and this
         worker's own current top-m (the union's k-th best), as packed keys."""
         nonlocal thr_version_seen
         if thr_exchange is None:
             return
-        thr_version_seen, lists, changed = thr_exchange.latest(thr_version_seen)
+        version, lists, changed = thr_exchange.latest(thr_version_seen)
         if lists is not None:
             own = _own_top_lists()
             for m in range(len(specs)):
@@ -6099,15 +6219,28 @@ def run_compute(
                 # near zero, and a peer list can be replaced by a shorter one).
                 spec_thr_ext[m] = (new_key if spec_thr_ext[m] is None
                                    else torch.maximum(spec_thr_ext[m], new_key))
+                if thr_exchange.stats["first_applied_file"] is None:
+                    # -1 = before the first file (inherited at startup); "final" =
+                    # first applied by the end-of-scan refresh (`trim_partials`),
+                    # i.e. nothing was pruned against a peer's list during the scan.
+                    thr_exchange.stats["first_applied_file"] = (
+                        "final" if file_idx is None else file_idx)
             thr_exchange.stats["applies"] += 1
             if changed:
                 thr_exchange.stats["versions_applied"] += 1
-            if thr_exchange.stats["first_applied_file"] is None:
-                thr_exchange.stats["first_applied_file"] = file_idx
+        # Only once applied in full: after a failed apply (`_thr_guarded`)
+        # the next one still counts the version as newly applied.
+        thr_version_seen = version
 
-    def _publish_thresholds() -> None:
+    def _publish_thresholds_impl() -> None:
         """Hand this worker's current per-query thresholds (scores only) to the
-        exchange. One small D2H copy; the network traffic is on its threads."""
+        exchange. One D2H copy; the file write is on its threads. Always
+        handed over, never compared with the last publish first: mid-scan
+        some query's top-m changes at nearly every file boundary, so the
+        check would almost never skip, and an exact one would need a device
+        copy of every published list (h x m fp16 per search) kept resident.
+        The exchange's latest-wins hand-over and >= 1 s write spacing bound
+        the write rate; an unchanged republish costs one extra write."""
         if thr_exchange is None:
             return
         # The top-m lists, float16 rounded toward -inf ON the device (a
@@ -7155,10 +7288,33 @@ def run_compute(
             # converged thresholds) and stop the exchange threads.
             _publish_thresholds()
             thr_exchange.close(final=True)
+            if cfg.params.trim_partials:
+                # Final, synchronous refresh on this thread (the poller has
+                # stopped; the changed peer files are still fetched
+                # concurrently, on a transient pool, see `_fetched`):
+                # whatever the peers published while this
+                # rank finished its scan raises the bound the partial is
+                # trimmed against at write time. `_apply_external_thresholds`
+                # keeps it monotone, so the value recorded below is still >=
+                # every threshold this rank pruned against.
+                t_ref = time.perf_counter()
+                try:
+                    folded = thr_exchange.poll_once()
+                except Exception as exc:  # noqa: BLE001 — trim less, never fail
+                    folded = 0
+                    logger.warning("threshold exchange: final refresh failed (%s); "
+                                   "trimming against the last known thresholds", exc)
+                _apply_external_thresholds(None)
+                thr_exchange.stats["final_refresh"] = {
+                    "peer_files_folded": int(folded),
+                    "seconds": round(time.perf_counter() - t_ref, 3),
+                }
             # What this worker actually pruned against (the lowered, applied
             # external thresholds), for the partial's `applied_threshold`
             # column. Nothing prunes after this point (the tail flush above
-            # was the last scoring), so this is >= every threshold used.
+            # was the last scoring), so this is >= every threshold used —
+            # and, with `trim_partials`, it is exactly the threshold the
+            # write-time trim below drops entries against.
             for m in range(len(specs)):
                 spec_thr_applied[m] = (
                     unpack_score(spec_thr_ext[m]).cpu().numpy().astype(np.float32, copy=False)
@@ -7448,13 +7604,18 @@ def run_compute(
             # order. Process query rows in chunks to bound peak GPU memory during sorting.
             h_i = spec_top_key[i].shape[0]
             chunk = max(1, min(h_i, DECODE_CHUNK_SLOTS // max(1, s.k)))
-            enc_parts, sc_parts = [], []
+            # Optionally trim partial results using the applied external threshold.
+            trim_on = thr_exchange is not None and cfg.params.trim_partials
+            trim_key = spec_thr_ext[i] if trim_on else None
+            enc_parts, sc_parts, trim_parts = [], [], []
             for r0 in range(0, h_i, chunk):
                 kb, order = torch.sort(
                     spec_top_key[i][r0 : r0 + chunk], dim=1, descending=True
                 )
                 enc_parts.append(spec_top_enc[i][r0 : r0 + chunk].gather(1, order).cpu().numpy())
                 del order
+                if trim_key is not None:
+                    trim_parts.append(_trim_mask(kb, trim_key[r0 : r0 + chunk]).cpu().numpy())
                 # Recover scores from the packed keys.
                 sc_parts.append(unpack_score(kb).cpu().numpy())
                 del kb
@@ -7465,6 +7626,34 @@ def run_compute(
             spec_top_key[i] = spec_top_enc[i] = None
             valid = sc > float("-inf")
             nan_hits = np.isnan(sc).sum(axis=1).astype(np.int32) if num_jobs is not None else None
+            if trim_key is not None:
+                trim = trim_parts[0] if len(trim_parts) == 1 else np.concatenate(trim_parts)
+                del trim_parts
+                n_before = int(valid.sum())
+                # The trimmed entries are FINITE (see `_trim_mask`), so
+                # `nan_hits` above is unaffected; dropping them from `valid`
+                # is all the writer below needs.
+                valid &= ~trim
+                n_kept = int(valid.sum())
+                logger.info(
+                    "search=%r trim: kept %d of %d entries (%.4f of k*NQ=%d; "
+                    "dropped %d below the applied external threshold)",
+                    s.name, n_kept, n_before, n_kept / max(1, s.k * h_i),
+                    s.k * h_i, n_before - n_kept,
+                )
+                trim_stats = {"entries_before": n_before, "entries_kept": n_kept,
+                              "kept_fraction_of_k_nq": round(n_kept / max(1, s.k * h_i), 6)}
+            elif trim_on:
+                # Exchange on but no peer list was ever applied: nothing to
+                # trim against, the partial is written whole.
+                n_kept = int(valid.sum())
+                logger.info("search=%r trim: no external threshold applied; kept all "
+                            "%d entries (%.4f of k*NQ=%d)", s.name, n_kept,
+                            n_kept / max(1, s.k * h_i), s.k * h_i)
+                trim_stats = {"entries_before": n_kept, "entries_kept": n_kept,
+                              "kept_fraction_of_k_nq": round(n_kept / max(1, s.k * h_i), 6)}
+            else:
+                trim_stats = None
             # A spec with a `rows` subset wrote state for its OWN queries only, so
             # its output covers those rows — ids and payload are sliced to match.
             # `query_ids`/`payload` stay full-length upstream (both loaders return
@@ -7575,6 +7764,8 @@ def run_compute(
                 "corpus_dtype": dtypes.get("corpus_dtype"),
                 "queries_dtype": dtypes.get("queries_dtype"),
             })
+            if trim_stats is not None:
+                entry["trim"] = trim_stats
             if num_jobs is None:
                 # Only a whole-corpus run can say anything true about short top-Ks.
                 # On a partial, "fewer than k hits" is the normal state of a stride
@@ -7637,9 +7828,11 @@ def run_compute(
         # RESOLVED native I/O settings (NOVA_BF_RUST_FETCH_* over the config).
         # Per-file fallbacks to pyarrow are logged, not counted here.
         "rust_fetch": rust_fetch_settings(),
-        # The configured bool stays under `threshold_exchange`; what the
-        # exchange actually did is here.
-        "threshold_exchange_stats": thr_exchange_stats,
+        # Snapshot exchange statistics to avoid concurrent updates during serialization.
+        "threshold_exchange_stats": dict(thr_exchange_stats),
+
+        # Record whether partial-result trimming was enabled with an active exchange.
+        "trim_partials_effective": bool(thr_exchange is not None and cfg.params.trim_partials),
         # What actually RAN, not what the kill switches permitted.
         "kernels": run_manifest.kernel_usage(
             _PRUNE_APPLIED["count"],

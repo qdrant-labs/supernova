@@ -196,7 +196,7 @@ def test_gpu_narrow_key_path_matches_the_oracle(ds_fixed, oracle, monkeypatch):
     _assert_matches_oracle(_run(ds_fixed, device="cuda", tag="ord_gpu32"),
                            ds_fixed, oracle, "gpu-int32")
     # `_force_mode` steers `build_ordinals` (the COMPUTE side). The merge's own
-    # `_dense_device_fold` ranks device lanes directly and is not governed by
+    # `_device_fold` ranks device lanes directly and is not governed by
     # `_gpu_mode`, so "device" entries are expected alongside the 32s; what
     # matters is that the narrow key really ran.
     assert 32 in seen, f"tier 2 did not run: {seen}"

@@ -1,114 +1,49 @@
-# Brute-force ground-truth config for `nova bf`:
-#   nova bf compute configs/brute_force/example.yaml                 # 1 GPU
+# Brute-force ground truth for `nova bf`:
+#   nova bf compute configs/brute_force/example.yaml                     # 1 GPU
 #   nova dist bf compute configs/brute_force/example.yaml --num-jobs 8   # fleet
-#   nova bf merge   configs/brute_force/example.yaml                 # combine partials
+#   nova bf merge   configs/brute_force/example.yaml                     # combine partials
 #
-# Output: {output.path}/bf_<queries-stem>_<name>_k<K>.parquet with columns
-#   query_id (str), <carried payload...>, hit_ids (list[str]), hit_scores (list[float])
-# Sanity check: if a query is also in the corpus, its top hit is itself (score ~1.0).
+# Output: {output.path}/bf_<queries-stem>_<name>_k<K>.parquet with
+#   query_id, <payload_fields...>, hit_ids (list[str]), hit_scores (list[float]).
+# Every other knob (I/O, batch sizes, two-pass, merge tuning) has a sensible
+# default; see docs/brute-force/overview.md#performance.
 
 corpus:
-  # The embedded parquets to search over (same files the loader ingests).
-  path: s3://qdrant--vectorforge/fiqa/bge-m3
+  path: s3://my-bucket/corpus/          # parquet file or directory
   dense_column: dense_embedding
-  # sparse_column: sparse_embedding  # only read by a search with vector_type: sparse
-  # Use an already-unique column for hit_ids — transparent for public data (e.g.
-  # fineweb's `id` = "<urn:uuid:...>") and resolvable without the loader's hashing.
-  # Omit to derive make_point_id(corpus_file, row), matching the point ids the
-  # loader synthesizes at ingest. A real id column is read alongside the dense
-  # vectors and kept in RAM per file for this worker's slice of the corpus
-  # (budget ~ slice_rows × id_size of host memory).
-  # id_column: id
+  # sparse_column: sparse_embedding     # for vector_type: sparse
+  # multivector_column: multivector_embedding   # for vector_type: multivector
+  # id_column: id                       # omit: ids match nova-load's point ids
 
 queries:
-  # Query embeddings (a parquet file or a dir of them).
-  path: s3://qdrant--vectorforge/fiqa/bge-m3/queries.parquet
+  path: s3://my-bucket/queries.parquet
   dense_column: dense_embedding
-  # sparse_column: sparse_embedding  # only read by a search with vector_type: sparse
-  # Use an existing column as the query id; omit to derive make_point_id(file, row).
-  # id_column: query_id
-  # Columns to carry from the queries file into each output row.
-  payload_fields:
-    - text
+  # id_column: query_id                 # omit: derived from file + row
+  payload_fields: [text]                # query columns copied into the output
 
 output:
-  path: s3://qdrant--vectorforge/fiqa/bge-m3/eval
+  path: s3://my-bucket/eval/            # must be shared (s3://) for a fleet run
 
 params:
-  io_workers: 16
-  io_thread_count: 0
-  # Score each corpus file against the queries in row-batches of this many rows
-  # instead of all at once, bounding the (n_queries × rows) score matrix on the
-  # GPU. Omit (default) to score the whole file in one matmul — fastest, and fine
-  # until a file is big enough (or the query set large enough) to OOM the GPU.
-  # Values below the largest k among that vector_type's searches are raised to it
-  # (a smaller batch can't fill any search's top-K). One value per vector_type,
-  # run-wide — every search of a vector_type ends up sharing one GPU pass over
-  # the corpus, so this isn't a per-search setting.
-  # Parallel byte-range S3 downloads for large corpus/query files. Enable for
-  # corpora written with a large flush threshold (~one row group per file),
-  # where a read is otherwise a single ~22-60 MB/s S3 stream; costs one file's
-  # raw bytes of extra host RAM while parsing. OFF by default.
-  # io_ranged_get: false
-  # dense_batch_size: 4096
-  # sparse_batch_size: 4096
-  # Sparse only: when a corpus slice's dense operand is too big to densify
-  # whole, chunk the corpus rows and stay on the (faster, more reproducible)
-  # dense GEMM branch instead of falling back to a sparse-CSR transpose matmul.
-  # Default true; set false only to reproduce an older ground-truth run's
-  # exact scores. See docs/brute-force/sparse-chunked-scoring-2026-09-02.md.
-  # sparse_chunk: true
-  # MaxSim implementation: torch (established/reference), triton_reduce
-  # (cuBLAS matmul + fused Triton ragged reduction, requires CUDA), or auto
-  # (triton_reduce when compatible, torch otherwise).
-  # multivector_kernel: torch
-  # Bound the ACTUAL ragged query-token x document-token product. Explicit
-  # query/document counts become upper bounds; whole documents are packed up
-  # to this element budget. One oversized document runs alone.
-  # multivector_token_budget: 170000000
-  # CUDA-only: overlap the next multivector slice's pinned H2D transfer with
-  # current-slice scoring and top-k. Slice and merge order remain unchanged.
-  # multivector_double_buffer: false
-  # Exact dense scoring optimization: `auto` (default) uses a safe two-pass
-  # screen when worthwhile; `off` always uses the regular one-pass fp32 path.
-  # two_pass: auto
-  # merge_batch_size: null
-  # merge_ranged_reads: false
-  # Which of two EXACTLY-tied candidates wins (see
-  # docs/brute-force/overview.md#ties). `ordinal` (default) takes the earlier
-  # corpus row and is free; `id` takes the lower `corpus.id_column`, which
-  # survives re-sharding the corpus, at the cost of one sort of this worker's
-  # id column at startup. Neither makes SCORES reproducible across batch
-  # sizes — pin `dense_batch_size` if you need that.
-  # tiebreak: ordinal
+  # Fleet runs: ranks share their running top-k thresholds so each prunes
+  # harder, and drop entries that cannot win so the merge reads less. Exact.
+  # Off by itself on a single worker; needs the shared output.path above.
+  threshold_exchange: true
+  trim_partials: true                   # only used with threshold_exchange
+  # Which of two exactly tied hits wins: ordinal (earlier corpus row, free) or
+  # id (lower corpus.id_column, survives re-sharding the corpus).
+  tiebreak: ordinal
+  two_pass: auto                        # exact pruning; `off` = plain fp32 scoring
 
-# One or more independent top-K searches computed in a single corpus scan (each
-# corpus file is read/decoded once per vector_type any search below needs, not
-# once per search — see docs/brute-force/overview.md#one-search-or-several-in-one-pass).
-searches:
-  - name: dense                # optional, unique if set, [A-Za-z0-9_-]+ — goes into the output
-                                # filename. Omit it and one is derived from vector_type/metric
-                                # (e.g. "dense_cosine", "_filtered" appended if `filter` is set),
-                                # with collisions disambiguated automatically (_2, _3, …).
-    vector_type: dense          # dense | sparse
-    metric: cosine               # cosine | dot | euclidean (euclidean unsupported with vector_type: sparse)
+searches:                               # all searches share one corpus scan
+  - name: dense                         # optional; goes into the output filename
+    vector_type: dense                  # dense | sparse | multivector
+    metric: cosine                      # cosine | dot | euclidean
     k: 1000
-    # Restrict eligible neighbors to corpus rows matching this predicate — shaped
-    # like a Qdrant filter (must = AND, should = OR-at-least-one, must_not = AND-NOT).
-    # A condition's `field` is the only place you name a corpus column to filter on
-    # — `compute` reads exactly (and only) the columns referenced here.
-    # filter:
+    # filter:                           # Qdrant-style: must / should / must_not
     #   must:
     #     - field: language
-    #       match: eng            # scalar = equality; a list matches any of them
+    #       match: eng
     #     - field: cost
-    #       range: {lt: 10}       # gt/gte/lt/lte, combinable in one condition
-    #     # match_from_query / range_from_query / match_text_from_query pull
-    #     # the comparison value from a QUERIES column instead, so it varies
-    #     # per query (tenant scoping, a per-query budget, …) — see
-    #     # docs/brute-force/overview.md#per-query-filters
-
-  # - name: sparse
-  #   vector_type: sparse
-  #   metric: dot
-  #   k: 1000
+    #       range: {lt: 10}
+    # rows: {column: query_set, isin: [dense]}   # only these query rows
