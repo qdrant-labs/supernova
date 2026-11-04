@@ -40,3 +40,5 @@ htmlcov/
 # zensical docs build output
 site/
 .cache/
+# Local-only notes: never committed, never published
+claude_only/
