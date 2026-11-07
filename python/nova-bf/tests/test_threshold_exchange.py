@@ -410,7 +410,10 @@ def test_single_worker_turns_the_exchange_off_quietly(tmp_path, monkeypatch, cap
                and r.levelname == "INFO" for r in caplog.records)
     assert not any(r.levelname == "WARNING" and "exchange" in r.message.lower()
                    for r in caplog.records)
-    (m,) = [json.load(open(f)) for f in glob.glob(os.path.join(str(out), "_bf_manifest_*_compute*.json"))]
+    # Unsharded: one manifest file; --num-jobs 1: a per-rank file in a dir.
+    (m,) = [json.load(open(f)) for f in
+            glob.glob(os.path.join(str(out), "_bf_manifest_*_compute*.json"))
+            + glob.glob(os.path.join(str(out), "_bf_manifest_*_compute*", "rank*.json"))]
     assert m["params"]["threshold_exchange_stats"] == {
         "enabled": False, "configured": True, "reason": "single-worker run"}
 
