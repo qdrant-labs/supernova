@@ -280,7 +280,8 @@ def test_liveness_matches_independent_masks_end_to_end(tmp_path, monkeypatch, wi
             rl = self.row_live(m)
             tl = {w: self.tile_live(m, w) for w in (1, 2, 3)}
             seen.append((m, cols, None if rl is None else rl.clone(),
-                         {w: None if t is None else t.clone() for w, t in tl.items()}))
+                         {w: None if t is None else t.clone() for w, t in tl.items()},
+                         isinstance(tr, slice)))
             return super().select(m)
 
     monkeypatch.setattr(compute, "_SliceFilters", Rec)
@@ -308,7 +309,14 @@ def test_liveness_matches_independent_masks_end_to_end(tmp_path, monkeypatch, wi
 
     checked = 0
     saw_compacted = saw_offbyte = False
-    for m, cols, rl, tl in seen:
+    kinds = set()
+    for m, cols, rl, tl, as_slice in seen:
+        # Contiguous-rows fast path: a slice whose rows are one contiguous run
+        # (including a contiguous run inside a union-compacted batch) must be
+        # handed on as a `slice`; only a genuinely scattered one as an array.
+        contiguous = np.array_equal(cols, np.arange(cols[0], cols[0] + len(cols)))
+        assert as_slice == contiguous, (cols, as_slice)
+        kinds.add(as_slice)
         s = searches[m]
         if s.filter is None:
             assert rl is None
@@ -331,3 +339,8 @@ def test_liveness_matches_independent_masks_end_to_end(tmp_path, monkeypatch, wi
     assert saw_offbyte
     if not with_baseline:
         assert saw_compacted, "expected union compaction to give non-contiguous rows"
+        # Both paths exercised inside one compacted batch: contiguous slices
+        # take the packed-slice path, scattered ones the bit gather.
+        assert kinds == {True, False}
+    else:
+        assert kinds == {True}

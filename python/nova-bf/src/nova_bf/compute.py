@@ -4551,7 +4551,15 @@ def _process_batch_group(
             true_rows = slice(r0, r0 + sl.n_rows)
         else:
             true_rows = orig_rows[r0 : r0 + sl.n_rows]
-            rows = torch.from_numpy(true_rows).to(device, non_blocking=True)
+            n_sl = len(true_rows)
+            if n_sl and int(true_rows[-1]) - int(true_rows[0]) == n_sl - 1:
+                # Replace contiguous orig_rows with a slice to enable faster on-device
+                # mask unpacking, preserving semantics.
+                a = int(true_rows[0])
+                true_rows = slice(a, a + n_sl)
+                rows = torch.arange(a, a + n_sl, dtype=torch.int64, device=device)
+            else:
+                rows = torch.from_numpy(true_rows).to(device, non_blocking=True)
 
         if encoded_row_ids is None:
             encoded_rows = gidx * MAX_ROWS_PER_FILE + rows
