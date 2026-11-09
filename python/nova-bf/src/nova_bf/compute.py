@@ -48,6 +48,7 @@ import numpy as np
 
 from tqdm import tqdm
 
+from benchmarks.streaming.faiss.faiss import python
 from nova_bf import manifest as run_manifest
 from nova_bf import mv_fp16
 from nova_bf import profiling
@@ -4411,12 +4412,20 @@ def _process_batch_group(
     two_pass: bool = True,
     mv_prune=None,
     spec_thr_ext: list | None = None,
+    slice_filters=None,
 ) -> float:
     """Process one vector-type batch, sharing work across search members.
 
     Slices are transferred/scored once where possible and folded into each
     member's top-K state. Returns processing-loop wall time.
+
+    Member row/column selection comes from one of two sources:
+    `slice_filters(rows, true_rows, n_cols)` builds a `_SliceFilters` per slice
+    before scoring (the filtered path, `_process_shared_batch`), whose `select`
+    is used; otherwise the plain `select(m, rows, true_rows, cache)` callable.
     """
+    if (select is None) == (slice_filters is None):
+        raise ValueError("pass exactly one of `select` and `slice_filters`")
     import torch
 
     n_rows = batch.n_rows
@@ -4558,8 +4567,15 @@ def _process_batch_group(
                 ordinal_row_ids[r0 : r0 + sl.n_rows].astype(np.int64, copy=False)
             ).to(device, non_blocking=True)
 
+        # This slice's filter state, built before two-pass decisions and exact
+        # scoring (pipelined pass one is already in flight) so liveness can
+        # inform them; it builds masks only on request.
+        sf = (None if slice_filters is None
+              else slice_filters(rows, true_rows, sl.n_rows))
+
         score_cache: dict[tuple, object] = {}
-        cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
+        # keyed by whatever the plain `select` memoizes on; unused with `sf`
+        cache: dict[object, object] | None = {} if sf is None else None
         rank_cache: dict[int, tuple] = {}
         subset_cache: dict[int, tuple] = {}
 
@@ -4640,7 +4656,9 @@ def _process_batch_group(
                                               _thr(m), spec_qsel[m]):
                         mv_probe[0] = False
 
-            sel_rows, sel_cols, cell_mask = select(m, rows, true_rows, cache)
+            sel_rows, sel_cols, cell_mask = (
+                sf.select(m) if sf is not None
+                else select(m, rows, true_rows, cache))
             if sel_rows is None:
                 continue
             
@@ -5293,6 +5311,181 @@ def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str)
     return keep
 
 
+class _SliceFilters:
+    """
+    Cache per-query filter masks and derive exact row/tile liveness.
+
+    Created once per slice, after pipelined pass one is launched but before
+    two-pass preparation and exact scoring. Liveness can therefore skip
+    rescoring and one-pass GEMM work, but not pass one.
+
+    Masks are built lazily and shared between liveness checks and score
+    masking, ensuring both use identical filter decisions.
+
+    Coordinates:
+      * cell_mask(f): (filter_n_q[f], n_cols), indexed by filter query rows
+        and slice columns (including union-compacted batches).
+      * row_live(m) / tile_live(m, w): indexed by member query rows,
+        mapped through spec_qrows[m] exactly as during score masking.
+
+    None liveness means no filter restriction for that slice. Dead rows/tiles
+    are exact (all cells masked), never approximate. Liveness methods return
+    fresh contiguous tensors. For two-pass, use tile_info["width"].
+
+    Masks are released after all members using the filter call select() or
+    release(). Requesting liveness for multiple members up front retains
+    their masks until release, increasing peak memory. Request liveness
+    before select(); requests after final release rebuild the mask.
+    """
+
+
+    __slots__ = ("_specs", "_rows", "_true_rows", "n_cols", "_device",
+                 "_build_mask", "_uniform_idx", "_qsel", "_qrows",
+                 "_member_height", "_per_query", "_masks", "_local_idx",
+                 "_users", "builds")
+
+    def __init__(self, specs, member_idxs, rows, true_rows, n_cols: int, device,
+                 *, build_mask, uniform_idx, spec_qsel, spec_qrows,
+                 member_height, per_query):
+        self._specs = specs
+        self._rows = rows
+        self._true_rows = true_rows
+        self.n_cols = int(n_cols)
+        self._device = device
+        self._build_mask = build_mask      # (f, rows, true_rows) -> tensor | None
+        self._uniform_idx = uniform_idx    # (f, true_rows) -> int64 tensor
+        self._qsel = spec_qsel
+        self._qrows = spec_qrows
+        self._member_height = member_height
+        self._per_query = per_query        # f -> bool
+        self._masks: dict = {}
+        self._local_idx: dict = {}
+        # Members of THIS group that will call `select` for each per-query filter.
+        self._users = Counter(
+            specs[m].filter for m in member_idxs
+            if not _is_unfiltered(specs[m].filter) and per_query(specs[m].filter)
+        )
+        self.builds = 0   # masks built this slice (tests pin memoisation)
+
+    # -- masks ---------------------------------------------------------------
+
+    def cell_mask(self, f):
+        """`(filter_n_q[f], n_cols)` bool mask for per-query filter `f`, or
+        `None` when no query has an allowed cell in this slice."""
+        got = self._masks.get(f, _UNCACHED)
+        if got is _UNCACHED:
+            got = self._build_mask(f, self._rows, self._true_rows)
+            self.builds += 1
+            self._masks[f] = got
+        return got
+
+    def _member_mask(self, m):
+        """Member `m`'s mask in its own rows, or `None` (no allowed cell)."""
+        cm = self.cell_mask(self._specs[m].filter)
+        if cm is not None and self._qsel[m] is not None:
+            cm = cm[self._qrows[m]]
+        return cm
+
+    def _uniform_local(self, f):
+        idx = self._local_idx.get(f)
+        if idx is None:
+            idx = self._uniform_idx(f, self._true_rows)
+            self._local_idx[f] = idx
+        return idx
+
+    # -- the masking step ----------------------------------------------------
+
+    def select(self, m):
+        """`(sel_rows, sel_cols, cell_mask)` for member `m`, exactly as the
+        pre-refactor `select` returned it (`cell_mask` still in FILTER rows;
+        the caller maps it). `(None, None, None)` = nothing to fold."""
+        f = self._specs[m].filter
+        if _is_unfiltered(f):
+            return self._rows, None, None
+        if self._per_query(f):
+            cm = self.cell_mask(f)
+            self._done(f)
+            if cm is None:
+                return None, None, None
+            return self._rows, None, cm
+        local_idx = self._uniform_local(f)
+        if local_idx.numel() == 0:
+            return None, None, None
+        return self._rows[local_idx], local_idx, None
+
+    def release(self, m) -> None:
+        """Member `m` will not call `select` this slice (it was skipped, e.g.
+        because it is filter-dead): count it as done so its filter's mask is
+        released after the remaining members, not held to the slice's end."""
+        f = self._specs[m].filter
+        if not _is_unfiltered(f) and self._per_query(f):
+            self._done(f)
+
+    def _done(self, f) -> None:
+        self._users[f] -= 1
+        if self._users[f] <= 0:
+            self._masks.pop(f, None)
+
+    # -- liveness ------------------------------------------------------------
+
+    def row_live(self, m):
+        """`(member_height[m],)` bool: does member `m`'s query have at least
+        one allowed cell in this slice? `None` = every row is live."""
+        import torch
+
+        f = self._specs[m].filter
+        if _is_unfiltered(f):
+            return None
+        h = self._member_height(m)
+        if self._per_query(f):
+            cm = self._member_mask(m)
+            if cm is None:
+                return torch.zeros(h, dtype=torch.bool, device=self._device)
+            return cm.any(dim=1)
+        if self._uniform_local(f).numel() == 0:
+            return torch.zeros(h, dtype=torch.bool, device=self._device)
+        return None
+
+    def tile_live(self, m, width: int):
+        """`(n_tiles, member_height[m])` bool, `n_tiles = ceil(n_cols / width)`:
+        does member `m`'s query have an allowed cell in column tile `t`
+        (columns `[t*width, (t+1)*width)`, the last tile partial)? Same layout
+        as `_twopass_prepare`'s `tile_live[:, rng]`. `None` = all live."""
+        import torch
+
+        width = int(width)
+        if width <= 0:
+            raise ValueError(f"tile width must be positive, got {width}")
+        f = self._specs[m].filter
+        if _is_unfiltered(f):
+            return None
+        h = self._member_height(m)
+        n_tiles = -(-self.n_cols // width)
+        if self._per_query(f):
+            cm = self._member_mask(m)
+            if cm is None:
+                return torch.zeros((n_tiles, h), dtype=torch.bool, device=self._device)
+            return _tile_any(cm, width, n_tiles).T.contiguous()
+        local = self._uniform_local(f)
+        cols = torch.zeros(self.n_cols, dtype=torch.bool, device=self._device)
+        cols[local] = True
+        return (_tile_any(cols[None, :], width, n_tiles)[0][:, None]
+                .expand(n_tiles, h).contiguous())
+
+
+def _tile_any(mask, width: int, n_tiles: int):
+    """`(r, n_cols)` bool -> `(r, n_tiles)`: any True per column tile, the last
+    tile zero-padded (padding is False, so it never makes a tile live)."""
+    import torch
+
+    r, n_cols = mask.shape
+    pad = n_tiles * width - n_cols
+    if pad:
+        mask = torch.cat(
+            (mask, torch.zeros((r, pad), dtype=torch.bool, device=mask.device)), dim=1)
+    return mask.reshape(r, n_tiles, width).any(dim=2)
+
+
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_key, spec_top_enc, spec_thr,
@@ -5322,79 +5515,70 @@ def _process_shared_batch(
     - per-query filter: keep all shared columns and apply a `(queries, rows)` mask;
     - uniform filter: select that filter's surviving columns.
 
-    Per-query masks may be GPU-evaluated or read from `PackedRowMask`; shared
-    filter work is cached only when multiple specs reuse it.
+    Per-query masks may be GPU-evaluated or read from `PackedRowMask`. Each
+    slice's masks live in one `_SliceFilters` (built before scoring, masks on
+    request): a filter shared by several members is built once per slice and
+    released after its last member's `select`. `filter_share_count` is no
+    longer consulted here (kept in the signature for the callers).
 
     `encoded_row_ids` carries pre-encoded row ids for coalesced multi-file batches.
     See `_process_batch_group` for the shared scoring loop.
     """
     import torch
 
-    def select(m: int, rows, true_rows, cache: dict[object, object]):
-        s = specs[m]
-        if _is_unfiltered(s.filter):
-            return rows, None, None
-        if filter_is_gpu_eligible[s.filter] or filter_is_per_query[s.filter]:
-            # `None` means "this slice has no row any query wants" — a cached
-            # VALUE, so the miss test needs its own sentinel.
-            cell_mask = cache.get(s.filter, _UNCACHED)
-            if cell_mask is _UNCACHED:
-                if filter_is_gpu_eligible[s.filter]:
-                    cell_mask = _gpu_evaluate(
-                        s.filter, leaf_gpu, rows,
-                        # this filter's own query rows, so the mask is
-                        # filter_n_q[s.filter] tall (see
-                        # `_narrow_gpu_leaf_state`)
-                        query_gpu_by_filter[s.filter], device,
-                    )
-                    if not cell_mask.any():
-                        cell_mask = None
-                else:
-                     # CPU per-query mask. Preserve row packing for contiguous slices; compacted
-                    # batches gather the selected row bits before transfer.
-                    pm = keeps[s.filter]
-                    # A mismatched mask height would apply rows to the wrong queries silently.
-                    if pm.n_queries != filter_n_q[s.filter]:
-                        raise RuntimeError(
-                            f"per-query filter mask is {pm.n_queries} queries "
-                            f"tall, expected {filter_n_q[s.filter]}"
-                        )
-                    if isinstance(true_rows, slice):
-                        r0, r1 = true_rows.start, true_rows.stop
-                        sub = pm.packed[:, r0 >> 3 : (r1 + 7) >> 3]
-                        if _packed_slice_any(pm.packed, r0, r1 - r0):
-                            cell_mask = _unpack_row_axis_device(
-                                sub, r1 - r0, device, bit_offset=r0 & 7,
-                            )
-                        else:
-                            cell_mask = None
-                    else:
-                        sel = (np.uint8(1) << (7 - (true_rows & 7)).astype(np.uint8))
-                        bits = pm.packed[:, true_rows >> 3] & sel
-                        if bits.any():
-                            cell_mask = torch.from_numpy(
-                                np.ascontiguousarray(bits)
-                            ).to(device, non_blocking=True) != 0
-                        else:
-                            cell_mask = None
-                if filter_share_count[s.filter] > 1:
-                    cache[s.filter] = cell_mask
-            if cell_mask is None:
-                return None, None, None
-            return rows, None, cell_mask
-        local_idx = cache.get(s.filter)
-        if local_idx is None:
-            local_np = np.nonzero(keeps[s.filter][true_rows])[0]
-            local_idx = torch.from_numpy(local_np).to(device, non_blocking=True)
-            cache[s.filter] = local_idx
-        if local_idx.numel() == 0:
-            return None, None, None
-        return rows[local_idx], local_idx, None
+    def build_mask(f, rows, true_rows):
+        """This slice's `(filter_n_q[f], n_cols)` mask for per-query filter `f`,
+        or `None` when no query has an allowed cell here."""
+        if filter_is_gpu_eligible[f]:
+            cell_mask = _gpu_evaluate(
+                f, leaf_gpu, rows,
+                # this filter's own query rows, so the mask is filter_n_q[f]
+                # tall (see `_narrow_gpu_leaf_state`)
+                query_gpu_by_filter[f], device,
+            )
+            return cell_mask if cell_mask.any() else None
+        # CPU per-query mask. Preserve row packing for contiguous slices; compacted
+        # batches gather the selected row bits before transfer.
+        pm = keeps[f]
+        # A mismatched mask height would apply rows to the wrong queries silently.
+        if pm.n_queries != filter_n_q[f]:
+            raise RuntimeError(
+                f"per-query filter mask is {pm.n_queries} queries "
+                f"tall, expected {filter_n_q[f]}"
+            )
+        if isinstance(true_rows, slice):
+            r0, r1 = true_rows.start, true_rows.stop
+            if not _packed_slice_any(pm.packed, r0, r1 - r0):
+                return None
+            sub = pm.packed[:, r0 >> 3 : (r1 + 7) >> 3]
+            return _unpack_row_axis_device(sub, r1 - r0, device, bit_offset=r0 & 7)
+        sel = (np.uint8(1) << (7 - (true_rows & 7)).astype(np.uint8))
+        bits = pm.packed[:, true_rows >> 3] & sel
+        if not bits.any():
+            return None
+        return torch.from_numpy(np.ascontiguousarray(bits)).to(device, non_blocking=True) != 0
+
+    def uniform_idx(f, true_rows):
+        local_np = np.nonzero(keeps[f][true_rows])[0]
+        return torch.from_numpy(local_np).to(device, non_blocking=True)
+
+    def per_query(f) -> bool:
+        return bool(filter_is_gpu_eligible[f] or filter_is_per_query[f])
+
+    def slice_filters(rows, true_rows, n_cols):
+        return _SliceFilters(
+            specs, member_idxs, rows, true_rows, n_cols, device,
+            build_mask=build_mask, uniform_idx=uniform_idx,
+            spec_qsel=spec_qsel, spec_qrows=spec_qrows,
+            member_height=lambda m: int(spec_thr[m].shape[0]),
+            per_query=per_query,
+        )
 
     return _process_batch_group(
         batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_key, spec_top_enc,
         spec_thr,
-        batch_size, gidx, device, orig_rows=orig_rows, select=select,
+        batch_size, gidx, device, orig_rows=orig_rows, select=None,
+        slice_filters=slice_filters,
         encoded_row_ids=encoded_row_ids,
         ordinal_base=ordinal_base, ordinal_row_ids=ordinal_row_ids,
         multivector_token_budget=multivector_token_budget,
@@ -6344,9 +6528,9 @@ def run_compute(
             len(gpu_vocab_luts),
             sum(t.nbytes for t in gpu_vocab_luts.values()) / (1 << 20),
         )
-    # How many specs share each distinct filter — used by _process_shared_batch
-    # to skip caching a per-query cell_mask when nobody else will reuse it
-    # (Front A's memory-shrinking complement).
+    # How many specs share each distinct filter. No longer read by
+    # _process_shared_batch (its per-slice `_SliceFilters` releases each mask
+    # after the last member using it); still passed through its signature.
     filter_share_count: dict[Filter | None, int] = Counter(spec_filter)
 
     # Narrow CPU per-query filter masks to the query rows that actually use them.

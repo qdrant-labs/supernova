@@ -1685,8 +1685,8 @@ def test_per_query_filter_mixed_static_and_per_query_leaf(tmp_path):
 
 def test_per_query_filter_shared_by_two_specs_matches_independent_ground_truth(tmp_path):
     """Two specs with an equal (but separately constructed) filter exercise
-    Front A's cache-sharing path (`filter_share_count[s.filter] > 1` in
-    `_process_shared_batch`'s `select`) — both specs must still get
+    Front A's cache-sharing path (one mask per filter per slice in
+    `_process_shared_batch`'s `_SliceFilters`) — both specs must still get
     correct, independently-verifiable results, and the SAME `cell_mask`
     object should back both (a `Filter` is frozen/hashable, so value-equal
     but distinct instances are still one dict key)."""
