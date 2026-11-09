@@ -25,6 +25,27 @@ _MERGE_ENV = (
 
 
 @pytest.fixture(autouse=True)
+def _tf32_flag_is_restored():
+    """Every test leaves torch's process-global TF32 matmul flag as it found it.
+
+    Tests set `torch.backends.cuda.matmul.allow_tf32` directly and rely on this
+    to restore it BY VALUE. `monkeypatch.setattr` cannot be used for it: on
+    torch >= 2.15 the flag is a property of `cuBLASModule`, monkeypatch's undo
+    deletes the attribute, that raises at teardown, and TF32 stays ON for every
+    later test -- silently changing GEMM bits under the two-pass suites.
+    """
+    try:
+        import torch
+        matmul = torch.backends.cuda.matmul
+        before = matmul.allow_tf32
+    except Exception:  # noqa: BLE001 - no torch / no such flag: nothing to guard
+        yield
+        return
+    yield
+    matmul.allow_tf32 = before
+
+
+@pytest.fixture(autouse=True)
 def _merge_env_is_hermetic(monkeypatch):
     """No test inherits the operator's run-rescue overrides.
 

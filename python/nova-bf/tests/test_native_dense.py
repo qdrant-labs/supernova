@@ -668,16 +668,22 @@ def test_id_pass_falls_back_to_pyarrow_when_fetch_declines(tmp_path, monkeypatch
 
 
 def test_fetch_declines_files_with_duplicate_top_level_names(tmp_path, fetch_on):
-    """The path read's dataset layer refuses duplicate names (even unread
-    ones); a buffer read would not -- so the fetch must defer, keeping
-    pass/fail identical."""
+    """Duplicate top-level names (even unread ones): the fetch must defer, so
+    pass/fail stays whatever the pyarrow path does. pyarrow's dataset layer
+    refused such files up to pyarrow 25 and reads the requested column from
+    26 on; either is fine as long as the native path never reads the file
+    itself (and, when pyarrow does read it, the answer is the right one)."""
     p = tmp_path / "dup.parquet"
     t = pa.Table.from_arrays([pa.array(["a", "b"]), pa.array([1, 2]), pa.array([3, 4])],
                              names=["id", "x", "x"])
     pq.write_table(t, str(p))
     store = Store(str(tmp_path))
-    with pytest.raises(Exception):
-        store.read_columns(str(p), ["id"])
+    try:
+        got = store.read_columns(str(p), ["id"])
+    except Exception:  # noqa: BLE001 - pyarrow <= 25 refuses the file
+        got = None
+    if got is not None:
+        assert got.column_names == ["id"] and got["id"].to_pylist() == ["a", "b"]
     assert store.read_columns_fetched(str(p), ["id"]) is None
 
 

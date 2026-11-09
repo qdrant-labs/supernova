@@ -1214,7 +1214,7 @@ def _eligible(monkeypatch):
 
     monkeypatch.setenv("NOVA_BF_TWOPASS_ON_CPU", "1")
     monkeypatch.setattr(twopass, "MIN_QUERY_ROWS", 4)
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.backends.cuda.matmul.allow_tf32 = False  # restored by conftest
     twopass.reset()
 
 
@@ -1251,7 +1251,7 @@ def test_the_tf32_refusal_is_reported_once_per_run_not_once_per_process(
 
     from nova_bf import compute as compute_mod
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    torch.backends.cuda.matmul.allow_tf32 = True  # restored by conftest
 
     def one_run():
         compute_mod._reset_twopass_hints()
@@ -1369,11 +1369,11 @@ def test_tf32_turns_the_two_pass_off_rather_than_widening_the_bound(monkeypatch)
 
     # Control: with TF32 off the group is eligible, or the assertion below
     # would pass for any reason at all.
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.backends.cuda.matmul.allow_tf32 = False  # restored by conftest
     assert compute_mod._twopass_groups(**args), (
         "control: the group should be eligible with TF32 off")
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    torch.backends.cuda.matmul.allow_tf32 = True  # restored by conftest
     monkeypatch.setattr(compute_mod, "_TP_TF32_WARNED", False)
     assert compute_mod._twopass_groups(**args) == {}, (
         "the two-pass accepted a group with TF32 enabled, and its bound does "
@@ -2137,7 +2137,7 @@ def test_tf32_does_not_veto_the_cpu_opt_in_path(monkeypatch):
 
     monkeypatch.setenv("NOVA_BF_TWOPASS_ON_CPU", "1")
     monkeypatch.setattr(twopass, "MIN_QUERY_ROWS", 4)
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    torch.backends.cuda.matmul.allow_tf32 = True  # restored by conftest
 
     assert compute_mod._twopass_groups(**_groups_args(device="cpu")), (
         "a CUDA-only flag refused the CPU path, which its arithmetic never "

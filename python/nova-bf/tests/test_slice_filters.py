@@ -328,9 +328,9 @@ def test_liveness_matches_independent_masks_end_to_end(tmp_path, monkeypatch, wi
             else:
                 assert not rl.any()
         else:
-            np.testing.assert_array_equal(rl.numpy(), mask.any(axis=1))
+            np.testing.assert_array_equal(rl.cpu().numpy(), mask.any(axis=1))
         for w, t in tl.items():
-            np.testing.assert_array_equal(t.numpy(), _np_tiles(mask, w))
+            np.testing.assert_array_equal(t.cpu().numpy(), _np_tiles(mask, w))
             assert t.is_contiguous()
         checked += 1
         saw_compacted |= not np.array_equal(cols, np.arange(cols[0], cols[0] + len(cols)))

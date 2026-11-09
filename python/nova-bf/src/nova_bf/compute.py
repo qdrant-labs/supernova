@@ -4463,6 +4463,14 @@ def _process_batch_group(
             (specs[m].metric, spec_cos_scale[m] is not None), []
         ).append(m)
 
+    # Per-query filters mask excluded scores to -inf. Fused corpus normalization
+    # can turn these into NaN for non-finite norms, so affected groups fall back
+    # to unfused scoring on those slices.
+    masked_score_keys = {
+        (specs[m].metric, spec_cos_scale[m] is not None)
+        for m in member_idxs if _is_per_query(specs[m].filter)
+    }
+
     # Buffer slice top-Ks so they can be merged in larger batches.
     pending: dict[int, list[tuple]] = {m: [] for m in member_idxs}
     pending_cols: dict[int, int] = {m: 0 for m in member_idxs}
@@ -4605,6 +4613,14 @@ def _process_batch_group(
         probe_live: dict[tuple, list] = {}
         # One prune-rate measurement per SLICE, summed over its members.
         mv_tally = [0, 0]
+        # Whether every corpus norm of this slice is finite; read once, and
+        # only when a masked group would otherwise take the fused cnorm path.
+        cn_finite: list = [None]
+
+        def _cn_finite() -> bool:
+            if cn_finite[0] is None:
+                cn_finite[0] = bool(torch.isfinite(sl.col_norms()).all())
+            return cn_finite[0]
 
         for m in member_idxs:
             s = specs[m]
@@ -4632,6 +4648,10 @@ def _process_batch_group(
                 and plan is None
                 and scale_in_packer
                 and not getattr(sl, "share_gram", False)
+                # masked cells: divide BEFORE masking when a norm is
+                # non-finite, so an excluded cell stays -inf (not NaN). The
+                # unfused path gives the same bits for every finite column.
+                and (score_key not in masked_score_keys or _cn_finite())
             )
             scores = None
             if plan is None:
@@ -6462,6 +6482,21 @@ def run_compute(
               else spec_q_norms[m][spec_qsel[m]]).contiguous()
         for m in range(len(specs))
     ]
+    # A per-query filter masks excluded cells to -inf BEFORE the packer divides
+    # by the query norm, and -inf / NaN (or / inf) is NaN: an excluded row would
+    # come back as a NaN candidate. A filtered cosine search whose own queries
+    # include a non-finite norm therefore divides by the query norm in `_scores`
+    # instead (before masking): same bits for every finite query, excluded
+    # cells stay -inf. One check per run.
+    for m in range(len(specs)):
+        cs = spec_cos_scale[m]
+        if cs is not None and _is_per_query(specs[m].filter) and not bool(torch.isfinite(cs).all()):
+            logger.warning(
+                "search %r: %d of its queries have a non-finite norm (NaN/inf "
+                "query vector); dividing by the query norm before the per-query "
+                "filter mask so filter-excluded rows stay excluded",
+                specs[m].name, int((~torch.isfinite(cs)).sum()))
+            spec_cos_scale[m] = None
 
     # spec_qrows is built further down, once `filter_rows` is known: its base is
     # the per-FILTER mask height, not the file's. See there.
