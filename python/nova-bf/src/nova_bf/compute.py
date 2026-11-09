@@ -48,7 +48,6 @@ import numpy as np
 
 from tqdm import tqdm
 
-from benchmarks.streaming.faiss.faiss import python
 from nova_bf import manifest as run_manifest
 from nova_bf import mv_fp16
 from nova_bf import profiling
