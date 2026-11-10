@@ -22,7 +22,10 @@ batch.
 Per-query filters instead mask individual `(query, row)` scores before top-K
 selection. Eligible numeric/categorical filters are evaluated on the GPU;
 text predicates use the CPU fallback, which stores their per-query row masks as
-row-packed `PackedRowMask`s and unpacks only the needed slice on device.
+row-packed `PackedRowMask`s and unpacks only the needed slice on device — or,
+for the common text shape, as a lazy `ComboRowMask` (distinct phrase rows plus
+the per-combination AND/OR structure) whose combination runs on the device per
+slice (`_combo_mask_device`; `NOVA_BF_NO_GPU_COMBO=1` restores the packed path).
 
 `SearchSpec.rows` narrows each spec to its own query rows, while shared query
 and filter structures may span larger run-wide unions.
@@ -48,6 +51,7 @@ import numpy as np
 
 from tqdm import tqdm
 
+from nova_bf import filters as filters_mod
 from nova_bf import manifest as run_manifest
 from nova_bf import mv_fp16
 from nova_bf import profiling
@@ -56,6 +60,7 @@ from nova_bf import topk_triton
 from nova_bf import twopass
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import (
+    ComboRowMask,
     PackedRowMask,
     _condition_mask,
     _match_any_membership,
@@ -1430,6 +1435,7 @@ def _reset_prune_instrumentation() -> None:
     })
     # A helper left by a caller outside `run_compute` must not carry into this run.
     _close_dense_staging()
+    _close_resident_pools()
 
 
 # Track how many query/slice rows survive pruning, overall and per search.
@@ -2558,6 +2564,327 @@ def _packed_slice_any(packed: np.ndarray, bit_offset: int, n_rows: int) -> bool:
     return bool(packed[:, lo_byte + 1 : hi_byte - 1].any())
 
 
+def _pack_cols_device(B, n: int):
+    """Pack each row of B into a compact bit representation on the GPU.
+
+    Each group of 8 columns becomes one byte, with nonzero values represented
+    as 1 bits and zero values as 0 bits. The first column in each group
+    occupies the most significant bit.
+
+    Input:  (rows, n) uint8 tensor
+    Output: (rows, ceil(n / 8)) uint8 tensor
+
+    If n is not divisible by 8, unused bits in the last byte are set to 0.
+    Equivalent to np.packbits(B != 0, axis=1), but runs on the GPU.
+    """
+    import torch
+
+    rows = int(B.shape[0])
+    w = (n + 7) // 8
+    if n % 8:
+        B = torch.nn.functional.pad(B, (0, 8 * w - n))
+    B = B.view(rows, w, 8)
+    out = torch.zeros((rows, w), dtype=torch.uint8, device=B.device)
+    for j in range(8):
+        out |= (B[:, :, j] != 0).to(torch.uint8) << (7 - j)
+    return out
+
+
+# Per-chunk temporaries of `_expand_unpack` (a uint8 and a bool of this size).
+_UNPACK_CHUNK_BYTES = 8 << 20
+
+
+def _expand_unpack(R, combo_of_query, bit_offset: int, n: int):
+    """Expand shared packed bitmasks into per-query boolean masks.
+
+    Each query selects a packed row from R via `combo_of_query`, then unpacks
+    the requested bit range. Processes queries in chunks to limit temporary
+    GPU memory usage.
+    """
+    import torch
+
+    n_q = int(combo_of_query.shape[0])
+    w = int(R.shape[1])
+    out = torch.empty((n_q, n), dtype=torch.bool, device=R.device)
+    shifts = _bit_shifts(R.device).view(1, 1, 8)
+    budget = min(_UNPACK_CHUNK_BYTES, (n_q * w) or 1)   # 1/8 of n_q x 8w
+    step = max(1, budget // max(1, 8 * w))
+    for q0 in range(0, n_q, step):
+        q1 = min(n_q, q0 + step)
+        rq = R.index_select(0, combo_of_query[q0:q1])
+        bits = (rq.unsqueeze(2) & shifts).reshape(q1 - q0, 8 * w)
+        del rq
+        torch.ne(bits[:, bit_offset:bit_offset + n], 0, out=out[q0:q1])
+        del bits
+    return out
+
+
+# Keep the full mask table on the device if it fits within the memory budget.
+# Otherwise, load smaller windows as needed to limit GPU and host memory use.
+_RESIDENT_PARTS_FREE_FRACTION = 0.25
+_RESIDENT_WINDOW_MAX_BYTES = 1 << 30
+_RESIDENT_WINDOW_BYTES = None  # Override window size for testing.
+
+# Reuse device buffers across files to avoid repeated allocations and excess
+# GPU memory reservation. Include extra capacity for varying file sizes.
+_RESIDENT_HEADROOM = 1.125
+_RESIDENT_ALIGN = 2 << 20
+
+# Pool of reusable buffers per device. Access is limited to one thread,
+# and operations use the same CUDA stream, so no synchronization is needed.
+_RESIDENT_POOLS: dict = {}
+
+
+class _Resident:
+    """Track a mask's device buffer and the currently loaded window.
+
+    The mask is loaded in fixed-width column windows to limit GPU memory
+    usage. `k` identifies the loaded window (-1 if none), and `view`
+    provides access to its data.
+    """
+
+    __slots__ = ("device", "buf", "width", "k", "view")
+
+    def __init__(self, device, buf, width):
+        self.device = device
+        self.buf = buf
+        self.width = width
+        self.k = -1
+        self.view = None
+
+
+def _resident_device_key(device) -> str:
+    """Pool key: "cuda" and "cuda:0" (the current device) are one pool."""
+    import torch
+
+    dev = torch.device(device)
+    return str(_indexed_cuda(dev)) if dev.type == "cuda" else str(dev)
+
+
+def _resident_largest_pooled(device) -> int:
+    """Bytes of the largest idle pooled buffer of `device` (0 if none): what
+    `_resident_acquire` can hand over or drop for a new mask, so it counts as
+    free when sizing that mask's window."""
+    if not _RESIDENT_POOLS:
+        return 0
+    return max((b.numel() for b in _RESIDENT_POOLS.get(_resident_device_key(device), ())),
+               default=0)
+
+
+def _close_resident_pools() -> None:
+    """Drop all pooled buffers. Safe to call repeatedly; buffers held by live
+    masks are not in the pools and stay valid."""
+    _RESIDENT_POOLS.clear()
+
+
+def _resident_window_width(n_parts: int, n_cols: int, device) -> int:
+    """Byte-columns per window: all of them when the table fits the budget,
+    else as many as `min(budget, _RESIDENT_WINDOW_MAX_BYTES)` holds (>= 1)."""
+    import torch
+
+    if _RESIDENT_WINDOW_BYTES is not None:
+        return max(1, min(n_cols, _RESIDENT_WINDOW_BYTES // max(1, n_parts)))
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return n_cols
+    free_mem, _ = torch.cuda.mem_get_info(dev)
+    # Include unused CUDA cached memory in the available budget, since PyTorch
+    # can reuse it for new allocations.
+    free_mem += torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+    free_mem += _resident_largest_pooled(device)
+    budget = _RESIDENT_PARTS_FREE_FRACTION * free_mem
+    if n_parts * n_cols <= budget:
+        return n_cols
+    return max(1, min(n_cols, int(min(budget, _RESIDENT_WINDOW_MAX_BYTES)) // max(1, n_parts)))
+
+
+def _resident_acquire(device, need: int):
+    """Acquire a reusable device buffer with at least `need` bytes.
+
+    Reuses the smallest suitable buffer, or allocates a new one with extra
+    capacity. Drops undersized buffers to avoid excess memory usage.
+    """
+    import torch
+
+    free = _RESIDENT_POOLS.setdefault(_resident_device_key(device), [])
+    fits = [i for i, b in enumerate(free) if b.numel() >= need]
+    if fits:
+        filters_mod._count("resident_reuses")
+        return free.pop(min(fits, key=lambda j: free[j].numel()))
+    if free:
+        free.pop(max(range(len(free)), key=lambda j: free[j].numel()))
+    cap = -(-int(need * _RESIDENT_HEADROOM) // _RESIDENT_ALIGN) * _RESIDENT_ALIGN
+    filters_mod._count("resident_allocs")
+    return torch.empty(max(cap, need), dtype=torch.uint8, device=device)
+
+
+def _resident_entry(cm: "ComboRowMask", device) -> _Resident:
+    """Get or create the mask's resident device state.
+
+    On first use, acquires a reusable buffer and determines the window
+    size. Caches the state for reuse without uploading any data yet.
+    """
+    key = str(device)
+    ent = cm._parts_dev.get(key)
+    if ent is None:
+        n_p, nb = cm.parts.shape
+        width = _resident_window_width(n_p, nb, device)
+        ent = cm._parts_dev[key] = _Resident(
+            device, _resident_acquire(device, n_p * width), width)
+    return ent
+
+
+def _resident_window(cm: "ComboRowMask", device, k: int):
+    """Return the requested mask window from device memory.
+
+    Reuses the loaded window when possible, otherwise uploads the new
+    window. Copies are ordered after previous GPU operations.
+    """
+    import torch
+
+    ent = _resident_entry(cm, device)
+    n_p, nb = cm.parts.shape
+    if ent.k != k:
+        c0, c1 = k * ent.width, min(nb, (k + 1) * ent.width)
+        src = cm.parts if (c0, c1) == (0, nb) else np.ascontiguousarray(cm.parts[:, c0:c1])
+        view = ent.buf[: n_p * (c1 - c0)].view(n_p, c1 - c0)
+        with profiling.slice_mark("bf_combo_parts_upload"):
+            view.copy_(torch.from_numpy(src))
+        filters_mod._count("resident_uploads")
+        ent.k, ent.view = k, view
+    return ent.view
+
+
+def _resident_release(cm: "ComboRowMask") -> None:
+    """Return the mask's device buffers to the pool for reuse.
+
+    Clears the mask's cached device state.
+    """
+    for key, ent in list(cm._parts_dev.items()):
+        if isinstance(ent, _Resident):
+            free = _RESIDENT_POOLS.setdefault(_resident_device_key(ent.device), [])
+            if all(b is not ent.buf for b in free):
+                free.append(ent.buf)
+    cm.release_device()
+
+
+def _combo_mask_device(cm: "ComboRowMask", true_rows, device):
+    """Build a per-query boolean mask for the selected rows on the device.
+
+    Combines the mask's shared components on the GPU, then expands them into
+    individual query masks. `parts` is read from the device (whole, or in
+    column windows when it is too big) and slices with no matching rows are
+    skipped.
+
+    Returns (n_queries, n_rows) boolean tensor, or None if no rows match.
+    """
+    import torch
+
+    n_p, nb = cm.parts.shape
+    if cm.n_queries == 0 or nb == 0:
+        return None
+    # Check for matching rows on the host when the query union is cheap to
+    # compute. This avoids unnecessary GPU transfers and synchronization
+    # for empty slices. Otherwise, check the combined mask on the device.
+    host_union = cm.union_packed() if cm.union_is_cheap() else None
+    if isinstance(true_rows, slice):
+        r0, r1 = true_rows.start, true_rows.stop
+        n = r1 - r0
+        if n <= 0:
+            return None
+        if host_union is not None and not _packed_slice_any(host_union[None, :], r0, n):
+            return None
+        b0, b1 = r0 >> 3, (r1 + 7) >> 3
+        w = _resident_entry(cm, device).width
+        k0, k1 = b0 // w, (b1 - 1) // w
+        if k0 == k1:
+            # a view: combine_torch only index_selects rows
+            win = _resident_window(cm, device, k0)
+            R = cm.combine_torch(win[:, b0 - k0 * w:b1 - k0 * w])
+        else:
+            # The slice crosses windows: combine each window's columns
+            # separately (columns are independent) into one result.
+            R = None
+            for k in range(k0, k1 + 1):
+                lo, hi = max(b0, k * w), min(b1, (k + 1) * w)
+                part = _resident_window(cm, device, k)[:, lo - k * w:hi - k * w]
+                if R is None:
+                    R = torch.empty((cm.n_combos, b1 - b0), dtype=torch.uint8,
+                                    device=part.device)
+                R[:, lo - b0:hi - b0] = cm.combine_torch(part)
+        if host_union is None:
+            # Clear the bits outside [r0, r1) in the boundary bytes, so the
+            # empty check is exact (the unpack below trims them anyway).
+            head = 0xFF >> (r0 & 7)
+            tail = (0xFF << ((-r1) & 7)) & 0xFF
+            if b1 - b0 == 1:
+                R[:, 0] &= head & tail
+            else:
+                R[:, 0] &= head
+                R[:, -1] &= tail
+            if not bool(R.any()):
+                return None
+        filters_mod._count("device_builds")
+        return _expand_unpack(R, cm.device_index(R.device)[3], r0 & 7, n)
+    sel = (np.uint8(1) << (7 - (true_rows & 7)).astype(np.uint8))
+    if host_union is not None and not (host_union[true_rows >> 3] & sel).any():
+        return None
+    n = len(true_rows)
+    if n == 0:
+        return None     # nothing selected: same as the packed path
+    # Gather each selected row's byte from every part on the device, keep only
+    # the row's own bit, then repack to bits so the combine runs at bit width.
+    # Done in chunks of rows (multiples of 8, so each chunk packs into whole
+    # bytes of P): the byte-wide gather is n_parts x rows, and n_parts can be
+    # well above the query count, so an unchunked gather could dwarf the mask.
+    cols = np.ascontiguousarray(true_rows >> 3, dtype=np.int64)
+    w = _resident_entry(cm, device).width
+    step = max(8, (_COMBINE_CHUNK_ROWS_BYTES // max(1, n_p)) // 8 * 8)
+    P = None
+    for i0 in range(0, n, step):
+        i1 = min(n, i0 + step)
+        sub = _gather_part_bytes(cm, device, cols[i0:i1], w, nb)
+        sub &= torch.from_numpy(sel[i0:i1]).to(sub.device, non_blocking=True)
+        if P is None:
+            P = torch.empty((n_p, (n + 7) // 8), dtype=torch.uint8, device=sub.device)
+        P[:, i0 >> 3:(i1 + 7) >> 3] = _pack_cols_device(sub, i1 - i0)
+        del sub
+    R = cm.combine_torch(P)
+    # padding bits are 0 in every part, hence in every combined row: exact
+    if host_union is None and not bool(R.any()):
+        return None
+    filters_mod._count("device_builds")
+    del P
+    return _expand_unpack(R, cm.device_index(R.device)[3], 0, n)
+
+
+# Byte budget of one row chunk of the compacted gather (n_parts x rows bytes).
+_COMBINE_CHUNK_ROWS_BYTES = 64 << 20
+
+
+def _gather_part_bytes(cm: "ComboRowMask", device, cols: np.ndarray, w: int, nb: int):
+    """`(n_parts, len(cols))` uint8: each part's byte at byte-columns `cols`,
+    read from the device copy of `parts` (window by window if it is windowed)."""
+    import torch
+
+    if w >= nb:
+        win = _resident_window(cm, device, 0)
+        return win.index_select(1, torch.from_numpy(cols).to(win.device, non_blocking=True))
+    sub = None
+    ks = cols // w
+    for k in np.unique(ks).tolist():
+        pos = np.flatnonzero(ks == k)
+        win = _resident_window(cm, device, k)
+        if sub is None:
+            sub = torch.empty((cm.parts.shape[0], len(cols)), dtype=torch.uint8,
+                              device=win.device)
+        got = win.index_select(
+            1, torch.from_numpy(cols[pos] - k * w).to(win.device, non_blocking=True))
+        sub.index_copy_(1, torch.from_numpy(pos).to(win.device, non_blocking=True), got)
+        del got
+    return sub
+
+
 # `cache.get` sentinel: an EMPTY per-query mask caches as `None`, which is a
 # real cached value here, not a miss (see `_process_shared_batch`'s `select`).
 _UNCACHED = object()
@@ -2577,7 +2904,11 @@ def _union_keep(
     parts = []
     for f in filters:
         m = keeps[f]
-        if isinstance(m, PackedRowMask):
+        if isinstance(m, ComboRowMask):
+            # Compute the union of matching rows directly from the shared mask
+            # components, avoiding expansion into individual query masks.
+            m = m.union_rows()
+        elif isinstance(m, PackedRowMask):
             m = np.unpackbits(
                 np.bitwise_or.reduce(m.packed, axis=0), count=n_rows
             ).astype(bool)
@@ -5573,6 +5904,8 @@ def _process_shared_batch(
                 f"per-query filter mask is {pm.n_queries} queries "
                 f"tall, expected {filter_n_q[f]}"
             )
+        if isinstance(pm, ComboRowMask):
+            return _combo_mask_device(pm, true_rows, device)
         if isinstance(true_rows, slice):
             r0, r1 = true_rows.start, true_rows.stop
             if not _packed_slice_any(pm.packed, r0, r1 - r0):
@@ -5888,6 +6221,9 @@ def run_compute(
     # Same for the kernel launch counters, which live in the kernel modules.
     _reset_sparse_branches()
     _reset_prune_instrumentation()
+    filters_mod.reset_combo_usage()
+    # Resolved once per run so every file takes the same combine path.
+    use_combo = filters_mod.combo_enabled()
     # After the reset, which returns the mode to "unconfigured".
     twopass.set_rescore_mode(cfg.params.two_pass_rescore)
     twopass.set_pipeline_pass_one(cfg.params.pipeline_pass_one)
@@ -7132,16 +7468,22 @@ def run_compute(
                         with ThreadPoolExecutor(max_workers=len(cpu_fallback_filters)) as pool:
                             masks = list(pool.map(
                                 lambda f: evaluate(f, table, filter_query_vals[f],
-                                                   filter_pool, filter_text_prep[f]),
+                                                   filter_pool, filter_text_prep[f],
+                                                   combo=use_combo),
                                 cpu_fallback_filters,
                             ))
                     else:
                         masks = [evaluate(f, table, filter_query_vals[f], filter_pool,
-                                          filter_text_prep[f])
+                                          filter_text_prep[f], combo=use_combo)
                                  for f in cpu_fallback_filters]
                     for f, mask in zip(cpu_fallback_filters, masks):
                         # `evaluate` already returns the per-query case ROW-PACKED
-                        # (a `filters.PackedRowMask`); nothing to do here.
+                        # (a `filters.PackedRowMask`) or as a lazy
+                        # `filters.ComboRowMask`. Warm a lazy mask's row union
+                        # here, on the reader, when it is cheap: the GPU thread
+                        # then decides empty slices on the host without a sync.
+                        if isinstance(mask, ComboRowMask) and mask.union_is_cheap():
+                            mask.union_packed()
                         keeps[f] = mask
 
                     # GPU-eligible filters share/deduplicate corpus leaf arrays.
@@ -7444,6 +7786,14 @@ def run_compute(
                             spec_thr_ext=spec_thr_ext,
                         )
 
+                # This file's slices are all enqueued: return its lazy masks'
+                # resident `parts` buffers to the pool and drop their index
+                # tensors now, before the next file's masks take buffers,
+                # rather than whenever the last reference happens to drop.
+                for m in keeps.values():
+                    if isinstance(m, ComboRowMask):
+                        _resident_release(m)
+
                 # Threshold exchange: publish ours, pick up the peers' maximum.
                 _publish_thresholds()
                 _apply_external_thresholds(gidx)
@@ -7579,7 +7929,10 @@ def run_compute(
                 twopass.release()
             finally:
                 # Join the run-scoped dense staging helper on every exit path.
-                _close_dense_staging()
+                try:
+                    _close_dense_staging()
+                finally:
+                    _close_resident_pools()
 
     wall = time.perf_counter() - wall0
     gb = bytes_seen / 1e9
@@ -8054,6 +8407,9 @@ def run_compute(
         # RESOLVED native I/O settings (NOVA_BF_RUST_FETCH_* over the config).
         # Per-file fallbacks to pyarrow are logged, not counted here.
         "rust_fetch": rust_fetch_settings(),
+        # Per-query text combine: lazy `ComboRowMask` combined on the device
+        # (permitted unless NOVA_BF_NO_GPU_COMBO) and what actually ran.
+        "text_filter_combine": {**filters_mod.combo_usage(), "permitted": use_combo},
         # Snapshot exchange statistics to avoid concurrent updates during serialization.
         "threshold_exchange_stats": dict(thr_exchange_stats),
 
