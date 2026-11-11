@@ -43,6 +43,9 @@ impl StormConfig {
             .take()
             .map(|n| n.trim().to_string())
             .filter(|n| !n.is_empty());
+        if let Some(hybrid) = cfg.query.hybrid.as_mut() {
+            hybrid.sparse_vector_name = hybrid.sparse_vector_name.trim().to_string();
+        }
         // A `.limit(0)` query returns nothing and, if `ground_truth_column` is
         // set, divides recall by 0 (NaN) — reject at config time rather than
         // silently corrupting the summary.
@@ -94,6 +97,7 @@ impl StormConfig {
         {
             return Err(ConfigError::SparseTargetUnsupported);
         }
+        validate_hybrid(&cfg)?;
         if let Some(filter) = &cfg.query.filter {
             filter.validate()?;
         }
@@ -109,6 +113,47 @@ impl StormConfig {
         })?;
         Self::from_yaml(&yaml)
     }
+}
+
+/// `vector_type: hybrid` needs all of its parts, and its parts mean nothing
+/// without it — a `hybrid` block or `sparse_column` on a dense run would
+/// otherwise be silently ignored, and the run would measure something else.
+fn validate_hybrid(cfg: &StormConfig) -> Result<(), ConfigError> {
+    let q = &cfg.query;
+    let fail = |msg: &str| Err(ConfigError::Hybrid(msg.to_string()));
+    if q.vector_type != VectorType::Hybrid {
+        if q.hybrid.is_some() || q.source.sparse_column.is_some() {
+            return fail("query.hybrid and query.source.sparse_column need `vector_type: hybrid`");
+        }
+        return Ok(());
+    }
+    if !matches!(cfg.target, crate::targets::TargetConfig::Qdrant(_)) {
+        return fail("only the qdrant target speaks hybrid queries today");
+    }
+    if q.vector_name.is_none() {
+        return fail("query.vector_name must name the dense vector the dense prefetch searches");
+    }
+    let Some(hybrid) = &q.hybrid else {
+        return fail("query.hybrid must be set (sparse_vector_name, optional prefetch_limit, fusion)");
+    };
+    if hybrid.sparse_vector_name.trim().is_empty() {
+        return fail("query.hybrid.sparse_vector_name must name the collection's sparse vector");
+    }
+    if hybrid.prefetch_limit == Some(0) {
+        return fail("query.hybrid.prefetch_limit must be greater than 0");
+    }
+    if q.source.sparse_column.as_deref().is_none_or(|c| c.trim().is_empty()) {
+        return fail("query.source.sparse_column must name the queries' sparse vector column");
+    }
+    // A fused score is a rank-derived number, not a distance: the tie-aware
+    // reporting would compare it with the ground truth's distances.
+    if q.source.ground_truth_score_column.is_some() {
+        return fail(
+            "query.source.ground_truth_score_column can't be used with hybrid: fused scores \
+             are not comparable with ground-truth scores (ground_truth_column alone is fine)",
+        );
+    }
+    Ok(())
 }
 
 impl QueryConfig {
@@ -129,6 +174,36 @@ pub enum VectorType {
     #[default]
     Dense,
     Sparse,
+    /// Dense AND sparse, fused server-side: `source.column` is the dense half,
+    /// `source.sparse_column` the sparse half, `query.hybrid` how they combine.
+    Hybrid,
+}
+
+/// `query.hybrid`: how a `vector_type: hybrid` query is put together — one
+/// prefetch per modality, each with the run's filter, then a fusion of the
+/// two lists. The dense prefetch searches `query.vector_name` with
+/// `query.search_params`; the sparse one searches `sparse_vector_name`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HybridConfig {
+    /// The collection's sparse vector, searched by the sparse prefetch.
+    pub sparse_vector_name: String,
+    /// Candidates each prefetch hands to the fusion. Unset = `top_k`.
+    #[serde(default)]
+    pub prefetch_limit: Option<u64>,
+    #[serde(default)]
+    pub fusion: Fusion,
+}
+
+/// How the two prefetch lists become one ranking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fusion {
+    /// Reciprocal rank fusion.
+    #[default]
+    Rrf,
+    /// Distribution-based score fusion.
+    Dbsf,
 }
 
 /// What to query with: the named vector, how many neighbours, and where the
@@ -144,6 +219,10 @@ pub struct QueryConfig {
     /// has them), and only the qdrant target supports it today.
     #[serde(default)]
     pub vector_type: VectorType,
+    /// Required by, and only allowed with, `vector_type: hybrid` — see
+    /// [`HybridConfig`].
+    #[serde(default)]
+    pub hybrid: Option<HybridConfig>,
     #[serde(default = "default_top_k")]
     pub top_k: u64,
     /// Two scores within this RELATIVE tolerance (`|a-b| / (1+|b|)`) count as
@@ -339,6 +418,11 @@ pub struct QuerySource {
     /// entries share that score.
     #[serde(default)]
     pub ground_truth_score_column: Option<String>,
+    /// The sparse half of a `vector_type: hybrid` query, a
+    /// `struct{indices, values}` column in the same row as `column` (the
+    /// dense half). Only allowed with `vector_type: hybrid`.
+    #[serde(default)]
+    pub sparse_column: Option<String>,
 }
 
 /// Per-worker load shape, replicated (NOT sharded) across the fleet.
@@ -521,6 +605,8 @@ pub enum ConfigError {
          the qdrant target speaks sparse today"
     )]
     SparseTargetUnsupported,
+    #[error("hybrid query: {0}")]
+    Hybrid(String),
     #[error(
         "filter condition on `{field}` must set exactly one of `match`, `range`, `match_text`, \
          `match_from_query`, `range_from_query`, or `match_text_from_query`"
@@ -920,6 +1006,94 @@ query:
         assert!(matches!(err, ConfigError::SparseTargetUnsupported));
     }
 
+    /// A hybrid config against `target`, with `query` and `source` extras.
+    fn hybrid_yaml(target: &str, query: &str, source: &str) -> String {
+        format!(
+            "target:\n{target}query:\n{query}  source:\n    uri: /tmp/q.parquet\n    \
+             column: dense_embedding\n{source}"
+        )
+    }
+
+    const QDRANT: &str = "  type: qdrant\n  url: http://localhost:6334\n  collection_name: c\n";
+    const HYBRID_QUERY: &str = "  vector_type: hybrid\n  vector_name: dense\n  hybrid:\n    \
+                                sparse_vector_name: \" sparse \"\n";
+    const SPARSE_COLUMN: &str = "    sparse_column: sparse_embedding\n";
+
+    #[cfg(feature = "elastic")]
+    #[test]
+    fn hybrid_against_a_target_without_it_is_rejected() {
+        let elastic = "  type: elastic\n  url: http://localhost:9200\n  index_name: c\n";
+        let err = StormConfig::from_yaml(&hybrid_yaml(elastic, HYBRID_QUERY, SPARSE_COLUMN))
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::Hybrid(_)), "{err}");
+    }
+
+    #[test]
+    fn parses_hybrid_with_defaults() {
+        let cfg = StormConfig::from_yaml(&hybrid_yaml(QDRANT, HYBRID_QUERY, SPARSE_COLUMN))
+            .expect("parses");
+        assert_eq!(cfg.query.vector_type, VectorType::Hybrid);
+        let hybrid = cfg.query.hybrid.expect("hybrid block");
+        assert_eq!(hybrid.sparse_vector_name, "sparse"); // padding gone
+        assert_eq!(hybrid.prefetch_limit, None);
+        assert_eq!(hybrid.fusion, Fusion::Rrf);
+        assert_eq!(cfg.query.source.sparse_column.as_deref(), Some("sparse_embedding"));
+    }
+
+    #[test]
+    fn parses_hybrid_fusion_and_prefetch_limit() {
+        let query = format!("{HYBRID_QUERY}    prefetch_limit: 200\n    fusion: dbsf\n");
+        let cfg =
+            StormConfig::from_yaml(&hybrid_yaml(QDRANT, &query, SPARSE_COLUMN)).expect("parses");
+        let hybrid = cfg.query.hybrid.expect("hybrid block");
+        assert_eq!(hybrid.prefetch_limit, Some(200));
+        assert_eq!(hybrid.fusion, Fusion::Dbsf);
+    }
+
+    #[test]
+    fn hybrid_rejects_missing_or_stray_parts() {
+        let cases = [
+            // each part missing
+            hybrid_yaml(QDRANT, HYBRID_QUERY, ""),
+            hybrid_yaml(QDRANT, "  vector_type: hybrid\n  vector_name: dense\n", SPARSE_COLUMN),
+            hybrid_yaml(
+                QDRANT,
+                "  vector_type: hybrid\n  hybrid:\n    sparse_vector_name: sparse\n",
+                SPARSE_COLUMN,
+            ),
+            hybrid_yaml(
+                QDRANT,
+                "  vector_type: hybrid\n  vector_name: dense\n  hybrid:\n    sparse_vector_name: \" \"\n",
+                SPARSE_COLUMN,
+            ),
+            hybrid_yaml(QDRANT, &format!("{HYBRID_QUERY}    prefetch_limit: 0\n"), SPARSE_COLUMN),
+            // fused scores are not ground-truth distances
+            hybrid_yaml(
+                QDRANT,
+                HYBRID_QUERY,
+                &format!("{SPARSE_COLUMN}    ground_truth_column: hit_ids\n    ground_truth_score_column: hit_scores\n"),
+            ),
+            // hybrid parts on a dense run would be silently ignored
+            hybrid_yaml(QDRANT, "  vector_name: dense\n", SPARSE_COLUMN),
+            hybrid_yaml(
+                QDRANT,
+                "  vector_name: dense\n  hybrid:\n    sparse_vector_name: sparse\n",
+                "",
+            ),
+        ];
+        for yaml in &cases {
+            let err = StormConfig::from_yaml(yaml).unwrap_err();
+            assert!(matches!(err, ConfigError::Hybrid(_)), "{yaml}\n-> {err}");
+        }
+        // ground_truth_column alone is allowed: a hybrid ground truth is valid.
+        let with_gt = hybrid_yaml(
+            QDRANT,
+            HYBRID_QUERY,
+            &format!("{SPARSE_COLUMN}    ground_truth_column: hit_ids\n"),
+        );
+        StormConfig::from_yaml(&with_gt).expect("ground_truth_column alone is fine");
+    }
+
     #[test]
     fn qdrant_timeout_defaults_generous_and_is_settable() {
         use crate::targets::TargetConfig;
@@ -975,7 +1149,7 @@ query:
     #[test]
     fn unknown_vector_type_is_rejected() {
         let err =
-            StormConfig::from_yaml(&yaml_with_query_extras("  vector_type: hybrid\n")).unwrap_err();
+            StormConfig::from_yaml(&yaml_with_query_extras("  vector_type: multivector\n")).unwrap_err();
         assert!(matches!(err, ConfigError::Yaml(_)));
     }
 

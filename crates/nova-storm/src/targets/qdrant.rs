@@ -9,8 +9,9 @@ use qdrant_client::Qdrant;
 use qdrant_client::qdrant::Filter as QdrantFilter;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::{
-    Condition, DatetimeRange, QuantizationSearchParams, Query, QueryBatchPointsBuilder,
-    QueryPointsBuilder, Range as QdrantRange, ScoredPoint, SearchParams, Timestamp, VectorInput,
+    Condition, DatetimeRange, PrefetchQuery, PrefetchQueryBuilder, QuantizationSearchParams, Query,
+    QueryBatchPointsBuilder, QueryPointsBuilder, Range as QdrantRange, ScoredPoint, SearchParams,
+    Timestamp, VectorInput,
 };
 use serde::Deserialize;
 
@@ -91,6 +92,17 @@ pub struct QdrantTarget {
     /// `query_batch`, using that query's own `QueryVector::filter_values`.
     /// Mutually exclusive with `static_filter` being `Some`.
     per_query_filter: Option<Filter>,
+    /// Set for `vector_type: hybrid`: how each query's two halves are
+    /// prefetched and fused (see [`hybrid_query`]).
+    hybrid: Option<HybridPlan>,
+}
+
+/// `query.hybrid`, resolved once at construction.
+#[derive(Debug, Clone)]
+struct HybridPlan {
+    sparse_vector_name: String,
+    prefetch_limit: u64,
+    fusion: qdrant_client::qdrant::Fusion,
 }
 
 impl From<&QuantizationSearchParamsConfig> for QuantizationSearchParams {
@@ -226,6 +238,14 @@ impl QdrantConfig {
             },
             static_filter,
             per_query_filter,
+            hybrid: query.hybrid.as_ref().map(|h| HybridPlan {
+                sparse_vector_name: h.sparse_vector_name.clone(),
+                prefetch_limit: h.prefetch_limit.unwrap_or(query.top_k),
+                fusion: match h.fusion {
+                    crate::config::Fusion::Rrf => qdrant_client::qdrant::Fusion::Rrf,
+                    crate::config::Fusion::Dbsf => qdrant_client::qdrant::Fusion::Dbsf,
+                },
+            }),
         })
     }
 }
@@ -382,7 +402,63 @@ fn query_input(vector: &VectorData) -> Query {
         VectorData::Sparse { indices, values } => {
             Query::new_nearest(VectorInput::new_sparse(indices.clone(), values.clone()))
         }
+        VectorData::Hybrid { .. } => unreachable!("hybrid queries are built by hybrid_query"),
     }
+}
+
+/// A hybrid query's two prefetches and their fusion. Each prefetch carries the
+/// run's filter (so both candidate lists are already restricted, and neither
+/// spends its `prefetch_limit` on points the filter would drop) and fetches
+/// `prefetch_limit` candidates; the search params tune the dense HNSW search
+/// only, since the sparse index has no `ef` or quantization. The fusion then
+/// ranks the union, and the outer request's `limit` keeps `top_k` of it.
+fn hybrid_query(
+    vector: &VectorData,
+    plan: &HybridPlan,
+    dense_vector_name: Option<&str>,
+    search_params: Option<&SearchParams>,
+    filter: Option<&QdrantFilter>,
+) -> ([PrefetchQuery; 2], Query) {
+    let VectorData::Hybrid {
+        dense,
+        indices,
+        values,
+    } = vector
+    else {
+        unreachable!("hybrid_query is only called with a hybrid vector");
+    };
+    let mut dense_prefetch = PrefetchQueryBuilder::default()
+        .query(Query::new_nearest(dense.clone()))
+        .limit(plan.prefetch_limit);
+    if let Some(name) = dense_vector_name {
+        dense_prefetch = dense_prefetch.using(name);
+    }
+    if let Some(params) = search_params {
+        dense_prefetch = dense_prefetch.params(params.clone());
+    }
+    let mut sparse_prefetch = PrefetchQueryBuilder::default()
+        .query(Query::new_nearest(VectorInput::new_sparse(
+            indices.clone(),
+            values.clone(),
+        )))
+        .using(plan.sparse_vector_name.clone())
+        .limit(plan.prefetch_limit);
+    if let Some(filter) = filter {
+        dense_prefetch = dense_prefetch.filter(filter.clone());
+        sparse_prefetch = sparse_prefetch.filter(filter.clone());
+    }
+    (
+        [dense_prefetch.build(), sparse_prefetch.build()],
+        Query::new_fusion(plan.fusion),
+    )
+}
+
+/// An exact keyword match. Not `Condition::matches(field, String)`: qdrant-client
+/// turns a string holding whitespace into a FULL-TEXT match, so `match: "Next UK"`
+/// would not be an equality at all, and on a server in strict mode (Qdrant Cloud)
+/// it fails for want of a text index.
+fn keyword(s: &str) -> qdrant_client::qdrant::r#match::MatchValue {
+    qdrant_client::qdrant::r#match::MatchValue::Keyword(s.to_string())
 }
 
 /// Translate a `match`/`match_from_query` value. Qdrant's own match condition
@@ -393,7 +469,7 @@ fn to_qdrant_match_condition(field: &str, spec: &MatchSpec) -> Result<Condition,
     match spec {
         MatchSpec::One(MatchValue::Bool(b)) => Ok(Condition::matches(field, *b)),
         MatchSpec::One(MatchValue::Int(i)) => Ok(Condition::matches(field, *i)),
-        MatchSpec::One(MatchValue::Str(s)) => Ok(Condition::matches(field, s.clone())),
+        MatchSpec::One(MatchValue::Str(s)) => Ok(Condition::matches(field, keyword(s))),
         MatchSpec::One(MatchValue::Float(v)) => Err(float_match_error(field, *v)),
         MatchSpec::Any(values) => to_qdrant_match_any(field, values),
     }
@@ -453,7 +529,7 @@ fn to_qdrant_match_from_value(
     value: &FilterFieldValue,
 ) -> Result<Condition, TargetError> {
     match value {
-        FilterFieldValue::Text(s) => Ok(Condition::matches(field, s.clone())),
+        FilterFieldValue::Text(s) => Ok(Condition::matches(field, keyword(s))),
         FilterFieldValue::Int(i) => Ok(Condition::matches(field, *i)),
         FilterFieldValue::Num(n) => integer_value(*n)
             .map(|i| Condition::matches(field, i))
@@ -724,9 +800,26 @@ impl QueryTarget for QdrantTarget {
             .iter()
             .map(|q| {
                 let mut builder = QueryPointsBuilder::new(&self.collection_name)
-                    .query(query_input(&q.vector))
                     .limit(self.top_k)
                     .with_payload(self.with_payload.clone());
+                if let VectorData::Hybrid { .. } = &q.vector {
+                    let plan = self.hybrid.as_ref().ok_or_else(|| {
+                        TargetError::Other("hybrid query vector without query.hybrid".to_string())
+                    })?;
+                    let filter = self.effective_filter(q)?;
+                    let (prefetches, fusion) = hybrid_query(
+                        &q.vector,
+                        plan,
+                        self.vector_name.as_deref(),
+                        self.search_params.as_ref(),
+                        filter.as_ref(),
+                    );
+                    for prefetch in prefetches {
+                        builder = builder.add_prefetch(prefetch);
+                    }
+                    return Ok(builder.query(fusion).build());
+                }
+                builder = builder.query(query_input(&q.vector));
                 if let Some(name) = &self.vector_name {
                     builder = builder.using(name.clone());
                 }
@@ -1182,6 +1275,80 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- sparse
+
+    #[test]
+    fn string_matches_are_keyword_even_with_spaces() {
+        use qdrant_client::qdrant::r#match::MatchValue as Qm;
+
+        let want = Condition::matches("advertiser", Qm::Keyword("Next UK".into()));
+        let literal = to_qdrant_match_condition(
+            "advertiser",
+            &MatchSpec::One(MatchValue::Str("Next UK".into())),
+        )
+        .unwrap();
+        let per_query =
+            to_qdrant_match_from_value("advertiser", &FilterFieldValue::Text("Next UK".into()))
+                .unwrap();
+        assert_eq!(literal, want);
+        assert_eq!(per_query, want);
+        assert_ne!(
+            per_query,
+            Condition::matches("advertiser", Qm::Text("Next UK".into()))
+        );
+    }
+
+    #[test]
+    fn hybrid_query_prefetches_both_halves_with_the_filter() {
+        use crate::queries::VectorData;
+
+        let plan = HybridPlan {
+            sparse_vector_name: "sparse".into(),
+            prefetch_limit: 50,
+            fusion: qdrant_client::qdrant::Fusion::Rrf,
+        };
+        let params = SearchParams {
+            hnsw_ef: Some(256),
+            ..Default::default()
+        };
+        let filter = QdrantFilter::must([Condition::matches("advertiser", "Nike".to_string())]);
+        let vector = VectorData::Hybrid {
+            dense: vec![0.1, 0.2],
+            indices: vec![7, 42],
+            values: vec![0.5, 0.25],
+        };
+        let ([dense, sparse], fusion) =
+            hybrid_query(&vector, &plan, Some("dense"), Some(&params), Some(&filter));
+
+        assert_eq!(dense.query, Some(Query::new_nearest(vec![0.1, 0.2])));
+        assert_eq!(dense.using.as_deref(), Some("dense"));
+        assert_eq!(dense.params, Some(params));
+        assert_eq!(dense.limit, Some(50));
+        assert_eq!(dense.filter.as_ref(), Some(&filter));
+
+        assert_eq!(
+            sparse.query,
+            Some(Query::new_nearest(VectorInput::new_sparse(
+                vec![7u32, 42],
+                vec![0.5f32, 0.25]
+            )))
+        );
+        assert_eq!(sparse.using.as_deref(), Some("sparse"));
+        assert_eq!(sparse.params, None); // ef / quantization are dense-only
+        assert_eq!(sparse.limit, Some(50));
+        assert_eq!(sparse.filter.as_ref(), Some(&filter));
+
+        assert_eq!(
+            fusion,
+            Query::new_fusion(qdrant_client::qdrant::Fusion::Rrf)
+        );
+
+        // Unfiltered: neither prefetch carries a filter.
+        let ([dense, sparse], _) = hybrid_query(&vector, &plan, Some("dense"), None, None);
+        assert_eq!(
+            (dense.filter, sparse.filter, dense.params),
+            (None, None, None)
+        );
+    }
 
     #[test]
     fn query_input_builds_dense_and_sparse() {

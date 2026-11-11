@@ -42,7 +42,7 @@ Environment variables support `${VAR}` and `${VAR:-default}` expansion.
 |---|---:|---|
 | `top_k` | `10` | Results per query |
 | `vector_name` | none | Named vector to search |
-| `vector_type` | `dense` | `dense` or `sparse` |
+| `vector_type` | `dense` | `dense`, `sparse` or `hybrid` (Qdrant) |
 | `with_payload` | `false` | Payload fields to return |
 | `search_params` | none | Backend-specific search settings |
 | `filter` | none | Qdrant filter |
@@ -50,6 +50,27 @@ Environment variables support `${VAR}` and `${VAR:-default}` expansion.
 | `rbo_p` | derived from `top_k` | RBO persistence |
 
 `query.source.uri` and `column` are required. `limit` controls the number of queries loaded. `ground_truth_column` enables recall; `ground_truth_score_column` enables tie-aware recall.
+
+### Hybrid Queries
+
+`vector_type: hybrid` sends one Qdrant query per row with two prefetches, dense and sparse, and fuses them. `source.column` is the dense half and `source.sparse_column` the sparse half, read from the same row. Each prefetch gets the run's filter; `search_params` apply to the dense prefetch only.
+
+```yaml
+query:
+  vector_type: hybrid
+  vector_name: dense              # the dense prefetch's vector
+  top_k: 10
+  hybrid:
+    sparse_vector_name: sparse    # the sparse prefetch's vector
+    prefetch_limit: 100           # candidates per prefetch; default top_k
+    fusion: rrf                   # rrf (default) or dbsf
+  source:
+    uri: queries.parquet
+    column: dense_embedding
+    sparse_column: sparse_embedding
+```
+
+Recall compares the fused results with `ground_truth_column`, so that ground truth must itself be hybrid. `ground_truth_score_column` is rejected: fused scores are not distances.
 
 ### Search Params
 
