@@ -453,6 +453,14 @@ fn hybrid_query(
     )
 }
 
+/// An exact keyword match. Not `Condition::matches(field, String)`: qdrant-client
+/// turns a string holding whitespace into a FULL-TEXT match, so `match: "Next UK"`
+/// would not be an equality at all, and on a server in strict mode (Qdrant Cloud)
+/// it fails for want of a text index.
+fn keyword(s: &str) -> qdrant_client::qdrant::r#match::MatchValue {
+    qdrant_client::qdrant::r#match::MatchValue::Keyword(s.to_string())
+}
+
 /// Translate a `match`/`match_from_query` value. Qdrant's own match condition
 /// has no float variant (only keyword/integer/bool, plus `MatchAny` lists of
 /// integers or keywords) — a `MatchValue::Float` is rejected here, not at
@@ -461,7 +469,7 @@ fn to_qdrant_match_condition(field: &str, spec: &MatchSpec) -> Result<Condition,
     match spec {
         MatchSpec::One(MatchValue::Bool(b)) => Ok(Condition::matches(field, *b)),
         MatchSpec::One(MatchValue::Int(i)) => Ok(Condition::matches(field, *i)),
-        MatchSpec::One(MatchValue::Str(s)) => Ok(Condition::matches(field, s.clone())),
+        MatchSpec::One(MatchValue::Str(s)) => Ok(Condition::matches(field, keyword(s))),
         MatchSpec::One(MatchValue::Float(v)) => Err(float_match_error(field, *v)),
         MatchSpec::Any(values) => to_qdrant_match_any(field, values),
     }
@@ -521,7 +529,7 @@ fn to_qdrant_match_from_value(
     value: &FilterFieldValue,
 ) -> Result<Condition, TargetError> {
     match value {
-        FilterFieldValue::Text(s) => Ok(Condition::matches(field, s.clone())),
+        FilterFieldValue::Text(s) => Ok(Condition::matches(field, keyword(s))),
         FilterFieldValue::Int(i) => Ok(Condition::matches(field, *i)),
         FilterFieldValue::Num(n) => integer_value(*n)
             .map(|i| Condition::matches(field, i))
@@ -1267,6 +1275,27 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- sparse
+
+    #[test]
+    fn string_matches_are_keyword_even_with_spaces() {
+        use qdrant_client::qdrant::r#match::MatchValue as Qm;
+
+        let want = Condition::matches("advertiser", Qm::Keyword("Next UK".into()));
+        let literal = to_qdrant_match_condition(
+            "advertiser",
+            &MatchSpec::One(MatchValue::Str("Next UK".into())),
+        )
+        .unwrap();
+        let per_query =
+            to_qdrant_match_from_value("advertiser", &FilterFieldValue::Text("Next UK".into()))
+                .unwrap();
+        assert_eq!(literal, want);
+        assert_eq!(per_query, want);
+        assert_ne!(
+            per_query,
+            Condition::matches("advertiser", Qm::Text("Next UK".into()))
+        );
+    }
 
     #[test]
     fn hybrid_query_prefetches_both_halves_with_the_filter() {
