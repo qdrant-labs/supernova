@@ -3527,6 +3527,7 @@ mod tests {
             limit: 10,
             ground_truth_column: Some("hit_ids".into()),
             ground_truth_score_column: Some("hit_scores".into()),
+            sparse_column: None,
         };
         let vectors =
             crate::queries::load_query_vectors(&source, crate::config::VectorType::Dense, None, 2, usize::MAX)

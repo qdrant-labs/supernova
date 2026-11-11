@@ -54,6 +54,13 @@ query:
   # REQUIRED for milvus (the annsField), elastic (the dense_vector field) and
   # opensearch (the knn_vector field).
   vector_name: dense
+  # vector_type: dense              # dense (default) | sparse | hybrid (qdrant only)
+  # Hybrid: dense + sparse prefetches, each with the filter, fused. Needs
+  # source.sparse_column too; see docs/storm/overview.md, "Hybrid Queries".
+  # hybrid:
+  #   sparse_vector_name: sparse
+  #   prefetch_limit: 100           # candidates per prefetch (default top_k)
+  #   fusion: rrf                   # rrf (default) | dbsf
   top_k: 10                         # neighbours per query (default 10)
   # A ground truth DEEPER than top_k is truncated to its first top_k ids at
   # load (the list is best-first, so the prefix is the true top-k) — recall is

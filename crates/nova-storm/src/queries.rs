@@ -33,6 +33,8 @@ use crate::filter::{Filter, FilterFieldValue};
 pub enum VectorData {
     Dense(Vec<f32>),
     Sparse { indices: Vec<u32>, values: Vec<f32> },
+    /// Both halves of one hybrid query, from the same row.
+    Hybrid { dense: Vec<f32>, indices: Vec<u32>, values: Vec<f32> },
 }
 
 impl VectorData {
@@ -42,6 +44,7 @@ impl VectorData {
         match self {
             VectorData::Dense(v) => v.len(),
             VectorData::Sparse { indices, .. } => indices.len(),
+            VectorData::Hybrid { dense, .. } => dense.len(),
         }
     }
 
@@ -49,11 +52,13 @@ impl VectorData {
         self.len() == 0
     }
 
-    /// The dense components, for targets that only speak dense.
+    /// The dense components, for targets that only speak dense. `None` for a
+    /// hybrid query too: searching its dense half alone would silently
+    /// measure a different query.
     pub fn as_dense(&self) -> Option<&[f32]> {
         match self {
             VectorData::Dense(v) => Some(v),
-            VectorData::Sparse { .. } => None,
+            VectorData::Sparse { .. } | VectorData::Hybrid { .. } => None,
         }
     }
 }
@@ -264,6 +269,14 @@ pub fn load_query_vectors(
     // odd characters survive. `cols` is the single source of truth for both the
     // SQL projection and "how many/which columns to read per row" below.
     let mut cols: Vec<&str> = vec![source.column.as_str()];
+    // Hybrid: the sparse half comes second, read right after the dense half.
+    let sparse_column = match vector_type {
+        VectorType::Hybrid => Some(source.sparse_column.as_deref().ok_or_else(|| {
+            QueryLoadError::Other("hybrid queries need query.source.sparse_column".to_string())
+        })?),
+        _ => None,
+    };
+    cols.extend(sparse_column);
     cols.extend(source.ground_truth_column.as_deref());
     let has_gt = source.ground_truth_column.is_some();
     // Only meaningful next to the id column; a score column without ids has
@@ -315,7 +328,7 @@ pub fn load_query_vectors(
                 source.column
             )));
         }
-        VectorType::Dense if is_struct => {
+        VectorType::Dense | VectorType::Hybrid if is_struct => {
             return Err(QueryLoadError::Other(format!(
                 "query column `{}` is `{column_type}`, not a list of floats — should \
                  query.vector_type be `sparse`?",
@@ -323,6 +336,22 @@ pub fn load_query_vectors(
             )));
         }
         _ => {}
+    }
+    if let Some(sparse) = sparse_column {
+        let sparse_type: String = conn.query_row(
+            &format!(
+                "SELECT column_type FROM (DESCRIBE SELECT \"{sparse}\" FROM read_parquet('{uri}'))",
+                uri = sql_str(&source.uri),
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        let t = sparse_type.trim();
+        if !(t.starts_with("STRUCT") && !t.ends_with("[]") && t.contains("indices") && t.contains("values")) {
+            return Err(QueryLoadError::Other(format!(
+                "hybrid sparse column `{sparse}` is `{sparse_type}`, not a struct{{indices, values}}"
+            )));
+        }
     }
 
     // Rows with nothing to query are excluded in SQL, BEFORE `LIMIT`, so they
@@ -333,6 +362,13 @@ pub fn load_query_vectors(
     // Rust-side skip below stays as a backstop for shapes SQL can't see.
     let non_empty = match vector_type {
         VectorType::Dense => format!("coalesce(len(\"{col}\"), 0) > 0", col = source.column),
+        // Both halves: a hybrid query missing one would be a single-modality query.
+        VectorType::Hybrid => format!(
+            "coalesce(len(\"{col}\"), 0) > 0 AND \"{sparse}\" IS NOT NULL \
+             AND coalesce(len(struct_extract(\"{sparse}\", 'indices')), 0) > 0",
+            col = source.column,
+            sparse = sparse_column.unwrap_or_default(),
+        ),
         VectorType::Sparse => format!(
             "coalesce(len(struct_extract(\"{col}\", 'indices')), 0) > 0",
             col = source.column
@@ -379,6 +415,16 @@ pub fn load_query_vectors(
                     continue;
                 }
                 VectorData::Sparse { indices, values }
+            }
+            VectorType::Hybrid => {
+                let dense = float_list(vector)?;
+                let sparse = values.next().expect("hybrid sparse column always present");
+                let (indices, values) = sparse_vector(sparse)?;
+                if dense.is_empty() || indices.is_empty() {
+                    empty_skipped += 1;
+                    continue;
+                }
+                VectorData::Hybrid { dense, indices, values }
             }
         };
         let ground_truth = if has_gt { values.next() } else { None };
@@ -1218,6 +1264,7 @@ mod tests {
             limit: 10,
             ground_truth_column: ground_truth_column.map(str::to_string),
             ground_truth_score_column: None,
+            sparse_column: None,
         }
     }
 
@@ -1455,6 +1502,83 @@ mod tests {
             vectors[0].filter_values.get("max_budget"),
             Some(&FilterFieldValue::Num(42.5))
         );
+    }
+
+    // ---------------------------------------------------------------- hybrid
+
+    fn hybrid_source(uri: String) -> QuerySource {
+        QuerySource {
+            sparse_column: Some("sparse".into()),
+            ..source(uri, None)
+        }
+    }
+
+    #[test]
+    fn loads_hybrid_query_vectors() {
+        in_dir("hybrid_ok", |dir| {
+            let file = dir.join("q.parquet");
+            write_sparse_parquet(
+                &file,
+                "SELECT [i::FLOAT, 0.5::FLOAT] AS embedding, \
+                        {'indices': [i::UINTEGER, (i + 100)::UINTEGER], 'values': [0.5::FLOAT, 0.25::FLOAT]} AS sparse \
+                 FROM range(3) r(i)",
+            );
+            let vectors = load_at_default_top_k(
+                &hybrid_source(file.display().to_string()),
+                VectorType::Hybrid,
+                None,
+            )
+            .unwrap();
+            assert_eq!(vectors.len(), 3);
+            assert_eq!(
+                vectors[1].vector,
+                VectorData::Hybrid {
+                    dense: vec![1.0, 0.5],
+                    indices: vec![1, 101],
+                    values: vec![0.5, 0.25]
+                }
+            );
+            // A dense-only target must not search the dense half alone.
+            assert_eq!(vectors[1].vector.as_dense(), None);
+        });
+    }
+
+    #[test]
+    fn skips_hybrid_rows_missing_either_half() {
+        in_dir("hybrid_half", |dir| {
+            let file = dir.join("q.parquet");
+            write_sparse_parquet(
+                &file,
+                "SELECT CASE WHEN i = 1 THEN []::FLOAT[] ELSE [1.0::FLOAT] END AS embedding, \
+                        CASE WHEN i = 2 THEN {'indices': []::UINTEGER[], 'values': []::FLOAT[]} \
+                             WHEN i = 3 THEN NULL \
+                             ELSE {'indices': [7::UINTEGER], 'values': [1.0::FLOAT]} END AS sparse \
+                 FROM range(5) r(i)",
+            );
+            let vectors = load_at_default_top_k(
+                &hybrid_source(file.display().to_string()),
+                VectorType::Hybrid,
+                None,
+            )
+            .unwrap();
+            // Rows 1 (no dense), 2 (empty sparse) and 3 (NULL sparse) are skipped.
+            assert_eq!(vectors.len(), 2);
+        });
+    }
+
+    #[test]
+    fn hybrid_sparse_column_of_the_wrong_shape_is_a_clear_error() {
+        in_dir("hybrid_bad_sparse", |dir| {
+            let file = dir.join("q.parquet");
+            write_sparse_parquet(&file, "SELECT [1.0::FLOAT] AS embedding, [2.0::FLOAT] AS sparse");
+            let err = load_at_default_top_k(
+                &hybrid_source(file.display().to_string()),
+                VectorType::Hybrid,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("not a struct"), "{err}");
+        });
     }
 
     // ---------------------------------------------------------------- sparse
