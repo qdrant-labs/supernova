@@ -47,6 +47,15 @@ DIM = 8
 ID_COL = "sid"
 
 
+
+@pytest.fixture(autouse=True)
+def _pyarrow_read_path(monkeypatch):
+    """These tests classify Store.read_columns calls; the native dense path
+    (NOVA_BF_RUST_FETCH_DENSE) adds a projected id-column read of its own that
+    looks exactly like an id-pass read. Pin the pyarrow path."""
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
+
 @pytest.fixture
 def corpus_and_queries(tmp_path):
     """Several shards, so the pass has more than one file to fan out over."""

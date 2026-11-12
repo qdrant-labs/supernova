@@ -1,18 +1,22 @@
-"""Evaluate a corpus-side `Filter` against one corpus file.
+"""Evaluate corpus filters for one file.
 
-Uniform filters produce a `(rows,)` boolean mask and are evaluated once per
-file before scoring. Per-query conditions produce a row-packed
-`PackedRowMask` over `(queries, rows)` and are applied per query during
-scoring rather than by compacting corpus rows.
+Uniform filters produce a row mask used to compact the corpus before
+scoring. Per-query filters produce masks applied during scoring.
 
-Text filters use Qdrant-style `word` tokenization: split on non-alphanumeric
-characters, lowercase tokens, and require all query tokens to occur in the
-row's token set. Query and corpus text use the same tokenization path.
+With combo=True, per-query filters return a FilterPlan containing text
+bitmaps, static row masks, and structured predicates for GPU evaluation
+and combination. PackedRowMask provides the reference path.
+
+Text matching uses Qdrant-style word tokenization: split on
+non-alphanumeric characters, lowercase tokens, and require all query
+tokens to appear in the document.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -23,6 +27,8 @@ import pyarrow.compute as pc
 from nova_bf import nativetok
 from nova_bf.config import Filter, FilterCondition
 from nova_bf.tokenize import TOKEN_SPLIT_PATTERN, tokenize, tokenize_many
+
+logger = logging.getLogger("nova_bf.filters")
 
 class PackedRowMask:
     """A `(queries, rows)` boolean mask packed along the row axis.
@@ -180,6 +186,907 @@ class TokenGrid:
         return np.unpackbits(self[token], count=self.n_rows).astype(bool)
 
 
+# Disable lazy GPU mask combination for testing or fallback to full masks.
+COMBO_ENV = "NOVA_BF_NO_GPU_COMBO"
+
+# Use lazy masks unless their shared components exceed both the full mask's
+# size and the per-file memory limit. Disable the guard for testing.
+_COMBO_PARTS_GUARD = True
+_COMBO_PARTS_MAX_BYTES = 2 << 30
+
+
+def combo_enabled() -> bool:
+    """True unless `NOVA_BF_NO_GPU_COMBO` is set."""
+    return not os.environ.get(COMBO_ENV)
+
+
+_COMBO_LOCK = threading.Lock()
+_COMBO_USAGE = {"combo_masks": 0, "packed_masks": 0, "device_builds": 0,
+                "host_materialisations": 0, "resident_uploads": 0,
+                "resident_allocs": 0, "resident_reuses": 0, "budget_fallbacks": 0,
+                "mixed_plans": 0, "struct_plans": 0}
+# Filters already warned about the byte budget this run (`reset_combo_usage` clears).
+_BUDGET_WARNED: set = set()
+
+
+def _count(key: str, n: int = 1) -> None:
+    with _COMBO_LOCK:
+        _COMBO_USAGE[key] += n
+
+
+def combo_usage() -> dict:
+    """Return GPU mask combination statistics, including plan types, mask
+    builds, buffer reuse, fallbacks, and whether lazy combination is enabled.
+    """
+    with _COMBO_LOCK:
+        got = dict(_COMBO_USAGE)
+    got["permitted"] = combo_enabled()
+    return got
+
+
+def reset_combo_usage() -> None:
+    with _COMBO_LOCK:
+        for k in _COMBO_USAGE:
+            _COMBO_USAGE[k] = 0
+        _BUDGET_WARNED.clear()
+
+
+def _warn_budget_once(filt, n_parts: int, nb: int, n_q: int, budget: int) -> None:
+    """Log (once per run per filter) that `filt`'s text part is built from
+    per-combination rows on the CPU (slower) because its phrase-row table is
+    over the byte budget, and how to fix it."""
+    with _COMBO_LOCK:
+        _COMBO_USAGE["budget_fallbacks"] += 1
+        if filt in _BUDGET_WARNED:
+            return
+        _BUDGET_WARNED.add(filt)
+    gib = 1 << 30
+    logger.warning(
+        "per-query text filter %s: %d distinct phrase rows (~%.1f GiB per file, "
+        "for %d queries) exceed the %.1f GiB budget, so files like this one combine "
+        "each query combination's phrases on the CPU instead of the GPU, which is "
+        "slower (results are unchanged). To keep it on the GPU: use fewer distinct "
+        "per-query phrases, split the query set, or raise "
+        "params.combo_parts_max_bytes. (Logged once per run per filter.)",
+        _filter_label(filt), n_parts, n_parts * nb / gib, n_q,
+        budget / gib)
+
+
+def _filter_label(filt) -> str:
+    """Short description of a filter for log messages: `must[text~kw], ...`."""
+    out = []
+    for kind in ("must", "should", "must_not"):
+        conds = getattr(filt, kind, None) or []
+        if conds:
+            out.append(f"{kind}[" + ", ".join(
+                f"{c.field}~{c.match_text_from_query}" if c.match_text_from_query
+                else c.field for c in conds) + "]")
+    return " ".join(out) or "<empty>"
+
+
+# Combine steps work in chunks so no temporary array exceeds this size.
+_COMBINE_CHUNK_BYTES = 64 << 20
+
+
+class TextPart:
+    """The text part of a `FilterPlan`: a memory-efficient per-query mask that
+    stores shared filter components.
+
+    Instead of storing a full mask for every query, queries with identical
+    filter conditions share a combination of bit-packed masks:
+
+    - `parts`: Unique bit-packed masks for individual filter conditions.
+    - `and_idx`: Components that must all match for each combination.
+    - `or_idx`: Components where at least one must match.
+    - `combo_group`: Maps combinations to shared OR groups.
+    - `combo_of_query`: Maps each query to its filter combination.
+
+    Masks are combined on demand, typically on the GPU, avoiding redundant
+    storage and computation. Supports checking matching rows without
+    expanding individual query masks.
+    """
+
+    __slots__ = ("parts", "n_rows", "and_idx", "or_idx", "combo_group",
+                 "combo_of_query", "_union", "_plan", "_dev", "_parts_dev")
+
+    ONES = 0
+    ZERO = 1
+
+    def __init__(self, parts: np.ndarray, n_rows: int, and_idx: np.ndarray,
+                 or_idx: np.ndarray, combo_group: np.ndarray,
+                 combo_of_query: np.ndarray, _parts_dev: dict | None = None):
+        nb = (n_rows + 7) // 8
+        if parts.ndim != 2 or parts.dtype != np.uint8 or parts.shape[1] != nb:
+            raise ValueError(
+                f"TextPart parts must be (n_parts, {nb}) uint8, got "
+                f"{parts.shape} {parts.dtype}")
+        if parts.shape[0] < 2:
+            raise ValueError("TextPart parts must start with the ONES and ZERO rows")
+        n_p = parts.shape[0]
+        for name, a in (("and_idx", and_idx), ("or_idx", or_idx)):
+            if a.ndim != 2 or a.shape[1] < 1:
+                raise ValueError(f"{name} must be 2-D with at least one column")
+            if a.size and (a.min() < 0 or a.max() >= n_p):
+                raise ValueError(f"{name} indexes outside parts")
+        if combo_group.shape != (and_idx.shape[0],):
+            raise ValueError("combo_group must have one entry per combination")
+        if combo_group.size and (combo_group.min() < 0
+                                 or combo_group.max() >= or_idx.shape[0]):
+            raise ValueError("combo_group indexes outside or_idx")
+        if combo_of_query.ndim != 1:
+            raise ValueError("combo_of_query must be 1-D")
+        if combo_of_query.size and (combo_of_query.min() < 0
+                                    or combo_of_query.max() >= and_idx.shape[0]):
+            raise ValueError("combo_of_query indexes outside the combinations")
+        # Drop combinations no query uses (e.g. after keeping only some
+        # queries): the emptiness check and the row union look at every
+        # combination, so an unused one would give wrong answers.
+        used, inv = np.unique(combo_of_query, return_inverse=True)
+        if len(used) != and_idx.shape[0]:
+            and_idx, combo_group = and_idx[used], combo_group[used]
+            combo_of_query = inv.reshape(-1)
+        self.parts = parts
+        self.n_rows = n_rows
+        # Copy with np.array(copy=True), not ascontiguousarray: a one-element
+        # view with a negative stride counts as contiguous, so it wouldn't be
+        # copied, and torch.from_numpy rejects negative strides.
+        self.and_idx = np.array(and_idx, dtype=np.int64, order="C", copy=True)
+        self.or_idx = np.array(or_idx, dtype=np.int64, order="C", copy=True)
+        self.combo_group = np.array(combo_group, dtype=np.int64, order="C", copy=True)
+        self.combo_of_query = np.array(combo_of_query, dtype=np.int64, order="C", copy=True)
+        self._union = None   # cached row union over all queries (packed)
+        self._plan = None    # cached `_union_plan()`
+        self._dev = {}       # device -> index tensors
+        # device -> GPU copy of `parts` (`compute._Resident`). The same dict is
+        # shared with every narrowing of this mask (they share `parts`), so the
+        # table is uploaded only once.
+        self._parts_dev = {} if _parts_dev is None else _parts_dev
+
+    # -- PackedRowMask-compatible surface -----------------------------------
+
+    @property
+    def n_queries(self) -> int:
+        return int(self.combo_of_query.shape[0])
+
+    @property
+    def n_combos(self) -> int:
+        return int(self.and_idx.shape[0])
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.n_queries, self.n_rows)
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    def __getitem__(self, qrows) -> "TextPart":
+        """Keep only some queries (same rules as `PackedRowMask`)."""
+        if isinstance(qrows, (int, np.integer)) and not isinstance(qrows, bool):
+            raise TypeError(
+                f"TextPart must stay 2-D: indexing with the integer "
+                f"{qrows} would drop the query axis. Use "
+                f"`[{qrows}:{qrows + 1}]`."
+            )
+        cq = self.combo_of_query[qrows]
+        if cq.ndim != 1:
+            raise ValueError("TextPart query indexing must keep one query axis")
+        return TextPart(self.parts, self.n_rows, self.and_idx, self.or_idx,
+                            self.combo_group, cq, _parts_dev=self._parts_dev)
+
+    def any(self) -> bool:
+        """True if some query may allow some row (from the union: exact for
+        FineWeb-shaped masks, a superset otherwise)."""
+        if self.n_queries == 0 or self.n_rows == 0:
+            return False
+        return bool(self.union_packed().any())
+
+    def unpack(self) -> np.ndarray:
+        return self.to_packed().unpack()
+
+    # -- host combine --------------------------------------------------------
+
+    def _col_step(self, n_rows_touched: int) -> int:
+        """Byte-columns per chunk in the CPU combine. Temporaries stay under
+        `_COMBINE_CHUNK_BYTES` and under a quarter of `parts` (at least 1 MiB),
+        so small files don't allocate 64 MiB scratch arrays."""
+        budget = min(_COMBINE_CHUNK_BYTES, max(1 << 20, self.parts.nbytes // 4))
+        return max(1, budget // max(1, n_rows_touched))
+
+    @staticmethod
+    def _or_groups_np(P: np.ndarray, or_idx) -> np.ndarray:
+        # mode="wrap" changes nothing here (indices are valid) but lets `out=`
+        # write in place; the default mode="raise" makes a buffered copy
+        G = np.take(P, or_idx[:, 0], axis=0)
+        if or_idx.shape[1] > 1:
+            tmp = np.empty_like(G)
+            for j in range(1, or_idx.shape[1]):
+                np.take(P, or_idx[:, j], axis=0, out=tmp, mode="wrap")
+                np.bitwise_or(G, tmp, out=G)
+        return G
+
+    @classmethod
+    def _combine_np(cls, P: np.ndarray, or_idx, combo_group, and_idx,
+                    G: np.ndarray | None = None) -> np.ndarray:
+        """Combined rows `(n_combos, width)` from `P`, a `(n_parts, width)`
+        uint8 block of `parts` columns (packed or gathered bits)."""
+        if G is None:
+            G = cls._or_groups_np(P, or_idx)
+        R = np.take(G, combo_group, axis=0)
+        tmp = np.empty_like(R)
+        for j in range(and_idx.shape[1]):
+            np.take(P, and_idx[:, j], axis=0, out=tmp, mode="wrap")
+            np.bitwise_and(R, tmp, out=R)
+        return R
+
+    def _union_plan(self):
+        """Plan and cache a union of matching rows across all queries.
+
+        Factor out shared conditions and use the rarest remaining required
+        condition from each combination. The union may include extra rows,
+        which is safe for compaction and emptiness checks.
+        """
+        if self._plan is not None:
+            return self._plan
+        any_live, common, direct, single, generic = _factor_union(
+            self.and_idx.tolist(), self.combo_group.tolist())
+        if generic:
+            own = {c: set(self.and_idx[c].tolist()) - common - {self.ONES} for c in generic}
+            counts = {p: _popcount(self.parts[p]) for p in set().union(*own.values())}
+            for c in generic:
+                p = min(own[c], key=lambda q: (counts[q], q))
+                single.setdefault(p, set()).add(int(self.combo_group[c]))
+        runs: list[tuple[int, int, tuple[int, ...]]] = []
+        for p in sorted(single):
+            key = tuple(sorted(single[p]))
+            if runs and runs[-1][1] == p and runs[-1][2] == key:
+                runs[-1] = (runs[-1][0], p + 1, key)
+            else:
+                runs.append((p, p + 1, key))
+        self._plan = (any_live, np.array(sorted(common), dtype=np.int64),
+                      np.array(sorted(direct), dtype=np.int64), runs)
+        return self._plan
+
+    def union_packed(self) -> np.ndarray:
+        """Compute the bit-packed union of all queries' matching rows.
+
+        Combines shared filter components efficiently without expanding
+        individual query masks. Processes data in chunks to limit memory
+        usage and caches the result for reuse.
+        """
+        if self._union is not None:
+            return self._union
+        nb = self.parts.shape[1]
+        out = np.zeros(nb, dtype=np.uint8)
+        any_live, common, direct, runs = (
+            self._union_plan() if self.n_queries else (False,) * 4)
+        if any_live and nb:
+            step = self._col_step(self.or_idx.shape[0] + 1)
+            for b0 in range(0, nb, step):
+                b1 = min(nb, b0 + step)
+                # make the chunk contiguous once; np.take on a strided view
+                # would copy it on every call
+                P = np.ascontiguousarray(self.parts[:, b0:b1])
+                G = self._or_groups_np(P, self.or_idx)
+                u = out[b0:b1]
+                if len(direct):
+                    u |= np.bitwise_or.reduce(G[direct], axis=0)
+                held: dict[tuple[int, ...], np.ndarray] = {}
+                for s0, s1, key in runs:
+                    h = held.get(key)
+                    if h is None:
+                        h = held[key] = np.bitwise_or.reduce(G[list(key)], axis=0)
+                    u |= np.bitwise_or.reduce(P[s0:s1], axis=0) & h
+                for k in common.tolist():
+                    u &= P[k]
+                del P, G, held      # free before the next chunk allocates
+            if self.n_rows & 7:
+                out[-1] &= _tail_mask(self.n_rows)
+        self._union = out
+        return out
+
+    def union_rows(self) -> np.ndarray:
+        """Return a Boolean mask of rows that may match at least one query."""
+        return np.unpackbits(self.union_packed(), count=self.n_rows).astype(bool)
+
+    def to_packed(self) -> PackedRowMask:
+        """Build the full per-query packed mask on the CPU."""
+        _count("host_materialisations")
+        nb = self.parts.shape[1]
+        out = np.empty((self.n_queries, nb), dtype=np.uint8)
+        if self.n_queries and nb:
+            and_idx, combo_group, cq = self.and_idx, self.combo_group, self.combo_of_query
+            step = self._col_step(and_idx.shape[0] + self.or_idx.shape[0] + self.n_queries)
+            for b0 in range(0, nb, step):
+                b1 = min(nb, b0 + step)
+                R = self._combine_np(np.ascontiguousarray(self.parts[:, b0:b1]),
+                                     self.or_idx, combo_group, and_idx)
+                out[:, b0:b1] = np.take(R, cq, axis=0)
+                del R
+            if self.n_rows & 7:
+                out[:, -1] &= _tail_mask(self.n_rows)
+        return PackedRowMask(out, self.n_rows)
+
+    # -- device combine ------------------------------------------------------
+
+    def device_index(self, device):
+        """The index arrays `(or_idx, combo_group, and_idx, combo_of_query)`
+        as int64 tensors on `device`, uploaded once per device. They are
+        small, so a plain blocking copy is fine."""
+        import torch
+
+        key = str(device)
+        got = self._dev.get(key)
+        if got is None:
+            got = tuple(
+                torch.from_numpy(a).to(device)
+                for a in (self.or_idx, self.combo_group, self.and_idx,
+                          self.combo_of_query)
+            )
+            self._dev[key] = got
+        return got
+
+    def release_device(self) -> None:
+        """Drop this mask's GPU copies (index tensors, and the `parts` copy it
+        shares with its narrowings). The scoring loop calls
+        `compute._resident_release`, which first returns the buffer to its
+        pool; calling this directly just frees the buffer, which is also safe."""
+        self._dev.clear()
+        self._parts_dev.clear()
+
+    def combine_torch(self, P):
+        """Combine on the GPU. `P` is a column slice of `parts` already on the
+        device (`(n_parts, width)` uint8); returns the `(n_combos, width)`
+        combined rows. Works in chunks so temporaries stay under
+        `_COMBINE_CHUNK_BYTES`."""
+        import torch
+
+        or_idx, combo_group, and_idx, _ = self.device_index(P.device)
+        width = int(P.shape[1])
+        step = max(1, _COMBINE_CHUNK_BYTES // max(1, width))
+
+        n_g = int(or_idx.shape[0])
+        G = torch.empty((n_g, width), dtype=torch.uint8, device=P.device)
+        for g0 in range(0, n_g, step):
+            g = G[g0:g0 + step]
+            ix = or_idx[g0:g0 + step]
+            torch.index_select(P, 0, ix[:, 0], out=g)
+            for j in range(1, ix.shape[1]):
+                g.bitwise_or_(P.index_select(0, ix[:, j]))
+
+        n_c = int(and_idx.shape[0])
+        R = torch.empty((n_c, width), dtype=torch.uint8, device=P.device)
+        for c0 in range(0, n_c, step):
+            r = R[c0:c0 + step]
+            torch.index_select(G, 0, combo_group[c0:c0 + step], out=r)
+            ix = and_idx[c0:c0 + step]
+            for j in range(ix.shape[1]):
+                r.bitwise_and_(P.index_select(0, ix[:, j]))
+        return R
+
+
+def _is_pq_struct(c) -> bool:
+    """A per-query structured (non-text) condition."""
+    return c.match_from_query is not None or c.range_from_query is not None
+
+
+class FilterPlan:
+    """Per-query filter plan combined on the GPU for each slice.
+
+    - text: Text bitmaps and their Boolean combinations, including static
+      predicates. Contains only the must side if structured should predicates
+      are present.
+    - should_text: Separate OR combination of text and static should predicates.
+    - static_keep / static_or: Static AND/OR row masks when no text part exists.
+    - struct_must / struct_should / struct_not: Per-query structured
+      predicates evaluated on the GPU.
+    - struct_union: Optional conservative row mask for corpus compaction.
+
+    Required predicates are ANDed, should predicates are ORed, and excluded
+    predicates are negated. The should group is required when applicable.
+
+    Union and emptiness checks may include extra rows but never exclude
+    valid matches.
+    """
+
+    __slots__ = ("text", "should_text", "static_keep", "static_or", "struct_must",
+                 "struct_should", "struct_not", "struct_union", "_n_queries", "_n_rows",
+                 "_dev")
+
+    def __init__(self, text, should_text, struct_must, struct_should, struct_not, *,
+                 static_keep=None, static_or=None, n_queries=None, n_rows=None):
+        if text is None:
+            if n_queries is None or n_rows is None:
+                raise ValueError("a FilterPlan without a text part needs n_queries and n_rows")
+        else:
+            n_queries, n_rows = text.n_queries, text.n_rows
+            if static_keep is not None or static_or is not None:
+                raise ValueError("static rows belong inside the text part when there is one")
+        if should_text is not None and should_text.n_queries != n_queries:
+            raise ValueError("FilterPlan parts must have the same number of queries")
+        self.text = text
+        self.should_text = should_text
+        self.static_keep = static_keep
+        self.static_or = static_or
+        self.struct_must = tuple(struct_must)
+        self.struct_should = tuple(struct_should)
+        self.struct_not = tuple(struct_not)
+        self.struct_union = None
+        self._n_queries = int(n_queries)
+        self._n_rows = int(n_rows)
+        self._dev = {}      # device -> (static_keep, static_or) tensors
+
+    @property
+    def n_queries(self) -> int:
+        return self._n_queries
+
+    @property
+    def n_rows(self) -> int:
+        return self._n_rows
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.n_queries, self.n_rows)
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    @property
+    def should_applies(self) -> bool:
+        """Whether a should OR constrains the result outside the text part."""
+        return bool(self.struct_should) or (self.text is None and self.static_or is not None)
+
+    def masks(self):
+        """The `TextPart`s this plan holds (for releasing device copies)."""
+        return [m for m in (self.text, self.should_text) if m is not None]
+
+    def union_rows(self) -> np.ndarray:
+        """Superset of the rows some query allows."""
+        out = (self.text.union_rows() if self.text is not None
+               else np.ones(self.n_rows, dtype=bool))
+        for part in (self.static_keep, self.struct_union):
+            if part is not None:
+                out = out & part
+        return out
+
+    def any(self) -> bool:
+        """Superset: True if some query might allow some row."""
+        if self.n_queries == 0 or self.n_rows == 0:
+            return False
+        return bool(self.union_rows().any())
+
+    def release_device(self) -> None:
+        """Drop the device copies of the static rows (text parts are released
+        through `compute._resident_release`)."""
+        self._dev.clear()
+
+
+def _is_static(c) -> bool:
+    return c.match_text_from_query is None and not _is_pq_struct(c)
+
+
+def _static_rows(filt, table, query_values, text_masks, cache=None):
+    """Build static AND and OR row masks for the filter.
+
+    Cache condition masks across filters within a file without modifying
+    them. Build text masks only when a cache miss requires them.
+    """
+    lazy = callable(text_masks)
+    built = [None if lazy else text_masks]
+
+    def masks():
+        if lazy and built[0] is None:
+            built[0] = text_masks()
+        return built[0]
+
+    def get(c):
+        m = None if cache is None else cache.get(c)
+        if m is None:
+            m = _condition_mask(c, table, query_values,
+                                masks() if c.match_text is not None else None)
+            if cache is not None:
+                cache[c] = m
+        return m
+
+    keep = None
+    for c in filt.must:
+        if _is_static(c):
+            keep = get(c) if keep is None else keep & get(c)
+    for c in filt.must_not:
+        if _is_static(c):
+            keep = ~get(c) if keep is None else keep & ~get(c)
+    rest_or = None
+    for c in filt.should:
+        if _is_static(c):
+            rest_or = get(c) if rest_or is None else rest_or | get(c)
+    return keep, rest_or
+
+
+def _pq_len(c, query_values) -> int:
+    """Number of queries a per-query structured condition's column holds."""
+    if c.match_from_query is not None:
+        return len(query_values[c.match_from_query])
+    r = c.range_from_query
+    col = next(b for b in (r.gt, r.gte, r.lt, r.lte) if b is not None)
+    return len(query_values[col])
+
+
+def _build_mixed_plan(filt, table, query_values, text_masks, cond_qsets,
+                      must_t, should_t, mnot_t, n: int, static_cache=None,
+                      parts_budget=None):
+    """`evaluate()`'s result for a filter with per-query text AND per-query
+    structured conditions. Static conditions stay 1-D (the structured
+    per-query ones are left for the GPU)."""
+    keep, rest_or = _static_rows(filt, table, query_values, text_masks, static_cache)
+    if keep is None:
+        keep = np.ones(n, dtype=bool)
+    struct_must = [c for c in filt.must if _is_pq_struct(c)]
+    struct_should = [c for c in filt.should if _is_pq_struct(c)]
+    struct_not = [c for c in filt.must_not if _is_pq_struct(c)]
+
+    lengths = {len(cond_qsets[c]) for c in (*must_t, *should_t, *mnot_t)}
+    lengths |= {_pq_len(c, query_values) for c in (*struct_must, *struct_should, *struct_not)}
+    if len(lengths) > 1:
+        raise ValueError(f"per-query conditions reference query columns of differing "
+                         f"lengths: {sorted(lengths)}")
+    n_q = lengths.pop()
+
+    def group(mt, st, nt):
+        combos: dict[tuple, list[int]] = {}
+        for q in range(n_q):
+            key = (tuple(cond_qsets[c][q] for c in mt), tuple(cond_qsets[c][q] for c in st),
+                   tuple(cond_qsets[c][q] for c in nt))
+            combos.setdefault(key, []).append(q)
+        return combos
+
+    if struct_should:
+        text = _build_combo_mask(n, n_q, group(must_t, [], mnot_t), must_t, [], mnot_t,
+                                 False, text_masks, keep, None, filt, parts_budget)
+        should_text = None
+        if should_t or rest_or is not None:
+            should_text = _build_combo_mask(
+                n, n_q, group([], should_t, []), [], should_t, [], True, text_masks,
+                np.ones(n, dtype=bool), rest_or, filt, parts_budget)
+    else:
+        text = _build_combo_mask(n, n_q, group(must_t, should_t, mnot_t), must_t, should_t,
+                                 mnot_t, bool(filt.should), text_masks, keep, rest_or, filt,
+                                 parts_budget)
+        should_text = None
+    return FilterPlan(text, should_text, struct_must, struct_should, struct_not)
+
+
+def _build_struct_plan(filt, table, query_values, text_masks, n: int, static_cache=None):
+    """Build a structured per-query filter plan for GPU evaluation.
+
+    Combine cached static row masks with per-query structured predicates.
+    """
+    keep, rest_or = _static_rows(filt, table, query_values, text_masks, static_cache)
+    struct_must = [c for c in filt.must if _is_pq_struct(c)]
+    struct_should = [c for c in filt.should if _is_pq_struct(c)]
+    struct_not = [c for c in filt.must_not if _is_pq_struct(c)]
+    lengths = {_pq_len(c, query_values) for c in (*struct_must, *struct_should, *struct_not)}
+    if len(lengths) > 1:
+        raise ValueError(f"per-query conditions reference query columns of differing "
+                         f"lengths: {sorted(lengths)}")
+    return FilterPlan(None, None, struct_must, struct_should, struct_not,
+                      static_keep=keep, static_or=rest_or, n_queries=lengths.pop(), n_rows=n)
+
+
+def _popcount(row: np.ndarray) -> int:
+    """Number of set bits in a packed uint8 row."""
+    if hasattr(np, "bitwise_count"):
+        return int(np.bitwise_count(row).sum())
+    return int(np.unpackbits(row).sum())
+
+
+def _factor_union(and_rows, combo_group):
+    """The grouping behind `TextPart._union_plan`, on plain lists. Returns
+    `(any_live, common_parts, direct_groups, {part: groups}, generic_combos)`."""
+    ONES, ZERO = TextPart.ONES, TextPart.ZERO
+    live = []
+    for c, row in enumerate(and_rows):
+        a = set(row)
+        a.discard(ONES)
+        if ZERO in a:
+            continue   # can never match (ANDs ZERO)
+        live.append((c, a))
+    common = set.intersection(*(a for _, a in live)) if live else set()
+    direct: set[int] = set()
+    single: dict[int, set[int]] = {}
+    generic: list[int] = []
+    for c, a in live:
+        rest = a - common
+        g = int(combo_group[c])
+        if not rest:
+            direct.add(g)
+        elif len(rest) == 1:
+            single.setdefault(next(iter(rest)), set()).add(g)
+        else:
+            generic.append(c)
+    return bool(live), common, direct, single, generic
+
+
+def _combination_rows_mask(n, specs, combo_ix, groups, combo_of_query,
+                           text_masks, keep, rest_or) -> TextPart:
+    """Build exact combination masks on the CPU when the bitmap budget is exceeded.
+
+    Compute phrase masks on demand and release them after their last use.
+    Return the combined masks as a TextPart instead of individual phrase masks.
+    """
+    nb = (n + 7) // 8
+    ONES, ZERO = TextPart.ONES, TextPart.ZERO
+    order = sorted(combo_ix.items(), key=lambda kv: kv[1])          # by combination id
+    or_of_group = {g: o for o, g in groups.items()}
+    refs: dict[int, int] = {}
+    for (ands, g), _ in order:
+        for i in (*ands, *or_of_group[g]):
+            refs[i] = refs.get(i, 0) + 1
+    cache: dict[int, np.ndarray] = {}
+
+    def part_row(i):
+        if i == ONES:
+            return _packed_ones(n)
+        if i == ZERO:
+            return np.zeros(nb, dtype=np.uint8)
+        got = cache.get(i)
+        if got is None:
+            key = specs[i]
+            if key[0] == "keep":
+                got = np.packbits(keep)
+            elif key[0] == "rest_or":
+                got = np.packbits(rest_or)
+            elif key[0] == "p":
+                got = _phrase_mask(text_masks[key[1]], key[2])
+            else:                                   # "n": negated phrase
+                got = _packed_not(_phrase_mask(text_masks[key[1]], key[2]), n)
+            cache[i] = got
+        return got
+
+    def done(i):
+        refs[i] -= 1
+        if refs[i] == 0:
+            cache.pop(i, None)
+
+    rows = np.empty((len(order) + 2, nb), dtype=np.uint8)
+    rows[ONES] = _packed_ones(n)
+    rows[ZERO] = 0
+    for (ands, g), c in order:
+        ors = or_of_group[g]
+        acc = np.bitwise_or.reduce([part_row(i) for i in ors], axis=0) if ors else \
+            np.zeros(nb, dtype=np.uint8)
+        for i in ands:
+            acc = acc & part_row(i)
+        rows[c + 2] = acc
+        for i in (*ands, *ors):
+            done(i)
+    k = len(order)
+    and_idx = (np.arange(k, dtype=np.int64) + 2).reshape(k, 1)
+    or_idx = np.full((1, 1), ONES, dtype=np.int64)
+    return TextPart(rows, n, and_idx, or_idx, np.zeros(k, dtype=np.int64), combo_of_query)
+
+
+def _build_combo_mask(
+    n: int, n_q: int, combos: dict, must_t, should_t, mnot_t, has_should: bool,
+    text_masks: dict, keep: np.ndarray, rest_or: np.ndarray | None, filt=None,
+    budget: int | None = None,
+) -> TextPart:
+    """Build shared filter bitmaps for lazy combination on the GPU.
+
+    If the memory budget is exceeded, build exact combination masks on the CPU.
+    """
+    nb = (n + 7) // 8
+    part_ix: dict[tuple, int] = {}
+    specs: list[tuple] = [("ones",), ("zero",)]
+
+    def part(key) -> int:
+        i = part_ix.get(key)
+        if i is None:
+            i = part_ix[key] = len(specs)
+            specs.append(key)
+        return i
+
+    ONES, ZERO = TextPart.ONES, TextPart.ZERO
+    # A keep that keeps every row changes nothing when ANDed: leave it out.
+    keep_i = None if bool(keep.all()) else part(("keep",))
+    rest_i = None if rest_or is None else part(("rest_or",))
+
+    groups: dict[tuple, int] = {}
+    combo_ix: dict[tuple, int] = {}
+    combo_of_query = np.empty(n_q, dtype=np.int64)
+    for (mkey, skey, nkey), qidxs in combos.items():
+        if any(ts is None for ts in mkey):
+            # A required phrase that is null or has no tokens can never match.
+            ands, ors = (ZERO,), (ONES,)
+        else:
+            a = [part(("p", c.field, ts)) for c, ts in zip(must_t, mkey)]
+            a += [part(("n", c.field, ts)) for c, ts in zip(mnot_t, nkey)
+                  if ts is not None]   # null must_not phrase: excludes nothing
+            if keep_i is not None:
+                a.append(keep_i)
+            if has_should:
+                o = [part(("p", c.field, ts)) for c, ts in zip(should_t, skey)
+                     if ts is not None]   # null should phrase: adds nothing
+                if rest_i is not None:
+                    o.append(rest_i)
+                ors = tuple(sorted(set(o))) or (ZERO,)
+            else:
+                ors = (ONES,)
+            ands = tuple(sorted(set(a))) or (ONES,)
+        g = groups.setdefault(ors, len(groups))
+        c = combo_ix.setdefault((ands, g), len(combo_ix))
+        combo_of_query[qidxs] = c
+
+    # Renumber the parts so each group set's single-part combinations sit side
+    # by side, letting `union_packed` OR them as one slice (see `_union_plan`).
+    # Only the numbering changes, not what gets combined.
+    _, _, _, single, _ = _factor_union(
+        [a for a, _ in combo_ix], [g for _, g in combo_ix])
+    order = sorted(range(2, len(specs)), key=lambda i: (
+        (0, tuple(sorted(single[i])), i) if i in single else (1, (), i)))
+    relabel = {ONES: ONES, ZERO: ZERO}
+    relabel.update({old: new for new, old in enumerate(order, start=2)})
+    specs = specs[:2] + [specs[i] for i in order]
+    combo_ix = {(tuple(sorted(relabel[x] for x in a)), g): c
+                for (a, g), c in combo_ix.items()}
+    groups = {tuple(sorted(relabel[x] for x in o)): g for o, g in groups.items()}
+
+    # Build combination masks on the CPU if phrase bitmaps exceed both
+    # the memory budget and the full per-query mask size.
+    budget = _COMBO_PARTS_MAX_BYTES if budget is None else int(budget)
+    if _COMBO_PARTS_GUARD and len(specs) * nb > max(n_q * nb, budget):
+        _warn_budget_once(filt, len(specs), nb, n_q, budget)
+        return _combination_rows_mask(n, specs, combo_ix, groups, combo_of_query,
+                                      text_masks, keep, rest_or)
+    parts = np.empty((len(specs), nb), dtype=np.uint8)
+    parts[ONES] = _packed_ones(n)
+    parts[ZERO] = 0
+    phrase_row: dict[tuple, int] = {}
+    for i, key in enumerate(specs[2:], start=2):
+        kind = key[0]
+        if kind == "keep":
+            parts[i] = np.packbits(keep)
+        elif kind == "rest_or":
+            parts[i] = np.packbits(rest_or)
+        elif kind == "p":
+            parts[i] = _phrase_mask(text_masks[key[1]], key[2])
+            phrase_row[key[1:]] = i
+    for i, key in enumerate(specs[2:], start=2):
+        if key[0] == "n":
+            j = phrase_row.get(key[1:])
+            src = parts[j] if j is not None else _phrase_mask(text_masks[key[1]], key[2])
+            parts[i] = _packed_not(src, n)
+
+    and_w = max((len(a) for a, _ in combo_ix), default=1)
+    or_w = max((len(o) for o in groups), default=1)
+    and_idx = np.full((len(combo_ix), and_w), ONES, dtype=np.int64)
+    for c, (a, _) in enumerate(combo_ix):
+        and_idx[c, :len(a)] = a
+    combo_group = np.fromiter((g for _, g in combo_ix), dtype=np.int64,
+                              count=len(combo_ix))
+    or_idx = np.full((max(1, len(groups)), or_w), ZERO, dtype=np.int64)
+    for o, g in groups.items():
+        or_idx[g, :len(o)] = o
+    return TextPart(parts, n, and_idx, or_idx, combo_group, combo_of_query)
+
+
+def _match_kind(t: pa.DataType) -> str:
+    """The comparison kind of an Arrow type for `match_from_query`: "int",
+    "string", "bool", "null" (an all-null column), or the type itself
+    (anything else, which is rejected). Dictionary columns use their values'
+    type."""
+    if pa.types.is_dictionary(t):
+        t = t.value_type
+    if pa.types.is_uint64(t):
+        return "uint64"     # rejected: numpy compares uint64 as float64 next to int64
+    if pa.types.is_integer(t):
+        return "int"
+    if pa.types.is_string(t) or pa.types.is_large_string(t) or (
+            hasattr(pa.types, "is_string_view") and pa.types.is_string_view(t)):
+        return "string"
+    if pa.types.is_boolean(t):
+        return "bool"
+    if pa.types.is_null(t):
+        return "null"
+    return str(t)
+
+
+def _list_value_type(t: pa.DataType) -> pa.DataType:
+    """A list column's element type (`MatchAny` query lists); other types as is."""
+    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t) or (
+            hasattr(pa.types, "is_list_view") and pa.types.is_list_view(t)):
+        return t.value_type
+    return t
+
+
+def check_match_types(named_filters, corpus_schema: pa.Schema, query_schema: pa.Schema,
+                      skip_fields=(), skip_query_cols=()) -> None:
+    """Validate exact-match predicate types for CPU and GPU consistency.
+
+    Match values must be integers (up to int64), strings, or booleans.
+    Corpus and query types must agree; query values may be lists.
+    Floats and uint64 are rejected to avoid precision loss.
+
+    Null values never match. Declared date fields are converted to epoch
+    microseconds and must be dates on both sides.
+
+    Raise ValueError listing all invalid conditions.
+    """
+    bad = []
+    for name, filt in named_filters:
+        if filt is None:
+            continue
+        for cond in filt.all_conditions():
+            if cond.match_from_query is None:
+                continue
+            c_date, q_date = cond.field in skip_fields, cond.match_from_query in skip_query_cols
+            where = f"search `{name}`: `{cond.field}`"
+            if c_date and q_date:
+                continue
+            if c_date != q_date:
+                bad.append(f"{where} vs query column `{cond.match_from_query}`: only "
+                           f"the {'corpus' if c_date else 'query'} side is a declared date field")
+                continue
+            if cond.field not in corpus_schema.names or cond.match_from_query not in query_schema.names:
+                continue   # missing columns are reported by their own checks
+            ct = corpus_schema.field(cond.field).type
+            qt = _list_value_type(query_schema.field(cond.match_from_query).type)
+            ck, qk = _match_kind(ct), _match_kind(qt)
+            if "null" in (ck, qk):
+                continue
+            if ck not in ("int", "string", "bool") or ck != qk:
+                bad.append(f"{where} ({ct}) vs query column "
+                           f"`{cond.match_from_query}` ({qt})")
+    if bad:
+        raise ValueError(
+            "match_from_query compares values of different or unsupported types: "
+            + "; ".join(bad) + ". Exact match needs both sides to be integers, "
+            "strings, or booleans (lists of them for a query column). For numbers "
+            "use range_from_query; otherwise cast one column so the types agree "
+            "(uint64 columns: cast to int64).")
+    check_static_match_types(named_filters, corpus_schema, skip_fields)
+
+
+# Which Python value types a static `match` may use against each column kind.
+_STATIC_MATCH_OK = {"int": (int, float), "float": (int, float), "string": (str,), "bool": (bool,)}
+
+
+def check_static_match_types(named_filters, corpus_schema: pa.Schema, skip_fields=()) -> None:
+    """Reject static `match` values whose kind doesn't fit the corpus column:
+    numbers (ints, floats) for integer and float columns, strings for string
+    columns, booleans for boolean columns. pyarrow would otherwise convert
+    them (`True` matching 1, `"5"` matching 5) where Qdrant matches neither,
+    and `match: true` and `match: 1` compare equal as configs, so they would
+    share one cached mask. Declared date fields, all-null columns and other
+    column types are not checked. Raises ValueError naming every offender."""
+    bad = []
+    for name, filt in named_filters:
+        if filt is None:
+            continue
+        for cond in filt.all_conditions():
+            if cond.match is None or cond.field in skip_fields \
+                    or cond.field not in corpus_schema.names:
+                continue
+            t = corpus_schema.field(cond.field).type
+            vt = t.value_type if pa.types.is_dictionary(t) else t
+            kind = "float" if pa.types.is_floating(vt) else _match_kind(t)
+            kind = "int" if kind == "uint64" else kind
+            ok = _STATIC_MATCH_OK.get(kind)
+            if ok is None:
+                continue
+            values = cond.match if isinstance(cond.match, tuple) else (cond.match,)
+            wrong = [v for v in values if type(v) not in ok]
+            if wrong:
+                bad.append(f"search `{name}`: `{cond.field}` ({t}) with match "
+                           f"value(s) {', '.join(repr(v) for v in wrong)}")
+    if bad:
+        raise ValueError(
+            "static match values don't fit their column's type: " + "; ".join(bad)
+            + ". Use numbers for integer/float fields, strings for string fields, "
+            "and true/false for boolean fields (quote a number only if the field "
+            "holds strings).")
+
+
 def pack_rows(mask: np.ndarray) -> PackedRowMask:
     """Bit-pack an `(n_queries, n_rows)` bool mask along the row axis."""
     return PackedRowMask(np.packbits(mask, axis=1), mask.shape[1])
@@ -242,6 +1149,25 @@ def _scan_batch_rows(col_nbytes: int, n_rows: int, width: int,
     return max(8, min(rows, cap) & ~7)
 
 
+def corpus_values(col) -> np.ndarray:
+    """Convert a corpus column to NumPy, preserving integer precision.
+
+    Decode dictionary columns and fill integer nulls with zero to avoid
+    float64 conversion. Callers track nulls using Arrow's validity mask.
+    """
+    col = _decode_dictionary(col)
+    if pa.types.is_integer(col.type) and col.null_count:
+        col = pc.fill_null(col, 0)
+    return col.to_numpy(zero_copy_only=False)
+
+
+def _decode_dictionary(col):
+    """Decode dictionary columns, preserving nulls in both indices and values."""
+    if pa.types.is_dictionary(col.type):
+        return col.cast(col.type.value_type)
+    return col
+
+
 def _corpus_null_mask(table: pa.Table, field: str) -> np.ndarray:
     """`(rows,)`: which rows have a null value in `field`. Used by the
     per-query condition masks below to explicitly AND out corpus-side nulls
@@ -249,23 +1175,19 @@ def _corpus_null_mask(table: pa.Table, field: str) -> np.ndarray:
     gets from `pc.fill_null(mask, False)`, made explicit here since a
     per-query condition builds its own numpy comparison directly rather than
     going through a pyarrow compute kernel that null-propagates for us."""
-    return table[field].is_null().to_numpy(zero_copy_only=False)
+    return _decode_dictionary(table[field]).is_null().to_numpy(zero_copy_only=False)
 
 
 def _match_from_query_mask(
     cond: FilterCondition, table: pa.Table, query_values: dict[str, np.ndarray],
 ) -> np.ndarray:
-    """`(n_queries, rows)` — per-query equality (or MatchAny, if the queries
-    column holds a list per row instead of a scalar). The scalar case is one
-    broadcast comparison (`query_vals[:, None] == corpus_vals[None, :]`),
-    reusing plain numpy `==` semantics — the same `MatchValue` rules
-    (`5 == 5.0`, `nan != nan`, `True == 1`) `Filter`'s docstring already
-    documents, for free. A null/missing per-query value already can't equal
-    anything (an object-array `None` only equals another `None`, and a
-    `nan` float never equals anything, including itself) — combined with
-    `_corpus_null_mask` explicitly ANDed out below, a null on EITHER side
-    never matches, symmetric with the static path's null handling."""
-    corpus_vals = table[cond.field].to_numpy(zero_copy_only=False)
+    """Build a per-query equality mask of shape (n_queries, rows).
+
+    Scalar query values use equality; list values match any member.
+    Both columns must have compatible types, and nulls on either side
+    never match. Results agree with the GPU's dictionary-encoded matching.
+    """
+    corpus_vals = corpus_values(table[cond.field])
     query_vals = query_values[cond.match_from_query]
     not_null = ~_corpus_null_mask(table, cond.field)
 
@@ -306,20 +1228,12 @@ def _match_any_membership(vocab: np.ndarray, list_values) -> np.ndarray:
 def _match_any_from_query_mask(
     corpus_vals: np.ndarray, query_lists, not_null: np.ndarray,
 ) -> np.ndarray:
-    """`(n_queries, rows)` — per-query MatchAny: query `q` keeps row `r` iff
-    `corpus_vals[r]` is a member of `query_lists[q]`. Factorizes `corpus_vals`'
-    DISTINCT values in this batch (cheap for the low-to-moderate-cardinality
-    categorical fields this is meant for) rather than an O(n_queries * rows)
-    membership test — cost tracks distinct-value count and per-query list
-    sizes, not row count.
+    """Build a per-query mask for matching any value in each query's list.
 
-    `not_null` (from `_corpus_null_mask`) excludes null corpus rows from the
-    distinct-value factorization BEFORE calling `np.unique` — `np.unique`'s
-    sort can't compare `None` against a string/number, so a null mixed into
-    an otherwise-typed object array raises `TypeError` if included. Null
-    rows are left at `False` for every query (the caller's own `not_null`
-    AND-out would catch this too, but getting it right here avoids a
-    negative gather index accidentally wrapping to the LAST column)."""
+    Evaluate membership over distinct corpus values rather than every row.
+    Exclude nulls before finding distinct values to avoid sorting errors.
+    The caller masks out null rows from the result.
+    """
     distinct = np.unique(corpus_vals[not_null]) if not_null.any() else np.empty(0, dtype=corpus_vals.dtype)
     pos = {v: i for i, v in enumerate(distinct)}
     corpus_idx = np.array([pos.get(v, -1) for v in corpus_vals], dtype=np.int64)
@@ -343,7 +1257,7 @@ def _range_from_query_mask(
     has. A null per-query bound value never matches for that query (`nan`
     compared to anything is `False`); corpus-side nulls are explicitly
     ANDed out the same way `_match_from_query_mask` does."""
-    corpus_vals = table[cond.field].to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
+    corpus_vals = corpus_values(table[cond.field]).astype(np.float64, copy=False)
     not_null = ~_corpus_null_mask(table, cond.field)
     r = cond.range_from_query
     mask = None
@@ -381,8 +1295,11 @@ def _token_row_masks(
     avoid 32-bit string-offset overflow on large inputs.
 
     `pool` may provide the process-wide scan pool; otherwise a private pool
-    is used.
+    is used. Dictionary-encoded text is decoded to plain strings first (the
+    scanners walk string offsets; nulls stay null).
     """
+    if pa.types.is_dictionary(col.type):
+        col = col.cast(col.type.value_type)
     ordered = sorted(tokens)
     n_tok = len(ordered)
     grid = np.zeros((n_tok, (n_rows + 7) // 8), dtype=np.uint8)
@@ -638,6 +1555,71 @@ def _match_text_from_query_mask(
     return result
 
 
+def _integer_value_type(t: pa.DataType) -> "pa.DataType | None":
+    """The integer type of an integer column (a dictionary column's value
+    type), else None."""
+    if pa.types.is_dictionary(t):
+        t = t.value_type
+    return t if pa.types.is_integer(t) else None
+
+
+def _int_match_values(values, int_type: pa.DataType) -> "list[int] | None":
+    """Static `match` values on an integer column as exact ints of that type,
+    or None when a value is not a number (bool/str: pyarrow's own handling).
+    A float counts only if it is a whole number (`x == 2.5` never holds for
+    an integer x); a value outside the type's range matches no row. Both are
+    dropped."""
+    import math
+    lo, hi = _int_limits(int_type)
+    out = []
+    for v in values:
+        if type(v) is float:
+            if not (math.isfinite(v) and v.is_integer()):
+                continue
+            v = int(v)
+        elif type(v) is not int:
+            return None
+        if lo <= v <= hi:
+            out.append(v)
+    return out
+
+
+def _int_limits(t: pa.DataType) -> tuple[int, int]:
+    info = np.iinfo(t.to_pandas_dtype())
+    return int(info.min), int(info.max)
+
+
+def _int_range_part(col, int_type: pa.DataType, op, bound: float):
+    """Compare an integer column against a static range bound without losing precision.
+
+    Convert the float bound to an equivalent integer bound to avoid casting
+    column values to float64. Handle out-of-range and NaN bounds explicitly.
+    Null values never match.
+    """
+    import math
+    lo, hi = _int_limits(int_type)
+    valid = pc.is_valid(col)
+    none = pc.and_(valid, pa.scalar(False))
+    if math.isnan(bound):
+        return none
+    up = op in (pc.greater, pc.greater_equal)           # keeps rows above the bound
+    if math.isinf(bound):
+        return valid if (bound < 0) == up else none
+    k = math.floor(bound) if op in (pc.greater, pc.less_equal) else math.ceil(bound)
+    strict = op in (pc.greater, pc.less)
+    if up:   # x > k (strict) or x >= k
+        if k > hi or (strict and k == hi):
+            return none
+        if k < lo or (not strict and k == lo):
+            return valid
+    else:    # x < k (strict) or x <= k
+        if k < lo or (strict and k == lo):
+            return none
+        if k > hi or (not strict and k == hi):
+            return valid
+    return op(col, pa.scalar(k, type=int_type))
+
+
 def _condition_mask(
     cond: FilterCondition, table: pa.Table, query_values: dict[str, np.ndarray] | None = None,
     text_masks: dict[str, TokenGrid] | None = None,
@@ -654,9 +1636,20 @@ def _condition_mask(
         # Already a numpy bool mask with corpus nulls resolved to False (see
         # `_token_row_masks`) — no arrow-null fill step to go through below.
         return _match_text_static_mask(cond, table, text_masks)
+    int_type = _integer_value_type(col.type)
+    if int_type is not None:
+        col = _decode_dictionary(col)
     if cond.match is not None:
         values = cond.match if isinstance(cond.match, tuple) else [cond.match]
-        mask = pc.is_in(col, value_set=pa.array(values))
+        ints = None if int_type is None else _int_match_values(values, int_type)
+        if ints is not None:
+            # Built in the column's own type: pyarrow's guess (int64) can't
+            # hold a uint64 value >= 2**63, and a float value would make it
+            # cast the column to float64 (which raises above 2**53).
+            value_set = pa.array(ints, type=int_type)
+        else:
+            value_set = pa.array(values)
+        mask = pc.is_in(col, value_set=value_set)
     else:
         r = cond.range
         mask = None
@@ -668,7 +1661,8 @@ def _condition_mask(
         ):
             if bound is None:
                 continue
-            part = op(col, bound)
+            part = (op(col, bound) if int_type is None
+                    else _int_range_part(col, int_type, op, bound))
             mask = part if mask is None else pc.and_(mask, part)
     # A null payload value (field absent/None on that row) never matches —
     # same as Qdrant treating a missing field as non-matching.
@@ -689,25 +1683,36 @@ def _static_first(conds) -> list[FilterCondition]:
 
 def evaluate(
     filt: Filter, table: pa.Table, query_values: dict[str, np.ndarray] | None = None,
-    pool=None, prep: "TextQueryPrep | None" = None,
-) -> "np.ndarray | PackedRowMask":
-    """Evaluate `filt` against one corpus file.
+    pool=None, prep: "TextQueryPrep | None" = None, combo: bool = False,
+    static_cache: dict | None = None, parts_budget: int | None = None,
+) -> "np.ndarray | PackedRowMask | FilterPlan":
+    """Evaluate a filter against one corpus file.
 
-    Uniform filters return a `(rows,)` boolean mask. If any condition is
-    per-query, returns a row-packed `PackedRowMask` representing
-    `(n_queries, rows)`.
+    Uniform filters return a Boolean row mask. Per-query filters return
+    a PackedRowMask or, with combo=True, a FilterPlan for GPU evaluation
+    and combination of text bitmaps and structured predicates.
 
-    Text conditions share one corpus tokenization pass per field.
-    `match_text_from_query` conditions use a packed, query-major combine so
-    per-condition `(n_queries, rows)` masks are never materialized.
+    Text conditions share corpus tokenization per field and reuse phrase
+    bitmaps without building full per-condition query masks.
 
-    `pool` may supply the shared text-scan pool, and `prep` may supply
-    file-independent query-text preprocessing.
+    Optional pool, prep, and static_cache reuse text scanning, query
+    preprocessing, and static predicate results.
 
-    The pre-fusion accumulators use non-in-place boolean operations so a 1-D
-    mask can broadcast to 2-D when a non-text per-query condition appears.
+    Use non-in-place Boolean operations to allow broadcasting uniform
+    masks to per-query masks.
     """
     n = len(table)
+
+    if combo and any(_is_pq_struct(c) for c in filt.all_conditions()) and not any(
+            c.match_text_from_query is not None for c in filt.all_conditions()):
+        # Per-query structured, no per-query text: static rows + structured
+        # conditions for the GPU. Text fields are tokenized only if a static
+        # text condition is not already in the per-file cache.
+        plan = _build_struct_plan(
+            filt, table, query_values,
+            lambda: _text_prep(filt, table, query_values, pool, prep)[0], n, static_cache)
+        _count("struct_plans")
+        return plan
 
     # Tokenize each text field once and reuse its token masks across conditions.
     text_masks, cond_qsets = _text_prep(filt, table, query_values, pool, prep)
@@ -716,6 +1721,15 @@ def evaluate(
     must_t = [c for c in filt.must if c.match_text_from_query is not None]
     should_t = [c for c in filt.should if c.match_text_from_query is not None]
     mnot_t = [c for c in filt.must_not if c.match_text_from_query is not None]
+
+    has_struct = any(_is_pq_struct(c) for c in filt.all_conditions())
+    if combo and has_struct and (must_t or should_t or mnot_t):
+        # Per-query text AND per-query structured: split for the GPU (decided
+        # before the static loops below, which would build 2-D masks).
+        plan = _build_mixed_plan(filt, table, query_values, text_masks, cond_qsets,
+                                 must_t, should_t, mnot_t, n, static_cache, parts_budget)
+        _count("mixed_plans")
+        return plan
 
     keep = np.ones(n, dtype=bool)
     for cond in _static_first(filt.must):
@@ -762,6 +1776,17 @@ def evaluate(
         )
         combos.setdefault(key, []).append(q)
 
+    keep_2d = keep.ndim == 2
+    rest_or_2d = rest_or is not None and rest_or.ndim == 2
+    if combo and not keep_2d and not rest_or_2d:
+        lazy = _build_combo_mask(
+            n, n_q, combos, must_t, should_t, mnot_t, bool(filt.should),
+            text_masks, keep, rest_or, filt, parts_budget,
+        )
+        _count("combo_masks")
+        return FilterPlan(lazy, None, (), (), ())     # a plan with only a text part
+    _count("packed_masks")
+
     # Cache packed phrase masks while they still have remaining uses.
     def _combo_key_list(mkey, skey, nkey) -> list[tuple[str, frozenset[str]]]:
         """The cache keys processing this combo will touch — mirrors the
@@ -786,8 +1811,6 @@ def evaluate(
             phrase_cache[(cond.field, ts)] = got
         return got
 
-    keep_2d = keep.ndim == 2
-    rest_or_2d = rest_or is not None and rest_or.ndim == 2
 
     # Build the per-query result directly in row-packed form. Text phrase masks
     # remain packed throughout; non-text accumulators are packed once before the

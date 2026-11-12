@@ -65,6 +65,10 @@ def ds(tmp_path):
 
 
 def _cfg(ds, out, **params) -> BruteForceConfig:
+    # Provenance tests: pin the exchange OFF. With it on (the default), a merge
+    # missing a rank is refused even when forced -- tested in
+    # test_threshold_exchange.py -- which would mask the checks tested here.
+    params.setdefault("threshold_exchange", False)
     return BruteForceConfig(
         corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
         queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
@@ -770,6 +774,7 @@ def test_the_merge_window_is_a_config_field(ds, tmp_path):
 # --------------------------------------------------------------------------
 
 def _two_search_cfg(ds, out, **params):
+    params.setdefault("threshold_exchange", False)   # see `_cfg`
     return BruteForceConfig(
         corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
         queries=QueriesConfig(path=ds["qpath"], id_column="qid"),

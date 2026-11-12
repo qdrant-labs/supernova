@@ -276,6 +276,9 @@ def test_slow_first_file_cannot_flood_host_memory(tmp_path, monkeypatch):
 
     Also checks the stalled run's results are bit-identical to an unstalled
     one: the window changes memory behavior, never consumption order."""
+    # Instruments the pyarrow read path (Store.read_columns): pin it.
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
     import threading
     import time
 

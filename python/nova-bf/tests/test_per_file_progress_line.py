@@ -103,6 +103,9 @@ def _slow_reads(monkeypatch, seconds=0.02):
     # instead of `Store.read_columns`, so the sleep would never fire and the
     # guard would (correctly) refuse. Do not inherit it from the shell.
     monkeypatch.delenv("NOVA_BF_READ_TIMING", raising=False)
+    # Same for the native readers: they bypass Store.read_columns entirely.
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_DENSE", "0")
+    monkeypatch.setenv("NOVA_BF_RUST_FETCH_COLUMNS", "0")
     real_read = Store.read_columns
 
     def slow(self, path, cols, *args, **kwargs):

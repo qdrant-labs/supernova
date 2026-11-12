@@ -1,31 +1,25 @@
 """Compute exact per-query top-K results over streamed corpus data.
 
-Each worker loads its queries, streams assigned corpus files, scores them in
-GPU-memory-bounded batches, and incrementally merges candidates into a running
-top-K. Corpus IDs are resolved only for final winners; the GPU state instead
-carries encoded source-file/row identifiers.
+Each worker streams its assigned corpus files, scores GPU-memory-bounded
+batches, and maintains a running top-K. Candidates are tracked by file
+and row indices; corpus IDs are resolved only for final winners.
 
-One run may execute multiple dense, sparse, multi-vector, filtered, and
-unfiltered `SearchSpec`s. Searches remain independent ranked lists, while
-compatible work is shared across specs, including decoded corpus batches,
-GPU-resident data, and score computations.
+A run can execute multiple dense, sparse, multi-vector, filtered, and
+unfiltered SearchSpecs. Compatible searches share corpus decoding, GPU
+data, and score computations while maintaining independent rankings.
 
-Dense metrics can share a `Q @ C^T` product and derive dot, cosine, or
-Euclidean scores from it; sparse dot and cosine similarly share their sparse
-product when applicable.
+Dense dot, cosine, and Euclidean searches can share a Q @ C^T product.
+Sparse dot and cosine searches can similarly share their sparse product.
 
-Uniform filters compact corpus rows before scoring when no unfiltered baseline
-requires the full batch. Multiple filtered searches sharing a vector type use
-the union of their surviving rows and select their own subsets from that shared
-batch.
+Uniform filters remove rows before scoring when no unfiltered search
+needs them. Compatible filtered searches score the union of matching rows
+and select their own subsets.
 
-Per-query filters instead mask individual `(query, row)` scores before top-K
-selection. Eligible numeric/categorical filters are evaluated on the GPU;
-text predicates use the CPU fallback, which stores their per-query row masks as
-row-packed `PackedRowMask`s and unpacks only the needed slice on device.
+Per-query filters mask scores before top-K selection. FilterPlan combines
+precomputed text bitmaps, static row masks, and structured predicates on
+the GPU for each slice.
 
-`SearchSpec.rows` narrows each spec to its own query rows, while shared query
-and filter structures may span larger run-wide unions.
+SearchSpec.rows selects each search's queries from the shared query set.
 """
 
 from __future__ import annotations
@@ -48,6 +42,7 @@ import numpy as np
 
 from tqdm import tqdm
 
+from nova_bf import filters as filters_mod
 from nova_bf import manifest as run_manifest
 from nova_bf import mv_fp16
 from nova_bf import profiling
@@ -56,6 +51,8 @@ from nova_bf import topk_triton
 from nova_bf import twopass
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import (
+    TextPart,
+    FilterPlan,
     PackedRowMask,
     _condition_mask,
     _match_any_membership,
@@ -65,7 +62,11 @@ from nova_bf.filters import (
 )
 from nova_bf.dates import convert_table_date_columns, normalize_date_fields
 from nova_bf.ids import make_point_id
-from nova_bf.io import ParquetFile, Store, dense_to_2d, multivector_to_ragged, sparse_to_coo_parts
+from nova_bf.io import (
+    ParquetFile, Store, configure_rust_fetch, dense_to_2d, multivector_to_ragged, rust_fetch_dense_enabled,
+    rust_fetch_columns_enabled, rust_fetch_settings,
+    sparse_to_coo_parts,
+)
 from nova_bf.results import (
     build_result_table,
     config_identity,
@@ -175,6 +176,41 @@ def _resolve_rank(num_jobs: int | None, job_rank: int | None) -> int | None:
     if not 0 <= job_rank < num_jobs:
         raise ValueError(f"job_rank must be in [0, {num_jobs - 1}], got {job_rank}")
     return job_rank
+
+
+# Messages of a device fault raised as a plain RuntimeError (torch before
+# `torch.AcceleratorError` existed, ~2.8; torch is unpinned).
+_DEVICE_FAULT_MARKERS = ("device-side assert", "illegal memory access",
+                         "illegal instruction", "misaligned address",
+                         "unspecified launch failure", "Triton Error [CUDA]",
+                         "cuDNN error", "CUDNN_STATUS_EXECUTION_FAILED")
+# Allocation failures are recoverable (the degrade case) whatever type they
+# arrive as: on torch >= 2.8 a failed cudaMalloc / pinned-host allocation
+# outside the caching allocator is a `torch.AcceleratorError` too.
+_ALLOC_FAILURE_MARKERS = ("out of memory", "alloc_failed")
+
+
+def _is_device_fault(exc: BaseException) -> bool:
+    """A sticky CUDA/device fault (`torch.AcceleratorError`, or a plain
+    RuntimeError saying "CUDA error: ..." / naming a device fault on an
+    older torch) -- never `torch.OutOfMemoryError`, which subclasses
+    RuntimeError but is a recoverable allocation failure."""
+    import torch
+
+    oom = getattr(torch, "OutOfMemoryError", None)
+    if oom is not None and isinstance(exc, oom):
+        return False
+    msg = str(exc)
+    # Before the AcceleratorError check: an allocation failure raised as one
+    # is still recoverable.
+    if any(m in msg.lower() for m in _ALLOC_FAILURE_MARKERS):
+        return False
+    accel = getattr(torch, "AcceleratorError", None)
+    if accel is not None and isinstance(exc, accel):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    return msg.lstrip().startswith("CUDA error") or any(m in msg for m in _DEVICE_FAULT_MARKERS)
 
 
 def _to_query_array(values: list) -> np.ndarray:
@@ -1391,6 +1427,7 @@ def _reset_prune_instrumentation() -> None:
     })
     # A helper left by a caller outside `run_compute` must not carry into this run.
     _close_dense_staging()
+    _close_resident_pools()
 
 
 # Track how many query/slice rows survive pruning, overall and per search.
@@ -2358,6 +2395,20 @@ def _merge_topk(top_key, top_enc, parts: list[tuple], k: int, thr=None):
     return top_key, top_enc
 
 
+def _trim_mask(keys, ext_key):
+    """Identify final top-k entries safely removable before merging.
+
+    Drops candidates strictly below the applied external threshold,
+    preserving ties and rows containing NaN or +inf scores.
+    The merge validates the threshold to ensure correctness.
+    """
+    import torch
+
+    sc = unpack_score(keys)
+    odd = (torch.isnan(sc) | (sc == float("inf"))).any(dim=1, keepdim=True)
+    return (keys < ext_key.unsqueeze(1)) & ~odd
+
+
 def _sample_mean_doc_tokens(store: Store, mine: list, column: str) -> float:
     """Mean tokens-per-doc from this worker's FIRST corpus file (a metadata-
     cheap, single-file read) — used only to derive multivector tile sizes from
@@ -2505,6 +2556,309 @@ def _packed_slice_any(packed: np.ndarray, bit_offset: int, n_rows: int) -> bool:
     return bool(packed[:, lo_byte + 1 : hi_byte - 1].any())
 
 
+def _pack_cols_device(B, n: int):
+    """Pack each row of B into a compact bit representation on the GPU.
+
+    Each group of 8 columns becomes one byte, with nonzero values represented
+    as 1 bits and zero values as 0 bits. The first column in each group
+    occupies the most significant bit.
+
+    Input:  (rows, n) uint8 tensor
+    Output: (rows, ceil(n / 8)) uint8 tensor
+
+    If n is not divisible by 8, unused bits in the last byte are set to 0.
+    Equivalent to np.packbits(B != 0, axis=1), but runs on the GPU.
+    """
+    import torch
+
+    rows = int(B.shape[0])
+    w = (n + 7) // 8
+    if n % 8:
+        B = torch.nn.functional.pad(B, (0, 8 * w - n))
+    B = B.view(rows, w, 8)
+    out = torch.zeros((rows, w), dtype=torch.uint8, device=B.device)
+    for j in range(8):
+        out |= (B[:, :, j] != 0).to(torch.uint8) << (7 - j)
+    return out
+
+
+# Per-chunk temporaries of `_expand_unpack` (a uint8 and a bool of this size).
+_UNPACK_CHUNK_BYTES = 8 << 20
+
+
+def _expand_unpack(R, combo_of_query, bit_offset: int, n: int):
+    """Expand shared packed bitmasks into per-query boolean masks.
+
+    Each query selects a packed row from R via `combo_of_query`, then unpacks
+    the requested bit range. Processes queries in chunks to limit temporary
+    GPU memory usage.
+    """
+    import torch
+
+    n_q = int(combo_of_query.shape[0])
+    w = int(R.shape[1])
+    out = torch.empty((n_q, n), dtype=torch.bool, device=R.device)
+    shifts = _bit_shifts(R.device).view(1, 1, 8)
+    budget = min(_UNPACK_CHUNK_BYTES, (n_q * w) or 1)   # 1/8 of n_q x 8w
+    step = max(1, budget // max(1, 8 * w))
+    for q0 in range(0, n_q, step):
+        q1 = min(n_q, q0 + step)
+        rq = R.index_select(0, combo_of_query[q0:q1])
+        bits = (rq.unsqueeze(2) & shifts).reshape(q1 - q0, 8 * w)
+        del rq
+        torch.ne(bits[:, bit_offset:bit_offset + n], 0, out=out[q0:q1])
+        del bits
+    return out
+
+
+# Keep the full mask table on the device if it fits within the memory budget.
+# Otherwise, load smaller windows as needed to limit GPU and host memory use.
+_RESIDENT_PARTS_FREE_FRACTION = 0.25
+_RESIDENT_WINDOW_MAX_BYTES = 1 << 30
+_RESIDENT_WINDOW_BYTES = None  # Override window size for testing.
+
+# Reuse device buffers across files to avoid repeated allocations and excess
+# GPU memory reservation. Include extra capacity for varying file sizes.
+_RESIDENT_HEADROOM = 1.125
+_RESIDENT_ALIGN = 2 << 20
+
+# Pool of reusable buffers per device. Access is limited to one thread,
+# and operations use the same CUDA stream, so no synchronization is needed.
+_RESIDENT_POOLS: dict = {}
+
+
+class _Resident:
+    """Track a mask's device buffer and the currently loaded window.
+
+    The mask is loaded in fixed-width column windows to limit GPU memory
+    usage. `k` identifies the loaded window (-1 if none), and `view`
+    provides access to its data.
+    """
+
+    __slots__ = ("device", "buf", "width", "k", "view")
+
+    def __init__(self, device, buf, width):
+        self.device = device
+        self.buf = buf
+        self.width = width
+        self.k = -1
+        self.view = None
+
+
+def _resident_device_key(device) -> str:
+    """Pool key: "cuda" and "cuda:0" (the current device) are one pool."""
+    import torch
+
+    dev = torch.device(device)
+    return str(_indexed_cuda(dev)) if dev.type == "cuda" else str(dev)
+
+
+def _resident_largest_pooled(device) -> int:
+    """Bytes of the largest idle pooled buffer of `device` (0 if none): what
+    `_resident_acquire` can hand over or drop for a new mask, so it counts as
+    free when sizing that mask's window."""
+    if not _RESIDENT_POOLS:
+        return 0
+    return max((b.numel() for b in _RESIDENT_POOLS.get(_resident_device_key(device), ())),
+               default=0)
+
+
+def _close_resident_pools() -> None:
+    """Drop all pooled buffers. Safe to call repeatedly; buffers held by live
+    masks are not in the pools and stay valid."""
+    _RESIDENT_POOLS.clear()
+
+
+def _resident_window_width(n_parts: int, n_cols: int, device) -> int:
+    """Byte-columns per window: all of them when the table fits the budget,
+    else as many as `min(budget, _RESIDENT_WINDOW_MAX_BYTES)` holds (>= 1)."""
+    import torch
+
+    if _RESIDENT_WINDOW_BYTES is not None:
+        return max(1, min(n_cols, _RESIDENT_WINDOW_BYTES // max(1, n_parts)))
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return n_cols
+    free_mem, _ = torch.cuda.mem_get_info(dev)
+    # Include unused CUDA cached memory in the available budget, since PyTorch
+    # can reuse it for new allocations.
+    free_mem += torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+    free_mem += _resident_largest_pooled(device)
+    budget = _RESIDENT_PARTS_FREE_FRACTION * free_mem
+    if n_parts * n_cols <= budget:
+        return n_cols
+    return max(1, min(n_cols, int(min(budget, _RESIDENT_WINDOW_MAX_BYTES)) // max(1, n_parts)))
+
+
+def _resident_acquire(device, need: int):
+    """Acquire a reusable device buffer with at least `need` bytes.
+
+    Reuses the smallest suitable buffer, or allocates a new one with extra
+    capacity. Drops undersized buffers to avoid excess memory usage.
+    """
+    import torch
+
+    free = _RESIDENT_POOLS.setdefault(_resident_device_key(device), [])
+    fits = [i for i, b in enumerate(free) if b.numel() >= need]
+    if fits:
+        filters_mod._count("resident_reuses")
+        return free.pop(min(fits, key=lambda j: free[j].numel()))
+    if free:
+        free.pop(max(range(len(free)), key=lambda j: free[j].numel()))
+    cap = -(-int(need * _RESIDENT_HEADROOM) // _RESIDENT_ALIGN) * _RESIDENT_ALIGN
+    filters_mod._count("resident_allocs")
+    return torch.empty(max(cap, need), dtype=torch.uint8, device=device)
+
+
+def _resident_entry(cm: "TextPart", device) -> _Resident:
+    """Get or create the mask's resident device state.
+
+    On first use, acquires a reusable buffer and determines the window
+    size. Caches the state for reuse without uploading any data yet.
+    """
+    key = str(device)
+    ent = cm._parts_dev.get(key)
+    if ent is None:
+        n_p, nb = cm.parts.shape
+        width = _resident_window_width(n_p, nb, device)
+        ent = cm._parts_dev[key] = _Resident(
+            device, _resident_acquire(device, n_p * width), width)
+    return ent
+
+
+def _resident_window(cm: "TextPart", device, k: int):
+    """Return the requested mask window from device memory.
+
+    Reuses the loaded window when possible, otherwise uploads the new
+    window. Copies are ordered after previous GPU operations.
+    """
+    import torch
+
+    ent = _resident_entry(cm, device)
+    n_p, nb = cm.parts.shape
+    if ent.k != k:
+        c0, c1 = k * ent.width, min(nb, (k + 1) * ent.width)
+        src = cm.parts if (c0, c1) == (0, nb) else np.ascontiguousarray(cm.parts[:, c0:c1])
+        view = ent.buf[: n_p * (c1 - c0)].view(n_p, c1 - c0)
+        with profiling.slice_mark("bf_combo_parts_upload"):
+            view.copy_(torch.from_numpy(src))
+        filters_mod._count("resident_uploads")
+        ent.k, ent.view = k, view
+    return ent.view
+
+
+def _resident_release(cm: "TextPart") -> None:
+    """Return the mask's device buffers to the pool for reuse.
+
+    Clears the mask's cached device state.
+    """
+    for key, ent in list(cm._parts_dev.items()):
+        if isinstance(ent, _Resident):
+            free = _RESIDENT_POOLS.setdefault(_resident_device_key(ent.device), [])
+            if all(b is not ent.buf for b in free):
+                free.append(ent.buf)
+    cm.release_device()
+
+
+def _combo_mask_device(cm: "TextPart", true_rows, device):
+    """Build a per-query boolean mask for the selected rows on the device.
+
+    Combines the mask's shared components on the GPU, then expands them into
+    individual query masks. `parts` is read from the device (whole, or in
+    column windows when it is too big) and slices with no matching rows are
+    skipped.
+
+    Returns (n_queries, n_rows) boolean tensor, or None if no rows match.
+    """
+    import torch
+
+    n_p, nb = cm.parts.shape
+    if cm.n_queries == 0 or nb == 0:
+        return None
+    # Skip slices with no matching rows, using the host-side union to avoid GPU sync.
+    host_union = cm.union_packed()
+    if isinstance(true_rows, slice):
+        r0, r1 = true_rows.start, true_rows.stop
+        n = r1 - r0
+        if n <= 0:
+            return None
+        if not _packed_slice_any(host_union[None, :], r0, n):
+            return None
+        b0, b1 = r0 >> 3, (r1 + 7) >> 3
+        w = _resident_entry(cm, device).width
+        k0, k1 = b0 // w, (b1 - 1) // w
+        if k0 == k1:
+            # a view: combine_torch only index_selects rows
+            win = _resident_window(cm, device, k0)
+            R = cm.combine_torch(win[:, b0 - k0 * w:b1 - k0 * w])
+        else:
+            # Combine each window separately into the output.
+            R = None
+            for k in range(k0, k1 + 1):
+                lo, hi = max(b0, k * w), min(b1, (k + 1) * w)
+                part = _resident_window(cm, device, k)[:, lo - k * w:hi - k * w]
+                if R is None:
+                    R = torch.empty((cm.n_combos, b1 - b0), dtype=torch.uint8,
+                                    device=part.device)
+                R[:, lo - b0:hi - b0] = cm.combine_torch(part)
+        filters_mod._count("device_builds")
+        return _expand_unpack(R, cm.device_index(R.device)[3], r0 & 7, n)
+    sel = (np.uint8(1) << (7 - (true_rows & 7)).astype(np.uint8))
+    if not (host_union[true_rows >> 3] & sel).any():
+        return None
+    n = len(true_rows)
+    if n == 0:
+        return None     # nothing selected: same as the packed path
+    # Gather each selected row's byte from every part on the device, keep only
+    # the row's own bit, then repack to bits so the combine runs at bit width.
+    # Done in chunks of rows (multiples of 8, so each chunk packs into whole
+    # bytes of P): the byte-wide gather is n_parts x rows, and n_parts can be
+    # well above the query count, so an unchunked gather could dwarf the mask.
+    cols = np.ascontiguousarray(true_rows >> 3, dtype=np.int64)
+    w = _resident_entry(cm, device).width
+    step = max(8, (_COMBINE_CHUNK_ROWS_BYTES // max(1, n_p)) // 8 * 8)
+    P = None
+    for i0 in range(0, n, step):
+        i1 = min(n, i0 + step)
+        sub = _gather_part_bytes(cm, device, cols[i0:i1], w, nb)
+        sub &= torch.from_numpy(sel[i0:i1]).to(sub.device, non_blocking=True)
+        if P is None:
+            P = torch.empty((n_p, (n + 7) // 8), dtype=torch.uint8, device=sub.device)
+        P[:, i0 >> 3:(i1 + 7) >> 3] = _pack_cols_device(sub, i1 - i0)
+        del sub
+    R = cm.combine_torch(P)
+    filters_mod._count("device_builds")
+    del P
+    return _expand_unpack(R, cm.device_index(R.device)[3], 0, n)
+
+
+# Byte budget of one row chunk of the compacted gather (n_parts x rows bytes).
+_COMBINE_CHUNK_ROWS_BYTES = 64 << 20
+
+
+def _gather_part_bytes(cm: "TextPart", device, cols: np.ndarray, w: int, nb: int):
+    """`(n_parts, len(cols))` uint8: each part's byte at byte-columns `cols`,
+    read from the device copy of `parts` (window by window if it is windowed)."""
+    import torch
+
+    if w >= nb:
+        win = _resident_window(cm, device, 0)
+        return win.index_select(1, torch.from_numpy(cols).to(win.device, non_blocking=True))
+    sub = None
+    ks = cols // w
+    for k in np.unique(ks).tolist():
+        pos = np.flatnonzero(ks == k)
+        win = _resident_window(cm, device, k)
+        if sub is None:
+            sub = torch.empty((cm.parts.shape[0], len(cols)), dtype=torch.uint8,
+                              device=win.device)
+        got = win.index_select(
+            1, torch.from_numpy(cols[pos] - k * w).to(win.device, non_blocking=True))
+        sub.index_copy_(1, torch.from_numpy(pos).to(win.device, non_blocking=True), got)
+        del got
+    return sub
+
+
 # `cache.get` sentinel: an EMPTY per-query mask caches as `None`, which is a
 # real cached value here, not a miss (see `_process_shared_batch`'s `select`).
 _UNCACHED = object()
@@ -2512,7 +2866,7 @@ _UNCACHED = object()
 
 def _union_keep(
     filters: list[Filter],
-    keeps: dict[Filter | None, "np.ndarray | PackedRowMask | None"],
+    keeps: dict[Filter | None, "np.ndarray | PackedRowMask | FilterPlan | None"],
     n_rows: int,
 ) -> np.ndarray:
     """Return the union of filtered row masks as `(n_rows,)` bool.
@@ -2524,7 +2878,11 @@ def _union_keep(
     parts = []
     for f in filters:
         m = keeps[f]
-        if isinstance(m, PackedRowMask):
+        if isinstance(m, FilterPlan):
+            # Compute the union of matching rows directly from the shared mask
+            # components, avoiding expansion into individual query masks.
+            m = m.union_rows()
+        elif isinstance(m, PackedRowMask):
             m = np.unpackbits(
                 np.bitwise_or.reduce(m.packed, axis=0), count=n_rows
             ).astype(bool)
@@ -4358,12 +4716,20 @@ def _process_batch_group(
     two_pass: bool = True,
     mv_prune=None,
     spec_thr_ext: list | None = None,
+    slice_filters=None,
 ) -> float:
     """Process one vector-type batch, sharing work across search members.
 
     Slices are transferred/scored once where possible and folded into each
     member's top-K state. Returns processing-loop wall time.
+
+    Member row/column selection comes from one of two sources:
+    `slice_filters(rows, true_rows, n_cols)` builds a `_SliceFilters` per slice
+    before scoring (the filtered path, `_process_shared_batch`), whose `select`
+    is used; otherwise the plain `select(m, rows, true_rows, cache)` callable.
     """
+    if (select is None) == (slice_filters is None):
+        raise ValueError("pass exactly one of `select` and `slice_filters`")
     import torch
 
     n_rows = batch.n_rows
@@ -4401,6 +4767,14 @@ def _process_batch_group(
         score_groups.setdefault(
             (specs[m].metric, spec_cos_scale[m] is not None), []
         ).append(m)
+
+    # Per-query filters mask excluded scores to -inf. Fused corpus normalization
+    # can turn these into NaN for non-finite norms, so affected groups fall back
+    # to unfused scoring on those slices.
+    masked_score_keys = {
+        (specs[m].metric, spec_cos_scale[m] is not None)
+        for m in member_idxs if _is_per_query(specs[m].filter)
+    }
 
     # Buffer slice top-Ks so they can be merged in larger batches.
     pending: dict[int, list[tuple]] = {m: [] for m in member_idxs}
@@ -4490,7 +4864,15 @@ def _process_batch_group(
             true_rows = slice(r0, r0 + sl.n_rows)
         else:
             true_rows = orig_rows[r0 : r0 + sl.n_rows]
-            rows = torch.from_numpy(true_rows).to(device, non_blocking=True)
+            n_sl = len(true_rows)
+            if n_sl and int(true_rows[-1]) - int(true_rows[0]) == n_sl - 1:
+                # Replace contiguous orig_rows with a slice to enable faster on-device
+                # mask unpacking, preserving semantics.
+                a = int(true_rows[0])
+                true_rows = slice(a, a + n_sl)
+                rows = torch.arange(a, a + n_sl, dtype=torch.int64, device=device)
+            else:
+                rows = torch.from_numpy(true_rows).to(device, non_blocking=True)
 
         if encoded_row_ids is None:
             encoded_rows = gidx * MAX_ROWS_PER_FILE + rows
@@ -4505,8 +4887,15 @@ def _process_batch_group(
                 ordinal_row_ids[r0 : r0 + sl.n_rows].astype(np.int64, copy=False)
             ).to(device, non_blocking=True)
 
+        # This slice's filter state, built before two-pass decisions and exact
+        # scoring (pipelined pass one is already in flight) so liveness can
+        # inform them; it builds masks only on request.
+        sf = (None if slice_filters is None
+              else slice_filters(rows, true_rows, sl.n_rows))
+
         score_cache: dict[tuple, object] = {}
-        cache: dict[object, object] = {}  # keyed by whatever select() memoizes on (e.g. Filter)
+        # keyed by whatever the plain `select` memoizes on; unused with `sf`
+        cache: dict[object, object] | None = {} if sf is None else None
         rank_cache: dict[int, tuple] = {}
         subset_cache: dict[int, tuple] = {}
 
@@ -4529,6 +4918,14 @@ def _process_batch_group(
         probe_live: dict[tuple, list] = {}
         # One prune-rate measurement per SLICE, summed over its members.
         mv_tally = [0, 0]
+        # Whether every corpus norm of this slice is finite; read once, and
+        # only when a masked group would otherwise take the fused cnorm path.
+        cn_finite: list = [None]
+
+        def _cn_finite() -> bool:
+            if cn_finite[0] is None:
+                cn_finite[0] = bool(torch.isfinite(sl.col_norms()).all())
+            return cn_finite[0]
 
         for m in member_idxs:
             s = specs[m]
@@ -4556,6 +4953,10 @@ def _process_batch_group(
                 and plan is None
                 and scale_in_packer
                 and not getattr(sl, "share_gram", False)
+                # masked cells: divide BEFORE masking when a norm is
+                # non-finite, so an excluded cell stays -inf (not NaN). The
+                # unfused path gives the same bits for every finite column.
+                and (score_key not in masked_score_keys or _cn_finite())
             )
             scores = None
             if plan is None:
@@ -4587,7 +4988,9 @@ def _process_batch_group(
                                               _thr(m), spec_qsel[m]):
                         mv_probe[0] = False
 
-            sel_rows, sel_cols, cell_mask = select(m, rows, true_rows, cache)
+            sel_rows, sel_cols, cell_mask = (
+                sf.select(m) if sf is not None
+                else select(m, rows, true_rows, cache))
             if sel_rows is None:
                 continue
             
@@ -4930,22 +5333,24 @@ def _is_per_query(f: Filter | None) -> bool:
     return f is not None and f.is_per_query()
 
 
+def _is_pq_struct(cond) -> bool:
+    """A per-query structured (non-text) condition."""
+    return cond.match_from_query is not None or cond.range_from_query is not None
+
+
+def _is_mixed(f: Filter) -> bool:
+    """Per-query text AND per-query structured conditions in one filter."""
+    conds = f.all_conditions()
+    return (any(c.match_text_from_query is not None for c in conds)
+            and any(_is_pq_struct(c) for c in conds))
+
+
 def _gpu_eligible(f: Filter | None) -> bool:
-    """Whether `f`'s per-query evaluation can run GPU-natively (Front A — see
-    this module's docstring) instead of `filters.py`'s CPU/numpy path:
-    needs at least one per-query leaf (a purely uniform filter already gets
-    the cheap column-gather path — see `_process_shared_batch` — so there's
-    nothing to speed up here) and no `match_text`/`match_text_from_query`
-    leaf ANYWHERE in the filter — torch has no string tensor type, so text
-    tokenization/matching stays CPU-only regardless of what else is in the
-    filter (see `filters._token_row_masks`'s single-pass tokenization
-    instead)."""
+    """Check whether a per-query filter can be evaluated directly on the GPU.
+    """
     if f is None or not _is_per_query(f):
         return False
-    return not any(
-        cond.match_text is not None or cond.match_text_from_query is not None
-        for cond in f.all_conditions()
-    )
+    return not any(cond.match_text_from_query is not None for cond in f.all_conditions())
 
 
 def _not_null_mask(vals: np.ndarray) -> np.ndarray:
@@ -4996,10 +5401,13 @@ def _safe_extreme(vals: np.ndarray, kind: str) -> float | None:
 
 def _row_union_from_gpu_leaves(
     f: Filter, leaf_arrays: dict[FilterCondition, np.ndarray],
-    query_filter_vals: dict[str, np.ndarray], n_rows: int,
+    query_filter_vals: dict[str, np.ndarray], n_rows: int, include_static: bool = True,
 ) -> np.ndarray | None:
     """`(rows,)` SAFE OVER-APPROXIMATION of "does at least one query want
-    this row" for a GPU-eligible per-query filter (Front B — see
+    this row" for a per-query filter's structured conditions (GPU-eligible
+    filters, and plans with `include_static=False`: their static rows are
+    already in the plan and their static leaves are not in `leaf_arrays`)
+    (Front B — see
     `run_compute`'s `has_baseline`/`vt_union_filters`), or `None` if `f.must`
     has no leaf at all to build one from (caller substitutes all-`True`: no
     tightening possible, but always correct).
@@ -5068,6 +5476,8 @@ def _row_union_from_gpu_leaves(
                 if hi is not None:
                     part &= arr <= hi
         else:
+            if not include_static:
+                continue        # the caller already has the static rows
             # Static match/range leaf — leaf_arrays[cond] IS its exact
             # (rows,) boolean mask (see _corpus_leaf_array), a necessary
             # condition for every query, so it tightens the union exactly.
@@ -5149,12 +5559,21 @@ def _corpus_leaf_array(
     `lut_for_cond` may provide a prebuilt vocab lookup to avoid rebuilding it
     for every file.
     """
+    if cond.match_from_query is None and cond.range_from_query is None:
+        return _condition_mask(cond, table)
+    # Decode dictionary columns before checking for nulls, which must never match.
+    col = filters_mod._decode_dictionary(table[cond.field])
+    nulls = col.is_null().to_numpy(zero_copy_only=False) if col.null_count else None
+    vals = filters_mod.corpus_values(col)     # exact ints even with nulls
     if cond.match_from_query is not None:
-        corpus_vals = table[cond.field].to_numpy(zero_copy_only=False)
-        return _encode_against_vocab(vocab_for_cond, corpus_vals, lut_for_cond)
-    if cond.range_from_query is not None:
-        return table[cond.field].to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
-    return _condition_mask(cond, table)
+        codes = _encode_against_vocab(vocab_for_cond, vals, lut_for_cond)
+        if nulls is not None:
+            codes[nulls] = -1               # -1: matches no query
+        return codes
+    vals = vals.astype(np.float64, copy=nulls is not None)
+    if nulls is not None:
+        vals[nulls] = np.nan                # NaN: every comparison is False
+    return vals
 
 
 def _narrow_gpu_leaf_state(state, idx):
@@ -5240,10 +5659,246 @@ def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str)
     return keep
 
 
+def _plan_mask_device(plan, rows, true_rows, leaf_gpu: dict, query_gpu: dict, device):
+    """Build the per-query filter mask for this slice on the GPU.
+
+    Combine text bitmaps, static row masks, and structured predicates
+    according to the filter's Boolean logic. Return None if no rows match.
+    """
+    import torch
+
+    m = None
+    if plan.text is not None:
+        m = _combo_mask_device(plan.text, true_rows, device)
+        if m is None:
+            return None
+        if not (plan.struct_must or plan.struct_not or plan.should_applies):
+            return m
+
+    def and_(x):
+        nonlocal m
+        m = x if m is None else (m & x)
+
+    keep_t, or_t = _plan_static_device(plan, device)
+    if keep_t is not None:
+        and_(keep_t[rows])
+    for cond in plan.struct_must:
+        and_(_gpu_cond_mask(cond, leaf_gpu, rows, query_gpu))
+    if plan.should_applies:
+        any_ = None
+        if plan.should_text is not None:
+            any_ = _combo_mask_device(plan.should_text, true_rows, device)
+        if or_t is not None:
+            x = or_t[rows]
+            any_ = x if any_ is None else (any_ | x)
+        for cond in plan.struct_should:
+            x = _gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
+            any_ = x if any_ is None else (any_ | x)
+        if any_ is None:        # only empty members: matches nothing
+            return None
+        and_(any_)
+    for cond in plan.struct_not:
+        and_(~_gpu_cond_mask(cond, leaf_gpu, rows, query_gpu))
+    if m is None or m.dim() != 2:
+        raise RuntimeError("a per-query filter plan produced no per-query mask")
+    return m if bool(m.any()) else None
+
+
+def _plan_static_device(plan, device):
+    """Upload and cache the plan's static Boolean masks once per device."""
+    import torch
+
+    if plan.static_keep is None and plan.static_or is None:
+        return None, None
+    key = str(device)
+    got = plan._dev.get(key)
+    if got is None:
+        got = plan._dev[key] = tuple(
+            None if a is None else torch.from_numpy(np.ascontiguousarray(a)).to(
+                device, non_blocking=True)
+            for a in (plan.static_keep, plan.static_or))
+    return got
+
+
+class _SliceFilters:
+    """
+    Cache per-query filter masks and derive exact row/tile liveness.
+
+    Created once per slice, after pipelined pass one is launched but before
+    two-pass preparation and exact scoring. Liveness can therefore skip
+    rescoring and one-pass GEMM work, but not pass one.
+
+    Masks are built lazily and shared between liveness checks and score
+    masking, ensuring both use identical filter decisions.
+
+    Coordinates:
+      * cell_mask(f): (filter_n_q[f], n_cols), indexed by filter query rows
+        and slice columns (including union-compacted batches).
+      * row_live(m) / tile_live(m, w): indexed by member query rows,
+        mapped through spec_qrows[m] exactly as during score masking.
+
+    None liveness means no filter restriction for that slice. Dead rows/tiles
+    are exact (all cells masked), never approximate. Liveness methods return
+    fresh contiguous tensors. For two-pass, use tile_info["width"].
+
+    Masks are released after all members using the filter call select() or
+    release(). Requesting liveness for multiple members up front retains
+    their masks until release, increasing peak memory. Request liveness
+    before select(); requests after final release rebuild the mask.
+    """
+
+
+    __slots__ = ("_specs", "_rows", "_true_rows", "n_cols", "_device",
+                 "_build_mask", "_uniform_idx", "_qsel", "_qrows",
+                 "_member_height", "_per_query", "_masks", "_local_idx",
+                 "_users", "builds")
+
+    def __init__(self, specs, member_idxs, rows, true_rows, n_cols: int, device,
+                 *, build_mask, uniform_idx, spec_qsel, spec_qrows,
+                 member_height, per_query):
+        self._specs = specs
+        self._rows = rows
+        self._true_rows = true_rows
+        self.n_cols = int(n_cols)
+        self._device = device
+        self._build_mask = build_mask      # (f, rows, true_rows) -> tensor | None
+        self._uniform_idx = uniform_idx    # (f, true_rows) -> int64 tensor
+        self._qsel = spec_qsel
+        self._qrows = spec_qrows
+        self._member_height = member_height
+        self._per_query = per_query        # f -> bool
+        self._masks: dict = {}
+        self._local_idx: dict = {}
+        # Members of THIS group that will call `select` for each per-query filter.
+        self._users = Counter(
+            specs[m].filter for m in member_idxs
+            if not _is_unfiltered(specs[m].filter) and per_query(specs[m].filter)
+        )
+        self.builds = 0   # masks built this slice (tests pin memoisation)
+
+    # -- masks ---------------------------------------------------------------
+
+    def cell_mask(self, f):
+        """`(filter_n_q[f], n_cols)` bool mask for per-query filter `f`, or
+        `None` when no query has an allowed cell in this slice."""
+        got = self._masks.get(f, _UNCACHED)
+        if got is _UNCACHED:
+            got = self._build_mask(f, self._rows, self._true_rows)
+            self.builds += 1
+            self._masks[f] = got
+        return got
+
+    def _member_mask(self, m):
+        """Member `m`'s mask in its own rows, or `None` (no allowed cell)."""
+        cm = self.cell_mask(self._specs[m].filter)
+        if cm is not None and self._qsel[m] is not None:
+            cm = cm[self._qrows[m]]
+        return cm
+
+    def _uniform_local(self, f):
+        idx = self._local_idx.get(f)
+        if idx is None:
+            idx = self._uniform_idx(f, self._true_rows)
+            self._local_idx[f] = idx
+        return idx
+
+    # -- the masking step ----------------------------------------------------
+
+    def select(self, m):
+        """`(sel_rows, sel_cols, cell_mask)` for member `m`, exactly as the
+        pre-refactor `select` returned it (`cell_mask` still in FILTER rows;
+        the caller maps it). `(None, None, None)` = nothing to fold."""
+        f = self._specs[m].filter
+        if _is_unfiltered(f):
+            return self._rows, None, None
+        if self._per_query(f):
+            cm = self.cell_mask(f)
+            self._done(f)
+            if cm is None:
+                return None, None, None
+            return self._rows, None, cm
+        local_idx = self._uniform_local(f)
+        if local_idx.numel() == 0:
+            return None, None, None
+        return self._rows[local_idx], local_idx, None
+
+    def release(self, m) -> None:
+        """Member `m` will not call `select` this slice (it was skipped, e.g.
+        because it is filter-dead): count it as done so its filter's mask is
+        released after the remaining members, not held to the slice's end."""
+        f = self._specs[m].filter
+        if not _is_unfiltered(f) and self._per_query(f):
+            self._done(f)
+
+    def _done(self, f) -> None:
+        self._users[f] -= 1
+        if self._users[f] <= 0:
+            self._masks.pop(f, None)
+
+    # -- liveness ------------------------------------------------------------
+
+    def row_live(self, m):
+        """`(member_height[m],)` bool: does member `m`'s query have at least
+        one allowed cell in this slice? `None` = every row is live."""
+        import torch
+
+        f = self._specs[m].filter
+        if _is_unfiltered(f):
+            return None
+        h = self._member_height(m)
+        if self._per_query(f):
+            cm = self._member_mask(m)
+            if cm is None:
+                return torch.zeros(h, dtype=torch.bool, device=self._device)
+            return cm.any(dim=1)
+        if self._uniform_local(f).numel() == 0:
+            return torch.zeros(h, dtype=torch.bool, device=self._device)
+        return None
+
+    def tile_live(self, m, width: int):
+        """`(n_tiles, member_height[m])` bool, `n_tiles = ceil(n_cols / width)`:
+        does member `m`'s query have an allowed cell in column tile `t`
+        (columns `[t*width, (t+1)*width)`, the last tile partial)? Same layout
+        as `_twopass_prepare`'s `tile_live[:, rng]`. `None` = all live."""
+        import torch
+
+        width = int(width)
+        if width <= 0:
+            raise ValueError(f"tile width must be positive, got {width}")
+        f = self._specs[m].filter
+        if _is_unfiltered(f):
+            return None
+        h = self._member_height(m)
+        n_tiles = -(-self.n_cols // width)
+        if self._per_query(f):
+            cm = self._member_mask(m)
+            if cm is None:
+                return torch.zeros((n_tiles, h), dtype=torch.bool, device=self._device)
+            return _tile_any(cm, width, n_tiles).T.contiguous()
+        local = self._uniform_local(f)
+        cols = torch.zeros(self.n_cols, dtype=torch.bool, device=self._device)
+        cols[local] = True
+        return (_tile_any(cols[None, :], width, n_tiles)[0][:, None]
+                .expand(n_tiles, h).contiguous())
+
+
+def _tile_any(mask, width: int, n_tiles: int):
+    """`(r, n_cols)` bool -> `(r, n_tiles)`: any True per column tile, the last
+    tile zero-padded (padding is False, so it never makes a tile live)."""
+    import torch
+
+    r, n_cols = mask.shape
+    pad = n_tiles * width - n_cols
+    if pad:
+        mask = torch.cat(
+            (mask, torch.zeros((r, pad), dtype=torch.bool, device=mask.device)), dim=1)
+    return mask.reshape(r, n_tiles, width).any(dim=2)
+
+
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_key, spec_top_enc, spec_thr,
-    keeps: dict[Filter | None, "np.ndarray | PackedRowMask | None"],
+    keeps: dict[Filter | None, "np.ndarray | PackedRowMask | FilterPlan | None"],
     filter_is_per_query: dict[Filter | None, bool],
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
     query_gpu_by_filter: dict[object, dict], filter_share_count: dict[Filter | None, int],
@@ -5269,79 +5924,80 @@ def _process_shared_batch(
     - per-query filter: keep all shared columns and apply a `(queries, rows)` mask;
     - uniform filter: select that filter's surviving columns.
 
-    Per-query masks may be GPU-evaluated or read from `PackedRowMask`; shared
-    filter work is cached only when multiple specs reuse it.
+    Per-query masks may be GPU-evaluated or read from `PackedRowMask`. Each
+    slice's masks live in one `_SliceFilters` (built before scoring, masks on
+    request): a filter shared by several members is built once per slice and
+    released after its last member's `select`. `filter_share_count` is no
+    longer consulted here (kept in the signature for the callers).
 
     `encoded_row_ids` carries pre-encoded row ids for coalesced multi-file batches.
     See `_process_batch_group` for the shared scoring loop.
     """
     import torch
 
-    def select(m: int, rows, true_rows, cache: dict[object, object]):
-        s = specs[m]
-        if _is_unfiltered(s.filter):
-            return rows, None, None
-        if filter_is_gpu_eligible[s.filter] or filter_is_per_query[s.filter]:
-            # `None` means "this slice has no row any query wants" — a cached
-            # VALUE, so the miss test needs its own sentinel.
-            cell_mask = cache.get(s.filter, _UNCACHED)
-            if cell_mask is _UNCACHED:
-                if filter_is_gpu_eligible[s.filter]:
-                    cell_mask = _gpu_evaluate(
-                        s.filter, leaf_gpu, rows,
-                        # this filter's own query rows, so the mask is
-                        # filter_n_q[s.filter] tall (see
-                        # `_narrow_gpu_leaf_state`)
-                        query_gpu_by_filter[s.filter], device,
-                    )
-                    if not cell_mask.any():
-                        cell_mask = None
-                else:
-                     # CPU per-query mask. Preserve row packing for contiguous slices; compacted
-                    # batches gather the selected row bits before transfer.
-                    pm = keeps[s.filter]
-                    # A mismatched mask height would apply rows to the wrong queries silently.
-                    if pm.n_queries != filter_n_q[s.filter]:
-                        raise RuntimeError(
-                            f"per-query filter mask is {pm.n_queries} queries "
-                            f"tall, expected {filter_n_q[s.filter]}"
-                        )
-                    if isinstance(true_rows, slice):
-                        r0, r1 = true_rows.start, true_rows.stop
-                        sub = pm.packed[:, r0 >> 3 : (r1 + 7) >> 3]
-                        if _packed_slice_any(pm.packed, r0, r1 - r0):
-                            cell_mask = _unpack_row_axis_device(
-                                sub, r1 - r0, device, bit_offset=r0 & 7,
-                            )
-                        else:
-                            cell_mask = None
-                    else:
-                        sel = (np.uint8(1) << (7 - (true_rows & 7)).astype(np.uint8))
-                        bits = pm.packed[:, true_rows >> 3] & sel
-                        if bits.any():
-                            cell_mask = torch.from_numpy(
-                                np.ascontiguousarray(bits)
-                            ).to(device, non_blocking=True) != 0
-                        else:
-                            cell_mask = None
-                if filter_share_count[s.filter] > 1:
-                    cache[s.filter] = cell_mask
-            if cell_mask is None:
-                return None, None, None
-            return rows, None, cell_mask
-        local_idx = cache.get(s.filter)
-        if local_idx is None:
-            local_np = np.nonzero(keeps[s.filter][true_rows])[0]
-            local_idx = torch.from_numpy(local_np).to(device, non_blocking=True)
-            cache[s.filter] = local_idx
-        if local_idx.numel() == 0:
-            return None, None, None
-        return rows[local_idx], local_idx, None
+    def build_mask(f, rows, true_rows):
+        """This slice's `(filter_n_q[f], n_cols)` mask for per-query filter `f`,
+        or `None` when no query has an allowed cell here."""
+        # legacy routing (switch off) keeps no entry for GPU-eligible filters
+        pm = keeps.get(f)
+        if isinstance(pm, FilterPlan):
+            if pm.n_queries != filter_n_q[f]:
+                raise RuntimeError(
+                    f"per-query filter mask is {pm.n_queries} queries "
+                    f"tall, expected {filter_n_q[f]}"
+                )
+            return _plan_mask_device(pm, rows, true_rows, leaf_gpu,
+                                     query_gpu_by_filter.get(f, {}), device)
+        if filter_is_gpu_eligible[f]:
+            cell_mask = _gpu_evaluate(
+                f, leaf_gpu, rows,
+                # this filter's own query rows, so the mask is filter_n_q[f]
+                # tall (see `_narrow_gpu_leaf_state`)
+                query_gpu_by_filter[f], device,
+            )
+            return cell_mask if cell_mask.any() else None
+        # CPU per-query mask. Preserve row packing for contiguous slices; compacted
+        # batches gather the selected row bits before transfer.
+        pm = keeps[f]
+        # A mismatched mask height would apply rows to the wrong queries silently.
+        if pm.n_queries != filter_n_q[f]:
+            raise RuntimeError(
+                f"per-query filter mask is {pm.n_queries} queries "
+                f"tall, expected {filter_n_q[f]}"
+            )
+        if isinstance(true_rows, slice):
+            r0, r1 = true_rows.start, true_rows.stop
+            if not _packed_slice_any(pm.packed, r0, r1 - r0):
+                return None
+            sub = pm.packed[:, r0 >> 3 : (r1 + 7) >> 3]
+            return _unpack_row_axis_device(sub, r1 - r0, device, bit_offset=r0 & 7)
+        sel = (np.uint8(1) << (7 - (true_rows & 7)).astype(np.uint8))
+        bits = pm.packed[:, true_rows >> 3] & sel
+        if not bits.any():
+            return None
+        return torch.from_numpy(np.ascontiguousarray(bits)).to(device, non_blocking=True) != 0
+
+    def uniform_idx(f, true_rows):
+        local_np = np.nonzero(keeps[f][true_rows])[0]
+        return torch.from_numpy(local_np).to(device, non_blocking=True)
+
+    def per_query(f) -> bool:
+        return bool(filter_is_gpu_eligible[f] or filter_is_per_query[f])
+
+    def slice_filters(rows, true_rows, n_cols):
+        return _SliceFilters(
+            specs, member_idxs, rows, true_rows, n_cols, device,
+            build_mask=build_mask, uniform_idx=uniform_idx,
+            spec_qsel=spec_qsel, spec_qrows=spec_qrows,
+            member_height=lambda m: int(spec_thr[m].shape[0]),
+            per_query=per_query,
+        )
 
     return _process_batch_group(
         batch, member_idxs, specs, spec_Q, spec_q_norms, spec_top_key, spec_top_enc,
         spec_thr,
-        batch_size, gidx, device, orig_rows=orig_rows, select=select,
+        batch_size, gidx, device, orig_rows=orig_rows, select=None,
+        slice_filters=slice_filters,
         encoded_row_ids=encoded_row_ids,
         ordinal_base=ordinal_base, ordinal_row_ids=ordinal_row_ids,
         multivector_token_budget=multivector_token_budget,
@@ -5520,6 +6176,25 @@ def _validate_query_filter_cols(
         )
 
 
+def _validate_match_types(specs, qstore: Store, corpus_files, cstore: Store, cfg) -> None:
+    """Validate match predicate types using the first query and corpus file schemas."""
+    named = [(s.name, s.filter) for s in specs if s.filter is not None]
+    if not any(c.match_from_query is not None or c.match is not None
+               for _, f in named for c in f.all_conditions()):
+        return
+    qfiles = qstore.list_parquets()
+    if not qfiles or not corpus_files:
+        return
+    import pyarrow.parquet as pq
+
+    qschema = pq.ParquetFile(qfiles[0].read_path, filesystem=qstore.fs).schema_arrow
+    cschema = pq.ParquetFile(corpus_files[0].read_path, filesystem=cstore.fs).schema_arrow
+    filters_mod.check_match_types(
+        named, cschema, qschema,
+        skip_fields=set(normalize_date_fields(cfg.corpus.date_fields)),
+        skip_query_cols=set(normalize_date_fields(cfg.queries.date_fields)))
+
+
 def _select_device(torch) -> str:
     """Which torch device this run scores on: CUDA when present, else CPU.
 
@@ -5624,9 +6299,16 @@ def run_compute(
     # Same for the kernel launch counters, which live in the kernel modules.
     _reset_sparse_branches()
     _reset_prune_instrumentation()
+    filters_mod.reset_combo_usage()
+    # Resolved once per run so every file takes the same combine path.
+    use_combo = filters_mod.combo_enabled()
     # After the reset, which returns the mode to "unconfigured".
     twopass.set_rescore_mode(cfg.params.two_pass_rescore)
     twopass.set_pipeline_pass_one(cfg.params.pipeline_pass_one)
+    configure_rust_fetch(
+        dense=cfg.params.rust_fetch_dense, columns=cfg.params.rust_fetch_columns,
+        concurrency=cfg.params.rust_fetch_concurrency,
+        part_mib=cfg.params.rust_fetch_part_mib, chunks=cfg.params.rust_fetch_chunks)
     # Local imports: both modules are imported function-locally throughout this
     # file (triton is optional), and `topk_triton` is otherwise reached only via
     # `tiebreak`.
@@ -5826,6 +6508,7 @@ def run_compute(
     # Applied BEFORE striding so the global file index — and thus make_point_id — is
     # over the filtered set, consistent between compute workers and merge.
     all_files = filter_corpus_files(all_files, cfg.corpus.include, cfg.corpus.exclude)
+    _validate_match_types(specs, qstore, all_files, cstore, cfg)
     # Compute the corpus fingerprint for both the manifest and threshold exchange.
     corpus_fp = run_manifest.corpus_fingerprint(all_files)
     if num_jobs is not None:
@@ -5964,6 +6647,33 @@ def run_compute(
     # `applied_threshold` column for the merge to verify against.
     spec_thr_applied: list = [None] * len(specs)
 
+    _run_scope_memo: list[str] = []
+
+    def _run_scope_id() -> str:
+        """sha256 scoping the threshold exchange's `_thresholds/<id>/` under
+        `output.path`. Covers every search's run identity (config, corpus
+        fingerprint, num_jobs, max_files, tiebreak), the query CONTENT, the
+        corpus listing with sizes, and this package's code hash, so files left
+        by any other run (or other code) on the same output path are never
+        read as this run's. Identical on every rank of one run; computed once."""
+        if not _run_scope_memo:
+            import hashlib as _hashlib
+            h = _hashlib.sha256("\n".join(sorted(
+                run_identity(config_identity(cfg, s_), corpus_fp["sha256"],
+                             num_jobs, max_files, cfg.params.tiebreak)
+                for s_ in specs
+            )).encode())
+            for vt in sorted(Q_np_by_vt):
+                h.update(vt.encode())
+                _thresholds.hash_array(h, Q_np_by_vt[vt])
+            if mv_q_offsets is not None:
+                _thresholds.hash_array(h, np.asarray(mv_q_offsets))
+            for f_ in all_files:
+                h.update(f"{f_.key}:{f_.size}\n".encode())
+            h.update(_thresholds.code_hash().encode())
+            _run_scope_memo.append(h.hexdigest())
+        return _run_scope_memo[0]
+
     def _start_threshold_exchange() -> None:
         """Constructed right before the scan's try/finally so that a failure
         in the remaining setup cannot leak its threads."""
@@ -5971,10 +6681,11 @@ def run_compute(
         if not cfg.params.threshold_exchange:
             return
         if not num_jobs or num_jobs < 2:
+            # The default config has it on, so a lone worker is the normal
+            # case here, not a misconfiguration: note it, don't warn.
             thr_exchange_stats["reason"] = "single-worker run"
-            logger.warning(
-                "params.threshold_exchange is set but this is a single-worker run "
-                "(no --num-jobs); nothing to exchange, continuing without it"
+            logger.info(
+                "threshold exchange off: single-worker run (no peers to exchange with)"
             )
         elif os.environ.get("NOVA_BF_NO_PRUNE"):
             thr_exchange_stats["reason"] = "NOVA_BF_NO_PRUNE"
@@ -5984,22 +6695,7 @@ def run_compute(
             )
         else:
             # Scope the exchange to THIS run
-            import hashlib as _hashlib
-            h = _hashlib.sha256("\n".join(sorted(
-                run_identity(config_identity(cfg, s_), corpus_fp["sha256"],
-                             num_jobs, max_files, cfg.params.tiebreak)
-                for s_ in specs
-            )).encode())
-
-            for vt in sorted(Q_np_by_vt):
-                h.update(vt.encode())
-                _thresholds.hash_array(h, Q_np_by_vt[vt])
-            if mv_q_offsets is not None:
-                _thresholds.hash_array(h, np.asarray(mv_q_offsets))
-            for f_ in all_files:
-                h.update(f"{f_.key}:{f_.size}\n".encode())
-            h.update(_thresholds.code_hash().encode())
-            exchange_id = h.hexdigest()
+            exchange_id = _run_scope_id()
             try:
                 thr_exchange = _thresholds.ThresholdExchange(
                     Store(cfg.output.path), exchange_id, job_rank, num_jobs,
@@ -6007,6 +6703,7 @@ def run_compute(
                                      _thresholds.publish_width(specs[m].k, num_jobs))
                      for m in range(len(specs))},
                     refresh_s=cfg.params.threshold_exchange_refresh_s,
+                    fetch_concurrency=cfg.params.threshold_exchange_fetch_concurrency,
                 )
             except Exception as exc:  # noqa: BLE001 — degrade to no exchange
                 thr_exchange = None
@@ -6018,13 +6715,24 @@ def run_compute(
                 return
             thr_exchange.stats["configured"] = True
             thr_exchange_stats = thr_exchange.stats
+            # Compute-thread wall time in the exchange hooks (see `_thr_timed`).
+            thr_exchange.stats.update({
+                "apply_calls": 0, "apply_seconds_total": 0.0, "apply_seconds_max": 0.0,
+                "publish_calls": 0, "publish_seconds_total": 0.0, "publish_seconds_max": 0.0,
+                # Hook calls that raised and were skipped (see `_thr_guarded`).
+                "apply_failures": 0, "publish_failures": 0,
+            })
             logger.info(
-                "threshold exchange ON: rank %d/%d publishes per-query thresholds "
-                "under %s/%s and prunes against the max over peers (refresh every "
-                "%.1fs; code hash %s — workers with a different one form a separate "
-                "exchange group)",
-                job_rank, num_jobs, cfg.output.path, thr_exchange.subdir,
-                cfg.params.threshold_exchange_refresh_s, _thresholds.code_hash()[:12],
+                "threshold exchange ON: rank %d/%d publishes its top-m scores per "
+                "query (m = publish width: %s) under %s/%s and prunes against the "
+                "k-th best of its own top-m ∪ every peer's (refresh every %.1fs, up "
+                "to %d concurrent GETs; code hash %s — workers with a different one "
+                "form a separate exchange group)",
+                job_rank, num_jobs,
+                ", ".join(f"{n}={w}" for n, w in thr_exchange.stats["publish_width"].items()),
+                cfg.output.path, thr_exchange.subdir,
+                cfg.params.threshold_exchange_refresh_s, thr_exchange.fetch_concurrency,
+                _thresholds.code_hash()[:12],
             )
             # A worker starting after its peers inherits their thresholds for
             # its very first file, not just from the second file on (-1 =
@@ -6074,13 +6782,59 @@ def run_compute(
             out.append(torch.topk(sc, w, dim=1, sorted=True).values if w < sc.shape[1] else sc)
         return out
 
+    def _thr_timed(key: str, fn, *args) -> None:
+        """Track exchange hook wall time, calls, and maximum duration.
+
+        CUDA timings include implicit synchronization but exclude asynchronous
+        work not yet completed when the hook returns.
+        """
+        t0 = time.perf_counter()
+        try:
+            fn(*args)
+        finally:
+            if thr_exchange is not None:
+                dt = time.perf_counter() - t0
+                st = thr_exchange.stats
+                st[f"{key}_calls"] = st.get(f"{key}_calls", 0) + 1
+                st[f"{key}_seconds_total"] = round(st.get(f"{key}_seconds_total", 0.0) + dt, 6)
+                st[f"{key}_seconds_max"] = round(max(st.get(f"{key}_seconds_max", 0.0), dt), 6)
+
+    def _thr_guarded(key: str, fn, *args) -> None:
+        """Run an exchange hook, counting and logging recoverable failures.
+
+        Retains the last valid pruning thresholds on failure.
+        Propagates CUDA device faults.
+        """
+        try:
+            _thr_timed(key, fn, *args)
+        except Exception as exc:  # noqa: BLE001 — see above; re-raised if not ours
+            if _is_device_fault(exc):
+                raise
+            st = thr_exchange.stats
+            st[f"{key}_failures"] = st.get(f"{key}_failures", 0) + 1
+            if st[f"{key}_failures"] == 1:
+                logger.warning(
+                    "threshold exchange: %s step failed (%s: %s); skipping it, this "
+                    "rank prunes against its last valid thresholds. Further failures "
+                    "are counted in threshold_exchange_stats.%s_failures, not logged.",
+                    key, type(exc).__name__, exc, key, exc_info=True,
+                )
+
     def _apply_external_thresholds(file_idx: int | None = None) -> None:
+        if thr_exchange is not None:
+            _thr_guarded("apply", _apply_external_thresholds_impl, file_idx)
+
+    def _publish_thresholds() -> None:
+        if thr_exchange is not None:
+            _thr_guarded("publish", _publish_thresholds_impl)
+
+    def _apply_external_thresholds_impl(file_idx: int | None = None) -> None:
         """Recompute the external bound from the peers' latest lists and this
         worker's own current top-m (the union's k-th best), as packed keys."""
         nonlocal thr_version_seen
         if thr_exchange is None:
             return
-        thr_version_seen, lists, changed = thr_exchange.latest(thr_version_seen)
+        version, lists, changed = thr_exchange.latest(thr_version_seen)
         if lists is not None:
             own = _own_top_lists()
             for m in range(len(specs)):
@@ -6091,15 +6845,28 @@ def run_compute(
                 # near zero, and a peer list can be replaced by a shorter one).
                 spec_thr_ext[m] = (new_key if spec_thr_ext[m] is None
                                    else torch.maximum(spec_thr_ext[m], new_key))
+                if thr_exchange.stats["first_applied_file"] is None:
+                    # -1 = before the first file (inherited at startup); "final" =
+                    # first applied by the end-of-scan refresh (`trim_partials`),
+                    # i.e. nothing was pruned against a peer's list during the scan.
+                    thr_exchange.stats["first_applied_file"] = (
+                        "final" if file_idx is None else file_idx)
             thr_exchange.stats["applies"] += 1
             if changed:
                 thr_exchange.stats["versions_applied"] += 1
-            if thr_exchange.stats["first_applied_file"] is None:
-                thr_exchange.stats["first_applied_file"] = file_idx
+        # Only once applied in full: after a failed apply (`_thr_guarded`)
+        # the next one still counts the version as newly applied.
+        thr_version_seen = version
 
-    def _publish_thresholds() -> None:
+    def _publish_thresholds_impl() -> None:
         """Hand this worker's current per-query thresholds (scores only) to the
-        exchange. One small D2H copy; the network traffic is on its threads."""
+        exchange. One D2H copy; the file write is on its threads. Always
+        handed over, never compared with the last publish first: mid-scan
+        some query's top-m changes at nearly every file boundary, so the
+        check would almost never skip, and an exact one would need a device
+        copy of every published list (h x m fp16 per search) kept resident.
+        The exchange's latest-wins hand-over and >= 1 s write spacing bound
+        the write rate; an unchanged republish costs one extra write."""
         if thr_exchange is None:
             return
         # The top-m lists, float16 rounded toward -inf ON the device (a
@@ -6130,6 +6897,21 @@ def run_compute(
               else spec_q_norms[m][spec_qsel[m]]).contiguous()
         for m in range(len(specs))
     ]
+    # A per-query filter masks excluded cells to -inf BEFORE the packer divides
+    # by the query norm, and -inf / NaN (or / inf) is NaN: an excluded row would
+    # come back as a NaN candidate. A filtered cosine search whose own queries
+    # include a non-finite norm therefore divides by the query norm in `_scores`
+    # instead (before masking): same bits for every finite query, excluded
+    # cells stay -inf. One check per run.
+    for m in range(len(specs)):
+        cs = spec_cos_scale[m]
+        if cs is not None and _is_per_query(specs[m].filter) and not bool(torch.isfinite(cs).all()):
+            logger.warning(
+                "search %r: %d of its queries have a non-finite norm (NaN/inf "
+                "query vector); dividing by the query norm before the per-query "
+                "filter mask so filter-excluded rows stay excluded",
+                specs[m].name, int((~torch.isfinite(cs)).sum()))
+            spec_cos_scale[m] = None
 
     # spec_qrows is built further down, once `filter_rows` is known: its base is
     # the per-FILTER mask height, not the file's. See there.
@@ -6170,6 +6952,9 @@ def run_compute(
     # sharing an identical per-query leaf build/transfer it only once —
     # same sharing leaf_arrays/leaf_gpu already give the corpus side below.
     filter_is_gpu_eligible: dict[Filter | None, bool] = {f: _gpu_eligible(f) for f in distinct_filters}
+    # Mixed per-query filters also need GPU state for their structured predicates.
+    filter_is_mixed: dict[Filter | None, bool] = {
+        f: bool(use_combo and f is not None and _is_mixed(f)) for f in distinct_filters}
     gpu_query_gpu: dict[FilterCondition, object] = {}
     gpu_vocabs: dict[FilterCondition, np.ndarray] = {}
     # Prebuild vocab lookup tables once instead of once per corpus file. 
@@ -6178,11 +6963,11 @@ def run_compute(
     gpu_vocab_luts: dict[FilterCondition, _VocabLut] = {}
     lut_budget = _VOCAB_LUT_PREBUILD_BYTES
     for f in distinct_filters:
-        if not filter_is_gpu_eligible[f]:
+        if not (filter_is_gpu_eligible[f] or filter_is_mixed[f]):
             continue
         for cond in f.all_conditions():
             if cond.match_from_query is None and cond.range_from_query is None:
-                continue  # a static leaf inside an eligible filter needs no per-query GPU state
+                continue  # a static (or text) leaf needs no per-query GPU state
             if cond in gpu_query_gpu:
                 continue
             qgpu, vocab = _build_gpu_leaf_state(cond, query_filter_vals, device)
@@ -6203,12 +6988,12 @@ def run_compute(
             len(gpu_vocab_luts),
             sum(t.nbytes for t in gpu_vocab_luts.values()) / (1 << 20),
         )
-    # How many specs share each distinct filter — used by _process_shared_batch
-    # to skip caching a per-query cell_mask when nobody else will reuse it
-    # (Front A's memory-shrinking complement).
+    # How many specs share each distinct filter. No longer read by
+    # _process_shared_batch (its per-slice `_SliceFilters` releases each mask
+    # after the last member using it); still passed through its signature.
     filter_share_count: dict[Filter | None, int] = Counter(spec_filter)
 
-    # Narrow CPU per-query filter masks to the query rows that actually use them.
+    # Narrow per-query filter masks / plans to the query rows that actually use them.
     # This keeps unrelated query sets in a unified file from increasing mask memory.
     filter_rows: dict[Filter | None, np.ndarray | None] = _union_rows_by_key(
         spec_filter, spec_rows, n_q
@@ -6235,8 +7020,8 @@ def run_compute(
         for f, r in filter_rows.items() if f is not None
     }
 
-    # Precompute file-independent text-query tokenization once for CPU-fallback
-    # filters. GPU-eligible filters bypass this path.
+    # Precompute file-independent text-query tokenization once per filter with
+    # text (GPU-eligible filters have no per-query text, so they need none).
     filter_text_prep: dict[Filter, object] = {
         f: prepare_text_queries(f, filter_query_vals[f])
         for f in distinct_filters
@@ -6247,7 +7032,7 @@ def run_compute(
     # that filter's own query rows.
     gpu_query_by_filter: dict[object, dict] = {}
     for f in distinct_filters:
-        if f is None or not filter_is_gpu_eligible[f]:
+        if f is None or not (filter_is_gpu_eligible[f] or filter_is_mixed[f]):
             continue
         r = filter_rows[f]
         if r is None:
@@ -6398,6 +7183,24 @@ def run_compute(
     if tiebreak == "id" and mine:
         t_ord = time.perf_counter()
 
+        id_fetch = rust_fetch_columns_enabled()
+
+        def _read_id_column(f):
+            # Native download of just the id column's chunks when
+            # params.rust_fetch_columns is on (pyarrow still decodes them; see
+            # Store.read_columns_fetched); otherwise -- or on any fallback --
+            # pyarrow's own projected read.
+            if id_fetch:
+                got = cstore.read_columns_fetched(f.read_path, [id_col])
+                if got is not None:
+                    return got[0][id_col]
+            return cstore.read_columns(
+                f.read_path, [id_col],
+                # `None` = the store's setting; `False` projects the column
+                # instead of buying the whole file. See ID_PASS_RANGED_GET.
+                ranged=None if ID_PASS_RANGED_GET else False,
+            )[id_col]
+
         def _rank_ids() -> None:
             try:
                 # `map` preserves file order, including duplicate-id tie order.
@@ -6415,15 +7218,7 @@ def run_compute(
                         with id_rank_lock:
                             if id_rank_cancel.is_set():
                                 return
-                            futures.append(pool.submit(
-                                lambda f=f: cstore.read_columns(
-                                    f.read_path, [id_col],
-                                    # `None` = the store's setting; `False`
-                                    # projects the column instead of buying the
-                                    # whole file. See ID_PASS_RANGED_GET.
-                                    ranged=None if ID_PASS_RANGED_GET else False,
-                                )[id_col]
-                            ))
+                            futures.append(pool.submit(_read_id_column, f))
                     # Resolve in file order, preserving the old `map`
                     # guarantee. A failed scan cancels all queued reads.
                     id_arrays = []
@@ -6503,6 +7298,25 @@ def run_compute(
     # Optional read-phase profiling, grouped by column shape/type so timings remain 
     # meaningful across corpora with different column names.
     read_timing = profiling.read_timing_on()
+    # rust_fetch dense read path (params.rust_fetch_dense; see io.py). Read timing
+    # keeps the pyarrow path: it exists to profile THAT path's stages.
+    # Only when the dense column plays no other role (id / filter / another
+    # vector type would need it from the pyarrow table too).
+    use_native_dense = (
+        "dense" in vts_needed and rust_fetch_dense_enabled() and not read_timing
+        and read_cols.count(dense_col) == 1
+        and dense_col not in ([id_col] if id_col else []) + filter_cols
+        and dense_col not in (
+            ([sparse_col] if "sparse" in vts_needed else [])
+            + ([multivector_col] if "multivector" in vts_needed else []))
+    )
+    if use_native_dense:
+        logger.info("dense corpus column %r: rust_fetch read path (params.rust_fetch_dense)", dense_col)
+    # Native DOWNLOAD (pyarrow still decodes) for the columns pyarrow reads
+    # (params.rust_fetch_columns; see Store.read_columns_fetched).
+    use_native_fetch = rust_fetch_columns_enabled() and not read_timing
+    if use_native_fetch:
+        logger.info("corpus columns read by pyarrow: rust_fetch download (params.rust_fetch_columns)")
     read_col_groups = {
         "dense": [dense_col] if "dense" in vts_needed else [],
         "sparse": [sparse_col] if "sparse" in vts_needed else [],
@@ -6571,15 +7385,61 @@ def run_compute(
                     t0 = time.perf_counter()
                     # Optional per-file read timing
                     rt: dict | None = None
+                    # Native dense path (opt-in, see io.py): the dense column
+                    # arrives already decoded; pyarrow reads only the OTHER
+                    # columns (projected -- never a whole-file ranged GET,
+                    # which would re-buy the dense bytes). None = fall back.
+                    native = (
+                        cstore.read_dense_versioned(f.read_path, dense_col)
+                        if use_native_dense else None
+                    )
+                    native_dense, native_etag = native if native is not None else (None, None)
                     if read_timing:
                         table, rt = profiling.fetch_and_decode(
                             cstore, f.read_path, read_cols, read_col_groups)
+                    elif native_dense is not None:
+                        rest_cols = [c for c in read_cols if c != dense_col]
+                        table = None
+                        fetch_pinned = False
+                        if rest_cols:
+                            # Native download pinned to the SAME version as the
+                            # dense read (None if that version is gone).
+                            fetched = (cstore.read_columns_fetched(f.read_path, rest_cols,
+                                                                   etag=native_etag)
+                                       if use_native_fetch else None)
+                            if fetched is not None:
+                                table, fetch_pinned = fetched[0], True
+                            else:
+                                table = cstore.read_columns(f.read_path, rest_cols, ranged=False)
+                            # Never keep a second reference to the table: the
+                            # reader drops it before compaction (peak memory).
+                            fetched = None
+                        if (table is not None and not fetch_pinned
+                                and not cstore.same_version(f.read_path, native_etag)):
+                            # Rewritten between the two reads: never pair one
+                            # version's ids/filters with another's vectors.
+                            # Read everything again in ONE pyarrow read.
+                            logger.warning("%s changed during the read; re-reading it with "
+                                           "pyarrow", f.key)
+                            native_dense = None
+                            table = cstore.read_columns(f.read_path, read_cols)
+                        if (table is not None and native_dense is not None
+                                and len(table) != native_dense.shape[0]):
+                            raise ValueError(
+                                f"{f.key}: native dense read gave {native_dense.shape[0]} "
+                                f"rows but the other columns have {len(table)}"
+                            )
                     else:
-                        table = cstore.read_columns(f.read_path, read_cols)
-                
+                        fetched = (cstore.read_columns_fetched(f.read_path, read_cols)
+                                   if use_native_fetch else None)
+                        table = (fetched[0] if fetched is not None
+                                 else cstore.read_columns(f.read_path, read_cols))
+                        fetched = None  # see above: no second reference to the table
+
                     # Normalize declared datetime columns before any filter reads them.
                     ts = time.perf_counter()
-                    table = convert_table_date_columns(table, corpus_date_fmts)
+                    if table is not None:
+                        table = convert_table_date_columns(table, corpus_date_fmts)
                     if rt is not None:
                         rt["dates"] = time.perf_counter() - ts
 
@@ -6587,7 +7447,9 @@ def run_compute(
                     arrs: dict[str, object] = {}
                     ts = time.perf_counter()
                     if "dense" in vts_needed:
-                        arrs["dense"] = dense_to_2d(table[dense_col])
+                        arrs["dense"] = (native_dense if native_dense is not None
+                                         else dense_to_2d(table[dense_col]))
+                    native_dense = None
                     if rt is not None:
                         # Recorded only when the stage RAN
                         if "dense" in vts_needed:
@@ -6629,7 +7491,9 @@ def run_compute(
                         rt["ids"] = time.perf_counter() - ts
 
                     # Keep only filter columns; vector/ID data is already retained elsewhere.
-                    n_rows_file = len(table)
+                    # `table` is None only on the native path with no other
+                    # columns to read (no ids, filters or other vector types).
+                    n_rows_file = len(table) if table is not None else int(arrs["dense"].shape[0])
                     ts = time.perf_counter()
                     if filter_cols:
                         table = table.select(filter_cols)
@@ -6664,9 +7528,10 @@ def run_compute(
                                 if k.startswith("decode_parquet_")
                             ) or "none",
                         )
-                    # Evaluate each distinct filter once per file. CPU per-query filters return a
-                    # row-packed `PackedRowMask`; GPU-eligible filters build fine masks lazily and
-                    # keep only a row-union mask here when compaction needs one.
+                    # Evaluate each distinct filter once per file. With the lazy combine on,
+                    # every per-query filter comes back as a `FilterPlan` for the GPU; legacy
+                    # routing gives `PackedRowMask`s, and GPU-eligible filters there keep only
+                    # a row-union mask here when compaction needs one.
                     n_rows = n_rows_file
                     if n_rows > MAX_ROWS_PER_FILE:
                         raise ValueError(
@@ -6679,29 +7544,57 @@ def run_compute(
 
                     # CPU-fallback filters can run concurrently. Use a private outer pool so tasks
                     # waiting on the shared scan pool cannot deadlock that same pool.
+                    # With the lazy combine on, EVERY filter goes through `evaluate`
+                    # (per-query ones come back as a `FilterPlan` / `TextPart`
+                    # for the GPU); off, GPU-eligible filters keep `_gpu_evaluate`.
                     cpu_fallback_filters = [
-                        f for f in distinct_filters if f is not None and not filter_is_gpu_eligible[f]
+                        f for f in distinct_filters
+                        if f is not None and (use_combo or not filter_is_gpu_eligible[f])
                     ]
+                    # one mask per static condition per file, shared by all filters
+                    static_cache: dict = {}
                     if len(cpu_fallback_filters) > 1:
                         with ThreadPoolExecutor(max_workers=len(cpu_fallback_filters)) as pool:
                             masks = list(pool.map(
                                 lambda f: evaluate(f, table, filter_query_vals[f],
-                                                   filter_pool, filter_text_prep[f]),
+                                                   filter_pool, filter_text_prep.get(f),
+                                                   combo=use_combo, static_cache=static_cache,
+                                                   parts_budget=cfg.params.combo_parts_max_bytes),
                                 cpu_fallback_filters,
                             ))
                     else:
                         masks = [evaluate(f, table, filter_query_vals[f], filter_pool,
-                                          filter_text_prep[f])
+                                          filter_text_prep.get(f), combo=use_combo,
+                                          static_cache=static_cache,
+                                          parts_budget=cfg.params.combo_parts_max_bytes)
                                  for f in cpu_fallback_filters]
                     for f, mask in zip(cpu_fallback_filters, masks):
-                        # `evaluate` already returns the per-query case ROW-PACKED
-                        # (a `filters.PackedRowMask`); nothing to do here.
+                        # Warm each plan's text-part row union here, on the reader:
+                        # the GPU thread then skips empty slices on the host
+                        # without a sync.
+                        if isinstance(mask, FilterPlan):
+                            for part in mask.masks():
+                                part.union_packed()
                         keeps[f] = mask
 
                     # GPU-eligible filters share/deduplicate corpus leaf arrays.
                     for f in distinct_filters:
                         if f is None:
                             keeps[f] = None
+                        elif isinstance(keeps.get(f), FilterPlan):
+                            # its per-query structured conditions run on the GPU
+                            plan = keeps[f]
+                            for cond in f.all_conditions():
+                                if _is_pq_struct(cond) and cond not in leaf_arrays:
+                                    leaf_arrays[cond] = _corpus_leaf_array(
+                                        cond, table, gpu_vocabs.get(cond),
+                                        gpu_vocab_luts.get(cond),
+                                    )
+                            if f in filters_needing_row_union:
+                                # superset of what the structured must side admits
+                                # (static rows are already in the plan)
+                                plan.struct_union = _row_union_from_gpu_leaves(
+                                    f, leaf_arrays, query_filter_vals, n_rows, include_static=False)
                         elif filter_is_gpu_eligible[f]:
                             for cond in f.all_conditions():
                                 if cond not in leaf_arrays:
@@ -6998,6 +7891,16 @@ def run_compute(
                             spec_thr_ext=spec_thr_ext,
                         )
 
+                # This file's slices are all enqueued: return its lazy masks'
+                # resident `parts` buffers to the pool and drop their index
+                # tensors now, before the next file's masks take buffers,
+                # rather than whenever the last reference happens to drop.
+                for m in keeps.values():
+                    if isinstance(m, FilterPlan):
+                        for part in m.masks():
+                            _resident_release(part)
+                        m.release_device()
+
                 # Threshold exchange: publish ours, pick up the peers' maximum.
                 _publish_thresholds()
                 _apply_external_thresholds(gidx)
@@ -7068,10 +7971,33 @@ def run_compute(
             # converged thresholds) and stop the exchange threads.
             _publish_thresholds()
             thr_exchange.close(final=True)
+            if cfg.params.trim_partials:
+                # Final, synchronous refresh on this thread (the poller has
+                # stopped; the changed peer files are still fetched
+                # concurrently, on a transient pool, see `_fetched`):
+                # whatever the peers published while this
+                # rank finished its scan raises the bound the partial is
+                # trimmed against at write time. `_apply_external_thresholds`
+                # keeps it monotone, so the value recorded below is still >=
+                # every threshold this rank pruned against.
+                t_ref = time.perf_counter()
+                try:
+                    folded = thr_exchange.poll_once()
+                except Exception as exc:  # noqa: BLE001 — trim less, never fail
+                    folded = 0
+                    logger.warning("threshold exchange: final refresh failed (%s); "
+                                   "trimming against the last known thresholds", exc)
+                _apply_external_thresholds(None)
+                thr_exchange.stats["final_refresh"] = {
+                    "peer_files_folded": int(folded),
+                    "seconds": round(time.perf_counter() - t_ref, 3),
+                }
             # What this worker actually pruned against (the lowered, applied
             # external thresholds), for the partial's `applied_threshold`
             # column. Nothing prunes after this point (the tail flush above
-            # was the last scoring), so this is >= every threshold used.
+            # was the last scoring), so this is >= every threshold used —
+            # and, with `trim_partials`, it is exactly the threshold the
+            # write-time trim below drops entries against.
             for m in range(len(specs)):
                 spec_thr_applied[m] = (
                     unpack_score(spec_thr_ext[m]).cpu().numpy().astype(np.float32, copy=False)
@@ -7110,7 +8036,10 @@ def run_compute(
                 twopass.release()
             finally:
                 # Join the run-scoped dense staging helper on every exit path.
-                _close_dense_staging()
+                try:
+                    _close_dense_staging()
+                finally:
+                    _close_resident_pools()
 
     wall = time.perf_counter() - wall0
     gb = bytes_seen / 1e9
@@ -7361,13 +8290,18 @@ def run_compute(
             # order. Process query rows in chunks to bound peak GPU memory during sorting.
             h_i = spec_top_key[i].shape[0]
             chunk = max(1, min(h_i, DECODE_CHUNK_SLOTS // max(1, s.k)))
-            enc_parts, sc_parts = [], []
+            # Optionally trim partial results using the applied external threshold.
+            trim_on = thr_exchange is not None and cfg.params.trim_partials
+            trim_key = spec_thr_ext[i] if trim_on else None
+            enc_parts, sc_parts, trim_parts = [], [], []
             for r0 in range(0, h_i, chunk):
                 kb, order = torch.sort(
                     spec_top_key[i][r0 : r0 + chunk], dim=1, descending=True
                 )
                 enc_parts.append(spec_top_enc[i][r0 : r0 + chunk].gather(1, order).cpu().numpy())
                 del order
+                if trim_key is not None:
+                    trim_parts.append(_trim_mask(kb, trim_key[r0 : r0 + chunk]).cpu().numpy())
                 # Recover scores from the packed keys.
                 sc_parts.append(unpack_score(kb).cpu().numpy())
                 del kb
@@ -7378,6 +8312,34 @@ def run_compute(
             spec_top_key[i] = spec_top_enc[i] = None
             valid = sc > float("-inf")
             nan_hits = np.isnan(sc).sum(axis=1).astype(np.int32) if num_jobs is not None else None
+            if trim_key is not None:
+                trim = trim_parts[0] if len(trim_parts) == 1 else np.concatenate(trim_parts)
+                del trim_parts
+                n_before = int(valid.sum())
+                # The trimmed entries are FINITE (see `_trim_mask`), so
+                # `nan_hits` above is unaffected; dropping them from `valid`
+                # is all the writer below needs.
+                valid &= ~trim
+                n_kept = int(valid.sum())
+                logger.info(
+                    "search=%r trim: kept %d of %d entries (%.4f of k*NQ=%d; "
+                    "dropped %d below the applied external threshold)",
+                    s.name, n_kept, n_before, n_kept / max(1, s.k * h_i),
+                    s.k * h_i, n_before - n_kept,
+                )
+                trim_stats = {"entries_before": n_before, "entries_kept": n_kept,
+                              "kept_fraction_of_k_nq": round(n_kept / max(1, s.k * h_i), 6)}
+            elif trim_on:
+                # Exchange on but no peer list was ever applied: nothing to
+                # trim against, the partial is written whole.
+                n_kept = int(valid.sum())
+                logger.info("search=%r trim: no external threshold applied; kept all "
+                            "%d entries (%.4f of k*NQ=%d)", s.name, n_kept,
+                            n_kept / max(1, s.k * h_i), s.k * h_i)
+                trim_stats = {"entries_before": n_kept, "entries_kept": n_kept,
+                              "kept_fraction_of_k_nq": round(n_kept / max(1, s.k * h_i), 6)}
+            else:
+                trim_stats = None
             # A spec with a `rows` subset wrote state for its OWN queries only, so
             # its output covers those rows — ids and payload are sliced to match.
             # `query_ids`/`payload` stay full-length upstream (both loaders return
@@ -7488,6 +8450,8 @@ def run_compute(
                 "corpus_dtype": dtypes.get("corpus_dtype"),
                 "queries_dtype": dtypes.get("queries_dtype"),
             })
+            if trim_stats is not None:
+                entry["trim"] = trim_stats
             if num_jobs is None:
                 # Only a whole-corpus run can say anything true about short top-Ks.
                 # On a partial, "fewer than k hits" is the normal state of a stride
@@ -7547,9 +8511,17 @@ def run_compute(
         # RESOLVED pass-one pipelining (NOVA_BF_PIPELINE_PASS_ONE over the
         # config); `kernels.twopass.pipeline_*` says what it actually did.
         "pipeline_pass_one": twopass.pipeline_pass_one(),
-        # The configured bool stays under `threshold_exchange`; what the
-        # exchange actually did is here.
-        "threshold_exchange_stats": thr_exchange_stats,
+        # RESOLVED native I/O settings (NOVA_BF_RUST_FETCH_* over the config).
+        # Per-file fallbacks to pyarrow are logged, not counted here.
+        "rust_fetch": rust_fetch_settings(),
+        # Per-query text combine: lazy `TextPart` combined on the device
+        # (permitted unless NOVA_BF_NO_GPU_COMBO) and what actually ran.
+        "text_filter_combine": {**filters_mod.combo_usage(), "permitted": use_combo},
+        # Snapshot exchange statistics to avoid concurrent updates during serialization.
+        "threshold_exchange_stats": dict(thr_exchange_stats),
+
+        # Record whether partial-result trimming was enabled with an active exchange.
+        "trim_partials_effective": bool(thr_exchange is not None and cfg.params.trim_partials),
         # What actually RAN, not what the kill switches permitted.
         "kernels": run_manifest.kernel_usage(
             _PRUNE_APPLIED["count"],

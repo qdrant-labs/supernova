@@ -28,7 +28,14 @@
 resources:
   cloud: aws
   region: us-east-1          # ← VERIFY against the corpus bucket (see note 1)
-  accelerators: A10G:1       # or: instance_type: g5.8xlarge   (25 Gbps fixed NIC)
+  # instance_type, NOT `accelerators: A10G:1`: that asks only for the GPU and
+  # lets the optimizer pick the cheapest A10G box, which is g5.xlarge at 16 GiB
+  # of RAM. The fineweb-10B scan peaks near 81 GiB of HOST memory at 32 ranks
+  # (see the id_column note in configs/brute_force/fineweb_shared_all.yaml), so
+  # that box OOMs before it finishes a file -- observed, not predicted, on the
+  # ms-marco filtered run. g5.8xlarge is 128 GiB / ~115.5 usable, and its NIC
+  # is a fixed 25 Gbps rather than credit-limited burst.
+  instance_type: g5.8xlarge  # 1x A10G, 32 vCPU, 128 GiB, 25 Gbps
   # use_spot stays false for ground truth: a preempted rank that never re-runs
   # silently drops its corpus slice, and `nova bf merge` can't tell — it merges
   # whatever partials exist, yielding INCOMPLETE ground truth with no error.
@@ -39,3 +46,32 @@ resources:
   # In us-east-1 → ami-041c37c1cd2c36a67. If your SkyPilot errors on this tag,
   # grep ~/.sky/catalogs/*/aws/images.csv for the current gpu tag.
   image_id: skypilot:custom-gpu-ubuntu-cuda13
+
+# ---------------------------------------------------------------------------
+# Worker install. IDENTICAL to nova-dist's shared default except `ffmpeg` is
+# dropped from the apt line. `setup` is one of the keys an override may replace
+# (see `_MERGE_KEYS` in nova_dist/sky.py), so this needs no change to
+# nova-dist and nothing pushed to master.
+#
+# WHY IT IS SAFE TO DROP: the shared default installs ffmpeg because `datasets`
+# -- pulled in by sentence-transformers, which nova-EMBED uses -- imports
+# torchcodec, and that dlopens libavutil/libavcodec at import time. nova-bf
+# does not touch that chain: `nova-bf[compute]` is torch plus
+# pydantic/pyarrow/numpy/pyyaml/tqdm/click, and nothing under
+# python/nova-bf/src imports sentence_transformers, datasets or torchcodec
+# (verified 2026-09-04). A bf worker never loads a codec.
+#
+# WHY BOTHER: ffmpeg drags in ~224 MB of codec dependencies. On 2026-09-04 that
+# apt fetch crawled (repeated `Ign:` lines from a struggling mirror) and the
+# worker was still in setup 22 minutes in when SkyPilot terminated the replica,
+# killing the run before it started. Setup is serialized ahead of the run and
+# billed at GPU rates -- x32 at fan-out.
+setup: |
+  set -e
+  SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+  command -v curl >/dev/null && command -v git >/dev/null || ($SUDO apt-get update && $SUDO apt-get install -y curl git)
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  if ! command -v cargo >/dev/null; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; . "$HOME/.cargo/env"; fi
+  UV_TOOL_BIN_DIR="$HOME/.local/bin" uv tool install --python 3.12 --with 'nova-textscan @ git+https://github.com/qdrant-labs/supernova@master#subdirectory=crates/nova-textscan' --with 'rust_fetch @ git+https://github.com/qdrant-labs/supernova@master#subdirectory=python/nova-bf/rust_io' 'nova-bf[compute] @ git+https://github.com/qdrant-labs/supernova@master#subdirectory=python/nova-bf'
+  $SUDO ln -sf "$HOME/.local/bin/nova-bf" /usr/local/bin/nova-bf

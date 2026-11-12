@@ -164,7 +164,9 @@ def _spy_masks(monkeypatch, seen, height_only=False):
 
     def spy(*a, **kw):
         mask = real(*a, **kw)
-        if getattr(mask, "ndim", 1) == 2:
+        # a FilterPlan without a text part holds no per-query mask at all
+        # (structured conditions are evaluated per batch on the GPU)
+        if getattr(mask, "ndim", 1) == 2 and getattr(mask, "text", True) is not None:
             seen.append(mask.shape[0] if height_only else mask.shape)
         return mask
 

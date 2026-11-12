@@ -34,6 +34,7 @@ def _find_oracle():
     here = pathlib.Path(__file__).resolve()
     for base in here.parents:
         for cand in (base / "docs" / "brute-force" / name,
+                     base / "docs" / "brute-force" / "claude_only" / name,
                      base / "docs" / "brute-force" / "tc-probe" / name,
                      base / name):
             if cand.exists():

@@ -93,9 +93,14 @@ def test_gpu_filter_mask_is_built_at_the_filters_own_height(tmp_path, monkeypatc
     cost."""
     cdir, qpath = _build(tmp_path)
     seen = []
-    real = compute_mod._gpu_evaluate
-    monkeypatch.setattr(compute_mod, "_gpu_evaluate",
-                        lambda *a, **k: seen.append(real(*a, **k).shape) or real(*a, **k))
+    real = compute_mod._plan_mask_device   # every per-query mask is built here
+
+    def spy(*a, **k):
+        m = real(*a, **k)
+        if m is not None:
+            seen.append(tuple(m.shape))
+        return m
+    monkeypatch.setattr(compute_mod, "_plan_mask_device", spy)
     run_compute(_cfg(tmp_path, cdir, qpath, "o1"))
     assert seen, "the GPU-eligible filter never ran"
     assert {h[0] for h in seen} == {6}, f"expected height 6, got {sorted({h[0] for h in seen})}"
