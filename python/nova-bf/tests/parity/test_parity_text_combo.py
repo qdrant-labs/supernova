@@ -1,7 +1,7 @@
 """`NOVA_BF_NO_GPU_COMBO`: the lazy per-query text combine is invisible.
 
 With the switch unset, per-query text filters reach scoring as a
-`filters.ComboRowMask` combined on the device per slice; with it set, as the
+`filters.TextPart` combined on the device per slice; with it set, as the
 materialised `PackedRowMask`. Both runs must agree hit-for-hit AND
 score-for-score (the masks are bit-identical, so nothing about scoring may
 move), and both must agree with the naive oracle — so a combine that broke

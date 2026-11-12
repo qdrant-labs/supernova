@@ -1,4 +1,4 @@
-"""The lazy per-query text combine (`filters.ComboRowMask`) is EXACT.
+"""The lazy per-query text combine (`filters.TextPart`) is EXACT.
 
 `evaluate(..., combo=True)` returns the production-shape per-query text mask
 as distinct phrase rows plus a per-combination AND/OR structure; `run_compute`
@@ -29,7 +29,7 @@ from nova_bf.config import (
     BruteForceConfig, CorpusConfig, Filter, FilterCondition, OutputConfig,
     ParamsConfig, QueriesConfig, RangeCondition, RangeFromQuery, SearchSpec,
 )
-from nova_bf.filters import ComboRowMask, PackedRowMask, evaluate
+from nova_bf.filters import TextPart, PackedRowMask, evaluate
 
 
 @pytest.fixture(autouse=True)
@@ -121,19 +121,51 @@ def _rand_filter(rng, allow_per_query_nontext=False):
     return Filter(**{g: tuple(cs) for g, cs in groups.items()})
 
 
+def _text_only(m):
+    """A text-only `FilterPlan`'s text part (what these tests examine); any
+    other result unchanged."""
+    if (isinstance(m, F.FilterPlan) and m.text is not None and m.should_text is None
+            and not (m.struct_must or m.struct_should or m.struct_not)):
+        return m.text
+    return m
+
+
 def _pair(filt, t, qv):
     old = evaluate(filt, t, qv, combo=False)
-    new = evaluate(filt, t, qv, combo=True)
+    new = _text_only(evaluate(filt, t, qv, combo=True))
     return old, new
+
+
+def _union_exact(cm) -> bool:
+    """The single union rule is exact iff no live combination has two or more
+    required parts of its own (FineWeb's shape); otherwise a superset."""
+    if isinstance(cm, F.FilterPlan):
+        cm = cm.text
+    if not isinstance(cm, TextPart):
+        return True
+    return not F._factor_union(cm.and_idx.tolist(), cm.combo_group.tolist())[4]
+
+
+def _check_union(new, want, ctx):
+    """`new` (rows,) bool union vs the true union `want`: a superset always,
+    equal when the union rule is exact for this mask."""
+    got = new.union_rows()
+    assert got.shape == want.shape, ctx
+    assert not (want & ~got).any(), ctx + " union drops an allowed row"
+    if _union_exact(new):
+        assert np.array_equal(got, want), ctx
 
 
 def _assert_same(old, new, ctx=""):
     assert isinstance(old, PackedRowMask), ctx
-    got = new.to_packed() if isinstance(new, ComboRowMask) else new
+    got = new.to_packed() if isinstance(new, TextPart) else new
     assert got.packed.shape == old.packed.shape, ctx
     assert np.array_equal(got.packed, old.packed), ctx   # padding bytes too
     assert new.shape == old.shape and new.n_queries == old.n_queries, ctx
-    assert new.any() == old.any(), ctx
+    if _union_exact(new):
+        assert new.any() == old.any(), ctx
+    else:
+        assert new.any() or not old.any(), ctx     # superset
 
 
 # ---------------------------------------------------------------------------
@@ -149,18 +181,18 @@ def test_fuzz_combo_to_packed_is_bit_identical(seed):
     filt = _rand_filter(rng)
     old, new = _pair(filt, t, qv)
     ctx = f"seed={seed} n={n} nq={nq} filt={filt}"
-    assert isinstance(new, ComboRowMask), ctx
+    assert isinstance(new, TextPart), ctx
     _assert_same(old, new, ctx)
     want_union = (np.unpackbits(np.bitwise_or.reduce(old.packed, axis=0), count=n).astype(bool)
                   if nq else np.zeros(n, bool))
-    assert np.array_equal(new.union_rows(), want_union), ctx
+    _check_union(new, want_union, ctx)
     assert np.array_equal(new.unpack(), old.unpack()), ctx
     # query narrowing keeps exactness (and unused combinations drop out)
     qsel = np.array(sorted(rng.sample(range(nq), rng.randint(1, nq))))
     _assert_same(old[qsel], new[qsel], ctx + " narrowed")
-    assert np.array_equal(
-        new[qsel].union_rows(),
-        np.unpackbits(np.bitwise_or.reduce(old[qsel].packed, axis=0), count=n).astype(bool)), ctx
+    _check_union(new[qsel],
+                 np.unpackbits(np.bitwise_or.reduce(old[qsel].packed, axis=0), count=n).astype(bool),
+                 ctx + " narrowed")
 
 
 @pytest.mark.parametrize("seed", range(60))
@@ -176,7 +208,7 @@ def test_raw_parts_and_device_combine_bytes(seed):
     t = _table(rng, n)
     qv = _qv(rng, nq)
     old, new = _pair(_rand_filter(rng), t, qv)
-    if not isinstance(new, ComboRowMask):
+    if not isinstance(new, TextPart):
         return
     ctx = f"seed={seed} n={n} nq={nq}"
     pad = np.uint8(~np.uint8(F._tail_mask(n)))
@@ -185,7 +217,7 @@ def test_raw_parts_and_device_combine_bytes(seed):
     got = R.numpy()[new.combo_of_query]
     assert np.array_equal(got, old.packed), ctx
     want_union = np.unpackbits(np.bitwise_or.reduce(old.packed, axis=0), count=n).astype(bool)
-    assert np.array_equal(new.union_rows(), want_union), ctx
+    _check_union(new, want_union, ctx)
 
 
 def test_zero_query_and_one_query_negative_stride_narrowing():
@@ -198,7 +230,7 @@ def test_zero_query_and_one_query_negative_stride_narrowing():
     qv = _qv(rng, 3, same_combo=True)
     filt = Filter(must=[FilterCondition(field="text", match_text_from_query="kw")])
     old, new = _pair(filt, t, qv)
-    assert isinstance(new, ComboRowMask) and new.and_idx.shape[0] == 1
+    assert isinstance(new, TextPart) and new.and_idx.shape[0] == 1
     empty = new[np.array([], dtype=np.int64)]
     assert empty.n_queries == 0 and empty.any() is False and empty.any() == old[np.array([], dtype=np.int64)].any()
     for sl in (slice(0, 1), slice(None, None, -3), slice(2, 1, -1)):
@@ -217,9 +249,8 @@ def test_host_combine_chunking_is_exact(monkeypatch, seed, chunk):
     qv = _qv(rng, rng.randint(1, 20))
     old, new = _pair(_rand_filter(rng), t, qv)
     _assert_same(old, new, f"seed={seed}")
-    assert np.array_equal(
-        new.union_rows(),
-        np.unpackbits(np.bitwise_or.reduce(old.packed, axis=0), count=len(t)).astype(bool))
+    _check_union(new, np.unpackbits(np.bitwise_or.reduce(old.packed, axis=0),
+                                    count=len(t)).astype(bool), f"seed={seed}")
 
 
 def test_fineweb_shape_and_dead_combos():
@@ -237,10 +268,88 @@ def test_fineweb_shape_and_dead_combos():
         should=[FilterCondition(field="url", match_text_from_query=f"s{i}") for i in range(9)],
     )
     old, new = _pair(filt, t, qv)
-    assert isinstance(new, ComboRowMask)
+    assert isinstance(new, TextPart)
     assert new.or_idx.shape[0] <= 4   # 3 slot groups + the dead combos' (ONES,)
     _assert_same(old, new)
     assert not old.packed[:2].any()          # the dead combos really are dead
+
+
+def _mixed_dense(plan, t, qv):
+    """CPU evaluation of a `FilterPlan`'s formula: the text parts via
+    `to_packed`, the structured per-query conditions via the CPU's own
+    per-condition masks. Must equal the full reference mask."""
+    if plan.text is not None:
+        m = plan.text.to_packed().unpack()
+    else:
+        m = np.ones(plan.shape, dtype=bool)
+        if plan.static_keep is not None:
+            m &= plan.static_keep[None, :]
+    for c in plan.struct_must:
+        m &= F._condition_mask(c, t, qv)
+    for c in plan.struct_not:
+        m &= ~F._condition_mask(c, t, qv)
+    if plan.should_applies:
+        s = (plan.should_text.to_packed().unpack() if plan.should_text is not None
+             else np.zeros_like(m))
+        if plan.static_or is not None:
+            s |= plan.static_or[None, :]
+        for c in plan.struct_should:
+            s |= F._condition_mask(c, t, qv)
+        m &= s
+    return m
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("seed", range(300))
+def test_mixed_plan_formula_is_exact(monkeypatch, seed, fallback):
+    """Random filters mixing per-query text with per-query structured
+    conditions in every group: the regrouped plan equals the full mask.
+    `fallback`: the byte budget forced to 0 with the guard on, so every text
+    part that has more phrase rows than queries is built from
+    per-combination rows instead (same result)."""
+    if fallback:
+        monkeypatch.setattr(F, "_COMBO_PARTS_GUARD", True)
+        monkeypatch.setattr(F, "_COMBO_PARTS_MAX_BYTES", 0)
+    rng = random.Random(77000 + seed)
+    t = _table(rng, rng.choice([1, 7, 8, 9, rng.randint(1, 120)]))
+    qv = _qv(rng, rng.randint(1, 14), same_combo=rng.random() < 0.2)
+    filt = _rand_filter(rng, allow_per_query_nontext=True)
+    plan = evaluate(filt, t, qv, combo=True)
+    if not isinstance(plan, F.FilterPlan):
+        return
+    want = evaluate(filt, t, qv, combo=False).unpack()
+    got = _mixed_dense(plan, t, qv)
+    assert got.shape == want.shape and np.array_equal(got, want), seed
+    assert plan.n_queries == want.shape[0]
+    # union / any are supersets of the truth
+    assert not (want.any(axis=0) & ~plan.union_rows()).any()
+    assert plan.any() or not want.any()
+
+
+@pytest.mark.parametrize("seed", range(300))
+def test_struct_plan_formula_is_exact(seed):
+    """Random per-query structured filters WITHOUT per-query text (static
+    conditions, static text included, in every group): the plan's static rows
+    + structured conditions equal the full mask; the static cache shared by
+    two filters gives the same answer as none."""
+    rng = random.Random(91000 + seed)
+    t = _table(rng, rng.choice([1, 7, 8, 9, rng.randint(1, 120)]))
+    qv = _qv(rng, rng.randint(1, 14))
+    base = _rand_filter(rng, allow_per_query_nontext=True)
+    groups = {g: tuple(c for c in getattr(base, g) if c.match_text_from_query is None)
+              for g in ("must", "should", "must_not")}
+    filt = Filter(**groups)
+    if not any(F._is_pq_struct(c) for c in filt.all_conditions()):
+        return
+    want = evaluate(filt, t, qv, combo=False)
+    want = want.unpack() if hasattr(want, "unpack") else np.broadcast_to(want, want.shape)
+    cache = {}
+    for _ in range(2):               # second call reads the cache
+        plan = evaluate(filt, t, qv, combo=True, static_cache=cache)
+        assert isinstance(plan, F.FilterPlan) and plan.text is None
+        got = _mixed_dense(plan, t, qv)
+        assert got.shape == want.shape and np.array_equal(got, want), seed
+    assert not (want.any(axis=0) & ~plan.union_rows()).any()
 
 
 def test_uniform_and_unsupported_shapes_keep_the_old_types():
@@ -253,14 +362,18 @@ def test_uniform_and_unsupported_shapes_keep_the_old_types():
         r = random.Random(seed)
         filt = _rand_filter(r, allow_per_query_nontext=True)
         old, new = _pair(filt, t, qv)
-        if isinstance(new, ComboRowMask):
+        if isinstance(new, TextPart):
             _assert_same(old, new)
+            continue
+        if isinstance(new, F.FilterPlan):
+            assert np.array_equal(_mixed_dense(new, t, qv), old.unpack())
             continue
         assert isinstance(new, PackedRowMask)
         assert np.array_equal(new.packed, old.packed)
+    # per-query text + per-query structured: a FilterPlan (GPU-combined)
     mixed = Filter(must=[FilterCondition(field="text", match_text_from_query="kw"),
                          FilterCondition(field="cat", match_from_query="cat_q")])
-    assert isinstance(evaluate(mixed, t, qv, combo=True), PackedRowMask)
+    assert isinstance(evaluate(mixed, t, qv, combo=True), F.FilterPlan)
 
 
 def test_combo_usage_counts():
@@ -298,6 +411,13 @@ def _old_build(pm, true_rows, device="cpu"):
 
 
 def _same_dev(a, b, ctx):
+    # None and an all-false mask mean the same thing ("nothing allowed"): the
+    # host union is a superset for multi-phrase shapes, so the new path may
+    # build an all-false mask where the reference returns None
+    if a is not None and b is None and not bool(a.any()):
+        a = None
+    if b is not None and a is None and not bool(b.any()):
+        b = None
     assert (a is None) == (b is None), ctx
     if a is not None:
         assert a.dtype == torch.bool and b.dtype == torch.bool, ctx
@@ -316,12 +436,10 @@ def _slices(rng, n):
 
 
 @pytest.mark.parametrize("window", [None, 1, 64])
-@pytest.mark.parametrize("empty_check", ["auto", "device"])
 @pytest.mark.parametrize("chunk", [None, 5])
 @pytest.mark.parametrize("seed", range(40))
-def test_device_slice_mask_matches_packed_path(monkeypatch, seed, chunk, empty_check, window):
-    """`empty_check="device"` forces the device-side None decision (taken
-    when the host union is not cheap); "auto" mostly takes the host one.
+def test_device_slice_mask_matches_packed_path(monkeypatch, seed, chunk, window):
+    """Device masks equal the packed reference (None == all-false).
     `window`: `parts` held whole (None) or in column windows of at most that
     many bytes (1: one column per window), slices and rows visited in random
     order so windows are reloaded back and forth."""
@@ -332,14 +450,12 @@ def test_device_slice_mask_matches_packed_path(monkeypatch, seed, chunk, empty_c
         monkeypatch.setattr(C, "_UNPACK_CHUNK_BYTES", 1 + seed % 3 * 64)
         # and the row-chunked compacted gather: 8 or 16 rows per chunk
         monkeypatch.setattr(C, "_COMBINE_CHUNK_ROWS_BYTES", 1 + seed % 2 * 400)
-    if empty_check == "device":
-        monkeypatch.setattr(ComboRowMask, "union_is_cheap", lambda self: False)
     rng = random.Random(4200 + seed)
     n = rng.choice([1, 8, 9, 23, rng.randint(1, 180)])
     t = _table(rng, n)
     qv = _qv(rng, rng.randint(1, 18), same_combo=rng.random() < 0.1)
     old, new = _pair(_rand_filter(rng), t, qv)
-    assert isinstance(new, ComboRowMask)
+    assert isinstance(new, TextPart)
     trs = list(_slices(rng, n))
     for _ in range(8):
         k = rng.randint(0, n)
@@ -359,11 +475,8 @@ def test_device_slice_mask_matches_packed_path(monkeypatch, seed, chunk, empty_c
 
 
 @pytest.mark.parametrize("window", [None, 1])
-@pytest.mark.parametrize("empty_check", ["auto", "device"])
-def test_device_mask_none_when_nothing_allowed(monkeypatch, empty_check, window):
+def test_device_mask_none_when_nothing_allowed(monkeypatch, window):
     monkeypatch.setattr(C, "_RESIDENT_WINDOW_BYTES", window)
-    if empty_check == "device":
-        monkeypatch.setattr(ComboRowMask, "union_is_cheap", lambda self: False)
     t = pa.table({"text": pa.array(["alpha"] * 5 + ["beta"] * 11)})
     qv = {"kw": np.array(["beta", None, "gamma"], dtype=object)}
     f = Filter(must=[FilterCondition(field="text", match_text_from_query="kw")])
@@ -371,7 +484,6 @@ def test_device_mask_none_when_nothing_allowed(monkeypatch, empty_check, window)
     for sl in (slice(0, 5), slice(1, 4), slice(5, 6), slice(0, 6), slice(4, 16)):
         _same_dev(C._combo_mask_device(new, sl, "cpu"), _old_build(old, sl), str(sl))
     assert C._combo_mask_device(new, slice(0, 5), "cpu") is None
-    assert new.union_is_cheap() == (empty_check == "auto")
     assert C._combo_mask_device(new, np.array([0, 4], dtype=np.int64), "cpu") is None
     assert C._combo_mask_device(new, np.array([], dtype=np.int64), "cpu") is None
 
@@ -412,8 +524,9 @@ def test_windows_loaded_once_per_sequential_pass(monkeypatch):
     """Windowed: a front-to-back pass of slices (some crossing windows) loads
     each window once; going back reloads; results exact throughout."""
     monkeypatch.setattr(C, "_RESIDENT_WINDOW_BYTES", 1)
-    # device-side emptiness check: every slice is built (none skipped on the host)
-    monkeypatch.setattr(ComboRowMask, "union_is_cheap", lambda self: False)
+    # an all-ones union: every slice is built (none skipped on the host)
+    monkeypatch.setattr(TextPart, "union_packed",
+                        lambda self: np.full(self.parts.shape[1], 0xFF, np.uint8))
     old, cm = _sized_mask(400)
     n_p, nb = cm.parts.shape
     F.reset_combo_usage()
@@ -556,7 +669,7 @@ def test_largest_pooled_and_device_key(monkeypatch, fresh_pools):
 
 
 def test_budget_fallback_warns_once_per_filter_and_counts(monkeypatch, caplog):
-    """Over the byte budget: the reference full mask (identical), a warning
+    """Over the byte budget: per-combination rows (identical to the full mask), a warning
     naming the filter and the fixes, logged once per run per filter, and a
     `budget_fallbacks` count per mask."""
     import logging
@@ -569,12 +682,13 @@ def test_budget_fallback_warns_once_per_filter_and_counts(monkeypatch, caplog):
                should=[FilterCondition(field="text", match_text_from_query="kw2")])
     F.reset_combo_usage()
     with caplog.at_level(logging.WARNING, logger="nova_bf.filters"):
-        got = [evaluate(f, t, qv, combo=True) for _ in range(3)]
-    assert all(type(g) is PackedRowMask for g in got)
+        got = [_text_only(evaluate(f, t, qv, combo=True)) for _ in range(3)]
+    # the fallback is still a text part (per-combination rows) for the GPU path
+    assert all(type(g) is TextPart for g in got)
     _assert_same(evaluate(f, t, qv, combo=False), got[0], "fallback")
     msgs = [r.getMessage() for r in caplog.records if "budget" in r.getMessage()]
     assert len(msgs) == 1, msgs
-    assert "text~kw" in msgs[0] and "_COMBO_PARTS_MAX_BYTES" in msgs[0] and "slower" in msgs[0]
+    assert "text~kw" in msgs[0] and "params.combo_parts_max_bytes" in msgs[0] and "slower" in msgs[0]
     assert F.combo_usage()["budget_fallbacks"] == 3
     F.reset_combo_usage()            # a new run warns again
     with caplog.at_level(logging.WARNING, logger="nova_bf.filters"):
@@ -591,10 +705,8 @@ def test_zero_rows_and_zero_queries_upload_nothing(fresh_pools):
     nobody = cm[np.array([], dtype=np.int64)]
     assert C._combo_mask_device(nobody, slice(0, 50), "cpu") is None
     assert not empty._parts_dev and not nobody._parts_dev
-    # an empty compacted batch uploads nothing either (device-side check path)
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(ComboRowMask, "union_is_cheap", lambda self: False)
-        assert C._combo_mask_device(cm, np.array([], dtype=np.int64), "cpu") is None
+    # an empty compacted batch uploads nothing either
+    assert C._combo_mask_device(cm, np.array([], dtype=np.int64), "cpu") is None
     assert not cm._parts_dev
     assert F.combo_usage()["resident_uploads"] == 0
 
@@ -606,13 +718,15 @@ def test_union_keep_matches(seed):
     t = _table(rng, n)
     qv = _qv(rng, rng.randint(1, 15))
     f1, f2 = _rand_filter(rng), _rand_filter(rng)
-    o1, n1 = _pair(f1, t, qv)
-    o2, n2 = _pair(f2, t, qv)
+    o1, o2 = evaluate(f1, t, qv, combo=False), evaluate(f2, t, qv, combo=False)
+    n1, n2 = evaluate(f1, t, qv, combo=True), evaluate(f2, t, qv, combo=True)   # plans
     uni = Filter(must=[FilterCondition(field="cat", match="a")])
     um = evaluate(uni, t, qv)
     want = C._union_keep([f1, f2, uni], {f1: o1, f2: o2, uni: um}, n)
     got = C._union_keep([f1, f2, uni], {f1: n1, f2: n2, uni: um}, n)
-    assert got.dtype == want.dtype and np.array_equal(got, want)
+    assert got.dtype == want.dtype and not (want & ~got).any()     # superset
+    if _union_exact(n1) and _union_exact(n2):
+        assert np.array_equal(got, want)
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +782,7 @@ STATIC_SHOULD = Filter(
     should=[FilterCondition(field="text", match_text_from_query="neg"),
             FilterCondition(field="text", match_text="alpha")],
 )
-MIXED = Filter(   # per-query non-text alongside text: the PackedRowMask fallback
+MIXED = Filter(   # per-query structured alongside text: a FilterPlan
     must=[FilterCondition(field="text", match_text_from_query="kw"),
           FilterCondition(field="cat", match_from_query="cat_q")],
 )
@@ -683,7 +797,7 @@ def _searches(with_unfiltered):
     return out
 
 
-def _run(ds, name, searches, batch):
+def _run(ds, name, searches, batch, **params):
     import json
     out = ds["tmp"] / name
     out.mkdir()
@@ -691,7 +805,7 @@ def _run(ds, name, searches, batch):
         corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
         queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
         output=OutputConfig(path=str(out)),
-        params=ParamsConfig(dense_batch_size=batch),
+        params=ParamsConfig(dense_batch_size=batch, **params),
         searches=searches,
     )
     res = {}
@@ -726,8 +840,8 @@ def test_run_compute_identical_with_switch(e2e_ds, monkeypatch, with_unfiltered,
 
     def spy_eval(*a, **kw):
         m = real_eval(*a, **kw)
-        if isinstance(m, ComboRowMask):
-            made.append(m)
+        if isinstance(m, F.FilterPlan):
+            made.extend(m.masks())
         return m
     monkeypatch.setattr(C, "evaluate", spy_eval)
     tag = f"{int(with_unfiltered)}_{batch}_{window}"
@@ -739,14 +853,15 @@ def test_run_compute_identical_with_switch(e2e_ds, monkeypatch, with_unfiltered,
     on, u_on = _run(e2e_ds, "on" + tag, _searches(with_unfiltered), batch)
     assert u_off["permitted"] is False and u_off["combo_masks"] == 0
     assert u_on["permitted"] is True
-    # 3 lazy-capable filters x 3 files; MIXED falls back on both runs
-    assert u_on["combo_masks"] == 9 and u_on["packed_masks"] == 3
+    # 3 lazy-capable filters x 3 files; MIXED is a FilterPlan (GPU-combined)
+    assert u_on["combo_masks"] == 9 and u_on["packed_masks"] == 0
+    assert u_on["mixed_plans"] == 3
     assert u_on["device_builds"] > 0 and u_on["host_materialisations"] == 0
-    # pooled: at most one buffer per lazy filter in flight (3), the rest reused;
-    # one buffer per mask that was ever used
-    assert 0 < u_on["resident_allocs"] <= 3
+    # pooled: at most one buffer per lazy mask in flight (3 text filters + the
+    # FilterPlan's text part = 4), the rest reused; one buffer per mask used
+    assert 0 < u_on["resident_allocs"] <= 4
     taken = u_on["resident_allocs"] + u_on["resident_reuses"]
-    assert 0 < taken <= u_on["combo_masks"]
+    assert 0 < taken <= u_on["combo_masks"] + 2 * u_on["mixed_plans"]
     if window is None:
         assert u_on["resident_uploads"] == taken     # whole table: once per mask
     else:
@@ -758,18 +873,43 @@ def test_run_compute_identical_with_switch(e2e_ds, monkeypatch, with_unfiltered,
     assert set(on) == set(off)
     short = 0
     for name in on:
-        assert on[name] == off[name], name   # ids, scores, order, lengths
+        if with_unfiltered:
+            # no compaction (an unfiltered search scores every row): byte-identical
+            assert on[name] == off[name], name   # ids, scores, order, lengths
+        else:
+            # Compaction active: MIXED's row union is a superset now, so the
+            # shared compacted batch differs and scores may move by an ULP
+            # (GEMM blocking). Same ids/order outside near-ties, tight tolerance.
+            _assert_hits_close(on[name], off[name], name)
         short += sum(len(h) < (60 if name == "mixed" else 40) for h in on[name]["hit_ids"])
     assert short, "fixture no longer produces short lists"
 
 
+def _assert_hits_close(a, b, label, rtol=1e-6):
+    """Per query: identical id lists with scores within `rtol` (relative), or
+    -- only at a near-tie -- lists that differ just at the top-K boundary
+    (tie-aware, as in tests/parity/compare.py, but at an ULP-level tolerance)."""
+    from parity import compare
+    assert a["query_id"] == b["query_id"], label
+    for qi, (ia, sa, ib, sb) in enumerate(zip(a["hit_ids"], a["hit_scores"],
+                                               b["hit_ids"], b["hit_scores"])):
+        ctx = f"{label} q{qi}"
+        if ia == ib:
+            np.testing.assert_allclose(sa, sb, rtol=rtol, atol=rtol, err_msg=ctx)
+            continue
+        assert len(ia) == len(ib), ctx
+        compare.assert_scores_agree(list(zip(ia, sa)), list(zip(ib, sb)),
+                                    metric="dot", label=ctx, tol=rtol)
+
+
 @pytest.mark.parametrize("cap", [0, None])
 def test_parts_guard_threshold_is_exact(monkeypatch, cap):
-    """Guard on: lazy iff `parts` bytes <= max(full mask bytes, the byte cap);
-    otherwise the reference PackedRowMask. With the cap at 0 that is "part
-    rows (ONES/ZERO included) <= queries", fuzzed until both sides of the
-    boundary have been hit; at the default cap (4 GiB) small tables are
-    always lazy. Bit-identical either way."""
+    """Guard on: the phrase-row `parts` iff its bytes <= max(full mask bytes,
+    the byte cap); otherwise the budget fallback (per-combination rows built
+    on the CPU, still a TextPart). With the cap at 0 that is "part rows
+    (ONES/ZERO included) <= queries", fuzzed until both sides of the boundary
+    have been hit; at the default cap small tables never fall back.
+    Bit-identical either way."""
     if cap is not None:
         monkeypatch.setattr(F, "_COMBO_PARTS_MAX_BYTES", cap)
     hit = {"eq": 0, "over": 0}
@@ -780,15 +920,175 @@ def test_parts_guard_threshold_is_exact(monkeypatch, cap):
         qv = _qv(rng, nq, same_combo=rng.random() < 0.3)
         filt = _rand_filter(rng)
         monkeypatch.setattr(F, "_COMBO_PARTS_GUARD", False)
-        lazy = evaluate(filt, t, qv, combo=True)
-        if not isinstance(lazy, ComboRowMask):
+        lazy = _text_only(evaluate(filt, t, qv, combo=True))
+        if not isinstance(lazy, TextPart):
             continue                     # a shape the lazy type cannot express
         rows = lazy.parts.shape[0]
         monkeypatch.setattr(F, "_COMBO_PARTS_GUARD", True)
-        got = evaluate(filt, t, qv, combo=True)
-        want_lazy = (rows <= nq) if cap == 0 else True
-        assert isinstance(got, ComboRowMask) == want_lazy, (seed, rows, nq)
+        F.reset_combo_usage()
+        got = _text_only(evaluate(filt, t, qv, combo=True))
+        want_fallback = (rows > nq) if cap == 0 else False
+        assert isinstance(got, TextPart), seed
+        assert (F.combo_usage()["budget_fallbacks"] == 1) == want_fallback, (seed, rows, nq)
+        if want_fallback:   # one part per combination (+ ONES/ZERO)
+            assert got.parts.shape[0] == got.n_combos + 2
         _assert_same(evaluate(filt, t, qv, combo=False), got, f"seed={seed}")
         hit["eq"] += rows == nq
         hit["over"] += rows == nq + 1
     assert hit["eq"] and hit["over"], hit
+
+
+MIXED_SHAPES = {
+    # text must + structured should (split mode, with and without text should)
+    "m_should": Filter(must=[FilterCondition(field="text", match_text_from_query="kw")],
+                       should=[FilterCondition(field="cat", match_from_query="cat_q"),
+                               FilterCondition(field="text", match_text_from_query="neg")]),
+    "m_should_struct_only": Filter(
+        must=[FilterCondition(field="text", match_text_from_query="kw")],
+        should=[FilterCondition(field="cat", match_from_query="cat_q")]),
+    # structured must_not alongside text, and text must_not alongside structured must
+    "m_not": Filter(must=[FilterCondition(field="text", match_text_from_query="kw")],
+                    must_not=[FilterCondition(field="cat", match_from_query="cat_q")]),
+    "m_not_text": Filter(must=[FilterCondition(field="cat", match_from_query="cat_q")],
+                         must_not=[FilterCondition(field="text", match_text_from_query="neg")]),
+    # structured-only plans (no per-query text) with static conditions in
+    # every group, including static text: the static step (one keep row, one
+    # should row) plus the structured conditions on the GPU
+    "s_must_static": Filter(must=[FilterCondition(field="cat", match_from_query="cat_q"),
+                                  FilterCondition(field="text", match_text="alpha")],
+                            must_not=[FilterCondition(field="cat", match="z")]),
+    "s_should_static": Filter(should=[FilterCondition(field="cat", match_from_query="cat_q"),
+                                      FilterCondition(field="text", match_text="beta gamma")]),
+    "s_not": Filter(must=[FilterCondition(field="text", match_text="delta")],
+                    must_not=[FilterCondition(field="cat", match_from_query="cat_q")]),
+}
+
+
+@pytest.mark.parametrize("window", [None, 1])
+@pytest.mark.parametrize("with_unfiltered", [False, True])
+def test_run_compute_mixed_shapes_match_switch_off(e2e_ds, monkeypatch, with_unfiltered, window):
+    """Every FilterPlan shape (mixed and structured-only) end to end equals
+    the old routing; every mask part (FilterPlan text and should parts
+    included) is released, and the static rows' device copies too."""
+    monkeypatch.setattr(C, "_RESIDENT_WINDOW_BYTES", window)
+    searches = [SearchSpec(name=n, vector_type="dense", metric="dot", k=40, filter=f)
+                for n, f in MIXED_SHAPES.items()]
+    if with_unfiltered:
+        searches.append(SearchSpec(name="all", vector_type="dense", metric="dot", k=5))
+    made, plans = [], []
+    real_eval = C.evaluate
+
+    def spy_eval(*a, **kw):
+        m = real_eval(*a, **kw)
+        if isinstance(m, F.FilterPlan):
+            made.extend(m.masks())
+            plans.append(m)
+        return m
+    monkeypatch.setattr(C, "evaluate", spy_eval)
+    tag = f"mx{int(with_unfiltered)}{window}"
+    monkeypatch.setenv("NOVA_BF_NO_GPU_COMBO", "1")
+    off, _ = _run(e2e_ds, "off" + tag, searches, 37)
+    monkeypatch.delenv("NOVA_BF_NO_GPU_COMBO")
+    on, u = _run(e2e_ds, "on" + tag, searches, 37)
+    n_mixed = sum(n.startswith("m_") for n in MIXED_SHAPES)
+    assert u["mixed_plans"] == n_mixed * 3                    # 3 files
+    assert u["struct_plans"] == (len(MIXED_SHAPES) - n_mixed) * 3
+    assert made and all(not m._parts_dev and not m._dev for m in made)
+    assert plans and all(not p._dev for p in plans)
+    assert set(on) == set(off)
+    for name in on:
+        if with_unfiltered:
+            assert on[name] == off[name], name
+        else:
+            _assert_hits_close(on[name], off[name], name)
+
+
+def test_combo_parts_budget_param_drives_the_fallback(e2e_ds, monkeypatch, caplog):
+    """`params.combo_parts_max_bytes` reaches the guard: at 0 (with the guard
+    on) every lazy text mask with more phrase rows than queries is built from
+    per-combination rows, a warning names the param, and outputs equal the
+    old routing exactly (no compaction change: an unfiltered search runs)."""
+    import logging
+    monkeypatch.setattr(F, "_COMBO_PARTS_GUARD", True)
+    searches = _searches(True)
+    monkeypatch.setenv("NOVA_BF_NO_GPU_COMBO", "1")
+    off, _ = _run(e2e_ds, "budget_off", searches, 37)
+    monkeypatch.delenv("NOVA_BF_NO_GPU_COMBO")
+    with caplog.at_level(logging.WARNING, logger="nova_bf.filters"):
+        on, u = _run(e2e_ds, "budget_on", searches, 37, combo_parts_max_bytes=0)
+    assert u["budget_fallbacks"] > 0
+    assert any("params.combo_parts_max_bytes" in r.getMessage() for r in caplog.records)
+    for name in on:
+        assert on[name] == off[name], name
+    _, u2 = _run(e2e_ds, "budget_default", searches, 37)
+    assert u2["budget_fallbacks"] == 0
+
+
+MIXED_SPLIT = Filter(   # structured should next to text: text must/should are separate parts
+    must=[FilterCondition(field="text", match_text_from_query="kw")],
+    must_not=[FilterCondition(field="text", match_text_from_query="neg")],
+    should=[FilterCondition(field="cat", match_from_query="cat_q"),
+            FilterCondition(field="url", match_text_from_query="d0"),
+            FilterCondition(field="url", match_text_from_query="d1")],
+)
+MIXED_SPLIT_SHOULD = Filter(   # split, and only the text SHOULD part exceeds the budget
+    must=[FilterCondition(field="text", match_text_from_query="kw")],
+    should=[FilterCondition(field="cat", match_from_query="cat_q"),
+            FilterCondition(field="text", match_text_from_query="neg"),
+            FilterCondition(field="url", match_text_from_query="d0")],
+)
+MIXED_NOT = Filter(   # structured must alongside text (no split), more phrase rows than queries
+    must=[FilterCondition(field="text", match_text_from_query="kw"),
+          FilterCondition(field="cat", match_from_query="cat_q")],
+    must_not=[FilterCondition(field="text", match_text_from_query="neg")],
+)
+
+
+@pytest.mark.parametrize("single", [True, False])
+@pytest.mark.parametrize("filt", [MIXED_SPLIT, MIXED_SPLIT_SHOULD, MIXED_NOT],
+                         ids=["split", "split_should", "nosplit"])
+def test_combo_parts_budget_reaches_mixed_plans(e2e_ds, monkeypatch, filt, single):
+    """The budget also reaches mixed plans' text parts (split and non-split),
+    and a run with a single filtered search (no multi-filter reader call):
+    at 0 the fallback fires, at the default it doesn't, hits unchanged."""
+    monkeypatch.setattr(F, "_COMBO_PARTS_GUARD", True)
+    searches = [SearchSpec(name="m", vector_type="dense", metric="dot", k=30, filter=filt)]
+    if not single:
+        # a second filtered search with no text part, so every fallback is m's
+        searches.append(SearchSpec(name="cat", vector_type="dense", metric="dot", k=25,
+                                   filter=Filter(must=[FilterCondition(
+                                       field="cat", match_from_query="cat_q")])))
+        searches.append(SearchSpec(name="all", vector_type="dense", metric="dot", k=5))
+    tag = f"{'s' if single else 'm'}_{id(filt)}"
+    on, u = _run(e2e_ds, f"mb_on_{tag}", searches, 37, combo_parts_max_bytes=0)
+    assert u["budget_fallbacks"] > 0 and u["mixed_plans"] > 0, u
+    base, u2 = _run(e2e_ds, f"mb_default_{tag}", searches, 37)
+    assert u2["budget_fallbacks"] == 0, u2
+    for name in on:
+        _assert_hits_close(on[name], base[name], (tag, name))
+
+
+def test_struct_union_tightens_compaction(e2e_ds, monkeypatch):
+    """The reader sets each structured plan's `struct_union` to the rows some
+    query's structured must side admits (here: category in the queries'
+    categories), so compaction does not fall back to every row."""
+    seen = []
+    real_eval = C.evaluate
+
+    def spy_eval(f, table, *a, **kw):
+        m = real_eval(f, table, *a, **kw)
+        if isinstance(m, F.FilterPlan) and m.text is None:
+            seen.append((m, table, a[0]))
+        return m
+    monkeypatch.setattr(C, "evaluate", spy_eval)
+    f = Filter(must=[FilterCondition(field="cat", match_from_query="cat_q")])
+    _run(e2e_ds, "struct_union", [SearchSpec(name="s", vector_type="dense", metric="dot",
+                                             k=10, filter=f)], 37)
+    assert seen
+    for plan, table, qv in seen:
+        wanted = {v for v in qv["cat_q"].tolist() if v is not None}
+        cats = table["cat"].to_pylist()
+        want = np.array([c is not None and c in wanted for c in cats])
+        assert plan.struct_union is not None, "reader did not set struct_union"
+        assert np.array_equal(plan.struct_union, want)
+        assert np.array_equal(plan.union_rows(), want)

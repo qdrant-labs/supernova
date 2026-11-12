@@ -1,34 +1,25 @@
 """Compute exact per-query top-K results over streamed corpus data.
 
-Each worker loads its queries, streams assigned corpus files, scores them in
-GPU-memory-bounded batches, and incrementally merges candidates into a running
-top-K. Corpus IDs are resolved only for final winners; the GPU state instead
-carries encoded source-file/row identifiers.
+Each worker streams its assigned corpus files, scores GPU-memory-bounded
+batches, and maintains a running top-K. Candidates are tracked by file
+and row indices; corpus IDs are resolved only for final winners.
 
-One run may execute multiple dense, sparse, multi-vector, filtered, and
-unfiltered `SearchSpec`s. Searches remain independent ranked lists, while
-compatible work is shared across specs, including decoded corpus batches,
-GPU-resident data, and score computations.
+A run can execute multiple dense, sparse, multi-vector, filtered, and
+unfiltered SearchSpecs. Compatible searches share corpus decoding, GPU
+data, and score computations while maintaining independent rankings.
 
-Dense metrics can share a `Q @ C^T` product and derive dot, cosine, or
-Euclidean scores from it; sparse dot and cosine similarly share their sparse
-product when applicable.
+Dense dot, cosine, and Euclidean searches can share a Q @ C^T product.
+Sparse dot and cosine searches can similarly share their sparse product.
 
-Uniform filters compact corpus rows before scoring when no unfiltered baseline
-requires the full batch. Multiple filtered searches sharing a vector type use
-the union of their surviving rows and select their own subsets from that shared
-batch.
+Uniform filters remove rows before scoring when no unfiltered search
+needs them. Compatible filtered searches score the union of matching rows
+and select their own subsets.
 
-Per-query filters instead mask individual `(query, row)` scores before top-K
-selection. Eligible numeric/categorical filters are evaluated on the GPU;
-text predicates use the CPU fallback, which stores their per-query row masks as
-row-packed `PackedRowMask`s and unpacks only the needed slice on device — or,
-for the common text shape, as a lazy `ComboRowMask` (distinct phrase rows plus
-the per-combination AND/OR structure) whose combination runs on the device per
-slice (`_combo_mask_device`; `NOVA_BF_NO_GPU_COMBO=1` restores the packed path).
+Per-query filters mask scores before top-K selection. FilterPlan combines
+precomputed text bitmaps, static row masks, and structured predicates on
+the GPU for each slice.
 
-`SearchSpec.rows` narrows each spec to its own query rows, while shared query
-and filter structures may span larger run-wide unions.
+SearchSpec.rows selects each search's queries from the shared query set.
 """
 
 from __future__ import annotations
@@ -60,7 +51,8 @@ from nova_bf import topk_triton
 from nova_bf import twopass
 from nova_bf.config import BruteForceConfig, Filter, FilterCondition, SearchSpec
 from nova_bf.filters import (
-    ComboRowMask,
+    TextPart,
+    FilterPlan,
     PackedRowMask,
     _condition_mask,
     _match_any_membership,
@@ -2718,7 +2710,7 @@ def _resident_acquire(device, need: int):
     return torch.empty(max(cap, need), dtype=torch.uint8, device=device)
 
 
-def _resident_entry(cm: "ComboRowMask", device) -> _Resident:
+def _resident_entry(cm: "TextPart", device) -> _Resident:
     """Get or create the mask's resident device state.
 
     On first use, acquires a reusable buffer and determines the window
@@ -2734,7 +2726,7 @@ def _resident_entry(cm: "ComboRowMask", device) -> _Resident:
     return ent
 
 
-def _resident_window(cm: "ComboRowMask", device, k: int):
+def _resident_window(cm: "TextPart", device, k: int):
     """Return the requested mask window from device memory.
 
     Reuses the loaded window when possible, otherwise uploads the new
@@ -2755,7 +2747,7 @@ def _resident_window(cm: "ComboRowMask", device, k: int):
     return ent.view
 
 
-def _resident_release(cm: "ComboRowMask") -> None:
+def _resident_release(cm: "TextPart") -> None:
     """Return the mask's device buffers to the pool for reuse.
 
     Clears the mask's cached device state.
@@ -2768,7 +2760,7 @@ def _resident_release(cm: "ComboRowMask") -> None:
     cm.release_device()
 
 
-def _combo_mask_device(cm: "ComboRowMask", true_rows, device):
+def _combo_mask_device(cm: "TextPart", true_rows, device):
     """Build a per-query boolean mask for the selected rows on the device.
 
     Combines the mask's shared components on the GPU, then expands them into
@@ -2783,16 +2775,14 @@ def _combo_mask_device(cm: "ComboRowMask", true_rows, device):
     n_p, nb = cm.parts.shape
     if cm.n_queries == 0 or nb == 0:
         return None
-    # Check for matching rows on the host when the query union is cheap to
-    # compute. This avoids unnecessary GPU transfers and synchronization
-    # for empty slices. Otherwise, check the combined mask on the device.
-    host_union = cm.union_packed() if cm.union_is_cheap() else None
+    # Skip slices with no matching rows, using the host-side union to avoid GPU sync.
+    host_union = cm.union_packed()
     if isinstance(true_rows, slice):
         r0, r1 = true_rows.start, true_rows.stop
         n = r1 - r0
         if n <= 0:
             return None
-        if host_union is not None and not _packed_slice_any(host_union[None, :], r0, n):
+        if not _packed_slice_any(host_union[None, :], r0, n):
             return None
         b0, b1 = r0 >> 3, (r1 + 7) >> 3
         w = _resident_entry(cm, device).width
@@ -2802,8 +2792,7 @@ def _combo_mask_device(cm: "ComboRowMask", true_rows, device):
             win = _resident_window(cm, device, k0)
             R = cm.combine_torch(win[:, b0 - k0 * w:b1 - k0 * w])
         else:
-            # The slice crosses windows: combine each window's columns
-            # separately (columns are independent) into one result.
+            # Combine each window separately into the output.
             R = None
             for k in range(k0, k1 + 1):
                 lo, hi = max(b0, k * w), min(b1, (k + 1) * w)
@@ -2812,22 +2801,10 @@ def _combo_mask_device(cm: "ComboRowMask", true_rows, device):
                     R = torch.empty((cm.n_combos, b1 - b0), dtype=torch.uint8,
                                     device=part.device)
                 R[:, lo - b0:hi - b0] = cm.combine_torch(part)
-        if host_union is None:
-            # Clear the bits outside [r0, r1) in the boundary bytes, so the
-            # empty check is exact (the unpack below trims them anyway).
-            head = 0xFF >> (r0 & 7)
-            tail = (0xFF << ((-r1) & 7)) & 0xFF
-            if b1 - b0 == 1:
-                R[:, 0] &= head & tail
-            else:
-                R[:, 0] &= head
-                R[:, -1] &= tail
-            if not bool(R.any()):
-                return None
         filters_mod._count("device_builds")
         return _expand_unpack(R, cm.device_index(R.device)[3], r0 & 7, n)
     sel = (np.uint8(1) << (7 - (true_rows & 7)).astype(np.uint8))
-    if host_union is not None and not (host_union[true_rows >> 3] & sel).any():
+    if not (host_union[true_rows >> 3] & sel).any():
         return None
     n = len(true_rows)
     if n == 0:
@@ -2850,9 +2827,6 @@ def _combo_mask_device(cm: "ComboRowMask", true_rows, device):
         P[:, i0 >> 3:(i1 + 7) >> 3] = _pack_cols_device(sub, i1 - i0)
         del sub
     R = cm.combine_torch(P)
-    # padding bits are 0 in every part, hence in every combined row: exact
-    if host_union is None and not bool(R.any()):
-        return None
     filters_mod._count("device_builds")
     del P
     return _expand_unpack(R, cm.device_index(R.device)[3], 0, n)
@@ -2862,7 +2836,7 @@ def _combo_mask_device(cm: "ComboRowMask", true_rows, device):
 _COMBINE_CHUNK_ROWS_BYTES = 64 << 20
 
 
-def _gather_part_bytes(cm: "ComboRowMask", device, cols: np.ndarray, w: int, nb: int):
+def _gather_part_bytes(cm: "TextPart", device, cols: np.ndarray, w: int, nb: int):
     """`(n_parts, len(cols))` uint8: each part's byte at byte-columns `cols`,
     read from the device copy of `parts` (window by window if it is windowed)."""
     import torch
@@ -2892,7 +2866,7 @@ _UNCACHED = object()
 
 def _union_keep(
     filters: list[Filter],
-    keeps: dict[Filter | None, "np.ndarray | PackedRowMask | None"],
+    keeps: dict[Filter | None, "np.ndarray | PackedRowMask | FilterPlan | None"],
     n_rows: int,
 ) -> np.ndarray:
     """Return the union of filtered row masks as `(n_rows,)` bool.
@@ -2904,7 +2878,7 @@ def _union_keep(
     parts = []
     for f in filters:
         m = keeps[f]
-        if isinstance(m, ComboRowMask):
+        if isinstance(m, FilterPlan):
             # Compute the union of matching rows directly from the shared mask
             # components, avoiding expansion into individual query masks.
             m = m.union_rows()
@@ -5359,22 +5333,24 @@ def _is_per_query(f: Filter | None) -> bool:
     return f is not None and f.is_per_query()
 
 
+def _is_pq_struct(cond) -> bool:
+    """A per-query structured (non-text) condition."""
+    return cond.match_from_query is not None or cond.range_from_query is not None
+
+
+def _is_mixed(f: Filter) -> bool:
+    """Per-query text AND per-query structured conditions in one filter."""
+    conds = f.all_conditions()
+    return (any(c.match_text_from_query is not None for c in conds)
+            and any(_is_pq_struct(c) for c in conds))
+
+
 def _gpu_eligible(f: Filter | None) -> bool:
-    """Whether `f`'s per-query evaluation can run GPU-natively (Front A — see
-    this module's docstring) instead of `filters.py`'s CPU/numpy path:
-    needs at least one per-query leaf (a purely uniform filter already gets
-    the cheap column-gather path — see `_process_shared_batch` — so there's
-    nothing to speed up here) and no `match_text`/`match_text_from_query`
-    leaf ANYWHERE in the filter — torch has no string tensor type, so text
-    tokenization/matching stays CPU-only regardless of what else is in the
-    filter (see `filters._token_row_masks`'s single-pass tokenization
-    instead)."""
+    """Check whether a per-query filter can be evaluated directly on the GPU.
+    """
     if f is None or not _is_per_query(f):
         return False
-    return not any(
-        cond.match_text is not None or cond.match_text_from_query is not None
-        for cond in f.all_conditions()
-    )
+    return not any(cond.match_text_from_query is not None for cond in f.all_conditions())
 
 
 def _not_null_mask(vals: np.ndarray) -> np.ndarray:
@@ -5425,10 +5401,13 @@ def _safe_extreme(vals: np.ndarray, kind: str) -> float | None:
 
 def _row_union_from_gpu_leaves(
     f: Filter, leaf_arrays: dict[FilterCondition, np.ndarray],
-    query_filter_vals: dict[str, np.ndarray], n_rows: int,
+    query_filter_vals: dict[str, np.ndarray], n_rows: int, include_static: bool = True,
 ) -> np.ndarray | None:
     """`(rows,)` SAFE OVER-APPROXIMATION of "does at least one query want
-    this row" for a GPU-eligible per-query filter (Front B — see
+    this row" for a per-query filter's structured conditions (GPU-eligible
+    filters, and plans with `include_static=False`: their static rows are
+    already in the plan and their static leaves are not in `leaf_arrays`)
+    (Front B — see
     `run_compute`'s `has_baseline`/`vt_union_filters`), or `None` if `f.must`
     has no leaf at all to build one from (caller substitutes all-`True`: no
     tightening possible, but always correct).
@@ -5497,6 +5476,8 @@ def _row_union_from_gpu_leaves(
                 if hi is not None:
                     part &= arr <= hi
         else:
+            if not include_static:
+                continue        # the caller already has the static rows
             # Static match/range leaf — leaf_arrays[cond] IS its exact
             # (rows,) boolean mask (see _corpus_leaf_array), a necessary
             # condition for every query, so it tightens the union exactly.
@@ -5578,12 +5559,21 @@ def _corpus_leaf_array(
     `lut_for_cond` may provide a prebuilt vocab lookup to avoid rebuilding it
     for every file.
     """
+    if cond.match_from_query is None and cond.range_from_query is None:
+        return _condition_mask(cond, table)
+    # Decode dictionary columns before checking for nulls, which must never match.
+    col = filters_mod._decode_dictionary(table[cond.field])
+    nulls = col.is_null().to_numpy(zero_copy_only=False) if col.null_count else None
+    vals = filters_mod.corpus_values(col)     # exact ints even with nulls
     if cond.match_from_query is not None:
-        corpus_vals = table[cond.field].to_numpy(zero_copy_only=False)
-        return _encode_against_vocab(vocab_for_cond, corpus_vals, lut_for_cond)
-    if cond.range_from_query is not None:
-        return table[cond.field].to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
-    return _condition_mask(cond, table)
+        codes = _encode_against_vocab(vocab_for_cond, vals, lut_for_cond)
+        if nulls is not None:
+            codes[nulls] = -1               # -1: matches no query
+        return codes
+    vals = vals.astype(np.float64, copy=nulls is not None)
+    if nulls is not None:
+        vals[nulls] = np.nan                # NaN: every comparison is False
+    return vals
 
 
 def _narrow_gpu_leaf_state(state, idx):
@@ -5667,6 +5657,67 @@ def _gpu_evaluate(f: Filter, leaf_gpu: dict, rows, query_gpu: dict, device: str)
     for cond in _static_first(f.must_not):
         keep = keep & ~_gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
     return keep
+
+
+def _plan_mask_device(plan, rows, true_rows, leaf_gpu: dict, query_gpu: dict, device):
+    """Build the per-query filter mask for this slice on the GPU.
+
+    Combine text bitmaps, static row masks, and structured predicates
+    according to the filter's Boolean logic. Return None if no rows match.
+    """
+    import torch
+
+    m = None
+    if plan.text is not None:
+        m = _combo_mask_device(plan.text, true_rows, device)
+        if m is None:
+            return None
+        if not (plan.struct_must or plan.struct_not or plan.should_applies):
+            return m
+
+    def and_(x):
+        nonlocal m
+        m = x if m is None else (m & x)
+
+    keep_t, or_t = _plan_static_device(plan, device)
+    if keep_t is not None:
+        and_(keep_t[rows])
+    for cond in plan.struct_must:
+        and_(_gpu_cond_mask(cond, leaf_gpu, rows, query_gpu))
+    if plan.should_applies:
+        any_ = None
+        if plan.should_text is not None:
+            any_ = _combo_mask_device(plan.should_text, true_rows, device)
+        if or_t is not None:
+            x = or_t[rows]
+            any_ = x if any_ is None else (any_ | x)
+        for cond in plan.struct_should:
+            x = _gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
+            any_ = x if any_ is None else (any_ | x)
+        if any_ is None:        # only empty members: matches nothing
+            return None
+        and_(any_)
+    for cond in plan.struct_not:
+        and_(~_gpu_cond_mask(cond, leaf_gpu, rows, query_gpu))
+    if m is None or m.dim() != 2:
+        raise RuntimeError("a per-query filter plan produced no per-query mask")
+    return m if bool(m.any()) else None
+
+
+def _plan_static_device(plan, device):
+    """Upload and cache the plan's static Boolean masks once per device."""
+    import torch
+
+    if plan.static_keep is None and plan.static_or is None:
+        return None, None
+    key = str(device)
+    got = plan._dev.get(key)
+    if got is None:
+        got = plan._dev[key] = tuple(
+            None if a is None else torch.from_numpy(np.ascontiguousarray(a)).to(
+                device, non_blocking=True)
+            for a in (plan.static_keep, plan.static_or))
+    return got
 
 
 class _SliceFilters:
@@ -5847,7 +5898,7 @@ def _tile_any(mask, width: int, n_tiles: int):
 def _process_shared_batch(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_key, spec_top_enc, spec_thr,
-    keeps: dict[Filter | None, "np.ndarray | PackedRowMask | None"],
+    keeps: dict[Filter | None, "np.ndarray | PackedRowMask | FilterPlan | None"],
     filter_is_per_query: dict[Filter | None, bool],
     filter_is_gpu_eligible: dict[Filter | None, bool], leaf_gpu: dict[FilterCondition, object],
     query_gpu_by_filter: dict[object, dict], filter_share_count: dict[Filter | None, int],
@@ -5887,6 +5938,16 @@ def _process_shared_batch(
     def build_mask(f, rows, true_rows):
         """This slice's `(filter_n_q[f], n_cols)` mask for per-query filter `f`,
         or `None` when no query has an allowed cell here."""
+        # legacy routing (switch off) keeps no entry for GPU-eligible filters
+        pm = keeps.get(f)
+        if isinstance(pm, FilterPlan):
+            if pm.n_queries != filter_n_q[f]:
+                raise RuntimeError(
+                    f"per-query filter mask is {pm.n_queries} queries "
+                    f"tall, expected {filter_n_q[f]}"
+                )
+            return _plan_mask_device(pm, rows, true_rows, leaf_gpu,
+                                     query_gpu_by_filter.get(f, {}), device)
         if filter_is_gpu_eligible[f]:
             cell_mask = _gpu_evaluate(
                 f, leaf_gpu, rows,
@@ -5904,8 +5965,6 @@ def _process_shared_batch(
                 f"per-query filter mask is {pm.n_queries} queries "
                 f"tall, expected {filter_n_q[f]}"
             )
-        if isinstance(pm, ComboRowMask):
-            return _combo_mask_device(pm, true_rows, device)
         if isinstance(true_rows, slice):
             r0, r1 = true_rows.start, true_rows.stop
             if not _packed_slice_any(pm.packed, r0, r1 - r0):
@@ -6115,6 +6174,25 @@ def _validate_query_filter_cols(
             f"queries file is missing column(s): {' and '.join(parts)} "
             f"— available columns: {sorted(schema_names)}"
         )
+
+
+def _validate_match_types(specs, qstore: Store, corpus_files, cstore: Store, cfg) -> None:
+    """Validate match predicate types using the first query and corpus file schemas."""
+    named = [(s.name, s.filter) for s in specs if s.filter is not None]
+    if not any(c.match_from_query is not None or c.match is not None
+               for _, f in named for c in f.all_conditions()):
+        return
+    qfiles = qstore.list_parquets()
+    if not qfiles or not corpus_files:
+        return
+    import pyarrow.parquet as pq
+
+    qschema = pq.ParquetFile(qfiles[0].read_path, filesystem=qstore.fs).schema_arrow
+    cschema = pq.ParquetFile(corpus_files[0].read_path, filesystem=cstore.fs).schema_arrow
+    filters_mod.check_match_types(
+        named, cschema, qschema,
+        skip_fields=set(normalize_date_fields(cfg.corpus.date_fields)),
+        skip_query_cols=set(normalize_date_fields(cfg.queries.date_fields)))
 
 
 def _select_device(torch) -> str:
@@ -6430,6 +6508,7 @@ def run_compute(
     # Applied BEFORE striding so the global file index — and thus make_point_id — is
     # over the filtered set, consistent between compute workers and merge.
     all_files = filter_corpus_files(all_files, cfg.corpus.include, cfg.corpus.exclude)
+    _validate_match_types(specs, qstore, all_files, cstore, cfg)
     # Compute the corpus fingerprint for both the manifest and threshold exchange.
     corpus_fp = run_manifest.corpus_fingerprint(all_files)
     if num_jobs is not None:
@@ -6873,6 +6952,9 @@ def run_compute(
     # sharing an identical per-query leaf build/transfer it only once —
     # same sharing leaf_arrays/leaf_gpu already give the corpus side below.
     filter_is_gpu_eligible: dict[Filter | None, bool] = {f: _gpu_eligible(f) for f in distinct_filters}
+    # Mixed per-query filters also need GPU state for their structured predicates.
+    filter_is_mixed: dict[Filter | None, bool] = {
+        f: bool(use_combo and f is not None and _is_mixed(f)) for f in distinct_filters}
     gpu_query_gpu: dict[FilterCondition, object] = {}
     gpu_vocabs: dict[FilterCondition, np.ndarray] = {}
     # Prebuild vocab lookup tables once instead of once per corpus file. 
@@ -6881,11 +6963,11 @@ def run_compute(
     gpu_vocab_luts: dict[FilterCondition, _VocabLut] = {}
     lut_budget = _VOCAB_LUT_PREBUILD_BYTES
     for f in distinct_filters:
-        if not filter_is_gpu_eligible[f]:
+        if not (filter_is_gpu_eligible[f] or filter_is_mixed[f]):
             continue
         for cond in f.all_conditions():
             if cond.match_from_query is None and cond.range_from_query is None:
-                continue  # a static leaf inside an eligible filter needs no per-query GPU state
+                continue  # a static (or text) leaf needs no per-query GPU state
             if cond in gpu_query_gpu:
                 continue
             qgpu, vocab = _build_gpu_leaf_state(cond, query_filter_vals, device)
@@ -6911,7 +6993,7 @@ def run_compute(
     # after the last member using it); still passed through its signature.
     filter_share_count: dict[Filter | None, int] = Counter(spec_filter)
 
-    # Narrow CPU per-query filter masks to the query rows that actually use them.
+    # Narrow per-query filter masks / plans to the query rows that actually use them.
     # This keeps unrelated query sets in a unified file from increasing mask memory.
     filter_rows: dict[Filter | None, np.ndarray | None] = _union_rows_by_key(
         spec_filter, spec_rows, n_q
@@ -6938,8 +7020,8 @@ def run_compute(
         for f, r in filter_rows.items() if f is not None
     }
 
-    # Precompute file-independent text-query tokenization once for CPU-fallback
-    # filters. GPU-eligible filters bypass this path.
+    # Precompute file-independent text-query tokenization once per filter with
+    # text (GPU-eligible filters have no per-query text, so they need none).
     filter_text_prep: dict[Filter, object] = {
         f: prepare_text_queries(f, filter_query_vals[f])
         for f in distinct_filters
@@ -6950,7 +7032,7 @@ def run_compute(
     # that filter's own query rows.
     gpu_query_by_filter: dict[object, dict] = {}
     for f in distinct_filters:
-        if f is None or not filter_is_gpu_eligible[f]:
+        if f is None or not (filter_is_gpu_eligible[f] or filter_is_mixed[f]):
             continue
         r = filter_rows[f]
         if r is None:
@@ -7446,9 +7528,10 @@ def run_compute(
                                 if k.startswith("decode_parquet_")
                             ) or "none",
                         )
-                    # Evaluate each distinct filter once per file. CPU per-query filters return a
-                    # row-packed `PackedRowMask`; GPU-eligible filters build fine masks lazily and
-                    # keep only a row-union mask here when compaction needs one.
+                    # Evaluate each distinct filter once per file. With the lazy combine on,
+                    # every per-query filter comes back as a `FilterPlan` for the GPU; legacy
+                    # routing gives `PackedRowMask`s, and GPU-eligible filters there keep only
+                    # a row-union mask here when compaction needs one.
                     n_rows = n_rows_file
                     if n_rows > MAX_ROWS_PER_FILE:
                         raise ValueError(
@@ -7461,35 +7544,57 @@ def run_compute(
 
                     # CPU-fallback filters can run concurrently. Use a private outer pool so tasks
                     # waiting on the shared scan pool cannot deadlock that same pool.
+                    # With the lazy combine on, EVERY filter goes through `evaluate`
+                    # (per-query ones come back as a `FilterPlan` / `TextPart`
+                    # for the GPU); off, GPU-eligible filters keep `_gpu_evaluate`.
                     cpu_fallback_filters = [
-                        f for f in distinct_filters if f is not None and not filter_is_gpu_eligible[f]
+                        f for f in distinct_filters
+                        if f is not None and (use_combo or not filter_is_gpu_eligible[f])
                     ]
+                    # one mask per static condition per file, shared by all filters
+                    static_cache: dict = {}
                     if len(cpu_fallback_filters) > 1:
                         with ThreadPoolExecutor(max_workers=len(cpu_fallback_filters)) as pool:
                             masks = list(pool.map(
                                 lambda f: evaluate(f, table, filter_query_vals[f],
-                                                   filter_pool, filter_text_prep[f],
-                                                   combo=use_combo),
+                                                   filter_pool, filter_text_prep.get(f),
+                                                   combo=use_combo, static_cache=static_cache,
+                                                   parts_budget=cfg.params.combo_parts_max_bytes),
                                 cpu_fallback_filters,
                             ))
                     else:
                         masks = [evaluate(f, table, filter_query_vals[f], filter_pool,
-                                          filter_text_prep[f], combo=use_combo)
+                                          filter_text_prep.get(f), combo=use_combo,
+                                          static_cache=static_cache,
+                                          parts_budget=cfg.params.combo_parts_max_bytes)
                                  for f in cpu_fallback_filters]
                     for f, mask in zip(cpu_fallback_filters, masks):
-                        # `evaluate` already returns the per-query case ROW-PACKED
-                        # (a `filters.PackedRowMask`) or as a lazy
-                        # `filters.ComboRowMask`. Warm a lazy mask's row union
-                        # here, on the reader, when it is cheap: the GPU thread
-                        # then decides empty slices on the host without a sync.
-                        if isinstance(mask, ComboRowMask) and mask.union_is_cheap():
-                            mask.union_packed()
+                        # Warm each plan's text-part row union here, on the reader:
+                        # the GPU thread then skips empty slices on the host
+                        # without a sync.
+                        if isinstance(mask, FilterPlan):
+                            for part in mask.masks():
+                                part.union_packed()
                         keeps[f] = mask
 
                     # GPU-eligible filters share/deduplicate corpus leaf arrays.
                     for f in distinct_filters:
                         if f is None:
                             keeps[f] = None
+                        elif isinstance(keeps.get(f), FilterPlan):
+                            # its per-query structured conditions run on the GPU
+                            plan = keeps[f]
+                            for cond in f.all_conditions():
+                                if _is_pq_struct(cond) and cond not in leaf_arrays:
+                                    leaf_arrays[cond] = _corpus_leaf_array(
+                                        cond, table, gpu_vocabs.get(cond),
+                                        gpu_vocab_luts.get(cond),
+                                    )
+                            if f in filters_needing_row_union:
+                                # superset of what the structured must side admits
+                                # (static rows are already in the plan)
+                                plan.struct_union = _row_union_from_gpu_leaves(
+                                    f, leaf_arrays, query_filter_vals, n_rows, include_static=False)
                         elif filter_is_gpu_eligible[f]:
                             for cond in f.all_conditions():
                                 if cond not in leaf_arrays:
@@ -7791,8 +7896,10 @@ def run_compute(
                 # tensors now, before the next file's masks take buffers,
                 # rather than whenever the last reference happens to drop.
                 for m in keeps.values():
-                    if isinstance(m, ComboRowMask):
-                        _resident_release(m)
+                    if isinstance(m, FilterPlan):
+                        for part in m.masks():
+                            _resident_release(part)
+                        m.release_device()
 
                 # Threshold exchange: publish ours, pick up the peers' maximum.
                 _publish_thresholds()
@@ -8407,7 +8514,7 @@ def run_compute(
         # RESOLVED native I/O settings (NOVA_BF_RUST_FETCH_* over the config).
         # Per-file fallbacks to pyarrow are logged, not counted here.
         "rust_fetch": rust_fetch_settings(),
-        # Per-query text combine: lazy `ComboRowMask` combined on the device
+        # Per-query text combine: lazy `TextPart` combined on the device
         # (permitted unless NOVA_BF_NO_GPU_COMBO) and what actually ran.
         "text_filter_combine": {**filters_mod.combo_usage(), "permitted": use_combo},
         # Snapshot exchange statistics to avoid concurrent updates during serialization.

@@ -346,6 +346,11 @@ class ParamsConfig(BaseModel):
     # top-k (~k/N per query left), so the merge reads less. Verified by merge.
     trim_partials: bool = True
 
+    # Per-file, per-text-part memory limit for phrase bitmaps, or the full
+    # per-query mask size if larger. Exceeding this limit falls back to CPU
+    # combination with a warning.
+    combo_parts_max_bytes: int = Field(default=2 << 30, ge=0, strict=True)
+
     # Which of two EXACTLY-tied candidates wins.
     # Neither makes SCORES reproducible across batch sizes — re-tiling a matmul
     # changes its reduction order, which can change whether a tie exists at all.

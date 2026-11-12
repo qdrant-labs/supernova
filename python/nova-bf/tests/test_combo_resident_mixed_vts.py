@@ -13,7 +13,7 @@ import pytest
 from nova_bf import compute as C, filters as F
 from nova_bf.config import (BruteForceConfig, CorpusConfig, Filter, FilterCondition,
                             OutputConfig, ParamsConfig, QueriesConfig, SearchSpec)
-from nova_bf.filters import ComboRowMask
+from nova_bf.filters import TextPart
 import test_combo_row_mask as T  # sibling test module (pytest puts tests/ on sys.path)
 
 DIM, VOCAB = 5, 40
@@ -88,8 +88,8 @@ def test_mixed_vts_resident(ds, monkeypatch, batch, with_mv, window):
     real = C.evaluate
     def spy(*a, **kw):
         m = real(*a, **kw)
-        if isinstance(m, ComboRowMask):
-            made.append(m)
+        if isinstance(m, F.FilterPlan):
+            made.extend(m.masks())
         return m
     monkeypatch.setattr(C, "evaluate", spy)
     monkeypatch.setenv("NOVA_BF_NO_GPU_COMBO", "1")
