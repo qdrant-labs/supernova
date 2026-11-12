@@ -4,7 +4,7 @@
 
 # supernova
 
-Generate massive pre-embedded datasets, load them into vector databases, and
+Generate vector benchmarks, load them into vector databases, and
 load-test the result — at scale.
 
 ## Install
